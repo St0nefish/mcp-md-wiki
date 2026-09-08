@@ -61,11 +61,39 @@ Authentication on the protected routes (`/mcp`, `/status`, `/metrics`, `/admin/r
 
 ## Workflow
 
-- **Branch protection** on `master`: direct push disabled, status checks required (`test` job must pass)
-- Work on feature branches, open PRs — auto-merge on CI pass (via `auto-merge.yaml` workflow)
-- `fix #N` in merge commit auto-closes GitHub issues
-- Branches auto-delete after merge
-- Pre-commit hook enforces `cargo fmt` + `cargo clippy` (activate with `./scripts/setup-dev.sh` after cloning)
+**Pattern A (CI-gated)**, per the knowledge base:
+`dev/tools/repo-workflow-patterns.md`. `master` takes no direct pushes and is
+protected by a repo **ruleset** (not classic branch protection) — direct push
+disabled, status checks required, exactly as before, but the mechanism is a
+ruleset and the details below are what changed:
+
+- Work on a branch, open a PR against `master`. `ci.yml` runs `test` and
+  `qdrant-integration`, fanning into a single `ci-pass` job — that is the
+  **only** required status check the ruleset enforces (never list individual
+  job names as required checks).
+- Merges are **squash only** (`allow_merge_commit: false`,
+  `allow_rebase_merge: false`) via `auto-merge.yml` (`gh pr merge --auto
+  --squash`), titled `<PR title> (#<number>)`. Auto-merge fires as soon as
+  `ci-pass` is green.
+- The ruleset's required-status-checks rule has
+  `strict_required_status_checks_policy: false` — PR branches do **not** need
+  to be up to date with `master` before merging. This is deliberate and
+  load-bearing: it's what lets several PRs opened from the same base commit
+  land in any order without serializing on each other. **Do not routinely
+  rebase a PR branch just because `master` moved, and do not add a bot that
+  force-pushes/rebases open PRs when `master` advances** — with the strict
+  flag off, that would be pure wasted CI for zero benefit. Refresh a branch
+  only to resolve a real conflict, or because the workflow file itself
+  changed (rare here, since GitHub reads workflow files from the PR's base
+  ref, not this Gitea gotcha).
+- `post-merge.yml` re-runs the cheap lint/test checks on `master` after every
+  push, to catch the rare semantic conflict that non-strict merging permits
+  (two PRs each green against an older base, broken once combined). It is
+  **not** a required check — it runs after the merge, not before.
+- `fix #N` in the merge commit auto-closes GitHub issues.
+- Branches auto-delete after merge.
+- Pre-commit hook enforces `cargo fmt` + `cargo clippy` (activate with
+  `./scripts/setup-dev.sh` after cloning).
 
 ## Issue tracking
 
