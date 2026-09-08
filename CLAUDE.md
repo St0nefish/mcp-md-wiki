@@ -74,7 +74,9 @@ ruleset and the details below are what changed:
 - Merges are **squash only** (`allow_merge_commit: false`,
   `allow_rebase_merge: false`) via `auto-merge.yml` (`gh pr merge --auto
   --squash`), titled `<PR title> (#<number>)`. Auto-merge fires as soon as
-  `ci-pass` is green.
+  `ci-pass` is green. The `auto-merge` job only runs for PRs authored by the
+  owner (`St0nefish`); other contributors' PRs still run full CI but require
+  a manual review and merge — they never land unattended.
 - The ruleset's required-status-checks rule has
   `strict_required_status_checks_policy: false` — PR branches do **not** need
   to be up to date with `master` before merging. This is deliberate and
