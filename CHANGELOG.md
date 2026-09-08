@@ -12,6 +12,8 @@ and correctness audit that closed roughly forty issues across security hardening
 indexing correctness, and doc drift, of which the entries below are a representative
 sample rather than an exhaustive list.
 
+<!-- verify-merge-a: inert marker for concurrent-PR auto-merge test, safe to delete -->
+
 ## [Unreleased]
 
 ### Documentation
