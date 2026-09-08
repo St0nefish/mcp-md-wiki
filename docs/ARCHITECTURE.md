@@ -1,5 +1,7 @@
 # Architecture
 
+<!-- verify-merge-b: inert marker for concurrent-PR auto-merge test, safe to delete -->
+
 Current-state reference for mcp-md-wiki. For setup instructions see [`deploy/USAGE.md`](../deploy/USAGE.md); for config options see [`deploy/config.example.yaml`](../deploy/config.example.yaml).
 
 ## Overview
