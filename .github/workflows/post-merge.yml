@@ -1,0 +1,80 @@
+name: Post-Merge
+
+# The ruleset's required_status_checks no longer requires PR branches to stay
+# up to date with master (strict_required_status_checks_policy: false), so
+# two PRs that were each green against an older master can still combine into
+# a broken master (a semantic conflict no textual merge conflict catches).
+# That trade buys order-independent landing for concurrent PRs; this workflow
+# is what catches the rare breakage it allows, immediately after the merge.
+#
+# Deliberately NOT a required status check -- it runs after the merge, not
+# before, so it cannot gate anything. See dev/tools/repo-workflow-patterns.md
+# in the knowledge base for the full rationale (Pattern A).
+#
+# Re-runs only the cheap, secret-free correctness checks from ci.yml's `test`
+# job (fmt, clippy, unit tests). Deliberately excludes:
+#   - the docker build/push step -- needs registry credentials and re-proves
+#     something the PR gate already proved builds
+#   - `qdrant-integration` -- needs a live Qdrant container wired through the
+#     self-hosted runner's network namespace; too heavy to duplicate on every
+#     push to master for what is meant to be a lightweight safety net
+# A semantic break that slips past the PR gate is far more likely to surface
+# in fmt/clippy/unit tests than in the Qdrant wire-protocol suite, so this
+# narrower set still catches what actually matters here.
+
+on:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read pinned Rust toolchain version
+        # Single source of truth is rust-toolchain.toml's `channel`, same as
+        # ci.yml -- see that file's identically-named step for why.
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          if [[ -z "$version" ]]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test
