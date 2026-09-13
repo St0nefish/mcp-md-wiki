@@ -16,6 +16,137 @@ sample rather than an exhaustive list.
 
 ## [Unreleased]
 
+### Retrieval
+
+- **Small-to-big section retrieval** (#286): `get_document` gains `line`/
+  `heading_path` (select the section containing a line, or matching a
+  suffix of a heading path — two ways to name the same section) with
+  optional `levels_up`, and `outline` (headings with line ranges: the whole
+  document's, or with a selector just that section's sub-headings), so a
+  client can fetch exactly the section it needs instead of a whole document
+  or a raw line range whose end it couldn't know. A selected section over
+  `search.section_max_bytes` (default 16000 bytes) comes back as
+  `outline_only`: its sub-heading outline instead of text, plus an `intro`
+  range (`null` when there is none) to read with `start_line`/`end_line`.
+  Outlines are capped to about `section_max_bytes`, shallowest levels first,
+  with `truncated`/`total_entries` and a `hint` on going deeper. The web UI's
+  `GET /api/doc/{*path}` accepts the same `line`/`heading_path`/`levels_up`/
+  `outline` query params (`outline` takes `true`/`false`; `?outline=1` is a
+  400) with identical JSON. These parameters were previously ignored on both
+  transports (the whole document came back); a request that passes them now
+  gets a section, an outline, or — for combinations such as `start_line` with
+  `outline` — an invalid-params error.
+- **`section` granularity and `heading_prefix` filter** (#286), behind a new
+  opt-in `chunking.heading_metadata` flag: `search` gains a `section`
+  granularity — one path-only row (`heading_path`, the section's line range,
+  the matched chunk's own `hit_line_start`/`hit_line_end`, score, `scope`, no
+  text) per matching section, where `scope` (`section`, `preamble` or
+  `whole_document`) says how to fetch it; a row for a heading with
+  sub-headings matched in that heading's own text before its first
+  sub-heading, which the hit range reads on its own — and a
+  `heading_prefix` filter (query mode only) that matches a run of
+  consecutive headings anywhere in a chunk's heading path. Each segment is a
+  complete heading name: `["Conditions"]`, `["Chapter 10: Game Mastering",
+  "Conditions"]` and `["Conditions", "Blinded"]` all match a chunk under
+  `Chapter 10: Game Mastering > Conditions > Blinded`, while `["Chapter 10",
+  "Conditions"]` does not. (`get_document`'s `heading_path`, by contrast,
+  must match the end of a section's path.) Both match headings ignoring case
+  (full Unicode case folding), invisible characters such as soft hyphens,
+  zero-width spaces and joiners, and whitespace differences; a segment of
+  only invisible characters is rejected as blank. With the flag on, chunk results carry `heading_path` (`[]`
+  before the first heading); with it off the key is omitted. Chunk results
+  now also carry `chunk_index` (MCP `structured_content` and `/api/search`),
+  regardless of the flag.
+- **`chunking.heading_metadata` changes chunk boundaries** (#286). While it is
+  on, chunking never merges content across a heading: every chunk lies
+  within one heading's own section (its heading line up to the next heading
+  of any level) or the text before the first heading, so a `section` row
+  names the deepest heading containing the match rather than a parent
+  covering many short siblings. `target_chunk_size` has no effect; an
+  oversized section still splits into several chunks, and a heading with no
+  text before its first sub-heading becomes a small chunk of its heading
+  line. Expect more, smaller chunks on documents with many short sections.
+  With the flag off (the default) sections still merge up to
+  `target_chunk_size`.
+- **Heading detection follows CommonMark, which moves section boundaries in
+  some existing documents** (#286, takes effect on the automatic re-embed
+  below). Headings are parsed by pulldown-cmark instead of "a line starting
+  with `#` outside a backtick or tilde fence": setext headings (`Title` over `===`
+  or `---`, including a paragraph directly above a `---` line) and ATX
+  headings indented by 1–3 spaces (`   # Title`) are now section boundaries;
+  `#tag` lines, `#` followed by a non-breaking space, runs of 7+ `#`, and `#`
+  lines inside HTML blocks are not; and a shorter fence inside a longer one, or a `~~~`
+  line inside a backtick fence, no longer ends the code block. Headings
+  inside blockquotes and list items remain non-boundaries, and with lone-CR
+  (classic Mac) line endings only the first heading on a line counts.
+  Heading text in breadcrumbs, `heading_path` and outlines is the rendered
+  plain text — emphasis markers, link syntax and a closing `#`
+  sequence are dropped, invisible characters that never affect rendering
+  (soft hyphens, zero-width spaces, BOM) removed, whitespace collapsed — and
+  is capped at 200 characters (cut on a character boundary, no ellipsis).
+  Zero-width joiners, direction marks and variation selectors stay in the
+  text, so emoji sequences and Persian or Indic joining display intact; they
+  don't count toward the cap.
+- **Config and schema surface** (#286). Both new config knobs default to
+  preserving current behavior (`heading_metadata: false`;
+  `search.granularities` defaults to all three granularities, but the
+  effective set drops `section` while the flag is off). Disabled
+  granularities and filters are removed from the MCP tool schema and
+  description, not just rejected at call time — as are parameters and
+  sentences that only apply to a disabled granularity or (with `document`
+  disabled) to searching without a query — and errors name only enabled
+  granularities. A `search.granularities` whose effective set is empty fails
+  config load; explicitly setting it with `section` while the flag is off
+  logs a warning (the default does not). Caller-visible changes on a
+  default config: the `search` schema's `granularity` gains an `enum` of the
+  enabled lowercase values (the server still accepts `"Chunk"`, but a
+  schema-validating client will not send it); `search` and `get_document`
+  tool and property descriptions are reworded; `heading_prefix`, previously
+  ignored, is an invalid-params error while the flag is off, as is
+  `granularity: "section"` (now "not enabled on this server" rather than
+  "unknown granularity"); and the `fields`-at-chunk rejection is reworded.
+  Enabling `chunking.heading_metadata` re-indexes the corpus automatically
+  (see below); while an indexing run spanning more than one file is in
+  progress (from the moment the reconcile scan first finds a document
+  chunked under different settings), `section` and `heading_prefix` results
+  carry a note (and
+  `indexing_in_progress: true`) that they may be incomplete. That note is a
+  sticky latch, not just an "is a run active right now" check: it stays on
+  through a failed run's retry backoff or permanent give-up and the wait for
+  the next reconcile, clearing only once a scan confirms nothing is left
+  stale or the run that processed a scan's findings succeeds. A frozen
+  scope's stale files never set it, by design — they are never re-chunked
+  until the schema is fixed.
+- **Changing `chunking.*` now re-chunks automatically — no silent mixed
+  index.** Each `indexed_files` row stores a fingerprint of every
+  `chunking.*` setting plus a code-level chunker version; the reconcile
+  scan and the indexer's skip-if-unchanged check both treat a mismatch as
+  dirty, so a chunking change applied by restart or `POST /admin/reload`
+  re-chunks and re-embeds affected documents on the next reconcile. The
+  reload response reports these settings under a new `reindex_scheduled`
+  bucket instead of `reindex_required` (which now lists only
+  `ui.semantic_edges.*`). **Upgrade note: one-time full re-embed.** Rows
+  written before this change have no fingerprint, so the first reconcile
+  after upgrading (startup) re-chunks and re-embeds the whole corpus once —
+  expect embedding load proportional to corpus size. While
+  `chunking.heading_metadata` is on, `target_chunk_size` has no effect and
+  is left out of the fingerprint, so changing it re-embeds nothing.
+- **Bug fix, takes effect on reindex:** chunk `line_start`/`line_end` now
+  count from the top of the raw file (including frontmatter), matching
+  `get_document` — previously they counted from the top of the frontmatter-
+  stripped body. Also, a merged chunk's heading breadcrumb is now the
+  deepest heading its merged sections actually share, rather than
+  defaulting to the first merged section's — content from later sections
+  was previously attributed to the wrong heading. The one-time
+  post-upgrade re-embed above rewrites existing chunks with the corrected
+  numbering, breadcrumbs and heading detection; no `index --full` is needed.
+  **Exception:** documents under a frozen schema scope (a `.kb-schema.yaml`
+  that fails to parse) are skipped by both the scan and the indexer, so
+  they keep their old chunks — old line numbering, no heading metadata, and
+  therefore absent from `section` and `heading_prefix` results — until the
+  schema is fixed, which re-indexes them. Documents that fail validation
+  likewise keep whatever chunks they already had.
+
 ### Documentation
 
 - Added a Backup and Recovery section to `deploy/TROUBLESHOOTING.md` covering what's

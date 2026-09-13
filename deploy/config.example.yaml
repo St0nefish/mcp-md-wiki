@@ -31,8 +31,8 @@
 # restart. Not every setting takes effect immediately: some are baked into
 # a value or service built once at startup (rate_limit, embedding batch/
 # timeout/concurrency tuning, anything auth-related) and stay restart-only;
-# chunking.* needs `mcp-md-wiki index --full` afterward to be meaningful (a
-# new chunk size only applies to documents indexed after the change). The
+# chunking.* changes re-chunk and re-embed affected documents automatically
+# (each indexed file records the chunking config it was built under). The
 # reload response reports exactly which category each changed setting fell
 # into — see README.md's "Config reload" section for the full contract. A
 # malformed or invalid file is rejected and the running config is left
@@ -158,17 +158,21 @@ frontmatter:
 # chunking — how markdown files are split into vector chunks
 # ----------------------------------------------------------------------------
 # The chunker is section-aware: it splits at heading boundaries first, then
-# combines small consecutive sections up to target_chunk_size. Sections that
+# combines small consecutive sections up to target_chunk_size (unless
+# heading_metadata, below, is on — then sections are never combined). Sections that
 # exceed max_chunk_size are split further by a secondary text splitter.
 #
-# REINDEX REQUIRED (whole section): POST /admin/reload picks these up for
-# the NEXT indexing run, but only for documents that run touches — existing
-# Qdrant chunks keep the old boundaries. Run `mcp-md-wiki index --full`
-# afterward for a consistent corpus.
+# AUTOMATIC REINDEX (whole section): every indexed file records a fingerprint
+# of these settings. Changing any of them (restart or POST /admin/reload)
+# makes the next reconcile re-chunk and re-embed every document built under
+# the old values (except target_chunk_size while heading_metadata is on, where
+# it has no effect) — no `index --full` needed, but expect one re-embed of the
+# corpus, with search serving a mix of old and new chunks until it finishes.
 chunking:
 
   # Ideal chunk size in characters. The chunker accumulates sections until
   # adding the next one would exceed this limit, then starts a new chunk.
+  # Unused while heading_metadata is on, and changing it then re-embeds nothing.
   target_chunk_size: 1000
 
   # Hard upper limit. Sections larger than this are force-split by a
@@ -184,6 +188,37 @@ chunking:
   # every chunk from that document. Gives the embedding model more context
   # about what the chunk relates to.
   prepend_description: true
+
+  # Prepend the heading breadcrumb a chunk's content falls under (e.g.
+  # "Spells > Fireball") ahead of its text, so the embedding and keyword arms
+  # see section context even for a mid-document chunk. A chunk that starts
+  # with its own heading line gets only that heading's ancestors (the heading
+  # itself is already in the text); a chunk merged from several sections
+  # (only possible with heading_metadata off) gets the deepest heading they all
+  # share.
+  prepend_heading_path: true
+
+  # Store structured heading data on each chunk's Qdrant payload: heading_path,
+  # heading_level, a heading_prefixes keyword array (backs search's
+  # heading_prefix filter: one key per run of consecutive headings in the
+  # chunk's path, each heading Unicode case-folded with invisible characters
+  # such as soft hyphens removed and whitespace collapsed), section_key, and
+  # section_line_start/section_line_end (the section's whole-subtree range).
+  # Heading text is capped at 200 characters everywhere it is stored (zero-width
+  # joiners, direction marks and variation selectors don't count toward the
+  # cap). Off by default — this widens every chunk's payload, and it's what search's
+  # `section` granularity groups by, so `section` and `heading_prefix` are
+  # both rejected while this is off.
+  #
+  # It also changes chunk boundaries: while on, small consecutive sections are
+  # never merged into one chunk (target_chunk_size has no effect while this is
+  # on), so every chunk lies within a single heading's own
+  # section and a section search row names the exact heading that matched.
+  # Expect more, smaller chunks on documents with many short sections. Turning
+  # it on (or off) re-indexes affected documents automatically on the next
+  # reconcile (restart or POST /admin/reload); section/heading_prefix results
+  # may be incomplete until that finishes.
+  heading_metadata: false
 
 
 # ----------------------------------------------------------------------------
@@ -576,6 +611,32 @@ search:
   # many of those candidates get returned. Raising it makes responses larger,
   # not searches slower. default_limit must not exceed it.
   max_limit: 50
+
+  # Which search.granularity values this instance exposes: any of chunk,
+  # document, section (lowercase; an unknown or duplicate value fails config
+  # load). Disabled values are rejected at call time AND removed from the MCP
+  # tool schema/description, so the model never sees them as an option.
+  #
+  # The EFFECTIVE set additionally drops `section` whenever
+  # chunking.heading_metadata (above) is off, regardless of what's listed
+  # here — so the default is harmless on an instance that hasn't turned
+  # heading_metadata on yet. Setting this key explicitly with `section` in it
+  # while heading_metadata is off logs a warning that section is gated off;
+  # leaving the key unset (as below) does not. The effective set must not be
+  # empty (`[section]` alone with heading_metadata off fails config load).
+  # Only `document` serves a search without a query; a set without it logs a
+  # warning, every search then needs a query, and the no-query parameters and
+  # sentences drop out of the tool schema and descriptions too.
+  # granularities: [chunk, document, section]
+
+  # Size cap, in bytes, on what get_document's section and outline modes
+  # return. A selected section (`line`/`heading_path`) larger than this comes
+  # back as an outline of its sub-headings instead (`outline_only: true`) so
+  # the caller can narrow further; a section with no sub-headings is returned
+  # in full regardless, since there's nothing smaller to offer. Outlines
+  # (including that one) are capped to roughly this many bytes of entries,
+  # shallowest levels first.
+  section_max_bytes: 16000
 
 
 # ----------------------------------------------------------------------------

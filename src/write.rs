@@ -77,12 +77,12 @@ pub fn dedup_verdict(top: Option<(String, f32)>, threshold: f32) -> Option<Dupli
 ///
 /// It deliberately does NOT reproduce `chunking.prepend_heading_path`'s
 /// breadcrumb, and that is safe for a non-obvious structural reason worth
-/// stating: `chunk::annotate_heading_paths` walks sections with an ancestor
-/// stack that starts empty for every document, and a chunk's heading path is
-/// fixed from whichever section started it. A document's FIRST chunk is always
-/// seeded from its first section, whose ancestor path is therefore always
-/// empty — so chunk 0 never carries a breadcrumb, whatever the document's
-/// heading structure. Since a create-path dedup query is doc-start text scored
+/// stating: a chunk's breadcrumb is seeded from the section that starts it and
+/// merging further pieces in can only narrow it (to a common ancestor, see
+/// `chunk::chunk_markdown`). A document's FIRST chunk is always seeded from its
+/// first section — the preamble, which has no breadcrumb, or the first heading,
+/// which has no ancestors because no heading precedes it — so chunk 0 never
+/// carries a breadcrumb, whatever the document's heading structure. Since a create-path dedup query is doc-start text scored
 /// against the corpus, matching chunk 0's basis is what matters.
 ///
 /// If a future chunking change breaks that invariant — anything that can give

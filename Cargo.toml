@@ -27,8 +27,21 @@ qdrant-client = "1"
 # Frontmatter parsing
 gray_matter = "0.2"
 
-# Markdown chunking
+# Markdown chunking. An upgrade that changes split points must bump
+# `ingest::CHUNKER_VERSION`, or the index silently mixes old and new chunks.
 text-splitter = { version = "0.18", features = ["markdown"] }
+
+# Heading detection (`heading.rs`): section boundaries, heading text/levels and
+# line numbers for chunking and `get_document`'s outline. Same version and
+# feature set text-splitter's `markdown` feature already compiles, so this adds
+# no new crate to the build. An upgrade that changes heading detection or heading
+# text must bump `ingest::CHUNKER_VERSION`, or the index silently mixes old and
+# new chunks.
+pulldown-cmark = { version = "0.12", default-features = false }
+# Unicode case folding for heading comparison (`heading::normalize_heading_text`).
+# Already in the build via pulldown-cmark; a folding change must bump
+# `ingest::CHUNKER_VERSION` for the same reason as above.
+unicase = "2.9"
 
 # Embeddings API (OpenAI-compatible)
 async-openai = "0.27"

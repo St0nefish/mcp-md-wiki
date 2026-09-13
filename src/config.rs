@@ -228,12 +228,38 @@ pub struct ChunkingConfig {
     /// corpus — see `docs/eval/heading-context-166.yaml` for the case file that
     /// would make it measurable.
     ///
-    /// Like `prepend_description`, this changes the text every future chunk
-    /// embeds — it is reindex-required (see `YAML_ONLY_SETTINGS`/`reload.rs`):
-    /// existing Qdrant chunks keep their old text until `mcp-md-wiki index --full`
-    /// re-chunks them.
+    /// Like every `chunking.*` field, this changes what every chunk embeds and
+    /// feeds `ingest::chunking_fingerprint`: changing it makes the next reconcile
+    /// re-chunk and re-embed the affected documents automatically (`reload.rs`
+    /// reports it as `reindex_scheduled`).
     #[serde(default = "default_true")]
     pub prepend_heading_path: bool,
+    /// Store structured heading data on each chunk's Qdrant payload (#286):
+    /// `heading_path`, `heading_level`, `heading_prefixes` (a normalized keyword
+    /// array enabling `search`'s `heading_prefix` filter), `section_key`, and
+    /// `section_line_start`/`section_line_end` (the attributed section's whole
+    /// subtree range). This is what `search`'s `section` granularity groups
+    /// by, and what `heading_prefix` filters on — both are unavailable when it
+    /// is off.
+    ///
+    /// It also changes chunking: while on, `chunk::chunk_markdown` never merges
+    /// content across a heading boundary, so every chunk lies within one
+    /// heading's own section (or the preamble) and a `section` hit names the
+    /// exact heading rather than a shared parent. `target_chunk_size` is unused
+    /// while it is on, and left out of `ingest::chunking_fingerprint` then, so
+    /// changing it re-embeds nothing.
+    ///
+    /// Off by default, same off-by-default precedent as `RerankingConfig.enabled`:
+    /// this widens the Qdrant payload for every chunk. Flipping it changes
+    /// `ingest::chunking_fingerprint`, so the next reconcile re-indexes every
+    /// document automatically; `section_key` grouping/`heading_prefix` filtering
+    /// see a partially populated corpus until that reconcile finishes.
+    /// `Chunk::heading_path`/`heading_level` (`chunk.rs`) are always computed
+    /// regardless of this flag — cheap to compute, so there is nothing to gate
+    /// there — only whether `ingest.rs` writes them (and the derived fields
+    /// above) into the Qdrant payload is gated by it.
+    #[serde(default)]
+    pub heading_metadata: bool,
 }
 
 impl Default for ChunkingConfig {
@@ -243,6 +269,7 @@ impl Default for ChunkingConfig {
             target_chunk_size: default_target_chunk_size(),
             prepend_description: true,
             prepend_heading_path: true,
+            heading_metadata: false,
         }
     }
 }
@@ -864,6 +891,137 @@ pub struct SearchConfig {
     /// Raising it makes responses larger, not searches slower.
     #[serde(default = "default_max_search_limit")]
     pub max_limit: u64,
+    /// Size cap, in bytes, on the text `get_document`'s section mode returns
+    /// for a single resolved section (#286). A section whose byte-exact
+    /// slice exceeds this is returned as an outline of its sub-headings
+    /// instead (`outline_only: true`) — see `retrieval::resolve_document_view`
+    /// — so a caller can narrow into a still-oversized section rather than
+    /// receiving a wall of text it didn't ask for. A section with no
+    /// sub-headings is returned in full regardless, since there is nothing
+    /// smaller to offer instead. Every outline is also capped to roughly this
+    /// many bytes of entries.
+    #[serde(default = "default_section_max_bytes")]
+    pub section_max_bytes: usize,
+    /// Which of `chunk`/`document`/`section` this deployment's `search` tool
+    /// allows a caller to request at all (#286). Deserialized as
+    /// [`Granularity`], so an unknown value fails to parse, naming the
+    /// accepted spellings; validated at load for non-empty, no duplicates,
+    /// and a non-empty EFFECTIVE set. The YAML value is matched
+    /// case-sensitively against the lowercase spellings — unlike
+    /// `mcp::parse_granularity`, which lowercases a CALLER's `granularity`
+    /// string before matching, so a request of `"Chunk"` still resolves even
+    /// though a `granularities: [Chunk]` in this list would not parse.
+    ///
+    /// This is the CONFIGURED set, not the effective one — `section` is
+    /// dropped at read time whenever `chunking.heading_metadata` is off,
+    /// since section search has nothing to group by (no `section_key`
+    /// payload field) without it. [`ResolvedConfig::effective_granularities`]
+    /// is the one helper that applies that rule; every consumer — call-time
+    /// validation in `mcp::search`, the `search` tool's schema `enum` and
+    /// `granularity` property description (`KbSearchServer::overlay_input_schema`),
+    /// and the composed description (`descriptions::granularity_sentence`) —
+    /// reads through it rather than re-deriving the subtraction, so they can
+    /// never disagree about what is actually enabled.
+    ///
+    /// Defaults to all three, so an existing deployment's caller-visible
+    /// `search` behavior is unchanged. `Applied` classification in
+    /// `reload.rs`: restricting or widening this set takes effect on the
+    /// very next `search` call — nothing about it requires a reindex.
+    #[serde(default = "default_granularities")]
+    pub granularities: Vec<Granularity>,
+}
+
+/// One `search` result granularity — shared by `search.granularities`
+/// (config) and `mcp::search`'s call-time resolution, so both sides model
+/// the same closed set. Serialized lowercase (`chunk`/`document`/`section`),
+/// which is both the YAML spelling and the caller-facing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Granularity {
+    /// One row per chunk (scored snippet). Requires a query.
+    Chunk,
+    /// One row per document. Serves both query and no-query (enumeration).
+    Document,
+    /// One row per heading section (path + line range, no text). Requires a
+    /// query and `chunking.heading_metadata`.
+    Section,
+}
+
+impl Granularity {
+    /// Every granularity, in the canonical order used wherever they are
+    /// enumerated: the effective set, the schema `enum`, and
+    /// `descriptions::granularity_sentence`.
+    pub const ALL: [Granularity; 3] = [
+        Granularity::Chunk,
+        Granularity::Document,
+        Granularity::Section,
+    ];
+
+    /// The canonical lowercase spelling (identical to the serde form).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Granularity::Chunk => "chunk",
+            Granularity::Document => "document",
+            Granularity::Section => "section",
+        }
+    }
+
+    /// Whether this granularity can serve a `search` call with no query
+    /// (enumeration). Only `document` can: `chunk` and `section` rank by a
+    /// query and have nothing to rank without one.
+    pub fn supports_no_query(self) -> bool {
+        matches!(self, Granularity::Document)
+    }
+}
+
+impl std::fmt::Display for Granularity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `search.granularities` minus `section` when `heading_metadata` is off, in
+/// [`Granularity::ALL`]'s canonical order regardless of how the YAML listed
+/// them — the single definition behind
+/// [`ResolvedConfig::effective_granularities`], also used by load-time
+/// validation (which runs before a `ResolvedConfig` exists).
+fn effective_granularities(search: &SearchConfig, chunking: &ChunkingConfig) -> Vec<Granularity> {
+    Granularity::ALL
+        .into_iter()
+        .filter(|g| search.granularities.contains(g))
+        .filter(|&g| g != Granularity::Section || chunking.heading_metadata)
+        .collect()
+}
+
+/// Whether `section` is configured in `search.granularities` but dropped
+/// from the effective set because `chunking.heading_metadata` is off — as
+/// opposed to an operator simply not listing it.
+fn section_gated_off(search: &SearchConfig, chunking: &ChunkingConfig) -> bool {
+    search.granularities.contains(&Granularity::Section) && !chunking.heading_metadata
+}
+
+/// The load-time warning for an operator who listed `section` in
+/// `search.granularities` while `chunking.heading_metadata` is off (#286).
+/// `None` unless the key was set explicitly: the default set includes
+/// `section`, so a config that never mentions `search.granularities` would
+/// otherwise warn on every startup and reload about a choice nobody made.
+fn section_gated_off_warning(
+    search: &SearchConfig,
+    chunking: &ChunkingConfig,
+    granularities_explicit: bool,
+) -> Option<String> {
+    if !granularities_explicit || !section_gated_off(search, chunking) {
+        return None;
+    }
+    Some(format!(
+        "search.granularities lists section, but chunking.heading_metadata is off, so section \
+         is disabled (enabled: {}) — enable chunking.heading_metadata to offer it",
+        effective_granularities(search, chunking)
+            .iter()
+            .map(|g| g.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 impl Default for SearchConfig {
@@ -876,8 +1034,14 @@ impl Default for SearchConfig {
             diversity_max_per_document: default_diversity_max_per_document(),
             default_limit: default_search_limit(),
             max_limit: default_max_search_limit(),
+            section_max_bytes: default_section_max_bytes(),
+            granularities: default_granularities(),
         }
     }
+}
+
+fn default_granularities() -> Vec<Granularity> {
+    Granularity::ALL.to_vec()
 }
 
 fn default_rrf_candidates() -> usize {
@@ -894,6 +1058,10 @@ fn default_search_limit() -> u64 {
 
 fn default_max_search_limit() -> u64 {
     50
+}
+
+fn default_section_max_bytes() -> usize {
+    16000
 }
 
 /// `ui` — pure YAML tuning knobs for the knowledge-base web UI (issue #53). No
@@ -1058,6 +1226,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("chunking.target_chunk_size", "chunking"),
     ("chunking.prepend_description", "chunking"),
     ("chunking.prepend_heading_path", "chunking"),
+    ("chunking.heading_metadata", "chunking"),
     ("embedding.api_key_env", "embedding"),
     ("embedding.batch_size", "embedding"),
     ("embedding.request_timeout_secs", "embedding"),
@@ -1095,6 +1264,8 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("search.diversity_max_per_document", "search"),
     ("search.default_limit", "search"),
     ("search.max_limit", "search"),
+    ("search.section_max_bytes", "search"),
+    ("search.granularities", "search"),
     ("reranking.enabled", "reranking"),
     ("reranking.candidate_limit", "reranking"),
     ("reranking.api_key_env", "reranking"),
@@ -1166,6 +1337,19 @@ const KNOWN_SECTIONS: &[&str] = &[
     "ui",
 ];
 
+/// Whether `content` sets `search.granularities` itself, as opposed to leaving it
+/// to its default. Leaf-level, unlike [`yaml_top_level_sections`]: a `search:`
+/// section that only sets `hybrid` does not count. Best-effort in the same way —
+/// unparseable content reports `false`.
+fn yaml_sets_search_granularities(content: &str) -> bool {
+    serde_yaml_ng::from_str::<serde_yaml_ng::Value>(content)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("search"))
+        .and_then(|search| search.get("granularities"))
+        .is_some_and(|g| !g.is_null())
+}
+
 /// Top-level YAML section keys actually present in `content`, intersected with
 /// [`KNOWN_SECTIONS`]. Best-effort: if `content` fails to parse as generic YAML
 /// (should not happen — `Config::load` only calls this after already deserializing
@@ -1209,7 +1393,7 @@ pub struct ResolvedConfig {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<ResolvedConfig> {
-        let (config, present_sections) = if path.exists() {
+        let (config, present_sections, granularities_explicit) = if path.exists() {
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read config file '{}'", path.display()))?;
             let config: Config = serde_yaml_ng::from_str(&content).with_context(|| {
@@ -1221,12 +1405,13 @@ impl Config {
                 )
             })?;
             let sections = yaml_top_level_sections(&content);
-            (config, sections)
+            let granularities_explicit = yaml_sets_search_granularities(&content);
+            (config, sections, granularities_explicit)
         } else {
             warn!("Config file '{}' not found, using defaults", path.display());
-            (Config::default(), HashSet::new())
+            (Config::default(), HashSet::new(), false)
         };
-        config.resolve_inner(&present_sections)
+        config.resolve_inner(&present_sections, granularities_explicit)
     }
 
     /// Apply env var overrides and validate required fields.
@@ -1239,12 +1424,16 @@ impl Config {
     /// non-test caller, and it calls `resolve_inner` directly.
     #[cfg(test)]
     fn resolve(self) -> anyhow::Result<ResolvedConfig> {
-        self.resolve_inner(&HashSet::new())
+        self.resolve_inner(&HashSet::new(), false)
     }
 
+    /// `granularities_explicit` is whether the YAML itself sets
+    /// `search.granularities` (see [`yaml_sets_search_granularities`]); it
+    /// only decides whether [`section_gated_off_warning`] fires.
     fn resolve_inner(
         self,
         present_sections: &HashSet<&'static str>,
+        granularities_explicit: bool,
     ) -> anyhow::Result<ResolvedConfig> {
         // Safety net for the migration: a deployment that still sets one of these
         // silently stops applying it, since ENV/YAML are now mutually exclusive per
@@ -1495,6 +1684,44 @@ impl Config {
         if self.search.default_limit == 0 {
             anyhow::bail!("search.default_limit must be >= 1");
         }
+        if self.search.section_max_bytes == 0 {
+            anyhow::bail!("search.section_max_bytes must be >= 1");
+        }
+        if self.search.granularities.is_empty() {
+            anyhow::bail!("search.granularities must not be empty");
+        }
+        {
+            // Unknown values never get this far — `Granularity`'s serde
+            // derive rejects them at parse time.
+            let mut seen = std::collections::HashSet::new();
+            for g in &self.search.granularities {
+                if !seen.insert(*g) {
+                    anyhow::bail!("search.granularities contains duplicate value '{}'", g);
+                }
+            }
+        }
+        {
+            let effective = effective_granularities(&self.search, &self.chunking);
+            if effective.is_empty() {
+                anyhow::bail!(
+                    "search.granularities leaves no granularity enabled: section requires \
+                     chunking.heading_metadata, which is off — enable it, or add chunk or \
+                     document to search.granularities"
+                );
+            }
+            if let Some(msg) =
+                section_gated_off_warning(&self.search, &self.chunking, granularities_explicit)
+            {
+                warn!("{msg}");
+            }
+            if !effective.iter().any(|g| g.supports_no_query()) {
+                warn!(
+                    "search.granularities enables no granularity that supports search without \
+                     a query (only document does) — every search call must carry a query, and \
+                     enumeration is unavailable"
+                );
+            }
+        }
         // Caught here rather than silently clamped: a default above the ceiling
         // means every caller who omits `limit` gets the ceiling, so the default
         // they configured never applies and nothing says so.
@@ -1731,6 +1958,26 @@ impl ResolvedConfig {
             fields.push("file_path".to_string());
         }
         fields
+    }
+
+    /// The `search` granularities this deployment actually allows a caller
+    /// to request right now (#286): `search.granularities` minus `section`
+    /// whenever `chunking.heading_metadata` is off, in [`Granularity::ALL`]'s
+    /// canonical order regardless of how the YAML listed them. This is the
+    /// single definition of "effective" shared by call-time validation
+    /// (`mcp::search`), the `search` tool's schema (`KbSearchServer::
+    /// overlay_input_schema`), and the composed description
+    /// (`descriptions::granularity_sentence`) — see
+    /// `SearchConfig::granularities`'s doc comment for why those must never
+    /// derive this subtraction independently.
+    pub fn effective_granularities(&self) -> Vec<Granularity> {
+        effective_granularities(&self.search, &self.chunking)
+    }
+
+    /// `section` is configured but gated off by `chunking.heading_metadata`
+    /// — see the free function of the same name.
+    pub fn section_gated_off(&self) -> bool {
+        section_gated_off(&self.search, &self.chunking)
     }
 
     /// Log a startup-time note when git integration is off — see
@@ -2579,6 +2826,210 @@ mcp:
             "expected the default_limit validation message, got: {err}"
         );
         clear_required_env();
+    }
+
+    // --- search.granularities (#286) ---------------------------------------
+
+    #[test]
+    fn search_granularities_default_is_all_three_in_canonical_order() {
+        let cfg = Config::from_str_raw("{}").unwrap();
+        assert_eq!(cfg.search.granularities, Granularity::ALL.to_vec());
+    }
+
+    #[test]
+    fn search_granularities_empty_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("search:\n  granularities: []\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("search.granularities must not be empty"),
+            "expected the empty-granularities validation message, got: {err}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn search_granularities_unknown_value_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("search:\n  granularities: [chunk, paragraph]\n").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown variant `paragraph`")
+                && msg.contains("`chunk`, `document`, `section`"),
+            "expected serde's unknown-variant message naming the accepted values, got: {msg}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn search_granularities_unknown_value_is_rejected_by_config_load_with_its_location() {
+        // The production path (`Config::load`) — the message must say WHERE the
+        // bad value is, not just that some enum somewhere failed to parse.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        std::fs::write(&path, "search:\n  granularities: [chunk, paragraph]\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("search.granularities") && msg.contains("unknown variant `paragraph`"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn search_granularities_with_an_empty_effective_set_is_rejected() {
+        // `[section]` alone with heading_metadata off parses, but leaves nothing
+        // a caller could ever request — a deploy-time error, not a call-time one.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("search:\n  granularities: [section]\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("search.granularities leaves no granularity enabled"),
+            "got: {err}"
+        );
+        // The same set with heading_metadata on is fine.
+        Config::from_str(
+            "chunking:\n  heading_metadata: true\nsearch:\n  granularities: [section]\n",
+        )
+        .expect("section with heading_metadata on is a valid (query-only) set");
+        clear_required_env();
+    }
+
+    #[test]
+    fn section_gated_off_warning_is_silent_for_the_default_granularities() {
+        for yaml in [
+            "",
+            "search:\n  hybrid: true\n",
+            "chunking:\n  max_chunk_size: 1000\n",
+        ] {
+            let cfg = Config::from_str_raw(yaml).unwrap();
+            let explicit = yaml_sets_search_granularities(yaml);
+            assert!(!explicit, "{yaml:?} does not set search.granularities");
+            assert!(section_gated_off(&cfg.search, &cfg.chunking));
+            assert_eq!(
+                section_gated_off_warning(&cfg.search, &cfg.chunking, explicit),
+                None,
+                "default granularities must not warn for {yaml:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn section_gated_off_warning_fires_when_section_is_listed_explicitly() {
+        let yaml = "search:\n  granularities: [chunk, section]\n";
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        let explicit = yaml_sets_search_granularities(yaml);
+        assert!(explicit);
+        let msg = section_gated_off_warning(&cfg.search, &cfg.chunking, explicit)
+            .expect("an explicit section with heading_metadata off warns");
+        assert!(msg.contains("enabled: chunk"), "{msg}");
+
+        let on =
+            "chunking:\n  heading_metadata: true\nsearch:\n  granularities: [chunk, section]\n";
+        let cfg = Config::from_str_raw(on).unwrap();
+        assert_eq!(
+            section_gated_off_warning(
+                &cfg.search,
+                &cfg.chunking,
+                yaml_sets_search_granularities(on)
+            ),
+            None,
+            "section is not gated off when heading_metadata is on"
+        );
+    }
+
+    #[test]
+    fn search_granularities_duplicate_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("search:\n  granularities: [chunk, chunk]\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("search.granularities contains duplicate value 'chunk'"),
+            "expected the duplicate-value validation message, got: {err}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn search_granularities_custom_subset_round_trips() {
+        let cfg = Config::from_str_raw("search:\n  granularities: [document]\n").unwrap();
+        assert_eq!(cfg.search.granularities, vec![Granularity::Document]);
+    }
+
+    /// A minimal but fully-populated `ResolvedConfig` for tests that need to
+    /// mutate individual fields (e.g. `search.granularities`,
+    /// `chunking.heading_metadata`) — same struct-literal pattern as
+    /// `resolved_config_usable_without_raw_config` above, factored out since
+    /// the `effective_granularities` tests below need several variants.
+    fn test_resolved_config() -> ResolvedConfig {
+        ResolvedConfig {
+            source: ResolvedSourceConfig::default(),
+            indexing: IndexingConfig::default(),
+            frontmatter: FrontmatterConfig::default(),
+            chunking: ChunkingConfig::default(),
+            embedding: ResolvedEmbeddingConfig {
+                base_url: "http://embed:8080/v1".into(),
+                model: "test-model".into(),
+                api_key: None,
+                vector_size: 768,
+                batch_size: 32,
+                request_timeout_secs: 60,
+                batch_concurrency: 4,
+            },
+            qdrant: ResolvedQdrantConfig {
+                url: "http://qdrant:6334".into(),
+                collection: "test-collection".into(),
+            },
+            validation: ValidationConfig::default(),
+            webhook: WebhookConfig::default(),
+            mcp: ResolvedMcpConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            write: WriteConfig::default(),
+            search: SearchConfig::default(),
+            reranking: None,
+            ui: UiConfig::default(),
+            provenance: ConfigProvenance::default(),
+        }
+    }
+
+    #[test]
+    fn effective_granularities_drops_section_when_heading_metadata_is_off() {
+        let mut config = test_resolved_config();
+        config.search.granularities = Granularity::ALL.to_vec();
+        config.chunking.heading_metadata = false;
+        assert_eq!(
+            config.effective_granularities(),
+            vec![Granularity::Chunk, Granularity::Document]
+        );
+    }
+
+    #[test]
+    fn effective_granularities_keeps_section_when_heading_metadata_is_on() {
+        let mut config = test_resolved_config();
+        // Listed out of canonical order on purpose — the result is canonical.
+        config.search.granularities = vec![
+            Granularity::Section,
+            Granularity::Chunk,
+            Granularity::Document,
+        ];
+        config.chunking.heading_metadata = true;
+        assert_eq!(config.effective_granularities(), Granularity::ALL.to_vec());
+    }
+
+    #[test]
+    fn effective_granularities_respects_administrative_restriction_regardless_of_heading_metadata()
+    {
+        let mut config = test_resolved_config();
+        config.search.granularities = vec![Granularity::Document];
+        config.chunking.heading_metadata = true;
+        assert_eq!(
+            config.effective_granularities(),
+            vec![Granularity::Document]
+        );
     }
 
     #[test]

@@ -279,6 +279,12 @@ pub struct IndexedFile {
     /// Fingerprint of the schema this file was last validated against. Empty for rows
     /// written before schema tracking existed, which forces one revalidation pass.
     pub schema_hash: String,
+    /// Fingerprint of the chunking configuration (`ingest::chunking_fingerprint`: every
+    /// `chunking.*` setting that shapes chunk text or payload, plus
+    /// `ingest::CHUNKER_VERSION`) this file was last chunked and embedded under. Empty
+    /// for rows written before this column existed, which never equals a real
+    /// fingerprint and so forces one re-chunk/re-embed per file after upgrading.
+    pub chunking_fingerprint: String,
     /// File modification time (Unix seconds) as of the last successful index of this
     /// file, or the last stat-only refresh of an unchanged file (`process_file`'s skip
     /// path via `StateDb::update_stat`, #139). The reconcile scan
@@ -300,6 +306,7 @@ pub struct ScanRow {
     pub file_path: String,
     pub content_hash: String,
     pub schema_hash: String,
+    pub chunking_fingerprint: String,
     pub mtime: i64,
     pub size: i64,
     /// `documents.content_hash` for this path, or `None` if no metadata row exists yet.
@@ -430,6 +437,20 @@ impl StateDb {
             &pool,
             "indexed_files",
             "schema_hash",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
+
+        // Chunking-config fingerprint (`ingest::chunking_fingerprint`). Same upgrade
+        // semantics as `schema_hash` above: pre-existing rows get '', which never equals
+        // a real fingerprint, so both the reconcile scan and `process_file`'s skip check
+        // treat every such file as dirty exactly once — a one-time re-chunk/re-embed of
+        // the whole corpus after upgrading. That is the point: without it a changed
+        // `chunking.*` setting (or chunker code) would leave the index silently mixed.
+        add_column_if_missing(
+            &pool,
+            "indexed_files",
+            "chunking_fingerprint",
             "TEXT NOT NULL DEFAULT ''",
         )
         .await?;
@@ -580,7 +601,7 @@ impl StateDb {
     #[cfg(test)]
     pub async fn get(&self, file_path: &str) -> Result<Option<IndexedFile>> {
         let row = sqlx::query_as::<_, IndexedFile>(
-            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, mtime, size
+            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, chunking_fingerprint, mtime, size
              FROM indexed_files WHERE file_path = ?",
         )
         .bind(file_path)
@@ -597,18 +618,21 @@ impl StateDb {
         content_hash: &str,
         chunk_count: i64,
         schema_hash: &str,
+        chunking_fingerprint: &str,
         mtime: i64,
         size: i64,
     ) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO indexed_files
-                (file_path, content_hash, chunk_count, indexed_at, schema_hash, mtime, size)
-             VALUES (?, ?, ?, datetime('now'), ?, ?, ?)",
+                (file_path, content_hash, chunk_count, indexed_at, schema_hash,
+                 chunking_fingerprint, mtime, size)
+             VALUES (?, ?, ?, datetime('now'), ?, ?, ?, ?)",
         )
         .bind(file_path)
         .bind(content_hash)
         .bind(chunk_count)
         .bind(schema_hash)
+        .bind(chunking_fingerprint)
         .bind(mtime)
         .bind(size)
         .execute(&self.pool)
@@ -649,7 +673,7 @@ impl StateDb {
 
     pub async fn list_all(&self) -> Result<Vec<IndexedFile>> {
         let rows = sqlx::query_as::<_, IndexedFile>(
-            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, mtime, size
+            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, chunking_fingerprint, mtime, size
              FROM indexed_files ORDER BY file_path",
         )
         .fetch_all(&self.pool)
@@ -679,7 +703,7 @@ impl StateDb {
     /// query per row.
     pub async fn fetch_indexed_files_page(&self, limit: i64, offset: i64) -> Result<Vec<ScanRow>> {
         let rows: Vec<ScanRow> = sqlx::query_as(
-            "SELECT i.file_path, i.content_hash, i.schema_hash, i.mtime, i.size, \
+            "SELECT i.file_path, i.content_hash, i.schema_hash, i.chunking_fingerprint, i.mtime, i.size, \
                     d.content_hash AS doc_hash \
              FROM indexed_files i LEFT JOIN documents d ON d.file_path = i.file_path \
              ORDER BY i.file_path LIMIT ? OFFSET ?",
@@ -703,7 +727,7 @@ impl StateDb {
                 continue;
             }
             let mut builder = QueryBuilder::<Sqlite>::new(
-                "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, mtime, size \
+                "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, chunking_fingerprint, mtime, size \
                  FROM indexed_files WHERE file_path IN (",
             );
             let mut separated = builder.separated(", ");
@@ -1735,7 +1759,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_and_get() {
         let (db, _dir) = test_db().await;
-        db.upsert("test.md", "abc123", 3, "", 0, 0).await.unwrap();
+        db.upsert("test.md", "abc123", 3, "", "", 0, 0)
+            .await
+            .unwrap();
         let entry = db.get("test.md").await.unwrap().unwrap();
         assert_eq!(entry.file_path, "test.md");
         assert_eq!(entry.content_hash, "abc123");
@@ -1745,8 +1771,12 @@ mod tests {
     #[tokio::test]
     async fn upsert_replaces() {
         let (db, _dir) = test_db().await;
-        db.upsert("test.md", "hash1", 2, "", 0, 0).await.unwrap();
-        db.upsert("test.md", "hash2", 5, "", 0, 0).await.unwrap();
+        db.upsert("test.md", "hash1", 2, "", "", 0, 0)
+            .await
+            .unwrap();
+        db.upsert("test.md", "hash2", 5, "", "", 0, 0)
+            .await
+            .unwrap();
         let entry = db.get("test.md").await.unwrap().unwrap();
         assert_eq!(entry.content_hash, "hash2");
         assert_eq!(entry.chunk_count, 5);
@@ -1755,7 +1785,7 @@ mod tests {
     #[tokio::test]
     async fn delete_removes() {
         let (db, _dir) = test_db().await;
-        db.upsert("test.md", "hash", 1, "", 0, 0).await.unwrap();
+        db.upsert("test.md", "hash", 1, "", "", 0, 0).await.unwrap();
         db.delete("test.md").await.unwrap();
         assert!(db.get("test.md").await.unwrap().is_none());
     }
@@ -1763,8 +1793,8 @@ mod tests {
     #[tokio::test]
     async fn list_and_count() {
         let (db, _dir) = test_db().await;
-        db.upsert("a.md", "h1", 1, "", 0, 0).await.unwrap();
-        db.upsert("b.md", "h2", 2, "", 0, 0).await.unwrap();
+        db.upsert("a.md", "h1", 1, "", "", 0, 0).await.unwrap();
+        db.upsert("b.md", "h2", 2, "", "", 0, 0).await.unwrap();
         assert_eq!(db.count().await.unwrap(), 2);
         let all = db.list_all().await.unwrap();
         assert_eq!(all.len(), 2);
@@ -1779,21 +1809,21 @@ mod tests {
         // the COALESCE in the query at all.
         assert_eq!(db.total_chunk_count().await.unwrap(), 0);
 
-        db.upsert("a.md", "h1", 3, "", 0, 0).await.unwrap();
-        db.upsert("b.md", "h2", 5, "", 0, 0).await.unwrap();
+        db.upsert("a.md", "h1", 3, "", "", 0, 0).await.unwrap();
+        db.upsert("b.md", "h2", 5, "", "", 0, 0).await.unwrap();
         assert_eq!(db.total_chunk_count().await.unwrap(), 8);
 
         // A re-upsert (simulating a shrinking file) replaces, not adds to, the prior
         // chunk_count — the sum must track the replacement, not accumulate it.
-        db.upsert("a.md", "h1v2", 1, "", 0, 0).await.unwrap();
+        db.upsert("a.md", "h1v2", 1, "", "", 0, 0).await.unwrap();
         assert_eq!(db.total_chunk_count().await.unwrap(), 6);
     }
 
     #[tokio::test]
     async fn clear_removes_all() {
         let (db, _dir) = test_db().await;
-        db.upsert("a.md", "h1", 1, "", 0, 0).await.unwrap();
-        db.upsert("b.md", "h2", 2, "", 0, 0).await.unwrap();
+        db.upsert("a.md", "h1", 1, "", "", 0, 0).await.unwrap();
+        db.upsert("b.md", "h2", 2, "", "", 0, 0).await.unwrap();
         db.clear().await.unwrap();
         assert_eq!(db.count().await.unwrap(), 0);
     }
@@ -1848,7 +1878,7 @@ mod tests {
     async fn delete_after_failure_allows_reprocessing() {
         let (db, _dir) = test_db().await;
         // Simulate: file was indexed with hash1
-        db.upsert("doc.md", "hash1", 3, "", 0, 0).await.unwrap();
+        db.upsert("doc.md", "hash1", 3, "", "", 0, 0).await.unwrap();
 
         // Simulate: upsert to Qdrant fails, so we delete the state entry
         // (this is what ingest.rs now does on failure)
@@ -1919,6 +1949,66 @@ mod tests {
             "pre-migration rows carry an empty fingerprint, which forces exactly one \
              revalidation pass"
         );
+        assert_eq!(
+            entry.chunking_fingerprint, "",
+            "pre-migration rows carry an empty chunking fingerprint, which never matches \
+             ingest::chunking_fingerprint and so forces exactly one re-chunk/re-embed"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrading_a_pre_chunking_fingerprint_db_adds_only_that_column() {
+        // The shape the release immediately before chunking fingerprints shipped with:
+        // schema_hash/mtime/size already present, chunking_fingerprint absent. Its rows
+        // carry real values in every existing column, which must survive untouched.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pre-fingerprint.db");
+        let options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", path.to_str().unwrap()))
+                .unwrap()
+                .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE indexed_files (
+                file_path    TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                chunk_count  INTEGER NOT NULL,
+                indexed_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                schema_hash  TEXT NOT NULL DEFAULT '',
+                mtime        INTEGER NOT NULL DEFAULT 0,
+                size         INTEGER NOT NULL DEFAULT -1
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO indexed_files (file_path, content_hash, chunk_count, schema_hash, mtime, size)
+             VALUES ('a.md', 'hash-a', 4, 'schema-fp', 123, 45)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = StateDb::new(&path).await.expect("upgrade must not fail");
+        let row = db.get("a.md").await.unwrap().unwrap();
+        assert_eq!(row.content_hash, "hash-a");
+        assert_eq!(row.chunk_count, 4);
+        assert_eq!(row.schema_hash, "schema-fp");
+        assert_eq!((row.mtime, row.size), (123, 45));
+        assert_eq!(
+            row.chunking_fingerprint, "",
+            "a pre-existing row must read back an empty (never-matching) chunking fingerprint"
+        );
+
+        let page = db.fetch_indexed_files_page(10, 0).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].chunking_fingerprint, "");
     }
 
     #[tokio::test]
@@ -1939,13 +2029,14 @@ mod tests {
         let path = legacy_db(&dir).await;
         let db = StateDb::new(&path).await.unwrap();
 
-        db.upsert("a.md", "hash-a2", 3, "fingerprint", 0, 0)
+        db.upsert("a.md", "hash-a2", 3, "fingerprint", "chunk-fp", 0, 0)
             .await
             .expect("writing to a migrated row must work");
 
         let entry = db.get("a.md").await.unwrap().unwrap();
         assert_eq!(entry.content_hash, "hash-a2");
         assert_eq!(entry.schema_hash, "fingerprint");
+        assert_eq!(entry.chunking_fingerprint, "chunk-fp");
     }
 
     #[tokio::test]
@@ -1988,8 +2079,12 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_db_already_has_the_column() {
         let (db, _dir) = test_db().await;
-        db.upsert("new.md", "h", 1, "fp", 0, 0).await.unwrap();
-        assert_eq!(db.get("new.md").await.unwrap().unwrap().schema_hash, "fp");
+        db.upsert("new.md", "h", 1, "fp", "cfp", 0, 0)
+            .await
+            .unwrap();
+        let row = db.get("new.md").await.unwrap().unwrap();
+        assert_eq!(row.schema_hash, "fp");
+        assert_eq!(row.chunking_fingerprint, "cfp");
     }
 
     // -- document metadata index --------------------------------------------
@@ -3482,7 +3577,7 @@ mod tests {
         // never computed on a full run. If clear() left `documents` behind, a file
         // deleted from disk would remain listed forever with no run able to detect it.
         let (db, _dir) = test_db().await;
-        db.upsert("gone.md", "h", 1, "", 0, 0).await.unwrap();
+        db.upsert("gone.md", "h", 1, "", "", 0, 0).await.unwrap();
         db.upsert_document_metadata("gone.md", &recipe_frontmatter(), 1, "h", 1)
             .await
             .unwrap();
@@ -3557,7 +3652,7 @@ mod tests {
         // The two tables track different things; an existing deployment has one
         // populated and the other empty until a backfill runs.
         let (db, _dir) = test_db().await;
-        db.upsert("r.md", "h1", 2, "", 0, 0).await.unwrap();
+        db.upsert("r.md", "h1", 2, "", "", 0, 0).await.unwrap();
 
         assert_eq!(db.count().await.unwrap(), 1);
         assert_eq!(db.document_count().await.unwrap(), 0);
@@ -3727,7 +3822,7 @@ mod tests {
         // here would make `ingest::scan_for_dirty`'s paging loop spin forever, since
         // `offset` would never advance past a permanently empty page.
         let (db, _dir) = test_db().await;
-        db.upsert("only.md", "h", 1, "", 0, 0).await.unwrap();
+        db.upsert("only.md", "h", 1, "", "", 0, 0).await.unwrap();
 
         let zero = db.fetch_indexed_files_page(0, 0).await.unwrap();
         assert_eq!(

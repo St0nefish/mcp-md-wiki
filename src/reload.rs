@@ -9,9 +9,12 @@
 //!
 //! What this module DOES hand-maintain is [`diff`]'s table of what happens to each
 //! YAML setting once it actually changes. Some are read fresh on every use and take
-//! effect immediately ([`ReloadEffect::Applied`]). Some only matter to *future*
-//! indexing and leave existing Qdrant points inconsistent with the new setting until
-//! a real reindex ([`ReloadEffect::ReindexRequired`]). The rest are baked into a
+//! effect immediately ([`ReloadEffect::Applied`]). `chunking.*` changes apply the same
+//! way but also invalidate every stored chunk; the indexer detects that through a
+//! per-file chunking fingerprint and re-chunks/re-embeds affected documents on its own
+//! ([`ReloadEffect::ReindexScheduled`]). Some only matter to *future* indexing and leave
+//! existing Qdrant points inconsistent with the new setting until a real reindex
+//! ([`ReloadEffect::ReindexRequired`]). The rest are baked into a
 //! value or service built once at server startup — a `reqwest::Client` timeout, a
 //! compiled `GlobSet`, a `GovernorLayer` — and stay exactly as they were until the
 //! process restarts ([`ReloadEffect::RestartRequired`]). That table is unavoidable
@@ -41,6 +44,15 @@ pub enum ReloadEffect {
     /// boundaries (or text basis) the OLD setting produced, so the corpus is
     /// inconsistent with the new config until `mcp-md-wiki index --full` rewrites it.
     ReindexRequired,
+    /// Read fresh by the indexer, AND every already-indexed document built under the old
+    /// value is re-chunked and re-embedded automatically — no operator action. Each
+    /// `indexed_files` row stores the `ingest::chunking_fingerprint` it was chunked
+    /// under; the full reconcile [`reload_config`] queues (and every later startup or
+    /// periodic sweep) flags every row whose fingerprint differs as dirty, so the
+    /// corpus converges on the new setting without `mcp-md-wiki index --full`. Costs one
+    /// re-embed of every affected document, spread over the worker's normal batching;
+    /// search may briefly serve a mix of old and new chunks while that runs.
+    ReindexScheduled,
 }
 
 /// One setting whose resolved value changed across a reload.
@@ -68,6 +80,9 @@ pub struct ReloadReport {
     pub applied: Vec<SettingChange>,
     pub restart_required: Vec<SettingChange>,
     pub reindex_required: Vec<SettingChange>,
+    /// Settings whose change triggers an automatic re-chunk/re-embed of affected
+    /// documents — see [`ReloadEffect::ReindexScheduled`].
+    pub reindex_scheduled: Vec<SettingChange>,
 }
 
 impl ReloadReport {
@@ -92,6 +107,7 @@ impl ReloadReport {
             ReloadEffect::Applied => self.applied.push(change),
             ReloadEffect::RestartRequired => self.restart_required.push(change),
             ReloadEffect::ReindexRequired => self.reindex_required.push(change),
+            ReloadEffect::ReindexScheduled => self.reindex_scheduled.push(change),
         }
     }
 
@@ -100,6 +116,7 @@ impl ReloadReport {
         self.applied.is_empty()
             && self.restart_required.is_empty()
             && self.reindex_required.is_empty()
+            && self.reindex_scheduled.is_empty()
     }
 }
 
@@ -201,9 +218,9 @@ struct ConsumerEntry {
 /// `ResolvedRerankingConfig::max_document_bytes` is likewise absent, and is not a
 /// YAML setting at all: it is derived from `chunking.max_chunk_size` in
 /// `Config::resolve_inner` and baked into `RerankClient` at construction. It rides
-/// on the classification `chunking.max_chunk_size` already has (reindex-required),
-/// so a change to that number reaches the reranker only on restart — the same
-/// lifetime as every other `RerankClient` field.
+/// on `chunking.max_chunk_size`'s entry, but unlike the indexer's use of that number
+/// (re-chunked automatically), a change reaches the reranker only on restart — the
+/// same lifetime as every other `RerankClient` field.
 const DIFF_TABLE: &[DiffField] = &[
     // ── source ───────────────────────────────────────────────────────────────
     // `source.git_token_env` names the env var used to authenticate git operations.
@@ -335,53 +352,77 @@ const DIFF_TABLE: &[DiffField] = &[
     },
     // ── chunking ─────────────────────────────────────────────────────────────
     // The indexer reads these fresh (same fresh-config path as indexing.*/
-    // frontmatter.* above), but the EFFECT only reaches documents chunked after the
-    // change — this is the reindex case the task spec calls out by name.
+    // frontmatter.* above), and every one of them feeds `ingest::chunking_fingerprint`,
+    // stored per file in `indexed_files`. A changed value changes the fingerprint, so
+    // the full reconcile `reload_config` queues flags every document chunked under the
+    // old value (`ingest::scan_for_dirty`, ahead of its stat pre-filter) and
+    // `process_file`'s skip check refuses to skip it — affected documents are
+    // re-chunked and re-embedded automatically. Hence ReindexScheduled, not
+    // ReindexRequired: no `index --full` is needed for a consistent corpus.
     DiffField {
         path: "chunking.max_chunk_size",
         get: |c| Some(d(&c.chunking.max_chunk_size)),
         consumers: &[ConsumerEntry {
-            effect: ReloadEffect::ReindexRequired,
+            effect: ReloadEffect::ReindexScheduled,
             setting: "chunking.max_chunk_size",
-            note: "read fresh by the chunker on the next indexing run, but only for \
-                   documents that run touches — existing Qdrant chunks keep the old \
-                   boundaries. Run `mcp-md-wiki index --full` for a consistent corpus.",
+            note: "read fresh by the chunker; every document chunked under the old value is \
+                   re-chunked and re-embedded automatically by the full reconcile this reload \
+                   queued (chunking fingerprint mismatch). The reranker's derived \
+                   max_document_bytes still only changes on restart.",
         }],
     },
     DiffField {
         path: "chunking.target_chunk_size",
         get: |c| Some(d(&c.chunking.target_chunk_size)),
         consumers: &[ConsumerEntry {
-            effect: ReloadEffect::ReindexRequired,
+            effect: ReloadEffect::ReindexScheduled,
             setting: "chunking.target_chunk_size",
-            note: "same as chunking.max_chunk_size: applies to future chunking only. Run \
-                   `mcp-md-wiki index --full` for a consistent corpus.",
+            note: "read fresh by the chunker; affected documents are re-chunked and re-embedded \
+                   automatically by the full reconcile this reload queued — except while \
+                   chunking.heading_metadata is on, where target_chunk_size has no effect (no \
+                   chunk ever merges across a heading boundary) and is excluded from the \
+                   chunking fingerprint, so no re-chunk or re-embed happens at all.",
         }],
     },
     DiffField {
         path: "chunking.prepend_description",
         get: |c| Some(d(&c.chunking.prepend_description)),
         consumers: &[ConsumerEntry {
-            effect: ReloadEffect::ReindexRequired,
+            effect: ReloadEffect::ReindexScheduled,
             setting: "chunking.prepend_description",
-            note: "changes the text every future chunk embeds (and, incidentally, the \
-                   create_document dedup query text — mcp.rs build_dedup_query); existing \
-                   chunks were embedded on the old basis. Run `mcp-md-wiki index --full` for \
-                   a consistent corpus.",
+            note: "changes the text every chunk embeds (and the create_document dedup query \
+                   text — write.rs build_dedup_query); affected documents are re-chunked and \
+                   re-embedded automatically by the full reconcile this reload queued.",
         }],
     },
     DiffField {
         path: "chunking.prepend_heading_path",
         get: |c| Some(d(&c.chunking.prepend_heading_path)),
         consumers: &[ConsumerEntry {
-            effect: ReloadEffect::ReindexRequired,
+            effect: ReloadEffect::ReindexScheduled,
             setting: "chunking.prepend_heading_path",
-            note: "changes the text every future chunk embeds — a chunk's heading-ancestry \
-                   breadcrumb is prepended before embedding, so existing chunks were embedded \
-                   on the other basis. Unlike prepend_description this does NOT affect the \
-                   create_document dedup query (a document's first chunk never carries a \
-                   breadcrumb — see write.rs build_dedup_query). Run `mcp-md-wiki index --full` \
-                   for a consistent corpus.",
+            note: "changes the text every chunk embeds (the heading-ancestry breadcrumb; does \
+                   not affect the create_document dedup query); affected documents are \
+                   re-chunked and re-embedded automatically by the full reconcile this reload \
+                   queued.",
+        }],
+    },
+    DiffField {
+        path: "chunking.heading_metadata",
+        get: |c| Some(d(&c.chunking.heading_metadata)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::ReindexScheduled,
+            setting: "chunking.heading_metadata",
+            note: "changes each chunk's Qdrant payload (heading_path/heading_level/ \
+                   heading_prefixes/section_key/section_line_start/section_line_end) and chunk \
+                   boundaries: while on, sections are never merged, so documents with many \
+                   short sections yield more, smaller chunks and more embedding calls. Affected \
+                   documents are re-chunked and re-embedded automatically by the full reconcile \
+                   this reload queued; section granularity and heading_prefix filtering see a \
+                   partially populated corpus until that reconcile finishes. The search schema \
+                   (heading_prefix, the granularity enum) changes on the next tools/list; the \
+                   composed tool descriptions on the next metadata-refresh tick, within \
+                   mcp.metadata_refresh_secs seconds (#286).",
         }],
     },
     // ── embedding ────────────────────────────────────────────────────────────
@@ -781,6 +822,39 @@ const DIFF_TABLE: &[DiffField] = &[
                    resolve_limit) as the ceiling a requested limit is clamped to.",
         }],
     },
+    DiffField {
+        path: "search.section_max_bytes",
+        get: |c| Some(d(&c.search.section_max_bytes)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "search.section_max_bytes",
+            note: "read fresh from the live config on every get_document call (mcp.rs/web.rs, \
+                   retrieval::resolve_document_view) as the size cap a resolved section's text \
+                   is checked against before falling back to an outline of its children.",
+        }],
+    },
+    DiffField {
+        path: "search.granularities",
+        // Reported by spelling (`["chunk", "document"]`), not the enum's Debug form.
+        get: |c| {
+            Some(d(&c
+                .search
+                .granularities
+                .iter()
+                .map(|g| g.as_str())
+                .collect::<Vec<_>>()))
+        },
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "search.granularities",
+            note: "read fresh via ResolvedConfig::effective_granularities on every search \
+                   call (call-time validation), tools/list and tools/get (the schema `enum`, \
+                   KbSearchServer::overlay_input_schema), and the next metadata-refresh tick \
+                   (the composed description, descriptions::granularity_sentence) — no reindex \
+                   involved; only chunking.heading_metadata (reindex-scheduled on its own) \
+                   affects what a granularity can actually return (#286).",
+        }],
+    },
     // ── reranking ────────────────────────────────────────────────────────────
     DiffField {
         path: "reranking.enabled",
@@ -819,10 +893,12 @@ const DIFF_TABLE: &[DiffField] = &[
     // after `upsert_pending`). A reload's automatic full reconcile
     // (`queue.mark_full()`, unconditional — see `reload_config`'s doc comment)
     // still goes through the worker's ordinary `scan_for_dirty`, which skips any
-    // file whose content hash is unchanged; only `mcp-md-wiki index --full`
-    // (`force = true`) bypasses that skip and reprocesses everything. So exactly
-    // like `chunking.*` above: flipping `ui.semantic_edges.enabled` on does not
-    // retroactively populate semantic edges for the existing corpus, and
+    // file whose content hash and schema/chunking fingerprints are unchanged; only
+    // `mcp-md-wiki index --full` (`force = true`) bypasses that skip and reprocesses
+    // everything. `ui.semantic_edges.*` is deliberately NOT part of the chunking
+    // fingerprint (it changes no chunk or point, only graph edges), so flipping
+    // `ui.semantic_edges.enabled` on does not retroactively populate semantic edges
+    // for the existing corpus, and
     // flipping it off does not retroactively remove already-computed ones —
     // both only apply to documents a future run actually touches, same caveat,
     // same fix (`mcp-md-wiki index --full`).
@@ -903,9 +979,13 @@ pub fn diff(old: &ResolvedConfig, new: &ResolvedConfig) -> ReloadReport {
 ///
 /// After a successful swap, an immediate full reconcile is queued
 /// (`reindex::mark_full`) so every indexing-observing setting that changed —
-/// `indexing.include`/`exclude`, `frontmatter.*`, `validation.*` — takes effect on
-/// the reindex worker's very next wake rather than waiting for the periodic sweep
-/// (`indexing.reconcile_interval_secs`, several minutes by default). This is queued
+/// `indexing.include`/`exclude`, `frontmatter.*`, `validation.*`, and `chunking.*`
+/// (whose fingerprint mismatch is what makes this reconcile re-chunk affected
+/// documents, [`ReloadEffect::ReindexScheduled`]) — takes effect on the reindex
+/// worker's very next wake rather than waiting for the periodic sweep
+/// (`indexing.reconcile_interval_secs`, several minutes by default). Without a chunking
+/// change the reconcile finds nothing fingerprint-dirty, so it stays a cheap stat
+/// sweep; with one, it is what actually re-chunks the corpus. This is queued
 /// unconditionally, not only when [`diff`] says something indexing-related changed:
 /// `scan_for_dirty` is deliberately cheap — it pages `indexed_files` and stats what
 /// it already knows about rather than hashing file content, see its doc comment —
@@ -998,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chunking_setting_is_reported_as_reindex_required_not_applied() {
+    fn a_chunking_setting_is_reported_as_reindex_scheduled() {
         let mut old = base_config();
         let mut new = base_config();
         old.chunking.max_chunk_size = 1000;
@@ -1007,11 +1087,89 @@ mod tests {
         let report = diff(&old, &new);
         assert!(report.applied.is_empty());
         assert!(report.restart_required.is_empty());
-        assert_eq!(report.reindex_required.len(), 1);
+        assert!(
+            report.reindex_required.is_empty(),
+            "chunking.* re-chunks automatically via its fingerprint; it must not tell the \
+             operator to run index --full"
+        );
+        assert_eq!(report.reindex_scheduled.len(), 1);
         assert_eq!(
-            report.reindex_required[0].setting,
+            report.reindex_scheduled[0].setting,
             "chunking.max_chunk_size"
         );
+        assert!(!report.is_empty());
+    }
+
+    #[test]
+    fn every_chunking_field_is_reindex_scheduled() {
+        // Every `chunking.*` setting feeds `ingest::chunking_fingerprint`, so every one
+        // must be classified the same way — a stray ReindexRequired would tell the
+        // operator to do work the indexer already does.
+        let chunking: Vec<&DiffField> = DIFF_TABLE
+            .iter()
+            .filter(|f| f.path.starts_with("chunking."))
+            .collect();
+        assert_eq!(chunking.len(), 5);
+        for field in chunking {
+            for consumer in field.consumers {
+                assert_eq!(
+                    consumer.effect,
+                    ReloadEffect::ReindexScheduled,
+                    "{} must be reindex_scheduled",
+                    field.path
+                );
+            }
+        }
+        // ...and the scheduled bucket is only ever chunking.*: it promises an
+        // automatic reindex, which only the chunking fingerprint delivers.
+        for field in DIFF_TABLE
+            .iter()
+            .filter(|f| !f.path.starts_with("chunking."))
+        {
+            for consumer in field.consumers {
+                assert_ne!(
+                    consumer.effect,
+                    ReloadEffect::ReindexScheduled,
+                    "{}",
+                    field.path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_chunking_reload_queues_a_full_reconcile() {
+        // The trigger that makes "reindex_scheduled" true: without a queued full
+        // reconcile nothing would run `scan_for_dirty` (which detects the fingerprint
+        // mismatch) until the next periodic sweep.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "chunking:\n  max_chunk_size: 1000\n");
+        let running = Config::load(&path).unwrap();
+        let old_fp = crate::ingest::chunking_fingerprint(&running.chunking);
+        let shared = crate::config::shared_config(std::sync::Arc::new(running));
+
+        write_config(tmp.path(), "chunking:\n  max_chunk_size: 2000\n");
+        let queue = crate::reindex::ReindexQueue::new();
+        assert!(!queue.snapshot().full_pending);
+        let report = reload_config(&path, &shared, &queue).unwrap();
+
+        assert_eq!(report.reindex_scheduled.len(), 1);
+        assert!(
+            queue.snapshot().full_pending,
+            "a chunking change must queue a full reconcile"
+        );
+        let live = crate::config::load_shared_config(&shared);
+        assert_ne!(
+            crate::ingest::chunking_fingerprint(&live.chunking),
+            old_fp,
+            "the swapped-in config must produce a different fingerprint, or the queued \
+             reconcile would find nothing to re-chunk"
+        );
+
+        clear_required_env();
     }
 
     #[test]

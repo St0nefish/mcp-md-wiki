@@ -14,7 +14,7 @@ use rmcp::{
 use tracing::{debug, error, warn};
 
 use crate::{
-    config::ResolvedConfig,
+    config::{Granularity, ResolvedConfig},
     document_fields,
     embed::EmbedClient,
     git,
@@ -895,43 +895,294 @@ fn build_query_conditions(
         ));
     }
 
-    crate::qdrant::lower_field_filters(&filters, &indexed)
-        .map_err(|e| McpError::invalid_params(e, None))
+    let mut conditions = crate::qdrant::lower_field_filters(&filters, &indexed)
+        .map_err(|e| McpError::invalid_params(e, None))?;
+
+    if let Some(condition) = heading_prefix_condition(&params.heading_prefix, config)? {
+        conditions.push(condition);
+    }
+
+    Ok(conditions)
 }
 
-/// Which kind of result `search` returns: one row per chunk, or one per document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Granularity {
-    Chunk,
-    Document,
+/// Lower `search`'s `heading_prefix` parameter to a Qdrant condition (#286):
+/// `Condition::matches(HEADING_PREFIXES_KEY, joined)`, where `joined` is
+/// `heading::heading_prefix_key` — matching against every chunk's own precomputed
+/// `heading_prefixes` array (`ingest::derive_heading_prefixes`, normalized the
+/// same way), which is what makes this a PREFIX restriction rather than an
+/// exact-depth match. `None` in gives `None` out (nothing to filter on). An
+/// empty list, a blank segment (empty once normalized, so one made only of
+/// whitespace or invisible characters), or any list while `chunking.heading_metadata`
+/// is off (the payload field this filters on is never written in that case) is
+/// a caller error — not a silent no-op that would otherwise look like "matches
+/// everything" or "matches nothing".
+fn heading_prefix_condition(
+    heading_prefix: &Option<Vec<String>>,
+    config: &ResolvedConfig,
+) -> Result<Option<qdrant_client::qdrant::Condition>, McpError> {
+    let Some(heading_prefix) = heading_prefix else {
+        return Ok(None);
+    };
+    if heading_prefix.is_empty() {
+        return Err(McpError::invalid_params(
+            "heading_prefix must not be empty — omit it entirely to search without a \
+             heading restriction"
+                .to_string(),
+            None,
+        ));
+    }
+    if heading_prefix
+        .iter()
+        .any(|s| crate::heading::normalize_heading_text(s).is_empty())
+    {
+        return Err(McpError::invalid_params(
+            "heading_prefix must not contain empty or blank segments (a segment of only \
+             whitespace or invisible characters is blank)"
+                .to_string(),
+            None,
+        ));
+    }
+    if !config.chunking.heading_metadata {
+        return Err(McpError::invalid_params(
+            HEADING_METADATA_OFF_HEADING_PREFIX.to_string(),
+            None,
+        ));
+    }
+    Ok(Some(qdrant_client::qdrant::Condition::matches(
+        crate::qdrant::HEADING_PREFIXES_KEY,
+        crate::heading::heading_prefix_key(heading_prefix),
+    )))
 }
 
-/// Parse a caller-supplied `granularity`, rejecting anything unrecognized.
-fn parse_granularity(raw: &str) -> Result<Granularity, McpError> {
+/// Rejection for `heading_prefix` while `chunking.heading_metadata` is off.
+/// Caller-facing, so it names neither the config key nor payload fields: it
+/// says what is missing and what the caller (or the server's operator) can do
+/// about it. The operator gets the config-key detail from the docs.
+const HEADING_METADATA_OFF_HEADING_PREFIX: &str = "heading_prefix is unavailable: this server does not have heading metadata enabled. \
+     Search without heading_prefix, or ask the server's operator to enable heading metadata";
+
+/// Rejection for `section` granularity while `chunking.heading_metadata` is
+/// off. Shared by `granularity_disabled_error` and `search_sections` so a
+/// caller sees one explanation for one cause. Caller-facing in the same way as
+/// [`HEADING_METADATA_OFF_HEADING_PREFIX`].
+const HEADING_METADATA_OFF_SECTION: &str = "section granularity is unavailable: this server does not have heading metadata \
+     enabled. Use another granularity, or ask the server's operator to enable heading metadata";
+
+/// The tail [`granularity_disabled_error`] appends when `section` is missing
+/// only because heading metadata is off — [`HEADING_METADATA_OFF_SECTION`]'s
+/// explanation, worded to follow "granularity 'section' is not enabled on
+/// this server" without repeating it.
+const HEADING_METADATA_OFF_SECTION_REASON: &str = ", because this server does not have heading \
+     metadata enabled. Use another granularity, or ask the server's operator to enable heading \
+     metadata";
+
+/// Appended to `section`-granularity and `heading_prefix`-filtered results
+/// while a multi-file indexing run is in flight: heading payload fields are
+/// written per document as the run reaches it, so e.g. right after
+/// `chunking.heading_metadata` is enabled the corpus is only partly covered.
+/// `None` otherwise — including during a routine single-file reindex, which
+/// can't leave other documents' metadata incomplete (see
+/// `status::IndexStatus::is_bulk_indexing`). Cheap — one read lock on
+/// `status::INDEX_STATUS`.
+fn heading_results_indexing_note() -> Option<&'static str> {
+    crate::status::INDEX_STATUS.is_bulk_indexing().then_some(
+        "Note: an indexing run is in progress; documents it has not reached yet may lack \
+         heading metadata, so these results may be incomplete.",
+    )
+}
+
+/// Attach [`heading_results_indexing_note`] (when one applies) to a finished
+/// `search` result: appended to the text block, and mirrored as
+/// `indexing_in_progress: true` in `structured_content`.
+fn annotate_heading_results(result: &mut CallToolResult, note: Option<&str>) {
+    let Some(note) = note else {
+        return;
+    };
+    if let Some(first) = result.content.first_mut()
+        && let Some(text) = first.as_text()
+    {
+        let mut annotated = text.text.trim_end().to_string();
+        annotated.push_str("\n\n");
+        annotated.push_str(note);
+        *first = Content::text(annotated);
+    }
+    if let Some(serde_json::Value::Object(map)) = result.structured_content.as_mut() {
+        map.insert(
+            "indexing_in_progress".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+}
+
+/// Parse a caller-supplied `granularity`, rejecting anything unrecognized. The
+/// rejection lists only `effective` — the granularities this deployment
+/// enables — so a disabled one is never advertised to a caller (#286).
+fn parse_granularity(raw: &str, effective: &[Granularity]) -> Result<Granularity, McpError> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "chunk" => Ok(Granularity::Chunk),
         "document" => Ok(Granularity::Document),
+        "section" => Ok(Granularity::Section),
         other => Err(McpError::invalid_params(
-            format!("unknown granularity '{other}': expected 'chunk' or 'document'"),
+            format!(
+                "unknown granularity '{other}': expected one of {}",
+                effective
+                    .iter()
+                    .map(|g| format!("'{g}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             None,
         )),
     }
 }
 
-/// Resolve the effective granularity for a `search` call: the caller's explicit
-/// choice if given, otherwise `chunk` when a query is present and `document` when it
-/// is not — reproducing the old `search` and `list_documents` tools' behaviour
-/// exactly. Pure and I/O-free so the default-in-both-directions property is
-/// unit-testable without a live index.
-fn resolve_granularity(
+/// The granularity a `search` call gets when it names none: `chunk` when a query
+/// is present and `document` when it is not — reproducing the old `search` and
+/// `list_documents` tools' behaviour exactly. Pure and I/O-free so the
+/// default-in-both-directions property is unit-testable without a live index.
+fn default_granularity(query_present: bool) -> Granularity {
+    if query_present {
+        Granularity::Chunk
+    } else {
+        Granularity::Document
+    }
+}
+
+/// Whether a granularity can serve a `search` call in the given query mode.
+/// `chunk` and `section` both require a query — `search_chunks`/
+/// `search_sections` reject its absence outright (see the `(false, ...)`
+/// arms in `search`'s match) — while `document` serves either mode
+/// (enumeration without a query, grouped results with one). Shared by
+/// `resolve_search_granularity`'s fallback walk below so "supports the
+/// mode" has exactly one definition.
+fn granularity_supports_mode(g: Granularity, query_present: bool) -> bool {
+    query_present || g.supports_no_query()
+}
+
+/// `effective`, as a comma-separated list for error messages.
+fn join_granularities(effective: &[Granularity]) -> String {
+    effective
+        .iter()
+        .map(|g| g.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Rejection for `fields` at a granularity whose results carry no frontmatter
+/// (`chunk`, `section`: they never join the document metadata index `fields`
+/// draws from). Suggests switching to `document` only when that granularity
+/// is enabled here (#286). Caller-facing, so it says what a result carries, not
+/// where the data lives.
+fn fields_rejection(granularity: Granularity, effective: &[Granularity]) -> McpError {
+    let msg = if effective.contains(&Granularity::Document) {
+        format!(
+            "fields only applies to document-granularity results (a {granularity} result \
+             carries no frontmatter fields) — omit it, or set granularity to 'document'"
+        )
+    } else {
+        "fields is not supported on this server (only document results carry frontmatter \
+         fields, and document granularity is not enabled) — omit it"
+            .to_string()
+    };
+    McpError::invalid_params(msg, None)
+}
+
+/// Rejection for `explain` at a grouped granularity (`document`, `section`),
+/// which has no per-arm score breakdown to report. Suggests switching to
+/// `chunk` only when that granularity is enabled here (#286).
+fn explain_rejection(granularity: Granularity, effective: &[Granularity]) -> McpError {
+    let reason = format!(
+        "{granularity}-granularity results collapse to one row per {granularity} with no \
+         per-arm score breakdown available to report"
+    );
+    let msg = if effective.contains(&Granularity::Chunk) {
+        format!(
+            "explain is chunk-granularity only; {reason} — omit it, or set granularity to 'chunk'"
+        )
+    } else {
+        format!("explain is not supported on this server; {reason} — omit it")
+    };
+    McpError::invalid_params(msg, None)
+}
+
+/// Build the caller-facing error for an explicitly-requested granularity
+/// that this deployment does not currently allow (#286). Lists exactly the
+/// granularities enabled here (the EFFECTIVE set), so a caller knows what to
+/// fall back to. The `chunking.heading_metadata` explanation is added only
+/// when that is actually why `section` is missing (`section_gated_off`:
+/// configured in `search.granularities`, dropped because the flag is off) —
+/// not when an operator simply left `section` out of the configured set.
+fn granularity_disabled_error(
+    requested: Granularity,
+    effective: &[Granularity],
+    section_gated_off: bool,
+) -> McpError {
+    let mut msg = format!(
+        "granularity '{requested}' is not enabled on this server (enabled: {})",
+        join_granularities(effective)
+    );
+    if requested == Granularity::Section && section_gated_off {
+        msg.push_str(HEADING_METADATA_OFF_SECTION_REASON);
+    }
+    McpError::invalid_params(msg, None)
+}
+
+/// Resolve a `search` call's granularity against this deployment's enabled
+/// set (#286), on top of `default_granularity`'s ordinary query-presence
+/// default:
+///
+/// - An explicit request is parsed, then checked against
+///   `effective` (`ResolvedConfig::effective_granularities`) and rejected
+///   by name — via [`granularity_disabled_error`] — if it isn't a member.
+/// - An omitted one first tries `default_granularity`'s usual default
+///   (`chunk` with a query, `document` without). If THAT default is itself
+///   disabled here, the first enabled granularity — in canonical
+///   chunk/document/section order — that also supports the current query
+///   mode ([`granularity_supports_mode`]) is used instead. If none does,
+///   that's a configuration problem, not a caller one, and is reported as
+///   such rather than silently doing nothing.
+///
+/// `descriptions::granularity_description` states these defaults in prose;
+/// `granularity_description_matches_resolution_for_every_effective_set`
+/// keeps the two in step.
+fn resolve_search_granularity(
     query_present: bool,
     requested: Option<&str>,
+    effective: &[Granularity],
+    section_gated_off: bool,
 ) -> Result<Granularity, McpError> {
-    match requested {
-        Some(raw) => parse_granularity(raw),
-        None if query_present => Ok(Granularity::Chunk),
-        None => Ok(Granularity::Document),
+    if let Some(raw) = requested {
+        let g = parse_granularity(raw, effective)?;
+        return if effective.contains(&g) {
+            Ok(g)
+        } else {
+            Err(granularity_disabled_error(g, effective, section_gated_off))
+        };
     }
+
+    let default = default_granularity(query_present);
+    if effective.contains(&default) {
+        return Ok(default);
+    }
+
+    Granularity::ALL
+        .into_iter()
+        .find(|&g| effective.contains(&g) && granularity_supports_mode(g, query_present))
+        .ok_or_else(|| {
+            McpError::invalid_params(
+                format!(
+                    "no enabled search granularity supports {} (enabled: {})",
+                    if query_present {
+                        "a query"
+                    } else {
+                        "enumeration (search without a query — only document does); provide \
+                         a query"
+                    },
+                    join_granularities(effective)
+                ),
+                None,
+            )
+        })
 }
 
 /// Whether `search`'s `query` should be treated as present. A blank/whitespace-only
@@ -954,16 +1205,162 @@ fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
 }
 
 /// Parameters for `get_document`.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+///
+/// Modes — see `retrieval::parse_document_view_request` for the exact
+/// validation rules (#286):
+///   - Nothing but `path`: the whole document (unchanged).
+///   - `start_line`/`end_line`: a raw line range (unchanged); excludes every
+///     other mode parameter.
+///   - `line` or `heading_path` (optionally with `levels_up`): one resolved
+///     section, by line or by heading path.
+///   - `outline: true`: the heading outline, no content — of the whole
+///     document, or of the selected section when combined with a selector.
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetDocumentParams {
     /// Relative path, unique basename, or absolute path.
     pub path: String,
-    /// First line to return (1-based, inclusive).
+    /// First line to return (1-based, inclusive). Not combinable with
+    /// `line`/`heading_path`/`outline`.
     #[serde(default)]
     pub start_line: Option<usize>,
-    /// Last line to return (1-based, inclusive).
+    /// Last line to return (1-based, inclusive). Not combinable with
+    /// `line`/`heading_path`/`outline`.
     #[serde(default)]
     pub end_line: Option<usize>,
+    /// Select a section by any 1-based line in it: the deepest heading whose
+    /// range contains the line (its heading line and intro text belong to
+    /// the section itself). Not combinable with `heading_path`.
+    #[serde(default)]
+    pub line: Option<usize>,
+    /// Select a section by heading path, e.g. `["Spells", "Fireball"]` — a
+    /// trailing suffix of the full path is enough; each segment is a complete
+    /// heading name, matched ignoring case, whitespace differences and
+    /// invisible characters (but not Unicode normalization form — a
+    /// precomposed accented character does not match a decomposed spelling of
+    /// the same text). Not combinable with `line`.
+    #[serde(default)]
+    pub heading_path: Option<Vec<String>>,
+    /// Climb this many parent headings above the selected section (a heading's
+    /// parent is the nearest heading above it with a lower level, so `levels_up:
+    /// 1` from a `###` directly under a `#` reaches the `#`; clamped at the
+    /// top-most heading). Requires `line` or `heading_path`.
+    #[serde(default)]
+    pub levels_up: Option<usize>,
+    /// Return a heading outline (with line ranges) instead of content: of the
+    /// whole document, or — with `line`/`heading_path` — of that section's
+    /// sub-headings.
+    #[serde(default)]
+    pub outline: Option<bool>,
+}
+
+/// `get_document`'s `Content::text` block for a resolved view (#286).
+/// `structured_content` (`retrieval::document_view_json`) carries the same
+/// data; this is for clients that render text content only. A text read is
+/// the text itself; an outline is one line per heading plus the truncation
+/// hint, so the text block never repeats the JSON payload.
+fn render_document_view_text(view: retrieval::DocumentView, section_max_bytes: usize) -> String {
+    match view {
+        retrieval::DocumentView::Range(slice) => slice.content,
+        retrieval::DocumentView::Outline(outline) => {
+            let mut text = match &outline.section {
+                Some(section) => format!(
+                    "Headings under section \"{}\" (lines {}-{}):\n\n",
+                    section.heading_path.join(" > "),
+                    section.line_start,
+                    section.line_end
+                ),
+                None => String::new(),
+            };
+            text.push_str(&render_outline_body(&outline));
+            text
+        }
+        retrieval::DocumentView::Section(section) => match &section.outline {
+            None => section.content.unwrap_or_default(),
+            Some(outline) => {
+                let mut text = format!(
+                    "Section \"{}\" (lines {}-{}) is larger than this server's {}-byte section \
+                     size limit, so here is its outline instead of its text. Fetch a sub-section by \
+                     its heading_path or line.\n\n{}",
+                    section.entry.heading_path.join(" > "),
+                    section.entry.line_start,
+                    section.entry.line_end,
+                    section_max_bytes,
+                    render_outline_body(outline),
+                );
+                if let Some(intro) = &section.intro {
+                    text.push_str(&format!(
+                        "\n\nThe section also has text of its own before its first sub-heading \
+                         (lines {}-{}); read it with start_line: {}, end_line: {}.",
+                        intro.line_start, intro.line_end, intro.line_start, intro.line_end
+                    ));
+                }
+                text
+            }
+        },
+    }
+}
+
+/// An outline's heading lines (relative to its scope) plus its truncation
+/// hint, if any.
+fn render_outline_body(outline: &retrieval::OutlineView) -> String {
+    let base_depth = outline.section.as_ref().map_or(0, |s| s.heading_path.len());
+    let mut text = render_outline_text(&outline.entries, base_depth);
+    if let Some(hint) = &outline.hint {
+        text.push_str("\n\n");
+        text.push_str(hint);
+    }
+    text
+}
+
+/// Plain-text rendering of outline entries: one line per entry, indented by
+/// ancestry depth below `base_depth` (the scope section's own depth, or 0
+/// for a whole document), e.g. `## Hardware (lines 12-40)`.
+fn render_outline_text(entries: &[retrieval::OutlineEntry], base_depth: usize) -> String {
+    if entries.is_empty() {
+        return "(no headings)".to_string();
+    }
+    entries
+        .iter()
+        .map(|e| {
+            if e.level == 0 {
+                format!(
+                    "(text before the first heading) (lines {}-{})",
+                    e.line_start, e.line_end
+                )
+            } else {
+                let indent = "  ".repeat(
+                    e.heading_path
+                        .len()
+                        .saturating_sub(base_depth)
+                        .saturating_sub(1),
+                );
+                format!(
+                    "{indent}{} {} (lines {}-{})",
+                    "#".repeat(e.level as usize),
+                    e.heading,
+                    e.line_start,
+                    e.line_end
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Map `retrieval::resolve_document_view`'s error into the `McpError` this
+/// tool surface returns. The `Range` arm keeps `get_document`'s existing
+/// range-error wording; `Section` follows the same "invalid_params + a `data`
+/// payload the caller can act on" shape `GetDocumentError::NotFound`'s
+/// suggestions already establish, except here the payload is structured
+/// (`hint`/`candidates`) rather than folded into the message text alone,
+/// since `SectionError::data()` already builds exactly that (#286).
+fn document_view_error_to_mcp(err: retrieval::DocumentViewError) -> McpError {
+    match err {
+        retrieval::DocumentViewError::Range(e) => McpError::invalid_params(e.to_string(), None),
+        retrieval::DocumentViewError::Section(e) => {
+            McpError::invalid_params(e.message(), Some(e.data()))
+        }
+    }
 }
 
 /// Parameters for `get_schema`.
@@ -1019,7 +1416,12 @@ pub struct UpdateSchemaParams {
 /// Parameters for `search` (also covers enumeration).
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
-    /// Semantic query. Omit to enumerate everything.
+    // Doc comments on these fields become the tool schema's property
+    // descriptions (schemars). Several are replaced at list time with
+    // effective-set-aware text, or removed when no enabled granularity can
+    // use them (`descriptions::search_property_descriptions`, applied in
+    // `KbSearchServer::overlay_input_schema`).
+    /// Semantic query. Omit to list every match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
 
@@ -1027,24 +1429,41 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<SearchFiltersInput>,
 
-    /// Restrict by location: a case-insensitive substring of the document's path,
-    /// the same in both modes. Matches anywhere in the path, so it also finds a
+    /// Restrict by location: a case-insensitive substring of the document's
+    /// path. Matches anywhere in the path, so it also finds a
     /// document from a fragment of its name — `stir_fr` finds
     /// `kitchen/recipes/stir_fry.md`. A short needle is correspondingly broad.
     /// A trailing slash is optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
 
-    /// "chunk" or "document"; defaults per query presence.
+    // Doc comments on these fields become the tool schema's property
+    // descriptions (schemars), so they stay caller-facing. `granularity`'s is
+    // replaced at list time with the effective-set text
+    // (`KbSearchServer::overlay_input_schema`); `heading_prefix` is removed
+    // from the schema entirely when `chunking.heading_metadata` is off.
+    /// What each result is. Omit for the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granularity: Option<String>,
+
+    /// Restrict results to everything under this run of consecutive headings,
+    /// starting at any level. Each segment is a complete heading name:
+    /// `["Conditions"]`, `["Chapter 10: Game Mastering", "Conditions"]` and
+    /// `["Conditions", "Blinded"]` all match text under `Chapter 10: Game
+    /// Mastering > Conditions > Blinded`; `["Chapter 10", "Conditions"]` does
+    /// not. Matched ignoring case, whitespace and invisible characters, but
+    /// not Unicode normalization form (a precomposed accented character does
+    /// not match a decomposed spelling of the same text). Requires a query;
+    /// must not be empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading_prefix: Option<Vec<String>>,
 
     /// Maximum results to return.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
 
     /// Number to skip, for paging. Exhaustive (no depth limit) in enumeration
-    /// mode. In query mode (chunk or document granularity), pages over the
+    /// mode. In query mode (any granularity), pages over the
     /// already-ranked results, so `offset + limit` is capped at
     /// reranking.candidate_limit when reranking is enabled, or a fixed depth
     /// otherwise — a request past that bound gets `offset_truncated: true` in
@@ -1071,9 +1490,8 @@ pub struct SearchParams {
     pub explain: Option<bool>,
 
     /// Frontmatter fields to include per result (dot-paths; document
-    /// granularity only, enumeration or query — rejected at chunk
-    /// granularity, since a chunk result never joins the document metadata
-    /// index this draws from).
+    /// granularity only, enumeration or query — rejected at any other
+    /// granularity, whose results carry no frontmatter).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<Vec<String>>,
 
@@ -2631,6 +3049,83 @@ impl KbSearchServer {
         tool
     }
 
+    /// Apply the live per-instance `search` restrictions to one
+    /// router-provided `Tool`'s `input_schema` (#286) — the schema
+    /// counterpart to `overlay_description` above, called from the same two
+    /// sites (`list_tools`/`get_tool`) so a disabled granularity or
+    /// `heading_prefix` disappears from what a caller/model can even see,
+    /// not just from prose it might skip: the `granularity` property's
+    /// `enum` becomes the effective set and its `description` becomes
+    /// `descriptions::granularity_description` for that set (the same text
+    /// the tool description carries), and `heading_prefix` is removed while
+    /// `chunking.heading_metadata` is off. Reads `self.config()` live, same
+    /// fresh-snapshot-per-call contract as every other config consumer
+    /// here. A no-op for every tool but `search`.
+    ///
+    /// `Tool::input_schema` is `Arc<JsonObject>`, shared with every OTHER
+    /// concurrent caller of `list_tools`/`get_tool` until the next one — this
+    /// clones the object before editing rather than mutating through the
+    /// `Arc`, so one request's overlay can never leak into another's, or
+    /// into the router's own cached `Tool` (see `ResolvedConfig::
+    /// effective_granularities`'s doc comment for why all three consumers of
+    /// that helper, this one included, must read a fresh snapshot rather
+    /// than share mutable state).
+    fn overlay_input_schema(&self, mut tool: Tool) -> Tool {
+        if tool.name.as_ref() != "search" {
+            return tool;
+        }
+        let config = self.config();
+        let effective = config.effective_granularities();
+
+        let mut schema: JsonObject = (*tool.input_schema).clone();
+        if let Some(properties) = schema.get_mut("properties").and_then(|v| v.as_object_mut()) {
+            if let Some(granularity) = properties
+                .get_mut("granularity")
+                .and_then(|v| v.as_object_mut())
+            {
+                // `type` stays `["string", "null"]` (granularity is an
+                // `Option<String>`) — `null` is included in the enum so an
+                // omitted/null granularity remains valid against it.
+                let mut values: Vec<serde_json::Value> = effective
+                    .iter()
+                    .map(|g| serde_json::Value::String(g.as_str().to_string()))
+                    .collect();
+                values.push(serde_json::Value::Null);
+                granularity.insert("enum".to_string(), serde_json::Value::Array(values));
+                granularity.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(crate::descriptions::granularity_description(
+                        &effective,
+                    )),
+                );
+            }
+            if !config.chunking.heading_metadata {
+                properties.remove("heading_prefix");
+            }
+            // Properties whose static doc comments assume every granularity
+            // and mode is on: rewritten, or removed when nothing enabled can
+            // use them.
+            for (name, description) in crate::descriptions::search_property_descriptions(&effective)
+            {
+                match description {
+                    Some(text) => {
+                        if let Some(property) =
+                            properties.get_mut(name).and_then(|v| v.as_object_mut())
+                        {
+                            property
+                                .insert("description".to_string(), serde_json::Value::String(text));
+                        }
+                    }
+                    None => {
+                        properties.remove(name);
+                    }
+                }
+            }
+        }
+        tool.input_schema = Arc::new(schema);
+        tool
+    }
+
     /// Write a non-document file into the KB, commit it, and queue a full reconcile.
     ///
     /// Used for `.kb-schema.yaml`, which is versioned and synced like a document but is
@@ -2975,7 +3470,22 @@ impl KbSearchServer {
         validate_search_params(&params)?;
 
         let query_present = query_is_present(&params.query);
-        let granularity = resolve_granularity(query_present, params.granularity.as_deref())?;
+        // This gate reads its own config snapshot; each downstream handler
+        // (search_chunks/search_grouped/search_sections/search_enumerate) then
+        // takes a fresh one via self.config(), so a `POST /admin/reload`
+        // landing between the two is visible to the handler. That is
+        // harmless: every handler re-checks what it depends on
+        // (`search_sections` the heading_metadata flag, `heading_prefix_condition`
+        // likewise) against its own snapshot rather than trusting this gate.
+        let config = self.config();
+        let effective_granularities = config.effective_granularities();
+        let section_gated_off = config.section_gated_off();
+        let granularity = resolve_search_granularity(
+            query_present,
+            params.granularity.as_deref(),
+            &effective_granularities,
+            section_gated_off,
+        )?;
 
         debug!(
             query_present,
@@ -2986,14 +3496,25 @@ impl KbSearchServer {
 
         match (query_present, granularity) {
             (false, Granularity::Chunk) => Err(McpError::invalid_params(
-                "chunk granularity requires a query; omit granularity (or set it to \
-                 'document') to enumerate without one"
+                if effective_granularities.contains(&Granularity::Document) {
+                    "chunk granularity requires a query; omit granularity (or set it to \
+                     'document') to enumerate without one"
+                } else {
+                    "chunk granularity requires a query"
+                }
+                .to_string(),
+                None,
+            )),
+            (false, Granularity::Section) => Err(McpError::invalid_params(
+                "section granularity requires a query — there is nothing to rank \
+                 sections by without one"
                     .to_string(),
                 None,
             )),
             (false, Granularity::Document) => self.search_enumerate(&params).await,
             (true, Granularity::Chunk) => self.search_chunks(&params).await,
             (true, Granularity::Document) => self.search_grouped(&params).await,
+            (true, Granularity::Section) => self.search_sections(&params).await,
         }
     }
 
@@ -3011,12 +3532,9 @@ impl KbSearchServer {
         // it used to (this was the SAME silent-no-op bug `explain` at document
         // granularity is, just for the mirror-image parameter/granularity pair).
         if params.fields.is_some() {
-            return Err(McpError::invalid_params(
-                "fields is document-granularity only (fields draws from the document \
-                 metadata index, which a chunk result never joins) — omit it, or set \
-                 granularity to 'document'"
-                    .to_string(),
-                None,
+            return Err(fields_rejection(
+                Granularity::Chunk,
+                &self.config().effective_granularities(),
             ));
         }
         let schemas = crate::schema::load_shared(&self.schema_cache);
@@ -3123,6 +3641,9 @@ impl KbSearchServer {
 
         let mut call_result = CallToolResult::success(vec![Content::text(text)]);
         call_result.structured_content = Some(structured);
+        if params.heading_prefix.is_some() {
+            annotate_heading_results(&mut call_result, heading_results_indexing_note());
+        }
         Ok(call_result)
     }
 
@@ -3149,12 +3670,9 @@ impl KbSearchServer {
         // ranking deserves an error telling them so, not a response that quietly
         // drops the one thing they asked for.
         if params.explain == Some(true) {
-            return Err(McpError::invalid_params(
-                "explain is chunk-granularity only; document-granularity results \
-                 collapse to one row per document with no per-arm score breakdown \
-                 available to report — omit it, or set granularity to 'chunk'"
-                    .to_string(),
-                None,
+            return Err(explain_rejection(
+                Granularity::Document,
+                &self.config().effective_granularities(),
             ));
         }
 
@@ -3264,12 +3782,135 @@ impl KbSearchServer {
 
         let mut call_result = CallToolResult::success(vec![Content::text(text)]);
         call_result.structured_content = Some(structured);
+        if params.heading_prefix.is_some() {
+            annotate_heading_results(&mut call_result, heading_results_indexing_note());
+        }
+        Ok(call_result)
+    }
+
+    /// query+section: Qdrant grouped by `section_key` (#286), collapsed to
+    /// each section's best-scoring chunk, returned as a path with no text — the
+    /// `search` tool's `section` granularity. Requires
+    /// `chunking.heading_metadata` (the flag that gates writing `section_key` at
+    /// all — see `ingest.rs`) and, like `search_grouped`, rejects `explain`
+    /// (no per-arm breakdown to report) and `fields` (no document-metadata join,
+    /// same reasoning `search_chunks` gives for the identical rejection).
+    async fn search_sections(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
+        let query = params.query.as_deref().unwrap_or_default();
+        let config = self.config();
+
+        if !config.chunking.heading_metadata {
+            return Err(McpError::invalid_params(
+                HEADING_METADATA_OFF_SECTION.to_string(),
+                None,
+            ));
+        }
+        if params.explain == Some(true) {
+            return Err(explain_rejection(
+                Granularity::Section,
+                &config.effective_granularities(),
+            ));
+        }
+        if params.fields.is_some() {
+            return Err(fields_rejection(
+                Granularity::Section,
+                &config.effective_granularities(),
+            ));
+        }
+
+        validate_path_prefix(&params.path_prefix)?;
+        let schemas = crate::schema::load_shared(&self.schema_cache);
+        let conditions = build_query_conditions(params, &config, &schemas)?;
+
+        let limit = resolve_limit(
+            params.limit,
+            config.search.default_limit,
+            config.search.max_limit,
+        );
+
+        let filters = SearchFilters { conditions };
+
+        let modified_after = params
+            .modified_after
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let modified_before = params
+            .modified_before
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        let path_filter = self
+            .resolve_path_filter(params.path_prefix.as_deref())
+            .await?;
+        let opts = SearchOptions {
+            limit,
+            min_score: params.min_score.or(config.search.min_score),
+            hybrid: config.search.hybrid,
+            rrf_candidates: config.search.rrf_candidates as u64,
+            phrase: config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available(),
+            explain: false,
+            modified_after,
+            modified_before,
+            path_filter,
+            rerank_candidate_limit: None,
+            diversity_max_per_document: None,
+        };
+
+        let offset = params.offset.unwrap_or(0);
+        let outcome = retrieval::search_sections(&self.deps(), query, &filters, &opts, offset)
+            .await
+            .map_err(|e| match e {
+                retrieval::SearchError::Embed(err) => {
+                    error!("Embedding query failed: {:#}", err);
+                    McpError::internal_error("Failed to generate query embedding".to_string(), None)
+                }
+                retrieval::SearchError::Search(err) => {
+                    error!("Qdrant grouped search failed: {:#}", err);
+                    McpError::internal_error("Search query failed".to_string(), None)
+                }
+                retrieval::SearchError::Document(err) => {
+                    error!("Document metadata lookup failed: {:#}", err);
+                    McpError::internal_error("Document metadata lookup failed".to_string(), None)
+                }
+            })?;
+        let path_prefix_truncated = outcome.path_prefix_truncated;
+        let offset_truncated = outcome.offset_truncated;
+        let sections = outcome.sections;
+
+        let (text, structured) = build_section_search_payload(
+            &sections,
+            path_prefix_truncated,
+            offset_truncated,
+            offset,
+        );
+
+        let mut call_result = CallToolResult::success(vec![Content::text(text)]);
+        call_result.structured_content = Some(structured);
+        annotate_heading_results(&mut call_result, heading_results_indexing_note());
         Ok(call_result)
     }
 
     /// document, no query: the former `list_documents` tool's behavior, unchanged
     /// output shape (`{total, returned, offset, has_more, documents}`).
     async fn search_enumerate(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
+        // Enumeration reads the state DB, which holds no heading data, so
+        // `heading_prefix` cannot be honored here. Validate it the same way
+        // query mode does first (so an empty list / the flag being off get
+        // their own message), then reject rather than silently ignore it —
+        // ignoring it would return every document as if the filter matched.
+        if params.heading_prefix.is_some() {
+            heading_prefix_condition(&params.heading_prefix, &self.config())?;
+            return Err(McpError::invalid_params(
+                "heading_prefix requires a query — a search without one lists whole \
+                 documents, which cannot be filtered by heading"
+                    .to_string(),
+                None,
+            ));
+        }
         let query = build_document_query(params)?;
 
         let index = self.state_db().await.map_err(|e| {
@@ -3725,13 +4366,22 @@ impl KbSearchServer {
             ));
         }
 
-        // Checked before the path is resolved: a malformed range is wrong no
-        // matter which document it was aimed at, so it should not cost a
-        // metadata-index open and a file read to say so.
-        let range = retrieval::LineRange::new(params.start_line, params.end_line)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        // Checked before the path is resolved: a malformed combination of
+        // parameters is wrong no matter which document it was aimed at, so it
+        // should not cost a metadata-index open and a file read to say so
+        // (#286 — mode resolution itself lives in retrieval.rs so this
+        // tool and `/api/doc` can't drift apart on it).
+        let request = retrieval::parse_document_view_request(
+            params.start_line,
+            params.end_line,
+            params.line,
+            params.heading_path,
+            params.levels_up,
+            params.outline.unwrap_or(false),
+        )
+        .map_err(|e| McpError::invalid_params(e, None))?;
 
-        debug!(path = %raw, ?range, "get_document called");
+        debug!(path = %raw, "get_document called");
 
         // The fuzzy-basename fallback resolves against the SQLite metadata index
         // rather than a Qdrant facet fetch, so the index has to be opened here.
@@ -3793,31 +4443,28 @@ impl KbSearchServer {
                         "score": l.score,
                     })).collect::<Vec<_>>(),
                 });
-                let slice = retrieval::slice_or_whole(doc.content, range.as_ref())
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                let rel_path = retrieval::relative_to_data(
+                    &doc.path.to_string_lossy(),
+                    &self.canonical_data_path,
+                );
+                let section_max_bytes = self.config().search.section_max_bytes;
+                let view =
+                    retrieval::resolve_document_view(&doc.content, &request, section_max_bytes)
+                        .map_err(document_view_error_to_mcp)?;
+
                 // structured_content must mirror the text block: MCP clients that
                 // prefer structuredContent render ONLY it, so a hash-only payload
                 // makes the document invisible to them (observed in practice).
-                //
-                // The line fields are reported unconditionally, including on a full
-                // read, so a client never has to branch on their presence to learn
-                // how much document it is holding.
-                let structured = serde_json::json!({
-                    "path": retrieval::relative_to_data(
-                        &doc.path.to_string_lossy(),
-                        &self.canonical_data_path,
-                    ),
-                    "content": &slice.content,
-                    "content_hash": content_hash,
-                    "start_line": slice.start_line,
-                    "end_line": slice.end_line,
-                    "total_lines": slice.total_lines,
-                    "partial": slice.partial(),
-                    "links_out": links_out,
-                    "links_in": links_in,
-                });
-                let mut result = CallToolResult::success(vec![Content::text(slice.content)]);
-                result.structured_content = Some(structured);
+                // The view-specific fields come from `retrieval::document_view_json`,
+                // shared with `/api/doc`; only the envelope is added here.
+                let mut structured = retrieval::document_view_json(&view);
+                structured.insert("path".to_string(), serde_json::json!(rel_path));
+                structured.insert("content_hash".to_string(), serde_json::json!(content_hash));
+                structured.insert("links_out".to_string(), links_out);
+                structured.insert("links_in".to_string(), links_in);
+                let text = render_document_view_text(view, section_max_bytes);
+                let mut result = CallToolResult::success(vec![Content::text(text)]);
+                result.structured_content = Some(serde_json::Value::Object(structured));
                 Ok(result)
             }
             Err(GetDocumentError::Outside) => {
@@ -4962,7 +5609,7 @@ fn build_chunk_search_payload(
         }
 
         let null = serde_json::Value::Null;
-        structured_results.push(serde_json::json!({
+        let mut row = serde_json::json!({
             "file_path": file_path,
             "title": title,
             "score": result.score,
@@ -4972,12 +5619,23 @@ fn build_chunk_search_payload(
             "type": doc_type,
             "tags": result.payload.get("tags").cloned().unwrap_or(null.clone()),
             "line_start": result.payload.get("line_start").cloned().unwrap_or(null.clone()),
-            "line_end": result.payload.get("line_end").cloned().unwrap_or(null),
+            "line_end": result.payload.get("line_end").cloned().unwrap_or(null.clone()),
             "dense_score": result.dense_score,
             "sparse_score": result.sparse_score,
             "pre_rerank_score": result.pre_rerank_score,
             "phrase_matched": result.phrase_score.is_some(),
-        }));
+            // Always present (the payload always carries it — see
+            // `ingest::upsert_pending`).
+            "chunk_index": result.payload.get("chunk_index").cloned().unwrap_or(null),
+        });
+        // Only when `chunking.heading_metadata` was on at index time (#286):
+        // omitted rather than `null` otherwise, the same as `/api/search`.
+        if let Some(heading_path) = result.payload.get(crate::qdrant::HEADING_PATH_KEY)
+            && let Some(map) = row.as_object_mut()
+        {
+            map.insert("heading_path".to_string(), heading_path.clone());
+        }
+        structured_results.push(row);
 
         output.push('\n');
     }
@@ -5115,6 +5773,90 @@ fn build_grouped_search_payload(
     (text.trim_end().to_string(), structured)
 }
 
+/// Builds `search`'s `section` granularity text and structured payload from
+/// already-fetched section hits (#286) — mirrors
+/// `build_grouped_search_payload`'s shape (same `returned`/
+/// `path_prefix_truncated`/`offset_truncated` envelope, same text +
+/// structured_content parity), but with `heading_path`/`line_start`/
+/// `line_end` (the section) and `hit_line_start`/`hit_line_end` (the matched
+/// chunk within it) in place of document metadata and, deliberately, **no
+/// `text` field at all** — that omission is the whole point of this
+/// granularity.
+fn build_section_search_payload(
+    sections: &[retrieval::SectionHit],
+    path_prefix_truncated: bool,
+    offset_truncated: bool,
+    offset: u64,
+) -> (String, serde_json::Value) {
+    let returned = sections.len();
+
+    let structured = serde_json::json!({
+        "returned": returned,
+        "path_prefix_truncated": path_prefix_truncated,
+        "offset_truncated": offset_truncated,
+        "results": sections
+            .iter()
+            .map(|s| serde_json::json!({
+                "file_path": s.file_path,
+                "heading_path": s.heading_path,
+                "line_start": s.line_start,
+                "line_end": s.line_end,
+                "hit_line_start": s.hit_line_start,
+                "hit_line_end": s.hit_line_end,
+                "score": s.score,
+                "scope": s.scope.as_str(),
+            }))
+            .collect::<Vec<_>>(),
+    });
+
+    let mut text = if returned == 0 {
+        "No sections matched.".to_string()
+    } else {
+        format!("{returned} section(s) matched, ranked by relevance.\n\n")
+    };
+
+    for section in sections {
+        // Each label says what the row is and, for the two heading-less
+        // kinds, how to fetch it — a `heading_path` fetch can't reach them.
+        let heading = match section.scope {
+            retrieval::SectionScope::Section => section.heading_path.join(" > "),
+            retrieval::SectionScope::Preamble => {
+                "(text before the first heading; fetch with line)".to_string()
+            }
+            retrieval::SectionScope::WholeDocument => {
+                "(whole document: no headings to select by, or changed since indexing; read it \
+                 whole)"
+                    .to_string()
+            }
+        };
+        text.push_str(&format!(
+            "- {} — {} (lines {}-{}, match at lines {}-{}, score {:.4})\n",
+            section.file_path,
+            heading,
+            section.line_start,
+            section.line_end,
+            section.hit_line_start,
+            section.hit_line_end,
+            section.score,
+        ));
+    }
+
+    if path_prefix_truncated {
+        text.push_str(
+            "\nNote: path_prefix matched more documents than could be filtered on at once, \
+             so fewer results than `limit` were returned and more may exist — use a \
+             longer, more specific path_prefix to be sure this is exhaustive.\n",
+        );
+    }
+    if offset_truncated {
+        // Same posture as `build_grouped_search_payload`: no reranker on this
+        // path, so the bound is always the fixed absolute ceiling.
+        text.push_str(&offset_truncated_note(offset, None));
+    }
+
+    (text.trim_end().to_string(), structured)
+}
+
 #[tool_handler]
 impl ServerHandler for KbSearchServer {
     fn get_info(&self) -> ServerInfo {
@@ -5136,9 +5878,10 @@ impl ServerHandler for KbSearchServer {
     // compile-time `#[tool(...)]` attributes) on every call, so a description
     // that needs to change at runtime — per `descriptions.rs`'s whole point —
     // cannot be baked into that attribute. These two methods apply this
-    // server's live `description_overlay` on top of the router's own `Tool`
-    // entries; `call_tool` is left for the macro to generate unchanged, since
-    // dispatch itself does not depend on the description text.
+    // server's live `description_overlay`, then the live per-instance schema
+    // restrictions (`overlay_input_schema`, #286), on top of the
+    // router's own `Tool` entries; `call_tool` is left for the macro to
+    // generate unchanged, since dispatch itself does not depend on either.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -5148,6 +5891,7 @@ impl ServerHandler for KbSearchServer {
             .list_all()
             .into_iter()
             .map(|tool| self.overlay_description(tool))
+            .map(|tool| self.overlay_input_schema(tool))
             .collect();
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -5157,6 +5901,7 @@ impl ServerHandler for KbSearchServer {
             .get(name)
             .cloned()
             .map(|tool| self.overlay_description(tool))
+            .map(|tool| self.overlay_input_schema(tool))
     }
 }
 
@@ -5563,33 +6308,54 @@ mod tests {
 
     #[test]
     fn granularity_defaults_to_chunk_when_a_query_is_present() {
-        assert_eq!(resolve_granularity(true, None).unwrap(), Granularity::Chunk);
+        assert_eq!(default_granularity(true), Granularity::Chunk);
     }
 
     #[test]
     fn granularity_defaults_to_document_when_no_query_is_present() {
-        assert_eq!(
-            resolve_granularity(false, None).unwrap(),
-            Granularity::Document
-        );
+        assert_eq!(default_granularity(false), Granularity::Document);
     }
 
     #[test]
     fn explicit_granularity_overrides_the_default_either_direction() {
         assert_eq!(
-            resolve_granularity(true, Some("document")).unwrap(),
+            resolve_search_granularity(true, Some("document"), &Granularity::ALL, false).unwrap(),
             Granularity::Document
         );
         assert_eq!(
-            resolve_granularity(false, Some("chunk")).unwrap(),
+            resolve_search_granularity(false, Some("chunk"), &Granularity::ALL, false).unwrap(),
             Granularity::Chunk
         );
     }
 
     #[test]
     fn unknown_granularity_is_rejected() {
-        let err = resolve_granularity(true, Some("paragraph")).unwrap_err();
-        assert!(format!("{:?}", err).contains("unknown granularity"));
+        let err = resolve_search_granularity(true, Some("paragraph"), &Granularity::ALL, false)
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown granularity"), "{msg}");
+        assert!(
+            msg.contains("expected one of 'chunk', 'document', 'section'"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_granularity_lists_only_the_effective_set() {
+        // Default config: `section` configured but gated off by heading_metadata.
+        let err = resolve_search_granularity(
+            true,
+            Some("paragraph"),
+            &[Granularity::Chunk, Granularity::Document],
+            true,
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("expected one of 'chunk', 'document'"), "{msg}");
+        assert!(
+            !msg.contains("section"),
+            "a disabled granularity leaked: {msg}"
+        );
     }
 
     #[test]
@@ -5597,6 +6363,232 @@ mod tests {
         assert!(!query_is_present(&Some("   ".to_string())));
         assert!(!query_is_present(&None));
         assert!(query_is_present(&Some("pasta".to_string())));
+    }
+
+    // --- search: per-instance granularity restriction (#286) --------------
+    // Pure unit tests over `resolve_search_granularity` directly — no server,
+    // no config, matching `default_granularity`'s own tests above. The
+    // integration-level fallback/rejection behavior through the real `search`
+    // tool entry point is covered further below, once `schema_tool_server_*`
+    // helpers are in scope.
+
+    #[test]
+    fn explicit_request_for_an_enabled_granularity_is_accepted() {
+        assert_eq!(
+            resolve_search_granularity(
+                true,
+                Some("chunk"),
+                &[Granularity::Chunk, Granularity::Document],
+                false
+            )
+            .unwrap(),
+            Granularity::Chunk
+        );
+    }
+
+    #[test]
+    fn explicit_request_for_a_disabled_granularity_is_rejected_naming_the_enabled_set() {
+        let err = resolve_search_granularity(true, Some("chunk"), &[Granularity::Document], false)
+            .unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("granularity 'chunk' is not enabled"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("document"), "must list the enabled set: {msg}");
+        assert!(
+            !msg.contains("heading metadata"),
+            "the heading-metadata clause is section-specific and must not appear for \
+             chunk: {msg}"
+        );
+    }
+
+    #[test]
+    fn explicit_request_for_disabled_section_names_the_heading_metadata_gate() {
+        // `section` configured but dropped because heading_metadata is off:
+        // the message carries the same explanation `search_sections` gives.
+        let err = resolve_search_granularity(
+            true,
+            Some("section"),
+            &[Granularity::Chunk, Granularity::Document],
+            true,
+        )
+        .unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("heading metadata enabled"), "got: {msg}");
+        assert_no_internals_in_caller_error(&msg);
+        assert!(
+            !msg.contains("section granularity is unavailable"),
+            "says 'not enabled' once, not twice: {msg}"
+        );
+        assert!(
+            msg.contains("enabled: chunk, document"),
+            "must label the effective set as what is enabled: {msg}"
+        );
+    }
+
+    #[test]
+    fn explicit_request_for_administratively_disabled_section_does_not_blame_heading_metadata() {
+        // `section` simply left out of search.granularities (flag state
+        // irrelevant): heading_metadata is not the reason and must not be named.
+        let err = resolve_search_granularity(
+            true,
+            Some("section"),
+            &[Granularity::Chunk, Granularity::Document],
+            false,
+        )
+        .unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("granularity 'section' is not enabled"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("heading metadata"), "got: {msg}");
+    }
+
+    /// Caller-facing rejections name no config keys, payload fields or indexing
+    /// mechanics — none of which a caller can act on.
+    fn assert_no_internals_in_caller_error(msg: &str) {
+        for internal in [
+            "chunking.",
+            "heading_metadata",
+            "section_key",
+            "heading_prefixes",
+            "payload",
+            "re-index",
+            "index --full",
+        ] {
+            assert!(!msg.contains(internal), "{internal:?} leaked into: {msg}");
+        }
+    }
+
+    /// For every non-empty effective set, the prose
+    /// `descriptions::granularity_description` gives callers (tool description
+    /// AND the schema's `granularity` property) must state exactly the default
+    /// `resolve_search_granularity` actually picks, with and without a query.
+    #[test]
+    fn granularity_description_matches_resolution_for_every_effective_set() {
+        use Granularity::{Chunk, Document, Section};
+        let sets: [&[Granularity]; 7] = [
+            &[Chunk, Document, Section],
+            &[Chunk, Document],
+            &[Chunk, Section],
+            &[Document, Section],
+            &[Chunk],
+            &[Document],
+            &[Section],
+        ];
+        for set in sets {
+            let desc = crate::descriptions::granularity_description(set);
+            let with_query = resolve_search_granularity(true, None, set, false)
+                .expect("every non-empty set can serve a query");
+            let without_query = resolve_search_granularity(false, None, set, false).ok();
+
+            // Never mentions a value outside the set.
+            for g in Granularity::ALL {
+                assert_eq!(
+                    desc.contains(&format!("`{}`", g.as_str())),
+                    set.contains(&g),
+                    "{set:?}: mention of `{g}` must match membership: {desc}"
+                );
+            }
+
+            match without_query {
+                Some(nq) if nq == with_query => {
+                    let q = with_query.as_str();
+                    assert!(
+                        desc.contains(&format!("Defaults to `{q}`"))
+                            || desc.contains(&format!("fixed to `{q}`")),
+                        "{set:?}: default is `{q}` either way: {desc}"
+                    );
+                    assert!(!desc.contains(" without"), "{set:?}: {desc}");
+                }
+                Some(nq) => assert!(
+                    desc.contains(&format!(
+                        "Defaults to `{}` with a query, `{}` without",
+                        with_query.as_str(),
+                        nq.as_str()
+                    )),
+                    "{set:?}: {desc}"
+                ),
+                None => {
+                    let q = with_query.as_str();
+                    assert!(
+                        desc.contains(&format!("Defaults to `{q}`"))
+                            || desc.contains(&format!("fixed to `{q}`")),
+                        "{set:?}: default with a query is `{q}`: {desc}"
+                    );
+                    assert!(
+                        desc.contains("every search needs a query"),
+                        "{set:?}: no-query search fails here, so the description must say a \
+                         query is always needed: {desc}"
+                    );
+                }
+            }
+            if without_query.is_some() {
+                assert!(
+                    !desc.contains("every search needs a query"),
+                    "{set:?}: enumeration works here: {desc}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_granularity_falls_back_to_the_first_enabled_one_supporting_the_query_mode() {
+        // Ordinary default (chunk, since a query is present) is disabled —
+        // falls back to document, which is enabled and supports either mode.
+        assert_eq!(
+            resolve_search_granularity(true, None, &[Granularity::Document], false).unwrap(),
+            Granularity::Document
+        );
+        // Same, but section is the only other one enabled alongside document —
+        // chunk (the ordinary default) is still skipped over.
+        assert_eq!(
+            resolve_search_granularity(
+                true,
+                None,
+                &[Granularity::Document, Granularity::Section],
+                false
+            )
+            .unwrap(),
+            Granularity::Document
+        );
+    }
+
+    #[test]
+    fn omitted_granularity_with_no_query_and_document_disabled_has_no_fallback() {
+        // Enumeration's only granularity is `document`; `chunk`/`section` both
+        // require a query, so if `document` is disabled there is nothing left
+        // to fall back to — this is a deployment configuration problem, not a
+        // caller one, and must be reported as such rather than silently
+        // picking something that can't work.
+        let err = resolve_search_granularity(
+            false,
+            None,
+            &[Granularity::Chunk, Granularity::Section],
+            false,
+        )
+        .unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("no enabled search granularity supports"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("enumeration"), "got: {msg}");
+    }
+
+    #[test]
+    fn granularity_supports_mode_matches_search_query_requirements() {
+        // document works either way; chunk/section both need a query — the
+        // same requirement `search`'s own (false, Chunk)/(false, Section)
+        // match arms enforce.
+        assert!(granularity_supports_mode(Granularity::Document, true));
+        assert!(granularity_supports_mode(Granularity::Document, false));
+        assert!(granularity_supports_mode(Granularity::Chunk, true));
+        assert!(!granularity_supports_mode(Granularity::Chunk, false));
+        assert!(granularity_supports_mode(Granularity::Section, true));
+        assert!(!granularity_supports_mode(Granularity::Section, false));
     }
 
     #[tokio::test]
@@ -5772,9 +6764,431 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            format!("{:?}", err).contains("document-granularity only"),
+            format!("{:?}", err).contains("fields only applies to document-granularity results"),
             "fields at chunk granularity must be rejected with an explicit error, \
              not silently ignored; got: {err:?}"
+        );
+    }
+
+    // --- search: section granularity (#286) ---
+
+    /// A server built from `make_test_resolved_config`'s defaults but with
+    /// `chunking.heading_metadata` forced on — needed to reach `search_sections`'
+    /// explain/fields rejections, which sit BEHIND the heading_metadata check in
+    /// the handler and would otherwise always report the wrong error.
+    fn schema_tool_server_with_heading_metadata(tmp: &tempfile::TempDir) -> KbSearchServer {
+        let mut config = make_test_resolved_config(tmp.path());
+        Arc::make_mut(&mut config).chunking.heading_metadata = true;
+        make_write_test_server(tmp, &["**/*.md".to_string()], config)
+    }
+
+    /// A server built from `make_test_resolved_config`'s defaults but with
+    /// `search.granularities` restricted to exactly `granularities` (#286) —
+    /// needed to reach `resolve_search_granularity`'s
+    /// disabled-granularity rejection and default-fallback behavior through
+    /// the real `search` tool entry point, rather than only unit-testing the
+    /// pure resolver directly (see the tests above this section).
+    fn schema_tool_server_with_granularities(
+        tmp: &tempfile::TempDir,
+        granularities: &[Granularity],
+    ) -> KbSearchServer {
+        let mut config = make_test_resolved_config(tmp.path());
+        Arc::make_mut(&mut config).search.granularities = granularities.to_vec();
+        make_write_test_server(tmp, &["**/*.md".to_string()], config)
+    }
+
+    #[tokio::test]
+    async fn search_rejects_an_explicitly_disabled_granularity_through_the_real_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server_with_granularities(&tmp, &[Granularity::Document]);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                granularity: Some("chunk".to_string()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("granularity 'chunk' is not enabled"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("document"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn search_falls_back_past_a_disabled_default_granularity_through_the_real_tool() {
+        // `chunk` is the ordinary default for a query, but it's disabled
+        // here — the call must not error out; it should fall back to
+        // `document` (still enabled) and actually route to the grouped
+        // (query+document) path. Proven the same way
+        // `search_grouped_routes_a_document_query_to_the_grouped_path_not_enumeration`
+        // proves routing: an unindexed filter field is rejected only on
+        // that path, before ever reaching Qdrant.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server_with_granularities(&tmp, &[Granularity::Document]);
+
+        let mut filters = serde_json::Map::new();
+        filters.insert("random_field".into(), serde_json::json!("x"));
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                filters: Some(SearchFiltersInput(filters)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("not indexed for Qdrant queries"),
+            "an omitted granularity with chunk disabled must fall back to the document \
+             (grouped) path rather than erroring outright; got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_reports_no_fallback_as_a_configuration_problem_through_the_real_tool() {
+        // Only `chunk` enabled, which requires a query — enumeration (no
+        // query, no explicit granularity) has no enabled granularity that
+        // can serve it.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server_with_granularities(&tmp, &[Granularity::Chunk]);
+
+        let err = server
+            .search(Parameters(SearchParams::default()))
+            .await
+            .unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("no enabled search granularity supports"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("enumeration"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn section_granularity_without_a_query_is_rejected() {
+        // Uses `schema_tool_server_with_heading_metadata`, not plain
+        // `schema_tool_server` — with heading_metadata off, `section` is
+        // already excluded from the effective granularity set (#286), so `resolve_search_granularity`'s disabled-granularity check
+        // would fire first and this test would observe THAT message
+        // instead of the one under test here. With the flag on, `section`
+        // is enabled and this exercises the `(query_present=false,
+        // Granularity::Section)` arm specifically.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server_with_heading_metadata(&tmp);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                granularity: Some("section".to_string()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("requires a query"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn section_granularity_without_heading_metadata_is_rejected() {
+        // `make_test_resolved_config`'s default has `chunking.heading_metadata`
+        // off (matching `ChunkingConfig::default()`), so `schema_tool_server`
+        // (unlike `schema_tool_server_with_heading_metadata` above) is exactly
+        // the fixture this test needs.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                granularity: Some("section".to_string()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("heading metadata enabled"), "got: {msg}");
+        assert_no_internals_in_caller_error(&msg);
+    }
+
+    #[tokio::test]
+    async fn search_sections_rejects_explain_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server_with_heading_metadata(&tmp);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                granularity: Some("section".to_string()),
+                explain: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("chunk-granularity only"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_sections_rejects_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server_with_heading_metadata(&tmp);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                granularity: Some("section".to_string()),
+                fields: Some(vec!["status".to_string()]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("fields only applies to document-granularity results"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn heading_prefix_is_rejected_when_the_flag_is_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                heading_prefix: Some(vec!["Conditions".to_string()]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("heading metadata enabled"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn heading_prefix_empty_list_is_rejected_even_with_the_flag_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server_with_heading_metadata(&tmp);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                heading_prefix: Some(vec![]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("must not be empty"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn heading_prefix_off_error_names_no_internals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                heading_prefix: Some(vec!["Conditions".to_string()]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("Search without heading_prefix"), "got: {msg}");
+        assert_no_internals_in_caller_error(&msg);
+    }
+
+    #[tokio::test]
+    async fn heading_prefix_blank_segment_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server_with_heading_metadata(&tmp);
+        // Whitespace, or only invisible characters (blank once normalized, so
+        // it would otherwise lower to a key that silently matches nothing).
+        for blank in ["  ", "\u{200b}", " \u{200d}\u{feff} "] {
+            let err = server
+                .search(Parameters(SearchParams {
+                    query: Some("test".to_string()),
+                    heading_prefix: Some(vec!["Conditions".to_string(), blank.to_string()]),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:?}").contains("empty or blank segments"),
+                "{blank:?} got: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn heading_prefix_without_a_query_is_rejected_not_ignored() {
+        // Enumeration reads the state DB, which has no heading data. Before
+        // this was rejected, the filter was silently dropped and every
+        // document came back with an exact `total`, as if it had matched.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server_with_heading_metadata(&tmp);
+        seed_document(&server, "notes/a.md", serde_json::json!({ "title": "A" })).await;
+
+        let err = server
+            .search(Parameters(SearchParams {
+                heading_prefix: Some(vec!["Conditions".to_string()]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("heading_prefix requires a query"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn heading_prefix_without_a_query_still_reports_the_flag_or_empty_list_first() {
+        // With the flag off, the more fundamental error wins over "requires a
+        // query", matching query mode's validation order.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        let err = server
+            .search(Parameters(SearchParams {
+                heading_prefix: Some(vec!["Conditions".to_string()]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("heading metadata enabled"),
+            "got: {err:?}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server_with_heading_metadata(&tmp);
+        let err = server
+            .search(Parameters(SearchParams {
+                heading_prefix: Some(vec![]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("must not be empty"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn heading_prefix_key_normalizes_case_and_whitespace() {
+        assert_eq!(
+            crate::heading::heading_prefix_key(&["conditions"]),
+            "conditions"
+        );
+        assert_eq!(
+            crate::heading::heading_prefix_key(&[" Conditions ", "Blinded  Condition"]),
+            ["conditions", "blinded condition"].join(crate::heading::HEADING_KEY_SEPARATOR)
+        );
+        // Same key whichever spelling the caller used.
+        assert_eq!(
+            crate::heading::heading_prefix_key(&["CONDITIONS"]),
+            crate::heading::heading_prefix_key(&["Conditions"])
+        );
+    }
+
+    #[test]
+    fn heading_prefix_condition_matches_the_normalized_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_test_resolved_config(tmp.path());
+        Arc::make_mut(&mut config).chunking.heading_metadata = true;
+        let condition = heading_prefix_condition(
+            &Some(vec!["  Conditions".to_string(), "BLINDED".to_string()]),
+            &config,
+        )
+        .unwrap()
+        .expect("a non-empty prefix lowers to a condition");
+        let expected = qdrant_client::qdrant::Condition::matches(
+            crate::qdrant::HEADING_PREFIXES_KEY,
+            ["conditions", "blinded"].join(crate::heading::HEADING_KEY_SEPARATOR),
+        );
+        assert_eq!(condition, expected);
+    }
+
+    #[test]
+    fn section_search_payload_distinguishes_section_preamble_and_document_rows() {
+        let hit = |heading_path: &[&str], scope| retrieval::SectionHit {
+            file_path: "a.md".to_string(),
+            heading_path: heading_path.iter().map(|s| s.to_string()).collect(),
+            line_start: 4,
+            line_end: 7,
+            hit_line_start: 5,
+            hit_line_end: 6,
+            score: 0.5,
+            scope,
+        };
+        let (text, structured) = build_section_search_payload(
+            &[
+                hit(&["A", "B"], retrieval::SectionScope::Section),
+                hit(&[], retrieval::SectionScope::Preamble),
+                hit(&[], retrieval::SectionScope::WholeDocument),
+            ],
+            false,
+            false,
+            0,
+        );
+        let scopes: Vec<&str> = structured["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["scope"].as_str().unwrap())
+            .collect();
+        assert_eq!(scopes, vec!["section", "preamble", "whole_document"]);
+        assert!(
+            text.contains("A > B (lines 4-7, match at lines 5-6"),
+            "{text}"
+        );
+        let first = &structured["results"][0];
+        assert_eq!(
+            (
+                first["hit_line_start"].as_u64(),
+                first["hit_line_end"].as_u64()
+            ),
+            (Some(5), Some(6))
+        );
+        assert!(text.contains("text before the first heading"), "{text}");
+        assert!(text.contains("whole document"), "{text}");
+        assert!(!text.contains("untitled preamble"), "{text}");
+    }
+
+    #[test]
+    fn annotate_heading_results_appends_the_note_to_text_and_structured_content() {
+        let mut result = CallToolResult::success(vec![Content::text("1 section(s) matched.\n")]);
+        result.structured_content = Some(serde_json::json!({ "returned": 1 }));
+
+        annotate_heading_results(&mut result, None);
+        assert_eq!(
+            result.content[0].as_text().unwrap().text,
+            "1 section(s) matched.\n",
+            "no note → untouched"
+        );
+        assert!(result.structured_content.as_ref().unwrap()["indexing_in_progress"].is_null());
+
+        annotate_heading_results(&mut result, Some("Note: indexing."));
+        assert_eq!(
+            result.content[0].as_text().unwrap().text,
+            "1 section(s) matched.\n\nNote: indexing."
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["indexing_in_progress"],
+            serde_json::json!(true)
         );
     }
 
@@ -7763,8 +9177,14 @@ mod tests {
         // returns `description: None` for all six. This asserts against the
         // actual runtime source of the description instead.
         let name = "write_document";
-        let description = crate::descriptions::compose_tool_description(name, false, None)
-            .unwrap_or_else(|| panic!("no compiled description for tool '{name}'"));
+        let description = crate::descriptions::compose_tool_description(
+            name,
+            false,
+            &Granularity::ALL,
+            false,
+            None,
+        )
+        .unwrap_or_else(|| panic!("no compiled description for tool '{name}'"));
 
         for mode in [
             "content",
@@ -7808,12 +9228,25 @@ mod tests {
     /// parameterized by the description overlay under test.
     fn make_overlay_test_server(overlay: HashMap<String, String>) -> KbSearchServer {
         let tmp = tempfile::tempdir().unwrap();
+        make_overlay_test_server_with_config(overlay, make_test_resolved_config(tmp.path()))
+    }
+
+    /// Same as [`make_overlay_test_server`], but with a caller-supplied
+    /// config rather than `make_test_resolved_config`'s defaults — needed by
+    /// the schema-overlay tests below (#286), which exercise
+    /// `overlay_input_schema`/`get_tool`/`list_tools`'s equivalent against a
+    /// restricted `search.granularities` or `chunking.heading_metadata`.
+    fn make_overlay_test_server_with_config(
+        overlay: HashMap<String, String>,
+        config: Arc<ResolvedConfig>,
+    ) -> KbSearchServer {
+        let tmp = tempfile::tempdir().unwrap();
         let instructions = Arc::new(RwLock::new("test".to_string()));
-        let config = crate::config::ResolvedQdrantConfig {
+        let qdrant_config = crate::config::ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
             collection: "test".into(),
         };
-        let qdrant = Arc::new(QdrantStore::new(&config).unwrap());
+        let qdrant = Arc::new(QdrantStore::new(&qdrant_config).unwrap());
         let embed_config = crate::config::ResolvedEmbeddingConfig {
             base_url: "http://localhost:8080/v1".into(),
             model: "test".into(),
@@ -7836,7 +9269,7 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             instructions,
-            crate::config::shared_config(make_test_resolved_config(tmp.path())),
+            crate::config::shared_config(config),
             empty_test_schema_cache(),
             None,
             Arc::new(crate::reindex::ReindexQueue::new()),
@@ -7858,7 +9291,14 @@ mod tests {
         // transport) is covered end-to-end by
         // `server::tests::tools_list_without_session_header_succeeds`
         // and its sibling assertions on `tools/list` descriptions.
-        let overlay = crate::descriptions::compose_tool_descriptions(None, false);
+        let default_config = make_test_resolved_config(&std::env::temp_dir());
+        let effective_granularities = default_config.effective_granularities();
+        let overlay = crate::descriptions::compose_tool_descriptions(
+            None,
+            false,
+            &effective_granularities,
+            default_config.chunking.heading_metadata,
+        );
         let server = make_overlay_test_server(overlay.clone());
 
         let tools: Vec<Tool> = KbSearchServer::tool_router()
@@ -7912,6 +9352,367 @@ mod tests {
     fn get_tool_returns_none_for_an_unknown_name() {
         let server = make_overlay_test_server(HashMap::new());
         assert!(server.get_tool("not_a_real_tool").is_none());
+    }
+
+    // --- input-schema overlay: granularity enum / heading_prefix (#286) ---
+
+    fn overlay_test_config(
+        granularities: &[Granularity],
+        heading_metadata: bool,
+    ) -> Arc<ResolvedConfig> {
+        let mut config = make_test_resolved_config(&std::env::temp_dir());
+        {
+            let resolved = Arc::make_mut(&mut config);
+            resolved.search.granularities = granularities.to_vec();
+            resolved.chunking.heading_metadata = heading_metadata;
+        }
+        config
+    }
+
+    #[test]
+    fn overlay_input_schema_sets_granularity_enum_to_the_effective_set() {
+        let server = make_overlay_test_server_with_config(
+            HashMap::new(),
+            overlay_test_config(&[Granularity::Chunk, Granularity::Document], false),
+        );
+        let tool = KbSearchServer::tool_router()
+            .get("search")
+            .cloned()
+            .unwrap();
+
+        let overlaid = server.overlay_input_schema(tool);
+        let properties = overlaid.input_schema["properties"].as_object().unwrap();
+        let granularity = properties["granularity"].as_object().unwrap();
+        let enum_values = granularity["enum"].as_array().unwrap();
+        let names: Vec<&str> = enum_values.iter().filter_map(|v| v.as_str()).collect();
+
+        assert_eq!(names, vec!["chunk", "document"]);
+        assert!(
+            enum_values.iter().any(serde_json::Value::is_null),
+            "null must remain a valid value — granularity stays an optional \
+             parameter: {enum_values:?}"
+        );
+        // `type` is untouched — still nullable, exactly what schemars produced.
+        assert_eq!(granularity["type"], serde_json::json!(["string", "null"]));
+        // The property description is the effective-set text, identical to
+        // what the tool description carries — never the static doc comment,
+        // and never mentioning the disabled `section`.
+        let description = granularity["description"].as_str().unwrap();
+        assert_eq!(
+            description,
+            crate::descriptions::granularity_description(&[
+                Granularity::Chunk,
+                Granularity::Document
+            ])
+        );
+        assert!(!description.contains("section"), "got: {description}");
+    }
+
+    #[test]
+    fn search_schema_property_descriptions_carry_no_internal_notes() {
+        // The router's raw schema (before any overlay) comes straight from
+        // `SearchParams`' doc comments — they must stay caller-facing.
+        let tool = KbSearchServer::tool_router()
+            .get("search")
+            .cloned()
+            .unwrap();
+        let schema = serde_json::Value::Object((*tool.input_schema).clone()).to_string();
+        for leak in [
+            "#286",
+            "Step ",
+            "default_granularity",
+            "heading_prefixes",
+            "chunking.",
+        ] {
+            assert!(
+                !schema.contains(leak),
+                "search's input schema leaks internal detail {leak:?}: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_input_schema_removes_heading_prefix_when_heading_metadata_is_off() {
+        let server = make_overlay_test_server_with_config(
+            HashMap::new(),
+            overlay_test_config(&Granularity::ALL, false),
+        );
+        let tool = KbSearchServer::tool_router()
+            .get("search")
+            .cloned()
+            .unwrap();
+
+        let overlaid = server.overlay_input_schema(tool);
+        let properties = overlaid.input_schema["properties"].as_object().unwrap();
+        assert!(
+            !properties.contains_key("heading_prefix"),
+            "heading_prefix must be removed from the schema when heading_metadata \
+             is off: {properties:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_input_schema_keeps_heading_prefix_when_heading_metadata_is_on() {
+        let server = make_overlay_test_server_with_config(
+            HashMap::new(),
+            overlay_test_config(&Granularity::ALL, true),
+        );
+        let tool = KbSearchServer::tool_router()
+            .get("search")
+            .cloned()
+            .unwrap();
+
+        let overlaid = server.overlay_input_schema(tool);
+        let properties = overlaid.input_schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("heading_prefix"));
+    }
+
+    /// Every way a text can mention granularity `g` as a choice.
+    fn granularity_mentions(g: Granularity) -> Vec<String> {
+        let g = g.as_str();
+        vec![
+            format!("`{g}`"),
+            format!("'{g}'"),
+            format!("\"{g}\""),
+            format!("{g} granularity"),
+            format!("{g}-granularity"),
+        ]
+    }
+
+    /// Phrases that only make sense when a search without a query is possible.
+    const ENUMERATION_MENTIONS: &[&str] = &[
+        "enumerat",
+        "no query",
+        "without a query",
+        "without a `query`",
+        "omit to list",
+        "exhaustive listing",
+        "listing without",
+        "order_by",
+        "descending",
+    ];
+
+    #[tokio::test]
+    async fn search_tool_and_server_description_never_mention_unavailable_choices() {
+        // Table test over all 7 non-empty granularity subsets x the
+        // heading_metadata flag: the full serialized `search` tool definition
+        // (description + input schema, as `get_tool`/`list_tools` serve it)
+        // and the composed server description must not mention a disabled
+        // granularity, nor no-query listing when no enabled granularity can
+        // serve one (#286).
+        let subsets: [&[Granularity]; 7] = [
+            &[
+                Granularity::Chunk,
+                Granularity::Document,
+                Granularity::Section,
+            ],
+            &[Granularity::Chunk, Granularity::Document],
+            &[Granularity::Chunk, Granularity::Section],
+            &[Granularity::Document, Granularity::Section],
+            &[Granularity::Chunk],
+            &[Granularity::Document],
+            &[Granularity::Section],
+        ];
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(data.path().join("area")).unwrap();
+        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
+            url: "http://127.0.0.1:1".into(),
+            collection: "unused".into(),
+        })
+        .unwrap();
+        for subset in subsets {
+            for heading_metadata in [false, true] {
+                let config = overlay_test_config(subset, heading_metadata);
+                let effective = config.effective_granularities();
+                if effective.is_empty() {
+                    continue; // Rejected at config load.
+                }
+                let overlay = crate::descriptions::compose_tool_descriptions(
+                    None,
+                    true,
+                    &effective,
+                    heading_metadata,
+                );
+                let server = make_overlay_test_server_with_config(overlay, Arc::clone(&config));
+                let tool = server.get_tool("search").unwrap();
+                let tool_json = serde_json::to_string(&tool).unwrap();
+                let schemas = crate::schema::SchemaCache::build(data.path(), &config.frontmatter);
+                let instructions = crate::server::compose_server_instructions(
+                    &config,
+                    &qdrant,
+                    data.path(),
+                    &schemas,
+                )
+                .await;
+                assert!(
+                    instructions.contains("Top-level areas"),
+                    "the areas sentence must be exercised: {instructions}"
+                );
+
+                let label = format!("{subset:?} heading_metadata={heading_metadata}");
+                for (surface, text) in [("tool", &tool_json), ("server", &instructions)] {
+                    // JSON-escaped quotes in the tool definition read as `\"`.
+                    let text = text.replace("\\\"", "\"").to_lowercase();
+                    if surface == "tool" && effective == Granularity::ALL {
+                        // Guard against needles that can never match: with
+                        // everything enabled, they must all be findable.
+                        for g in Granularity::ALL {
+                            assert!(text.contains(&format!("\"{}\"", g.as_str())), "{text}");
+                            assert!(text.contains(&format!("`{}`", g.as_str())), "{text}");
+                        }
+                        assert!(text.contains("without a `query`"), "{text}");
+                        assert!(text.contains("order_by"), "{text}");
+                    }
+                    for g in Granularity::ALL
+                        .into_iter()
+                        .filter(|g| !effective.contains(g))
+                    {
+                        for needle in granularity_mentions(g) {
+                            assert!(
+                                !text.contains(&needle),
+                                "{label}: {surface} mentions disabled {needle}: {text}"
+                            );
+                        }
+                    }
+                    if !crate::descriptions::enumeration_available(&effective) {
+                        for needle in ENUMERATION_MENTIONS {
+                            assert!(
+                                !text.contains(needle),
+                                "{label}: {surface} mentions unavailable no-query listing \
+                                 ({needle}): {text}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fields_and_explain_errors_only_suggest_enabled_granularities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chunk_only = schema_tool_server_with_granularities(&tmp, &[Granularity::Chunk]);
+        let err = chunk_only
+            .search(Parameters(SearchParams {
+                query: Some("q".into()),
+                fields: Some(vec!["title".into()]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(!err.message.contains("'document'"), "{}", err.message);
+        assert!(err.message.contains("fields"), "{}", err.message);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_test_resolved_config(tmp.path());
+        Arc::make_mut(&mut config).search.granularities =
+            vec![Granularity::Document, Granularity::Section];
+        Arc::make_mut(&mut config).chunking.heading_metadata = true;
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+        for granularity in ["document", "section"] {
+            let err = server
+                .search(Parameters(SearchParams {
+                    query: Some("q".into()),
+                    granularity: Some(granularity.into()),
+                    explain: Some(true),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert!(!err.message.contains("'chunk'"), "{}", err.message);
+            assert!(err.message.contains("explain"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn overlay_input_schema_is_a_noop_for_non_search_tools() {
+        let server = make_overlay_test_server_with_config(
+            HashMap::new(),
+            overlay_test_config(&[Granularity::Document], false),
+        );
+        let tool = KbSearchServer::tool_router()
+            .get("get_document")
+            .cloned()
+            .unwrap();
+        let original_schema = Arc::clone(&tool.input_schema);
+
+        let overlaid = server.overlay_input_schema(tool);
+        assert!(
+            Arc::ptr_eq(&original_schema, &overlaid.input_schema),
+            "a non-search tool's input_schema must be returned unchanged, not even \
+             cloned"
+        );
+    }
+
+    #[test]
+    fn list_tools_schema_enum_and_heading_prefix_removal_follow_config() {
+        // Same end-to-end intent as `list_tools_returns_the_overlay_composed_descriptions`
+        // above: `list_tools`'s hand-written body cannot be exercised directly
+        // here (see that test's comment on `Peer`'s constructor being
+        // unreachable), so this drives the exact two-step overlay
+        // (`overlay_description` then `overlay_input_schema`) `list_tools`
+        // applies to every router `Tool`, for a restricted config.
+        let config = overlay_test_config(&[Granularity::Document], false);
+        let server = make_overlay_test_server_with_config(HashMap::new(), Arc::clone(&config));
+
+        let tools: Vec<Tool> = KbSearchServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| server.overlay_description(tool))
+            .map(|tool| server.overlay_input_schema(tool))
+            .collect();
+
+        let search_tool = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "search")
+            .expect("search tool should be registered");
+        let properties = search_tool.input_schema["properties"].as_object().unwrap();
+        let enum_values = properties["granularity"]["enum"].as_array().unwrap();
+        let names: Vec<&str> = enum_values.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(names, vec!["document"]);
+        assert!(!properties.contains_key("heading_prefix"));
+
+        // Every OTHER tool's schema must be untouched by the overlay.
+        for tool in &tools {
+            if tool.name.as_ref() != "search" {
+                let router_schema = KbSearchServer::tool_router()
+                    .get(tool.name.as_ref())
+                    .unwrap()
+                    .input_schema
+                    .clone();
+                assert_eq!(
+                    tool.input_schema, router_schema,
+                    "'{}' schema must be unaffected by the search-only overlay",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_tool_input_schema_matches_the_list_tools_overlay_path() {
+        // `list_tools`'s hand-written body applies `overlay_description` then
+        // `overlay_input_schema` to each router `Tool` (#286); `get_tool`
+        // must apply the exact same two steps for a single tool, or a client
+        // calling `tools/get` could see a schema `tools/list` would never
+        // have produced — the schema counterpart to
+        // `get_tool_returns_the_same_text_as_list_tools_would_for_that_tool`
+        // above.
+        let config = overlay_test_config(&[Granularity::Chunk, Granularity::Document], false);
+        let server = make_overlay_test_server_with_config(HashMap::new(), config);
+
+        let tool = server
+            .get_tool("search")
+            .expect("search tool should be registered");
+
+        let router_tool = KbSearchServer::tool_router()
+            .get("search")
+            .cloned()
+            .unwrap();
+        let via_list_tools_path =
+            server.overlay_input_schema(server.overlay_description(router_tool));
+
+        assert_eq!(tool.input_schema, via_list_tools_path.input_schema);
     }
 
     #[test]
@@ -8006,8 +9807,7 @@ mod tests {
         let overlong_path = "a".repeat(MAX_PATH_LEN + 1);
         let params = GetDocumentParams {
             path: overlong_path,
-            start_line: None,
-            end_line: None,
+            ..Default::default()
         };
         let result = server.get_document(Parameters(params)).await;
         assert!(result.is_err(), "overlong path should return an error");
@@ -8030,6 +9830,7 @@ mod tests {
                 path: "range_doc.md".into(),
                 start_line,
                 end_line,
+                ..Default::default()
             }))
             .await?;
         let text = match &result.content[0].raw {
@@ -8241,6 +10042,7 @@ mod tests {
                 path: "no/such/document.md".into(),
                 start_line: Some(9),
                 end_line: Some(2),
+                ..Default::default()
             }))
             .await
             .unwrap_err()
@@ -8249,6 +10051,666 @@ mod tests {
         assert!(
             !err.contains("not found"),
             "a bad range should be reported as such, not masked by the path lookup: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // get_document section/outline modes (#286)
+    // -----------------------------------------------------------------------
+
+    const SECTION_DOC: &str = "# Guide\n\n## Alpha\n\nAlpha body.\n\n### Alpha Sub\n\nAlpha sub body.\n\n## Beta\n\nBeta body.\n";
+
+    /// A server whose `search.section_max_bytes` is `section_max_bytes`, with
+    /// `SECTION_DOC` written at `section_doc.md`.
+    fn section_test_server(tmp: &tempfile::TempDir, section_max_bytes: usize) -> KbSearchServer {
+        std::fs::write(tmp.path().join("section_doc.md"), SECTION_DOC).unwrap();
+        let mut config = (*make_test_resolved_config(tmp.path())).clone();
+        config.search.section_max_bytes = section_max_bytes;
+        make_write_test_server(tmp, &["**/*.md".to_string()], Arc::new(config))
+    }
+
+    async fn get_document_result(
+        server: &KbSearchServer,
+        params: GetDocumentParams,
+    ) -> Result<(String, serde_json::Value), McpError> {
+        let result = server.get_document(Parameters(params)).await?;
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected a text content block, got {other:?}"),
+        };
+        Ok((text, result.structured_content.unwrap()))
+    }
+
+    fn section_doc_params(overrides: GetDocumentParams) -> GetDocumentParams {
+        GetDocumentParams {
+            path: "section_doc.md".into(),
+            ..overrides
+        }
+    }
+
+    // --- param exclusivity ---------------------------------------------------
+
+    #[tokio::test]
+    async fn get_document_rejects_range_combined_with_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+        let err = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                start_line: Some(1),
+                line: Some(3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected 'mutually exclusive' in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_rejects_range_combined_with_outline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+        let err = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                end_line: Some(2),
+                outline: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected 'mutually exclusive' in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_structured_content_is_the_shared_view_json_plus_the_envelope() {
+        // Parity with `/api/doc`, structurally: both adapters must emit
+        // exactly `retrieval::document_view_json` plus their envelope (web.rs
+        // has the mirror test), so neither can grow a field the other lacks.
+        let hash = crate::ingest::compute_hash_from_bytes(SECTION_DOC.as_bytes());
+        let cases: Vec<(usize, GetDocumentParams)> = vec![
+            (16000, GetDocumentParams::default()),
+            (
+                16000,
+                GetDocumentParams {
+                    start_line: Some(2),
+                    end_line: Some(4),
+                    ..Default::default()
+                },
+            ),
+            (
+                16000,
+                GetDocumentParams {
+                    line: Some(7),
+                    ..Default::default()
+                },
+            ),
+            (
+                10,
+                GetDocumentParams {
+                    heading_path: Some(vec!["Alpha".into()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                10,
+                GetDocumentParams {
+                    heading_path: Some(vec!["Beta".into()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                1,
+                GetDocumentParams {
+                    outline: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                16000,
+                GetDocumentParams {
+                    line: Some(3),
+                    levels_up: Some(1),
+                    outline: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (cap, params) in cases {
+            let request = retrieval::parse_document_view_request(
+                params.start_line,
+                params.end_line,
+                params.line,
+                params.heading_path.clone(),
+                params.levels_up,
+                params.outline.unwrap_or(false),
+            )
+            .unwrap();
+            let label = format!("{params:?}");
+            let tmp = tempfile::tempdir().unwrap();
+            let server = section_test_server(&tmp, cap);
+            let (_, mut structured) = get_document_result(&server, section_doc_params(params))
+                .await
+                .unwrap();
+            let obj = structured.as_object_mut().unwrap();
+            assert!(obj.remove("links_out").is_some(), "{label}");
+            assert!(obj.remove("links_in").is_some(), "{label}");
+            let view = retrieval::resolve_document_view(SECTION_DOC, &request, cap).unwrap();
+            let mut expected = retrieval::document_view_json(&view);
+            expected.insert("path".into(), serde_json::json!("section_doc.md"));
+            expected.insert("content_hash".into(), serde_json::json!(hash));
+            assert_eq!(structured, serde_json::Value::Object(expected), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_document_outline_with_a_selector_outlines_that_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+        let (text, structured) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                line: Some(3),
+                outline: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            structured["section"]["heading_path"],
+            serde_json::json!(["Guide", "Alpha"])
+        );
+        assert_eq!(
+            structured["outline"],
+            serde_json::json!([{
+                "heading": "Alpha Sub",
+                "heading_path": ["Guide", "Alpha", "Alpha Sub"],
+                "level": 3,
+                "line_start": 7,
+                "line_end": 10,
+            }])
+        );
+        assert_eq!(structured["truncated"], false);
+        assert!(structured.get("content").is_none());
+        assert!(text.contains("Guide > Alpha"), "{text}");
+        assert!(text.contains("### Alpha Sub (lines 7-10)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_document_rejects_line_combined_with_heading_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+        let err = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                line: Some(3),
+                heading_path: Some(vec!["Alpha".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected 'mutually exclusive' in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_rejects_levels_up_without_a_selector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+        let err = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                levels_up: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("levels_up"),
+            "expected an error naming levels_up, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_rejects_an_empty_heading_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+        let err = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                heading_path: Some(vec![]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("heading_path"),
+            "expected an error naming heading_path, got: {err}"
+        );
+    }
+
+    // --- section mode ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_document_section_by_line_returns_the_resolved_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+
+        // Line 7 ("Alpha sub body.") sits inside "### Alpha Sub".
+        let (text, structured) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                line: Some(7),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(text.contains("Alpha sub body."));
+        assert_eq!(
+            structured["section"]["heading_path"],
+            serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
+        );
+        assert_eq!(structured["section"]["level"], 3);
+        assert_eq!(structured["outline_only"], false);
+        assert_eq!(
+            structured["content"], text,
+            "structured_content must mirror the text block"
+        );
+        assert!(
+            structured.get("outline").is_none(),
+            "a full section response must not also carry an outline"
+        );
+        // content_hash is always over the whole file, matching range mode.
+        assert_eq!(
+            structured["content_hash"],
+            crate::ingest::compute_hash_from_bytes(SECTION_DOC.as_bytes()).to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_section_by_heading_path_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+
+        let (text, structured) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                heading_path: Some(vec!["Beta".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(text.contains("Beta body."));
+        assert_eq!(
+            structured["section"]["heading_path"],
+            serde_json::json!(["Guide", "Beta"])
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_section_levels_up_climbs_to_the_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+
+        let (text, structured) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                heading_path: Some(vec!["Alpha Sub".to_string()]),
+                levels_up: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            structured["section"]["heading_path"],
+            serde_json::json!(["Guide", "Alpha"])
+        );
+        assert!(
+            text.contains("Alpha Sub"),
+            "climbing must include the child subtree"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_section_not_found_reports_a_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+
+        let err = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                heading_path: Some(vec!["Nonexistent".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Guide"));
+        assert_eq!(
+            err.data,
+            Some(serde_json::json!({ "hint": ["Guide"] })),
+            "the McpError data payload should carry the structured hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_section_exceeding_the_cap_falls_back_to_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Trivially small — "## Alpha"'s own subtree text always exceeds it.
+        let server = section_test_server(&tmp, 10);
+
+        let (text, structured) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                heading_path: Some(vec!["Alpha".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(structured["outline_only"], true);
+        assert!(structured.get("content").is_none());
+        let outline = structured["outline"].as_array().unwrap();
+        assert_eq!(outline.len(), 1);
+        assert_eq!(
+            outline[0]["heading_path"],
+            serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
+        );
+        assert!(
+            text.contains("Alpha Sub"),
+            "the text block should still name the child section, got: {text}"
+        );
+        // The intro is surfaced, and the text block says exactly how to read
+        // it: a plain start_line/end_line range.
+        assert_eq!(
+            structured["intro"]["heading_path"],
+            serde_json::json!(["Guide", "Alpha"])
+        );
+        let intro_start = structured["intro"]["line_start"].as_u64().unwrap() as usize;
+        let intro_end = structured["intro"]["line_end"].as_u64().unwrap() as usize;
+        assert!(
+            text.contains(&format!("start_line: {intro_start}, end_line: {intro_end}")),
+            "{text}"
+        );
+        let (intro_text, _) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                start_line: Some(intro_start),
+                end_line: Some(intro_end),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(intro_text, "## Alpha\n\nAlpha body.\n\n");
+
+        // Fetching by a line inside the intro resolves to the same section,
+        // so it gets the same outline_only response — never a silent slice.
+        let (_, by_line) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                line: Some(intro_start + 2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_line, structured);
+    }
+
+    #[tokio::test]
+    async fn get_document_outline_only_text_does_not_repeat_the_json_or_claim_a_blank_intro() {
+        // Heading-only intro: no intro, and no "has its own text" claim.
+        let tmp = tempfile::tempdir().unwrap();
+        let big = "x".repeat(300);
+        std::fs::write(
+            tmp.path().join("intro.md"),
+            format!("# A\n## B\n{big}\n## C\n{big}\n"),
+        )
+        .unwrap();
+        let mut config = (*make_test_resolved_config(tmp.path())).clone();
+        config.search.section_max_bytes = 400;
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], Arc::new(config));
+        let (text, structured) = get_document_result(
+            &server,
+            GetDocumentParams {
+                path: "intro.md".into(),
+                line: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(structured["outline_only"], true);
+        assert!(structured["intro"].is_null());
+        assert!(!text.contains("text of its own"), "{text}");
+        assert!(!text.contains("\"heading_path\""), "{text}");
+        assert!(text.contains("## B (lines 2-3)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_document_section_exceeding_the_cap_with_no_children_returns_full_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 10);
+
+        let (text, structured) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                heading_path: Some(vec!["Beta".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(structured["outline_only"], false);
+        assert!(text.contains("Beta body."));
+        assert_eq!(structured["content"], text);
+        // Text served past the cap because there is nothing smaller to
+        // narrow into must be flagged, not indistinguishable from a normal read.
+        assert_eq!(structured["oversized"], true);
+        assert_eq!(structured["partial"], true);
+    }
+
+    #[tokio::test]
+    async fn get_document_section_duplicate_exact_heading_path_is_ambiguous() {
+        // Two sections sharing the exact same full
+        // heading_path must not silently resolve to the first one.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+        std::fs::write(
+            tmp.path().join("dup.md"),
+            "# S\n## Fireball\na\n## Fireball\nb\n",
+        )
+        .unwrap();
+
+        let err = get_document_result(
+            &server,
+            GetDocumentParams {
+                path: "dup.md".into(),
+                heading_path: Some(vec!["Fireball".to_string()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        let data = err.data.expect("Ambiguous must carry structured data");
+        let candidates = data["candidates"].as_array().unwrap();
+        assert_eq!(
+            candidates.len(),
+            2,
+            "both duplicate sections must be listed"
+        );
+    }
+
+    // --- outline mode -----------------------------------------------------
+
+    #[tokio::test]
+    async fn get_document_outline_mode_returns_no_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+
+        let (text, structured) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                outline: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            structured.get("content").is_none(),
+            "outline mode must not carry a content field"
+        );
+        let outline = structured["outline"].as_array().unwrap();
+        assert_eq!(outline.len(), 4, "Guide, Alpha, Alpha Sub, Beta");
+        assert_eq!(outline[0]["heading_path"], serde_json::json!(["Guide"]));
+        assert_eq!(
+            outline[1]["heading_path"],
+            serde_json::json!(["Guide", "Alpha"])
+        );
+        // Text block and structured_content must describe the same headings.
+        for heading in ["Guide", "Alpha", "Alpha Sub", "Beta"] {
+            assert!(
+                text.contains(heading),
+                "text block missing heading {heading:?}, got: {text}"
+            );
+        }
+        assert!(
+            !text.is_empty(),
+            "the text block should still describe the outline"
+        );
+        assert_eq!(
+            structured["content_hash"],
+            crate::ingest::compute_hash_from_bytes(SECTION_DOC.as_bytes()).to_string()
+        );
+        // Outline responses report the untruncated total and whether
+        // this response was capped, plus the whole document's line count.
+        assert_eq!(structured["total_entries"], 4);
+        assert_eq!(structured["truncated"], false);
+        assert_eq!(
+            structured["total_lines"].as_u64().unwrap(),
+            crate::retrieval::count_lines(SECTION_DOC) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_outline_mode_truncates_past_the_section_max_bytes_budget() {
+        // An outline with many headings must not produce
+        // an unbounded response.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 200);
+        let mut many_headings = String::new();
+        for i in 0..200 {
+            many_headings.push_str(&format!("# Heading number {i}\n\nbody\n\n"));
+        }
+        std::fs::write(tmp.path().join("many.md"), &many_headings).unwrap();
+
+        let (_, structured) = get_document_result(
+            &server,
+            GetDocumentParams {
+                path: "many.md".into(),
+                outline: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(structured["total_entries"], 200);
+        assert_eq!(structured["truncated"], true);
+        let outline = structured["outline"].as_array().unwrap();
+        assert!(!outline.is_empty());
+        assert!((outline.len() as u64) < 200);
+    }
+
+    // --- selector validation ------------------------------------------------
+
+    #[tokio::test]
+    async fn get_document_rejects_line_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+        let err = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                line: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("1-based") || err.contains("1 or greater"),
+            "expected a 1-based line error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_rejects_a_blank_heading_path_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+        let err = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                heading_path: Some(vec!["Alpha".to_string(), "  ".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("heading_path"),
+            "expected an error naming heading_path, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_section_by_heading_path_ignores_internal_whitespace_and_case() {
+        // Matching must collapse internal whitespace, not just trim/lowercase.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+        let (_, structured) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                heading_path: Some(vec!["  alpha   sub  ".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            structured["section"]["heading_path"],
+            serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
         );
     }
 
@@ -10930,8 +13392,7 @@ mod tests {
         let result = server
             .get_document(Parameters(GetDocumentParams {
                 path: "docs/guide.md".to_string(),
-                start_line: None,
-                end_line: None,
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -12329,6 +14790,36 @@ mod tests {
             assert!(entry["text"].is_string());
         }
         assert_eq!(structured["returned"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn build_chunk_search_payload_heading_path_is_omitted_when_the_payload_has_none() {
+        let bare = payload_search_result("/data/notes/a.md", "A", 0.9);
+        let mut with_path = payload_search_result("/data/notes/b.md", "B", 0.5);
+        with_path.payload.insert(
+            crate::qdrant::HEADING_PATH_KEY.to_string(),
+            serde_json::json!(["Guide", "Setup"]),
+        );
+        let (_text, structured) = build_chunk_search_payload(
+            &[bare, with_path],
+            Path::new("/data"),
+            false,
+            "dense cosine",
+            false,
+            false,
+            0,
+            None,
+        );
+        let rows = structured["results"].as_array().unwrap();
+        assert!(
+            rows[0].get("heading_path").is_none(),
+            "no heading_path key (not even null) without heading metadata: {}",
+            rows[0]
+        );
+        assert_eq!(
+            rows[1]["heading_path"],
+            serde_json::json!(["Guide", "Setup"])
+        );
     }
 
     #[test]

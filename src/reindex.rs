@@ -363,13 +363,14 @@ fn schema_rebuild_runner(
 /// ever write to it, the first being `update_schema`'s own synchronous rebuild.
 ///
 /// Takes the LIVE `SharedConfig` handle, not a one-off `Arc<ResolvedConfig>`: a
-/// fresh snapshot is loaded before every drain (see the `load_shared_config` call
-/// below), so `indexing.include`/`exclude`/`exclude_files`, `frontmatter.*`,
-/// `validation.*`, and `chunking.*` all pick up a `POST /admin/reload` swap on the
-/// worker's very next wake — no restart needed. This is what makes those settings
-/// `reload::ReloadEffect::Applied` (or `ReindexRequired` for `chunking.*`, since the
-/// effect only reaches documents indexed after the change) rather than
-/// restart-required — see `reload.rs`'s classification table.
+/// fresh snapshot is loaded before every drained unit (see `drain_and_run_with`), so
+/// `indexing.include`/`exclude`/`exclude_files`, `frontmatter.*`, `validation.*`, and
+/// `chunking.*` all pick up a `POST /admin/reload` swap on the next unit the worker
+/// drains — no restart needed. This is what makes those settings
+/// `reload::ReloadEffect::Applied` (or `ReindexScheduled` for `chunking.*`: the reload
+/// queues a full reconcile, and that reconcile's chunking-fingerprint check re-chunks
+/// every affected document) rather than restart-required — see `reload.rs`'s
+/// classification table.
 ///
 /// `queue` is the injected dependency every producer (the MCP write tools,
 /// `webhook::handle_webhook`, `web.rs`'s write routes) must hold the SAME `Arc`
@@ -394,9 +395,7 @@ pub async fn run_worker(
     };
     loop {
         queue.notify.notified().await;
-        // Fresh snapshot per wake, not per process — see this function's doc comment.
-        let config = crate::config::load_shared_config(&shared_config);
-        drain_and_run_with(&queue, &config, &ingest_runner, &rebuild).await;
+        drain_and_run_with(&queue, &shared_config, &ingest_runner, &rebuild).await;
     }
 }
 
@@ -408,9 +407,17 @@ pub async fn run_worker(
 /// and the loop runs again immediately instead of returning to the caller (which, in
 /// `run_worker`, means going back to sleep on `Notify` — exactly the bug being fixed,
 /// where a webhook landing mid-reindex used to be dropped instead of picked back up).
+///
+/// The config snapshot is loaded from `shared_config` once per drained unit, not
+/// once per wake (#286). A single wake can keep draining for a long time — a
+/// full re-embed, or webhook traffic that keeps the queue busy — and a
+/// `POST /admin/reload` landing meanwhile queues a full reconcile that this same
+/// loop picks up. Reusing the wake's snapshot would run that reconcile with the
+/// pre-reload `chunking.*` fingerprint, find nothing dirty, and consume the
+/// reload's reconcile as a no-op until the next periodic sweep.
 async fn drain_and_run_with(
     queue: &ReindexQueue,
-    config: &Arc<ResolvedConfig>,
+    shared_config: &SharedConfig,
     run: &(dyn Fn(Arc<ResolvedConfig>, Unit) -> RunFuture + Sync),
     rebuild_schema: &(dyn Fn(Arc<ResolvedConfig>) -> RebuildFuture + Sync),
 ) {
@@ -419,6 +426,7 @@ async fn drain_and_run_with(
         if paths.is_empty() && !full {
             return;
         }
+        let config = &crate::config::load_shared_config(shared_config);
         // `full` wins: a pending full reconcile already covers whatever the specific
         // paths would have done, so there is no reason to index them twice.
         let unit = if full {
@@ -724,7 +732,7 @@ mod tests {
             Box::new(|| Ok(())),
         ]));
 
-        let config = test_config();
+        let config = crate::config::shared_config(test_config());
         let runner_for_closure = Arc::clone(&runner);
         let run_fn = boxed_runner(move |unit| runner_for_closure.run_sync(unit));
         drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
@@ -753,7 +761,7 @@ mod tests {
         queue.mark_full();
 
         let runner = Arc::new(FakeRunner::new(vec![Box::new(|| Ok(()))]));
-        let config = test_config();
+        let config = crate::config::shared_config(test_config());
         let runner_for_closure = Arc::clone(&runner);
         let run_fn = boxed_runner(move |unit| runner_for_closure.run_sync(unit));
         drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
@@ -769,7 +777,7 @@ mod tests {
 
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_for_closure = Arc::clone(&attempts);
-        let config = test_config();
+        let config = crate::config::shared_config(test_config());
 
         let run_fn = boxed_runner(move |_unit| {
             attempts_for_closure.fetch_add(1, Ordering::SeqCst);
@@ -793,7 +801,7 @@ mod tests {
 
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_for_closure = Arc::clone(&attempts);
-        let config = test_config();
+        let config = crate::config::shared_config(test_config());
 
         // Every attempt fails transiently — proves the loop terminates rather than
         // retrying forever, and that it stops at exactly the documented cap.
@@ -817,7 +825,7 @@ mod tests {
 
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_for_closure = Arc::clone(&attempts);
-        let config = test_config();
+        let config = crate::config::shared_config(test_config());
 
         let run_fn = boxed_runner(move |_unit| {
             let n = attempts_for_closure.fetch_add(1, Ordering::SeqCst);
@@ -836,10 +844,53 @@ mod tests {
         );
     }
 
+    /// A config reload that lands while a unit is running must reach the unit
+    /// the same wake drains next (#286): the reload queues a full reconcile, and
+    /// running it with the pre-reload snapshot would compare against the old
+    /// chunking fingerprint and find nothing to do.
+    #[tokio::test]
+    async fn a_reload_mid_run_reaches_the_next_drained_unit() {
+        let queue = Arc::new(ReindexQueue::new());
+        queue.mark_paths([path("a.md")]);
+        let shared = crate::config::shared_config(test_config());
+        let original_max = crate::config::load_shared_config(&shared)
+            .chunking
+            .max_chunk_size;
+
+        let seen_max: Arc<StdMutex<Vec<usize>>> = Arc::new(StdMutex::new(Vec::new()));
+        let (queue_for_run, shared_for_run, seen_for_run) = (
+            Arc::clone(&queue),
+            Arc::clone(&shared),
+            Arc::clone(&seen_max),
+        );
+        let run_fn = move |cfg: Arc<ResolvedConfig>, unit: Unit| -> RunFuture {
+            seen_for_run
+                .lock()
+                .unwrap()
+                .push(cfg.chunking.max_chunk_size);
+            if unit == Unit::Paths(vec![path("a.md")]) {
+                // What `/admin/reload` does mid-run: swap the config, queue a
+                // full reconcile.
+                let mut reloaded = (*cfg).clone();
+                reloaded.chunking.max_chunk_size = original_max + 1;
+                crate::config::store_shared_config(&shared_for_run, reloaded);
+                queue_for_run.mark_full();
+            }
+            Box::pin(async { Ok(()) })
+        };
+        drain_and_run_with(&queue, &shared, &run_fn, &noop_rebuild()).await;
+
+        assert_eq!(
+            *seen_max.lock().unwrap(),
+            vec![original_max, original_max + 1],
+            "the reconcile queued by the reload must run with the reloaded config"
+        );
+    }
+
     #[tokio::test]
     async fn an_empty_drain_never_invokes_the_runner() {
         let queue = ReindexQueue::new();
-        let config = test_config();
+        let config = crate::config::shared_config(test_config());
         let calls = Arc::new(AtomicU32::new(0));
         let calls_for_closure = Arc::clone(&calls);
 
@@ -900,7 +951,7 @@ mod tests {
             })
         };
 
-        let config = test_config();
+        let config = crate::config::shared_config(test_config());
         drain_and_run_with(&queue, &config, &run_fn, &rebuild).await;
 
         assert_eq!(
@@ -924,7 +975,7 @@ mod tests {
         };
 
         let run_fn = boxed_runner(|_unit| Ok(()));
-        let config = test_config();
+        let config = crate::config::shared_config(test_config());
         drain_and_run_with(&queue, &config, &run_fn, &rebuild).await;
 
         assert_eq!(
@@ -947,7 +998,7 @@ mod tests {
         };
 
         let run_fn = boxed_runner(|_unit| Ok(()));
-        let config = test_config();
+        let config = crate::config::shared_config(test_config());
         drain_and_run_with(&queue, &config, &run_fn, &rebuild).await;
 
         assert_eq!(

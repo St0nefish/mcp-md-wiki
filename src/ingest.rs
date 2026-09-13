@@ -12,14 +12,90 @@ use crate::{
     chunk,
     config::{IndexingConfig, ResolvedConfig, SemanticEdgesConfig},
     embed::{EmbedClient, EmbedStore},
+    heading,
     qdrant::{
-        CHUNK_TEXT_KEY, PATH_ANCESTORS_KEY, QdrantPoint, QdrantStore, SearchResult, VectorStore,
+        CHUNK_TEXT_KEY, HEADING_LEVEL_KEY, HEADING_PATH_KEY, HEADING_PREFIXES_KEY,
+        PATH_ANCESTORS_KEY, QdrantPoint, QdrantStore, SECTION_KEY, SECTION_LINE_END_KEY,
+        SECTION_LINE_START_KEY, SearchResult, VectorStore,
     },
     schema::{ResolvedSchema, SchemaCache},
     state::{IndexedFile, StateDb},
     status::{INDEX_STATUS, Phase, RunMode, Trigger},
     validate,
 };
+
+/// Shift every chunk's line fields (`line_start`/`line_end` and the attributed
+/// section's `section_line_start`/`section_line_end`) from body-relative (the
+/// numbering `chunk::chunk_markdown` produces, counted from the top of the
+/// frontmatter-stripped body) to file-relative, matching `get_document` and
+/// `retrieval::outline` (#286). `content` is the raw file the chunked body
+/// was parsed from. Shared by both `process_file` call sites.
+fn shift_chunks_to_file_lines(chunks: &mut [chunk::Chunk], content: &str) {
+    let offset = heading::body_line_offset(content);
+    if offset == 0 {
+        return;
+    }
+    for c in chunks.iter_mut() {
+        c.line_start += offset;
+        c.line_end += offset;
+        c.section_line_start += offset;
+        c.section_line_end += offset;
+    }
+}
+
+/// Run one file's chunking step (`run` — `chunk_markdown` plus
+/// [`shift_chunks_to_file_lines`] in production) with a panic confined to that file.
+/// Returns `None`, after logging, when it panicked.
+///
+/// Chunking is pure and meant to be panic-free (#286 made `heading.rs`'s ranges
+/// total), but it runs inside `index_paths_generic`'s per-path loop, which backs the
+/// CLI `index`, the server's startup index and every worker unit. An escaped panic
+/// there aborts the whole run: files already chunked into `pending` are never
+/// flushed, every later path is never processed, and since the offending file never
+/// gets a state row, every later reconcile hits it again. So a bug triggered by one
+/// document's shape is contained to that document here instead. The caller reports
+/// it as [`FileOutcome::Invalid`], the same per-file "could not index this" outcome a
+/// validation failure gets: counted, skipped, and retried by the next reconcile.
+///
+/// `AssertUnwindSafe` is sound: the closure only borrows immutable inputs and builds
+/// a fresh `Vec`, so nothing observable is left half-updated by an unwind.
+fn chunk_isolated(
+    file_path: &str,
+    run: impl FnOnce() -> Vec<chunk::Chunk>,
+) -> Option<Vec<chunk::Chunk>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(chunks) => Some(chunks),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            error!(
+                file = %file_path,
+                "Chunking panicked; skipping this file and continuing the run (it is \
+                 retried on the next reconcile). This is a bug — please report the \
+                 document shape: {message}"
+            );
+            None
+        }
+    }
+}
+
+/// [`chunk_isolated`] over the production chunking step for one file.
+fn chunk_file(
+    file_path: &str,
+    content: &str,
+    body: &str,
+    description: Option<&str>,
+    chunking: &crate::config::ChunkingConfig,
+) -> Option<Vec<chunk::Chunk>> {
+    chunk_isolated(file_path, || {
+        let mut chunks = chunk::chunk_markdown(body, description, chunking);
+        shift_chunks_to_file_lines(&mut chunks, content);
+        chunks
+    })
+}
 
 /// How often a long-running phase emits a progress line.
 ///
@@ -206,6 +282,77 @@ pub fn compute_hash_from_bytes(content: &[u8]) -> String {
     hasher.update(content);
     let digest = hasher.finalize();
     hex::encode(digest)
+}
+
+/// Version of the chunking/payload logic, folded into [`chunking_fingerprint`].
+///
+/// **Bump this whenever a code change alters, for identical input and identical
+/// `chunking.*` config, either the chunk text that gets embedded or the per-chunk
+/// payload written to Qdrant** — `chunk.rs` splitting/prepending rules, `heading.rs`'s
+/// heading model, `shift_chunks_to_file_lines`, or the payload fields
+/// `upsert_pending` derives from a chunk. Bumping it changes every file's fingerprint,
+/// so the next reconcile (startup, periodic sweep, or `/admin/reload`) re-chunks and
+/// re-embeds the whole corpus once, instead of leaving it a silent mix of old- and
+/// new-logic chunks. Do not bump it for changes that leave chunk text and payload
+/// byte-identical (refactors, logging, docs).
+///
+/// **Dependency upgrades count too.** The fingerprint cannot see crate versions, so
+/// also bump this when upgrading `pulldown-cmark` (heading detection and heading
+/// text) or `text-splitter` (oversized-section split points) in a way that changes
+/// chunking output for some input — check with the chunking tests and a corpus
+/// diff before assuming an upgrade is inert. `Cargo.toml` carries the same reminder
+/// next to both dependencies.
+///
+/// History: `1` — #286 (heading model in `heading.rs`, section payload fields,
+/// normalized `heading_prefixes` and `section_key` paths joined with
+/// `heading::HEADING_KEY_SEPARATOR`). There is no `0`: rows written before fingerprints
+/// existed carry `''`, which never matches.
+pub(crate) const CHUNKER_VERSION: u32 = 1;
+
+/// Stable fingerprint of everything that determines a file's chunks and their payload,
+/// apart from the file's own bytes and its schema (tracked separately as
+/// `schema_hash`): [`CHUNKER_VERSION`] plus every `chunking.*` setting.
+///
+/// Stored per file in `indexed_files.chunking_fingerprint`. A mismatch marks the file
+/// dirty in both [`scan_for_dirty`] (ahead of the stat pre-filter) and
+/// [`process_file`]'s skip-if-unchanged check, so a chunking config change re-chunks
+/// and re-embeds every affected file automatically.
+///
+/// Deliberately a SHA-256 over an explicit, hand-ordered `key=value` string rather
+/// than `std::hash` (SipHash with per-process random keys — not stable across runs)
+/// or a serde serialization (field order and float/`Option` formatting are not a
+/// contract): the value must be identical across restarts, builds and platforms, or
+/// every restart would re-embed the corpus. `target_chunk_size` is folded in resolved
+/// (`ChunkingConfig::target`) because `None` and `Some(max_chunk_size)` chunk
+/// identically, and only while `heading_metadata` is off: with it on, chunks never
+/// merge toward a target, so changing `target_chunk_size` must not re-embed the
+/// corpus for byte-identical chunks. **Adding a field to `ChunkingConfig` that affects chunk text or
+/// payload means adding it here** — the exhaustive destructuring below makes that a
+/// compile error, and `chunking_fingerprint_changes_with_every_chunking_field` is
+/// where the new field's sensitivity gets a test.
+///
+/// Computed once per indexing run / reconcile scan, never per file.
+pub(crate) fn chunking_fingerprint(chunking: &crate::config::ChunkingConfig) -> String {
+    let crate::config::ChunkingConfig {
+        max_chunk_size,
+        target_chunk_size: _,
+        prepend_description,
+        prepend_heading_path,
+        heading_metadata,
+    } = chunking;
+    // `target_chunk_size` only steers the accumulate-to-target merge, which
+    // `heading_metadata` turns off, so it is left out while that flag is on.
+    let target = if *heading_metadata {
+        String::new()
+    } else {
+        format!("target_chunk_size={};", chunking.target())
+    };
+    let canonical = format!(
+        "chunker_version={CHUNKER_VERSION};max_chunk_size={max_chunk_size};\
+         {target}prepend_description={prepend_description};\
+         prepend_heading_path={prepend_heading_path};heading_metadata={heading_metadata}"
+    );
+    compute_hash_from_bytes(canonical.as_bytes())
 }
 
 /// Modification time as a Unix timestamp, falling back to 0 with a warning.
@@ -529,6 +676,8 @@ struct PendingFile {
     display_mtime: i64,
     /// Fingerprint of the schema this file was validated against.
     schema_hash: String,
+    /// [`chunking_fingerprint`] of the config this file's chunks were produced under.
+    chunking_fingerprint: String,
 }
 
 /// Result of processing a single discovered file.
@@ -614,6 +763,7 @@ async fn process_file(
     config: &ResolvedConfig,
     schema: &ResolvedSchema,
     schema_hash: &str,
+    chunking_fp: &str,
     git_mtimes: &HashMap<String, i64>,
 ) -> Result<FileOutcome> {
     let file_path = rel_key.to_string();
@@ -642,11 +792,15 @@ async fn process_file(
 
     // Skip unchanged files unless forced. The schema fingerprint is part of the
     // condition: editing a .kb-schema.yaml changes no document's bytes, so without this
-    // a tightened rule would never be applied to anything already indexed.
+    // a tightened rule would never be applied to anything already indexed. The chunking
+    // fingerprint is part of it for the same reason: a changed `chunking.*` setting (or
+    // a `CHUNKER_VERSION` bump) changes no bytes either, and skipping here would leave
+    // this file's old chunks in a now-mixed index.
     if !force
         && let Some(ref entry) = state_entry
         && entry.content_hash == hash
         && entry.schema_hash == schema_hash
+        && entry.chunking_fingerprint == chunking_fp
     {
         debug!("Unchanged, skipping: {}", file_path);
         return Ok(FileOutcome::Skipped { hash, mtime, size });
@@ -661,11 +815,15 @@ async fn process_file(
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
 
-                let chunks = chunk::chunk_markdown(
+                let Some(chunks) = chunk_file(
+                    &file_path,
+                    content,
                     &validated.body,
                     description.as_deref(),
                     &config.chunking,
-                );
+                ) else {
+                    return Ok(FileOutcome::Invalid);
+                };
 
                 if chunks.is_empty() {
                     warn!("No chunks produced for: {}", file_path);
@@ -685,6 +843,7 @@ async fn process_file(
                     size,
                     display_mtime,
                     schema_hash: schema_hash.to_string(),
+                    chunking_fingerprint: chunking_fp.to_string(),
                 }))
             }
             Ok((result, None)) => {
@@ -735,7 +894,15 @@ async fn process_file(
             .get("description")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        let chunks = chunk::chunk_markdown(&body, description.as_deref(), &config.chunking);
+        let Some(chunks) = chunk_file(
+            &file_path,
+            content,
+            &body,
+            description.as_deref(),
+            &config.chunking,
+        ) else {
+            return Ok(FileOutcome::Invalid);
+        };
         if chunks.is_empty() {
             warn!("No chunks produced for: {}", file_path);
             return Ok(FileOutcome::Empty);
@@ -752,6 +919,7 @@ async fn process_file(
             size,
             display_mtime,
             schema_hash: schema_hash.to_string(),
+            chunking_fingerprint: chunking_fp.to_string(),
         }))
     }
 }
@@ -763,6 +931,14 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     store: &Q,
     state: &StateDb,
     collection: &str,
+    // #286: gates writing `heading_path`/`heading_level`/
+    // `heading_prefixes`/`section_key`/`section_line_start`/`section_line_end`
+    // into every chunk's payload below. `chunk.heading_path`/`heading_level`
+    // themselves are always computed (cheap — see `chunk::Chunk`'s doc
+    // comment); here the flag decides only whether they reach Qdrant. (The
+    // same flag also makes `chunk::chunk_markdown` keep every chunk within one
+    // heading's section, which happened before these chunks got here.)
+    heading_metadata: bool,
 ) -> Result<()> {
     // Flatten all chunk texts in order, recording boundaries
     let mut all_texts: Vec<String> = Vec::new();
@@ -840,6 +1016,51 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
                 serde_json::Value::Number(chunk.line_end.into()),
             );
 
+            // #286: structured heading data, written only when the flag is
+            // on — an unindexed corpus (or one indexed before the flag was
+            // flipped on) keeps the payload shape it always had.
+            if heading_metadata {
+                payload.insert(
+                    HEADING_PATH_KEY.to_string(),
+                    serde_json::Value::Array(
+                        chunk
+                            .heading_path
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+                payload.insert(
+                    HEADING_LEVEL_KEY.to_string(),
+                    serde_json::Value::Number(chunk.heading_level.into()),
+                );
+                payload.insert(
+                    HEADING_PREFIXES_KEY.to_string(),
+                    serde_json::Value::Array(
+                        derive_heading_prefixes(&chunk.heading_path)
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+                // The chunker attributes each chunk to one section and carries
+                // its range, so no lookup is needed here. The key includes the
+                // line range so two same-named headings stay distinct sections.
+                payload.insert(
+                    SECTION_KEY.to_string(),
+                    serde_json::Value::String(section_key(&pf.file_path, chunk)),
+                );
+                payload.insert(
+                    SECTION_LINE_START_KEY.to_string(),
+                    serde_json::Value::Number(chunk.section_line_start.into()),
+                );
+                payload.insert(
+                    SECTION_LINE_END_KEY.to_string(),
+                    serde_json::Value::Number(chunk.section_line_end.into()),
+                );
+            }
+
             all_points.push(QdrantPoint {
                 id: make_point_id(&pf.file_path, chunk.index),
                 vector: vector.clone(),
@@ -905,6 +1126,7 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
                 &pf.hash,
                 *count as i64,
                 &pf.schema_hash,
+                &pf.chunking_fingerprint,
                 pf.mtime,
                 pf.size,
             )
@@ -1271,6 +1493,7 @@ async fn flush_pending_batch<E: EmbedStore, Q: VectorStore + NeighborStore>(
     state: &StateDb,
     collection: &str,
     semantic_edges: &SemanticEdgesConfig,
+    heading_metadata: bool,
 ) -> Result<usize> {
     if pending.is_empty() {
         return Ok(0);
@@ -1288,7 +1511,7 @@ async fn flush_pending_batch<E: EmbedStore, Q: VectorStore + NeighborStore>(
 
     INDEX_STATUS.set_phase(Phase::Embedding);
     info!("Embedding chunks for {} changed file(s)…", count);
-    upsert_pending(&batch, embedder, store, state, collection).await?;
+    upsert_pending(&batch, embedder, store, state, collection, heading_metadata).await?;
 
     // Precompute semantic (kNN) edges for the web UI graph view, same as the
     // pre-#160 single terminal call — no-ops when `semantic_edges.enabled` is false.
@@ -1497,6 +1720,70 @@ pub(crate) fn derive_path_ancestors(rel_path: &str) -> Vec<String> {
     ancestors
 }
 
+/// The `heading_prefixes` keywords for a chunk (#286): the
+/// `heading::heading_prefix_key` of every contiguous run of `heading_path`
+/// segments, starting at any depth — ordered by start depth, then by length.
+/// E.g. for `["Game Mastering", "Conditions", "Blinded"]`:
+/// `["game mastering", "game mastering\u{1f}conditions",
+/// "game mastering\u{1f}conditions\u{1f}blinded", "conditions",
+/// "conditions\u{1f}blinded", "blinded"]`.
+///
+/// `search`'s `heading_prefix` parameter is lowered through the same
+/// `heading_prefix_key` to one `Condition::matches(HEADING_PREFIXES_KEY, key)`,
+/// so a caller's `["Conditions"]`, `["Game Mastering", "Conditions"]` and
+/// `["Conditions", "Blinded"]` all match this chunk: the filter matches a run of
+/// consecutive headings anywhere in the path, not only one anchored at the
+/// file's top heading (which a PDF-converted chapter's H1 would otherwise force
+/// every caller to know). The run must be contiguous: `["Game Mastering",
+/// "Blinded"]` does not match. Each segment is a whole heading name, normalized
+/// (`heading::normalize_heading_text`: invisible characters removed, whitespace
+/// collapsed, Unicode case-folded) and joined with
+/// `heading::HEADING_KEY_SEPARATOR`, never `" > "`, so a heading whose own text
+/// contains `" > "` cannot collide with a two-level path.
+///
+/// A path of depth `n` yields `n(n+1)/2` keys — at most 21, since CommonMark
+/// headings nest at most 6 deep. Each segment of a key is at most
+/// `heading::MAX_HEADING_TEXT_CHARS` characters (`normalize_heading_text` caps
+/// it after case folding). Duplicates (a path that repeats a heading name) are
+/// dropped. The display `heading_path` payload field keeps the stored heading
+/// text instead: not case-folded, and with the joiners and direction marks
+/// that change how it renders. An empty `heading_path` (a chunk with no
+/// heading ancestry) yields an empty `Vec` — nothing to filter on.
+fn derive_heading_prefixes(heading_path: &[String]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for start in 0..heading_path.len() {
+        for end in start + 1..=heading_path.len() {
+            let key = crate::heading::heading_prefix_key(&heading_path[start..end]);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// The [`SECTION_KEY`] payload value grouping `chunk` with every other chunk
+/// attributed to the same section (#286):
+/// `"{file_path}#{section_line_start}-{section_line_end}:{heading path joined by
+/// heading::HEADING_KEY_SEPARATOR}"` (U+001F, which heading text cannot contain).
+/// The line range makes two same-named headings distinct sections, and would
+/// separate the preamble from a whole-document root attribution (same start
+/// line, empty path) — though with `chunking.heading_metadata` on, the only
+/// mode that writes this key, the chunker never attributes a chunk to the
+/// root. `chunk`'s section lines must already be
+/// file-relative (`shift_chunks_to_file_lines`).
+fn section_key(file_path: &str, chunk: &chunk::Chunk) -> String {
+    format!(
+        "{}#{}-{}:{}",
+        file_path,
+        chunk.section_line_start,
+        chunk.section_line_end,
+        chunk
+            .heading_path
+            .join(crate::heading::HEADING_KEY_SEPARATOR),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Markdown link extraction (feeds the `document_links` graph)
 // ---------------------------------------------------------------------------
@@ -1543,8 +1830,8 @@ pub(crate) fn derive_path_ancestors(rel_path: &str) -> Vec<String> {
 /// - Images (`![alt](target)`), including the reference forms `![alt][ref]` and
 ///   shortcut `![alt]`, are skipped entirely for every syntax above — an image is
 ///   not a document reference.
-/// - Anything inside a fenced code block (`` ``` `` or `~~~`, tracked the same
-///   line-oriented way `chunk::split_sections` tracks fences for headings) or an
+/// - Anything inside a fenced code block (`` ``` `` or `~~~`, tracked by simple
+///   line-oriented toggling) or an
 ///   inline code span (`` `...` ``) is skipped for every syntax above, including
 ///   reference definitions: a definition line inside a fence is not indexed, and a
 ///   definition line wholly wrapped in an inline code span never matches the
@@ -1668,8 +1955,7 @@ enum RawLinkKind {
 /// [`find_markdown_link_occurrences`] — see [`extract_markdown_links`]'s doc comment
 /// for exactly what each recognized syntax (inline, reference-style, wiki-style,
 /// autolink) requires to match. Walks `body` line by line, tracking fenced code
-/// blocks (`` ``` `` /`~~~` toggling, the same line-oriented way `chunk::split_sections`
-/// tracks fences for headings).
+/// blocks by line-oriented `` ``` `` /`~~~` toggling.
 ///
 /// Reference-style links need the WHOLE document before they can be resolved: a
 /// `[ref]: target` definition may appear after every use site that names it, so a
@@ -2384,7 +2670,9 @@ const SCAN_PAGE_SIZE: i64 = 1000;
 /// needed to catch each one without reading a single file's content:
 ///
 /// 1. **Changed or new.** It exists on disk with no `indexed_files` row, or with an
-///    `mtime`/`size` that no longer matches the row. This is a pre-filter only — the
+///    `mtime`/`size` that no longer matches the row. A changed schema or chunking
+///    fingerprint also counts, checked before the stat pre-filter since neither moves
+///    a file's stat. This is a pre-filter only — the
 ///    content hash remains the sole authority on whether a file actually changed, and
 ///    that authoritative check happens when `index_paths` re-reads the file. A false
 ///    positive here (mtime touched, bytes unchanged) costs one wasted hash comparison
@@ -2398,7 +2686,20 @@ const SCAN_PAGE_SIZE: i64 = 1000;
 /// At a corpus size of thousands to tens of thousands of documents, content-hashing
 /// (or even just fully materializing) the whole corpus on every sweep would dominate
 /// the sweep's cost; this function never does either.
-pub async fn scan_for_dirty(config: &ResolvedConfig) -> Result<Vec<PathBuf>> {
+///
+/// `scan` is the caller's [`crate::status::ReconcileScan`] guard: the first
+/// non-frozen file found with a stale chunking fingerprint marks it, which
+/// makes `INDEX_STATUS.is_bulk_indexing()` true from that moment — and keeps
+/// it true past this function returning, through however long the indexing
+/// run that follows (and any retry of it) takes, until [`scan_and_index`]
+/// confirms nothing stale remains (#286; round-6 review L1). A frozen scope's
+/// stale files never mark this, by design: they are skipped before the
+/// fingerprint check below ever runs, since they are never re-chunked until
+/// the schema is fixed and must not pin the note on forever.
+pub async fn scan_for_dirty(
+    config: &ResolvedConfig,
+    scan: &crate::status::ReconcileScan<'_>,
+) -> Result<Vec<PathBuf>> {
     let state = StateDb::new(Path::new(&config.state_db_path()))
         .await
         .context("Failed to open state DB")?;
@@ -2407,6 +2708,8 @@ pub async fn scan_for_dirty(config: &ResolvedConfig) -> Result<Vec<PathBuf>> {
     INDEX_STATUS.set_files_total(discovered.len() as u64);
 
     let schemas = SchemaCache::build(&data_path, &config.frontmatter);
+    // Once per scan, not per row — see `chunking_fingerprint`'s doc comment.
+    let chunking_fp = chunking_fingerprint(&config.chunking);
 
     // Every path currently on disk. Needed twice: to tell an orphan (row, no file)
     // from a live one while paging `indexed_files`, and — via `visited`, below — to
@@ -2459,6 +2762,17 @@ pub async fn scan_for_dirty(config: &ResolvedConfig) -> Result<Vec<PathBuf>> {
             // lookup against the already-built schema tree — and it can flip a file
             // dirty even when its bytes and stat metadata are untouched.
             if schemas.resolve_for(rel).fingerprint() != row.schema_hash {
+                dirty.insert(PathBuf::from(&row.file_path));
+                continue;
+            }
+
+            // Reason 1c: the chunking fingerprint moved (a `chunking.*` change applied
+            // by restart or `/admin/reload`, a `CHUNKER_VERSION` bump, or a pre-upgrade
+            // row with an empty fingerprint). Same shape as 1a, and it must sit ahead
+            // of the stat pre-filter for the same reason: the file's bytes and stat are
+            // untouched, so 1b would otherwise short-circuit past it forever.
+            if row.chunking_fingerprint != chunking_fp {
+                scan.mark_rechunk();
                 dirty.insert(PathBuf::from(&row.file_path));
                 continue;
             }
@@ -2869,7 +3183,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
             collection,
             vector_size,
             &indexed_fields,
-            config.search.phrase,
+            crate::qdrant::IndexFeatures::from_config(config),
         )
         .await
         .context("Failed to ensure Qdrant collection")?;
@@ -2909,6 +3223,9 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     // `build_git_mtimes`'s doc comment for why this must be computed once here
     // rather than once per file.
     let git_mtimes = build_git_mtimes(config, &rel_keys).await;
+
+    // Once per run, not per file — compared against each row in `process_file`.
+    let chunking_fp = chunking_fingerprint(&config.chunking);
 
     // ── Per-path processing ──────────────────────────────────────────────────
     let mut pending: Vec<PendingFile> = Vec::new();
@@ -2982,6 +3299,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
             config,
             schema,
             &schema_hash,
+            &chunking_fp,
             &git_mtimes,
         )
         .await?
@@ -3050,6 +3368,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
                         &state,
                         collection,
                         &config.ui.semantic_edges,
+                        config.chunking.heading_metadata,
                     )
                     .await?;
                 }
@@ -3069,6 +3388,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         &state,
         collection,
         &config.ui.semantic_edges,
+        config.chunking.heading_metadata,
     )
     .await?;
 
@@ -3242,7 +3562,15 @@ async fn detect_qdrant_wipe<Q: VectorStore>(
 pub async fn scan_and_index(config: &ResolvedConfig, force: bool, trigger: Trigger) -> Result<()> {
     if force {
         let (_data_path, all_paths) = discover_relative(config).await?;
-        return index_paths(config, &all_paths, true, trigger).await;
+        let result = index_paths(config, &all_paths, true, trigger).await;
+        // A full reindex re-chunks every non-frozen file under the current
+        // settings, so no non-frozen file can be stale afterward (#286 round-6
+        // L1) — frozen scopes are excluded from this concern by design, same
+        // as everywhere else: see `status::IndexStatus::clear_stale_chunking`.
+        if result.is_ok() {
+            INDEX_STATUS.clear_stale_chunking();
+        }
+        return result;
     }
 
     // The wipe-detection round trip below needs its own state DB handle and its own
@@ -3269,13 +3597,43 @@ pub async fn scan_and_index(config: &ResolvedConfig, force: bool, trigger: Trigg
              leaving search silently empty until an operator notices."
         );
         let (_data_path, all_paths) = discover_relative(config).await?;
-        return index_paths(config, &all_paths, true, trigger).await;
+        let result = index_paths(config, &all_paths, true, trigger).await;
+        if result.is_ok() {
+            INDEX_STATUS.clear_stale_chunking();
+        }
+        return result;
     }
 
-    let dirty = scan_for_dirty(config)
+    // The scan's guard is what `mark_rechunk` (inside `scan_for_dirty`) uses to
+    // set `IndexStatus`'s sticky "stale chunking remains" latch — see that
+    // method's doc comment for why it deliberately outlives this guard rather
+    // than clearing when it drops (#286 round-6 L1: that used to leave the note
+    // dark during retry backoff, a permanent give-up, and the wait for the next
+    // reconcile). Two independent confirmations clear it below: this scan
+    // itself finding nothing to re-chunk, and — separately — the run that
+    // follows finishing successfully. Either is sufficient; both are cheap to
+    // check, so there is no reason to pick only one.
+    let scan = INDEX_STATUS.begin_reconcile_scan();
+    let dirty = scan_for_dirty(config, &scan)
         .await
         .context("Reconcile scan failed")?;
-    index_paths(config, &dirty, false, trigger).await
+    if !scan.rechunk_detected() {
+        // This scan found no non-frozen file chunked under a stale
+        // fingerprint. That is a fresh, authoritative read of the whole
+        // corpus, independent of whatever the run below does next (which may
+        // fail for an unrelated reason, e.g. a new file's embedding call).
+        INDEX_STATUS.clear_stale_chunking();
+    }
+    let result = index_paths(config, &dirty, false, trigger).await;
+    if result.is_ok() {
+        // The run just processed every file this scan marked dirty, the
+        // fingerprint-stale ones included — nothing from this scan remains
+        // stale. A failed run must NOT reach this: those files are still
+        // chunked under the old settings, and the note must stay on through
+        // the retry backoff (or permanent give-up) that follows.
+        INDEX_STATUS.clear_stale_chunking();
+    }
+    result
 }
 
 #[cfg(test)]
@@ -3307,6 +3665,44 @@ mod tests {
             compute_hash_from_bytes(b"hello"),
             compute_hash_from_bytes(b"world")
         );
+    }
+
+    /// #286: chunk line ranges (and the attributed section range) must count
+    /// from the top of the raw file, matching `get_document`'s numbering — not
+    /// from after the stripped frontmatter block, which is what
+    /// `chunk::chunk_markdown` alone produces. Pins the whole raw-file ->
+    /// parse -> chunk -> shift pipeline, including files ending in a newline
+    /// (almost every real file) and CRLF, where the body gray_matter returns is
+    /// not a byte suffix of the raw file.
+    #[test]
+    fn chunk_line_ranges_count_from_file_top() {
+        let lf =
+            "---\ntitle: Test\ntype: guide\n---\n\n# Heading\n\nBody line one.\nBody line two.";
+        for content in [
+            lf.to_string(),
+            format!("{lf}\n"),
+            format!("{lf}\n\n"),
+            format!("{lf}\n").replace('\n', "\r\n"),
+        ] {
+            let lines: Vec<&str> = content.lines().collect();
+            assert_eq!(lines[5], "# Heading");
+
+            let (_, body) = validate::parse_frontmatter_raw(&content);
+            let mut chunks =
+                chunk::chunk_markdown(&body, None, &crate::config::ChunkingConfig::default());
+            assert_eq!(chunks.len(), 1);
+            // Body-relative: "# Heading" is the body's own first line.
+            assert_eq!(chunks[0].line_start, 1);
+
+            shift_chunks_to_file_lines(&mut chunks, &content);
+            assert_eq!(
+                chunks[0].line_start, 6,
+                "shifted line_start must equal the heading's real line; {content:?}"
+            );
+            assert_eq!(chunks[0].section_line_start, 6, "{content:?}");
+            assert_eq!(chunks[0].section_line_end, lines.len(), "{content:?}");
+            assert!(chunks[0].line_end <= chunks[0].section_line_end);
+        }
     }
 
     #[tokio::test]
@@ -3458,7 +3854,15 @@ mod tests {
         let mut fm = HashMap::new();
         fm.insert("title".into(), serde_json::json!("Unchanged"));
         state
-            .upsert("unchanged.md", &unchanged_hash, 1, &schema_hash, 0, 0)
+            .upsert(
+                "unchanged.md",
+                &unchanged_hash,
+                1,
+                &schema_hash,
+                &chunking_fingerprint(&config.chunking),
+                0,
+                0,
+            )
             .await
             .unwrap();
         state
@@ -3466,7 +3870,15 @@ mod tests {
             .await
             .unwrap();
         state
-            .upsert("missing.md", "stale-hash", 1, &schema_hash, 0, 0)
+            .upsert(
+                "missing.md",
+                "stale-hash",
+                1,
+                &schema_hash,
+                &chunking_fingerprint(&config.chunking),
+                0,
+                0,
+            )
             .await
             .unwrap();
         state
@@ -3653,7 +4065,15 @@ mod tests {
         // content hash and schema hash match, so `process_file` must take the
         // `Skipped` path, not the `Ready` one.
         state
-            .upsert("unchanged.md", &hash, 1, &schema_hash, 0, 0)
+            .upsert(
+                "unchanged.md",
+                &hash,
+                1,
+                &schema_hash,
+                &chunking_fingerprint(&config.chunking),
+                0,
+                0,
+            )
             .await
             .unwrap();
 
@@ -4388,7 +4808,9 @@ mod tests {
         let config = scan_test_config(&dir);
         std::fs::write(dir.path().join("new.md"), "# New").unwrap();
 
-        let dirty = scan_for_dirty(&config).await.unwrap();
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
         assert_eq!(dirty, vec![PathBuf::from("new.md")]);
     }
 
@@ -4402,16 +4824,26 @@ mod tests {
         let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
 
         let db = open_scan_test_db(&config).await;
-        db.upsert("doc.md", "some-hash", 1, &schema_hash, mtime, size)
-            .await
-            .unwrap();
+        db.upsert(
+            "doc.md",
+            "some-hash",
+            1,
+            &schema_hash,
+            &chunking_fingerprint(&config.chunking),
+            mtime,
+            size,
+        )
+        .await
+        .unwrap();
         let mut fm = HashMap::new();
         fm.insert("title".into(), serde_json::json!("Doc"));
         db.upsert_document_metadata("doc.md", &fm, mtime, "some-hash", 1)
             .await
             .unwrap();
 
-        let dirty = scan_for_dirty(&config).await.unwrap();
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
         assert!(
             dirty.is_empty(),
             "unchanged stat + fresh metadata must not be marked dirty: {dirty:?}"
@@ -4430,16 +4862,26 @@ mod tests {
         let db = open_scan_test_db(&config).await;
         // Record a DIFFERENT mtime than what's actually on disk, simulating a file
         // that was touched (or genuinely edited) since the last index.
-        db.upsert("doc.md", "some-hash", 1, &schema_hash, mtime - 1000, size)
-            .await
-            .unwrap();
+        db.upsert(
+            "doc.md",
+            "some-hash",
+            1,
+            &schema_hash,
+            &chunking_fingerprint(&config.chunking),
+            mtime - 1000,
+            size,
+        )
+        .await
+        .unwrap();
         let mut fm = HashMap::new();
         fm.insert("title".into(), serde_json::json!("Doc"));
         db.upsert_document_metadata("doc.md", &fm, mtime, "some-hash", 1)
             .await
             .unwrap();
 
-        let dirty = scan_for_dirty(&config).await.unwrap();
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
         assert_eq!(dirty, vec![PathBuf::from("doc.md")]);
     }
 
@@ -4471,13 +4913,16 @@ mod tests {
             "old-hash",
             1,
             &schema_hash,
+            &chunking_fingerprint(&config.chunking),
             stale_mtime,
             real_size,
         )
         .await
         .unwrap();
 
-        let dirty = scan_for_dirty(&config).await.unwrap();
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
         assert_eq!(
             dirty,
             vec![PathBuf::from("doc.md")],
@@ -4494,11 +4939,21 @@ mod tests {
 
         // No file written to disk at all — a row with nothing behind it.
         let db = open_scan_test_db(&config).await;
-        db.upsert("gone.md", "some-hash", 1, &schema_hash, 0, 0)
+        db.upsert(
+            "gone.md",
+            "some-hash",
+            1,
+            &schema_hash,
+            &chunking_fingerprint(&config.chunking),
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
             .await
             .unwrap();
-
-        let dirty = scan_for_dirty(&config).await.unwrap();
         assert_eq!(dirty, vec![PathBuf::from("gone.md")]);
     }
 
@@ -4514,11 +4969,21 @@ mod tests {
         // indexed_files says "some-hash", but there is no `documents` row at all —
         // the upgrade/backfill case, not a content change.
         let db = open_scan_test_db(&config).await;
-        db.upsert("doc.md", "some-hash", 1, &schema_hash, mtime, size)
+        db.upsert(
+            "doc.md",
+            "some-hash",
+            1,
+            &schema_hash,
+            &chunking_fingerprint(&config.chunking),
+            mtime,
+            size,
+        )
+        .await
+        .unwrap();
+
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
             .await
             .unwrap();
-
-        let dirty = scan_for_dirty(&config).await.unwrap();
         assert_eq!(
             dirty,
             vec![PathBuf::from("doc.md")],
@@ -4537,7 +5002,261 @@ mod tests {
         let db = open_scan_test_db(&config).await;
         // A fingerprint that will never match the real one built from `dir` — stands
         // in for "the schema changed since this was last indexed".
-        db.upsert("doc.md", "some-hash", 1, "stale-fingerprint", mtime, size)
+        db.upsert(
+            "doc.md",
+            "some-hash",
+            1,
+            "stale-fingerprint",
+            "",
+            mtime,
+            size,
+        )
+        .await
+        .unwrap();
+        let mut fm = HashMap::new();
+        fm.insert("title".into(), serde_json::json!("Doc"));
+        db.upsert_document_metadata("doc.md", &fm, mtime, "some-hash", 1)
+            .await
+            .unwrap();
+
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
+        assert_eq!(dirty, vec![PathBuf::from("doc.md")]);
+    }
+
+    // -- chunking fingerprint --------------------------------------------------
+
+    #[test]
+    fn chunking_fingerprint_is_stable_across_runs_and_platforms() {
+        // Pinned, not merely "equal to itself this run": a fingerprint that drifted
+        // between builds, processes or platforms would re-embed the whole corpus on
+        // every restart. This golden value changes ONLY when CHUNKER_VERSION is bumped
+        // or the canonical string in `chunking_fingerprint` is deliberately changed —
+        // both of which are meant to trigger a one-time reindex, so update it then.
+        let default = crate::config::ChunkingConfig::default();
+        assert_eq!(
+            chunking_fingerprint(&default),
+            chunking_fingerprint(&default)
+        );
+        assert_eq!(
+            chunking_fingerprint(&default),
+            compute_hash_from_bytes(
+                format!(
+                    "chunker_version={CHUNKER_VERSION};max_chunk_size=1500;\
+                     target_chunk_size=1000;prepend_description=true;\
+                     prepend_heading_path=true;heading_metadata=false"
+                )
+                .as_bytes()
+            )
+        );
+        assert_eq!(
+            CHUNKER_VERSION, 1,
+            "bumped? update the golden hash below too (sha256 of the canonical string)"
+        );
+        assert_eq!(
+            chunking_fingerprint(&default),
+            "7222485585dc86e2c0679340753d74d3aacbf22f5978cecd737d4a104181d381",
+            "golden fingerprint drifted — see this test's comment"
+        );
+    }
+
+    #[test]
+    fn chunking_fingerprint_changes_with_every_chunking_field() {
+        use crate::config::ChunkingConfig;
+        let base = ChunkingConfig {
+            max_chunk_size: 1000,
+            target_chunk_size: Some(800),
+            prepend_description: true,
+            prepend_heading_path: true,
+            heading_metadata: false,
+        };
+        let base_fp = chunking_fingerprint(&base);
+        assert!(
+            !base_fp.is_empty(),
+            "an empty fingerprint would match legacy rows"
+        );
+
+        // One variant per field. The exhaustive destructuring inside
+        // `chunking_fingerprint` makes adding a `ChunkingConfig` field a compile error
+        // there; this list is where its sensitivity gets proven.
+        let variants: Vec<(&str, ChunkingConfig)> = vec![
+            (
+                "max_chunk_size",
+                ChunkingConfig {
+                    max_chunk_size: 2000,
+                    ..base.clone()
+                },
+            ),
+            (
+                "target_chunk_size",
+                ChunkingConfig {
+                    target_chunk_size: Some(500),
+                    ..base.clone()
+                },
+            ),
+            (
+                "prepend_description",
+                ChunkingConfig {
+                    prepend_description: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "prepend_heading_path",
+                ChunkingConfig {
+                    prepend_heading_path: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "heading_metadata",
+                ChunkingConfig {
+                    heading_metadata: true,
+                    ..base.clone()
+                },
+            ),
+        ];
+        let mut seen = HashSet::from([base_fp.clone()]);
+        for (field, cfg) in &variants {
+            let fp = chunking_fingerprint(cfg);
+            assert_ne!(fp, base_fp, "changing {field} must change the fingerprint");
+            assert!(seen.insert(fp), "{field} collided with another variant");
+        }
+    }
+
+    #[test]
+    fn chunking_fingerprint_treats_unset_target_as_max() {
+        // `target_chunk_size: None` chunks exactly like `Some(max_chunk_size)`; the two
+        // must not force a pointless corpus re-embed when an operator spells it out.
+        let unset = crate::config::ChunkingConfig {
+            max_chunk_size: 1200,
+            target_chunk_size: None,
+            ..Default::default()
+        };
+        let explicit = crate::config::ChunkingConfig {
+            target_chunk_size: Some(1200),
+            ..unset.clone()
+        };
+        assert_eq!(
+            chunking_fingerprint(&unset),
+            chunking_fingerprint(&explicit)
+        );
+    }
+
+    #[test]
+    fn chunking_fingerprint_ignores_target_while_heading_metadata_is_on() {
+        // #286: with `heading_metadata` on, chunks never merge toward
+        // `target_chunk_size`, so changing it must not re-embed the corpus.
+        // With the flag off it still counts (see the per-field test above).
+        let on = crate::config::ChunkingConfig {
+            max_chunk_size: 1500,
+            target_chunk_size: Some(1000),
+            prepend_description: true,
+            prepend_heading_path: true,
+            heading_metadata: true,
+        };
+        for target in [None, Some(1), Some(500), Some(1500)] {
+            assert_eq!(
+                chunking_fingerprint(&on),
+                chunking_fingerprint(&crate::config::ChunkingConfig {
+                    target_chunk_size: target,
+                    ..on.clone()
+                }),
+                "target {target:?}"
+            );
+        }
+        assert_eq!(
+            chunking_fingerprint(&on),
+            compute_hash_from_bytes(
+                format!(
+                    "chunker_version={CHUNKER_VERSION};max_chunk_size=1500;\
+                     prepend_description=true;prepend_heading_path=true;\
+                     heading_metadata=true"
+                )
+                .as_bytes()
+            )
+        );
+        // Every other field still counts with the flag on.
+        for other in [
+            crate::config::ChunkingConfig {
+                max_chunk_size: 2000,
+                ..on.clone()
+            },
+            crate::config::ChunkingConfig {
+                prepend_description: false,
+                ..on.clone()
+            },
+            crate::config::ChunkingConfig {
+                prepend_heading_path: false,
+                ..on.clone()
+            },
+        ] {
+            assert_ne!(chunking_fingerprint(&on), chunking_fingerprint(&other));
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_flags_a_chunking_fingerprint_change_even_with_unchanged_stat() {
+        let dir = TempDir::new().unwrap();
+        let mut config = scan_test_config(&dir);
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Doc").unwrap();
+        let (mtime, size) = stat(&path);
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+
+        // Indexed under the current config: stat, schema and metadata all match.
+        let db = open_scan_test_db(&config).await;
+        db.upsert(
+            "doc.md",
+            "some-hash",
+            1,
+            &schema_hash,
+            &chunking_fingerprint(&config.chunking),
+            mtime,
+            size,
+        )
+        .await
+        .unwrap();
+        let mut fm = HashMap::new();
+        fm.insert("title".into(), serde_json::json!("Doc"));
+        db.upsert_document_metadata("doc.md", &fm, mtime, "some-hash", 1)
+            .await
+            .unwrap();
+        let routine = INDEX_STATUS.begin_reconcile_scan();
+        assert!(
+            scan_for_dirty(&config, &routine).await.unwrap().is_empty(),
+            "precondition: nothing is dirty under the config the row was indexed with"
+        );
+        assert!(
+            !routine.rechunk_detected(),
+            "a scan with nothing to re-chunk must not raise the incomplete-results note"
+        );
+
+        // Operator changes a chunking setting (restart or /admin/reload). No byte and
+        // no stat moved — only the fingerprint can notice.
+        config.chunking.max_chunk_size += 500;
+        let scan = INDEX_STATUS.begin_reconcile_scan();
+        let dirty = scan_for_dirty(&config, &scan).await.unwrap();
+        assert_eq!(dirty, vec![PathBuf::from("doc.md")]);
+        // #286: the incomplete-results note shows from the scan on, before any
+        // indexing run has started.
+        assert!(scan.rechunk_detected());
+        assert!(INDEX_STATUS.is_bulk_indexing());
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_flags_a_legacy_row_with_an_empty_chunking_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Doc").unwrap();
+        let (mtime, size) = stat(&path);
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+
+        let db = open_scan_test_db(&config).await;
+        // '' is what the column migration gives every pre-existing row.
+        db.upsert("doc.md", "some-hash", 1, &schema_hash, "", mtime, size)
             .await
             .unwrap();
         let mut fm = HashMap::new();
@@ -4546,8 +5265,122 @@ mod tests {
             .await
             .unwrap();
 
-        let dirty = scan_for_dirty(&config).await.unwrap();
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
         assert_eq!(dirty, vec![PathBuf::from("doc.md")]);
+    }
+
+    #[tokio::test]
+    async fn index_paths_generic_rechunks_unchanged_content_after_a_chunking_change() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+
+        let content = "# Unchanged\n\nSame as last run.";
+        let path = dir.path().join("unchanged.md");
+        std::fs::write(&path, content).unwrap();
+        let (real_mtime, real_size) = stat(&path);
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+        let hash = compute_hash_from_bytes(content.as_bytes());
+
+        let state = open_scan_test_db(&config).await;
+        // Same bytes, same schema, same stat — but chunked under a different config.
+        state
+            .upsert(
+                "unchanged.md",
+                &hash,
+                1,
+                &schema_hash,
+                "fingerprint-of-the-old-chunking-config",
+                real_mtime,
+                real_size,
+            )
+            .await
+            .unwrap();
+
+        let embedder = MockEmbedClient::ok(vec![vec![1.0, 2.0, 3.0]]);
+        let store = TrackingMockVectorStore::all_ok();
+        let result = index_paths_generic(
+            &config,
+            &[PathBuf::from("unchanged.md")],
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        assert_eq!(
+            store.upserted_points.lock().unwrap().len(),
+            1,
+            "a chunking fingerprint mismatch must re-chunk and re-embed unchanged content"
+        );
+        let entry = state.get("unchanged.md").await.unwrap().unwrap();
+        assert_eq!(
+            entry.chunking_fingerprint,
+            chunking_fingerprint(&config.chunking),
+            "the row must record the fingerprint it was re-chunked under, or every \
+             later reconcile would re-embed it again"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_file_skip_requires_a_matching_chunking_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "# Hello\nSome body text here.";
+        std::fs::write(&path, content).unwrap();
+        let config = config_no_validation();
+        let current_fp = chunking_fingerprint(&config.chunking);
+
+        let row = |fp: &str| {
+            Some(IndexedFile {
+                file_path: "doc.md".into(),
+                content_hash: compute_hash_from_bytes(content.as_bytes()),
+                chunk_count: 1,
+                indexed_at: String::new(),
+                schema_hash: "schema".into(),
+                chunking_fingerprint: fp.to_string(),
+                mtime: 0,
+                size: 0,
+            })
+        };
+
+        // (stored fingerprint, expect skipped)
+        for (stored, expect_skip) in [
+            (current_fp.as_str(), true),
+            ("stale-fingerprint", false),
+            // Legacy row from before the column existed.
+            ("", false),
+        ] {
+            let outcome = process_file(
+                &path,
+                "doc.md",
+                content,
+                false,
+                row(stored),
+                &config,
+                &test_schema(),
+                "schema",
+                &current_fp,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+            match outcome {
+                FileOutcome::Skipped { .. } => {
+                    assert!(expect_skip, "stored fingerprint {stored:?} must not skip")
+                }
+                FileOutcome::Ready(pf) => {
+                    assert!(!expect_skip, "stored fingerprint {stored:?} must skip");
+                    assert!(!pf.chunks.is_empty());
+                    assert_eq!(pf.chunking_fingerprint, current_fp);
+                }
+                other => panic!("unexpected outcome {}", outcome_name(&other)),
+            }
+        }
     }
 
     #[tokio::test]
@@ -4566,10 +5399,65 @@ mod tests {
         // should ever be marked dirty.
         std::fs::write(dir.path().join("broken/new.md"), "# New").unwrap();
 
-        let dirty = scan_for_dirty(&config).await.unwrap();
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
         assert!(
             dirty.is_empty(),
             "a frozen scope must never be marked dirty by the scan: {dirty:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_never_marks_rechunk_for_a_frozen_scopes_stale_fingerprint() {
+        // #286 round-6 L1: a frozen scope's file is never re-chunked until the
+        // schema is fixed, so its stale chunking fingerprint must not pin the
+        // "results may be incomplete" note on forever the way a normal stale
+        // file does. `mark_rechunk` must simply never be called for it.
+        let dir = TempDir::new().unwrap();
+        let mut config = scan_test_config(&dir);
+        std::fs::create_dir_all(dir.path().join("broken")).unwrap();
+        std::fs::write(
+            dir.path().join("broken/.kb-schema.yaml"),
+            "fields: [not, a, mapping]",
+        )
+        .unwrap();
+        let path = dir.path().join("broken/doc.md");
+        std::fs::write(&path, "# Doc").unwrap();
+        let (mtime, size) = stat(&path);
+
+        // Indexed while the scope was still valid, under the config about to
+        // change — a stale chunking fingerprint, same as an ordinary file's.
+        let db = open_scan_test_db(&config).await;
+        db.upsert(
+            "broken/doc.md",
+            "some-hash",
+            1,
+            "irrelevant-while-frozen",
+            &chunking_fingerprint(&config.chunking),
+            mtime,
+            size,
+        )
+        .await
+        .unwrap();
+
+        // Operator changes a chunking setting; the scope is (independently)
+        // now frozen too.
+        config.chunking.max_chunk_size += 500;
+
+        let scan = INDEX_STATUS.begin_reconcile_scan();
+        let dirty = scan_for_dirty(&config, &scan).await.unwrap();
+        assert!(
+            dirty.is_empty(),
+            "a frozen scope's file must not be marked dirty even with a stale \
+             chunking fingerprint: {dirty:?}"
+        );
+        assert!(
+            !scan.rechunk_detected(),
+            "a frozen scope's stale fingerprint must never raise the \
+             incomplete-results note — it can never be fixed by re-chunking \
+             until the schema is fixed, so the note must not claim indexing \
+             will catch up on its own"
         );
     }
 
@@ -4580,10 +5468,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = test_state_db(&dir).await;
         // 500 chunks tracked as live across a handful of files...
-        db.upsert("a.md", "hash-a", 250, "schema", 100, 10)
+        db.upsert("a.md", "hash-a", 250, "schema", "", 100, 10)
             .await
             .unwrap();
-        db.upsert("b.md", "hash-b", 250, "schema", 100, 10)
+        db.upsert("b.md", "hash-b", 250, "schema", "", 100, 10)
             .await
             .unwrap();
         // ...but Qdrant reports only 3 points — the collection was wiped while
@@ -4601,7 +5489,7 @@ mod tests {
     async fn detect_qdrant_wipe_ignores_a_deficit_within_slack() {
         let dir = TempDir::new().unwrap();
         let db = test_state_db(&dir).await;
-        db.upsert("a.md", "hash-a", 1000, "schema", 100, 10)
+        db.upsert("a.md", "hash-a", 1000, "schema", "", 100, 10)
             .await
             .unwrap();
         // Just inside QDRANT_WIPE_DEFICIT_SLACK (50) — an ordinary mid-write window,
@@ -4619,7 +5507,7 @@ mod tests {
     async fn detect_qdrant_wipe_ignores_a_surplus() {
         let dir = TempDir::new().unwrap();
         let db = test_state_db(&dir).await;
-        db.upsert("a.md", "hash-a", 10, "schema", 100, 10)
+        db.upsert("a.md", "hash-a", 10, "schema", "", 100, 10)
             .await
             .unwrap();
         // Qdrant has MORE points than state.db expects — a legitimate, one-sided-safe
@@ -4658,7 +5546,7 @@ mod tests {
     async fn detect_qdrant_wipe_is_suppressed_while_a_run_is_in_flight() {
         let dir = TempDir::new().unwrap();
         let db = test_state_db(&dir).await;
-        db.upsert("a.md", "hash-a", 500, "schema", 100, 10)
+        db.upsert("a.md", "hash-a", 500, "schema", "", 100, 10)
             .await
             .unwrap();
         // The collection was just dropped and not yet rebuilt — exactly the
@@ -5188,7 +6076,7 @@ mod tests {
         )
         .unwrap();
 
-        db.upsert("recipe.md", "stale-hash", 3, "", 0, 0)
+        db.upsert("recipe.md", "stale-hash", 3, "", "", 0, 0)
             .await
             .unwrap();
         assert_eq!(db.document_count().await.unwrap(), 0);
@@ -5242,7 +6130,7 @@ mod tests {
         )
         .unwrap();
 
-        db.upsert("recipes/chili.md", "stale-hash", 1, "", 0, 0)
+        db.upsert("recipes/chili.md", "stale-hash", 1, "", "", 0, 0)
             .await
             .unwrap();
         assert!(
@@ -5398,6 +6286,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: String::new(),
             schema_hash: String::new(),
+            chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
         });
@@ -5412,11 +6301,74 @@ mod tests {
             &config,
             &test_schema(),
             "",
+            "",
             &HashMap::new(),
         )
         .await
         .unwrap();
         assert!(matches!(outcome, FileOutcome::Skipped { .. }));
+    }
+
+    /// #286: a panic in one file's chunking step is confined to that file — the
+    /// helper reports it as `None` rather than unwinding out of the indexing loop.
+    #[test]
+    fn chunk_isolated_contains_a_panicking_chunk_step() {
+        assert!(chunk_isolated("bad.md", || panic!("simulated chunking bug")).is_none());
+        let formatted = chunk_isolated("bad.md", || panic!("with {}", "formatting"));
+        assert!(formatted.is_none());
+        let ok = chunk_isolated("good.md", Vec::new);
+        assert!(ok.is_some_and(|chunks| chunks.is_empty()));
+    }
+
+    /// #286: with lone-CR (classic Mac) line endings pulldown-cmark can see two
+    /// headings on one '\n'-line. Through the real `process_file` path, both
+    /// shapes index with valid, file-relative ranges and no panic.
+    #[tokio::test]
+    async fn process_file_indexes_lone_cr_documents_without_panicking() {
+        let dir = TempDir::new().unwrap();
+        let config = config_no_validation();
+        for content in [
+            "# A\r# B\nbody",
+            "# Title\rintro\r\r## Part\rtext\r",
+            "---\ntitle: T\n---\n# A\r# B\nbody\n",
+        ] {
+            let path = dir.path().join("doc.md");
+            std::fs::write(&path, content).unwrap();
+            let outcome = process_file(
+                &path,
+                "doc.md",
+                content,
+                false,
+                None,
+                &config,
+                &test_schema(),
+                "",
+                "",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+            let FileOutcome::Ready(pf) = outcome else {
+                panic!(
+                    "expected Ready for {content:?}, got {}",
+                    outcome_name(&outcome)
+                );
+            };
+            let file_lines = content.split('\n').count();
+            for c in &pf.chunks {
+                assert!(
+                    c.section_line_start <= c.line_start
+                        && c.line_start <= c.line_end
+                        && c.line_end <= c.section_line_end
+                        && c.section_line_end <= file_lines,
+                    "invalid ranges for {content:?}: chunk {}-{}, section {}-{}",
+                    c.line_start,
+                    c.line_end,
+                    c.section_line_start,
+                    c.section_line_end
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -5432,6 +6384,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: String::new(),
             schema_hash: String::new(),
+            chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
         });
@@ -5445,6 +6398,7 @@ mod tests {
             state_entry,
             &config,
             &test_schema(),
+            "",
             "",
             &HashMap::new(),
         )
@@ -5474,6 +6428,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: String::new(),
             schema_hash: String::new(),
+            chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
         });
@@ -5487,6 +6442,7 @@ mod tests {
             state_entry,
             &config,
             &test_schema(),
+            "",
             "",
             &HashMap::new(),
         )
@@ -5514,6 +6470,7 @@ mod tests {
             None,
             &config,
             &test_schema(),
+            "",
             "",
             &HashMap::new(),
         )
@@ -5547,6 +6504,7 @@ mod tests {
             None,
             &config,
             &test_schema(),
+            "",
             "",
             &git_mtimes,
         )
@@ -5593,6 +6551,7 @@ mod tests {
             &config,
             &test_schema(),
             "",
+            "",
             &HashMap::new(),
         )
         .await
@@ -5624,6 +6583,7 @@ mod tests {
             None,
             &config,
             &test_schema(),
+            "",
             "",
             &HashMap::new(),
         )
@@ -5657,6 +6617,7 @@ mod tests {
             None,
             &config,
             &test_schema(),
+            "",
             "",
             &HashMap::new(),
         )
@@ -5695,6 +6656,7 @@ mod tests {
             None,
             &config,
             &ResolvedSchema::from_config(&config.frontmatter),
+            "",
             "",
             &HashMap::new(),
         )
@@ -5739,6 +6701,7 @@ mod tests {
             None,
             &config,
             &ResolvedSchema::from_config(&config.frontmatter),
+            "",
             "",
             &HashMap::new(),
         )
@@ -5785,6 +6748,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: "now".into(),
             schema_hash: "abc".into(),
+            chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
         });
@@ -5798,6 +6762,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             "abc",
+            "",
             &HashMap::new(),
         )
         .await
@@ -5821,6 +6786,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: "now".into(),
             schema_hash: "old-fingerprint".into(),
+            chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
         });
@@ -5834,6 +6800,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             "new-fingerprint",
+            "",
             &HashMap::new(),
         )
         .await
@@ -5863,6 +6830,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: "now".into(),
             schema_hash: String::new(),
+            chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
         });
@@ -5876,6 +6844,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             &test_schema().fingerprint(),
+            "",
             &HashMap::new(),
         )
         .await
@@ -5904,6 +6873,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: "now".into(),
             schema_hash: String::new(),
+            chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
         });
@@ -5917,6 +6887,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             &test_schema().fingerprint(),
+            "",
             &HashMap::new(),
         )
         .await
@@ -5941,6 +6912,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             "fingerprint-xyz",
+            "",
             &HashMap::new(),
         )
         .await
@@ -6117,7 +7089,7 @@ mod tests {
             _collection: &str,
             _vector_size: u64,
             _indexed_fields: &[crate::qdrant::IndexedField],
-            _enable_phrase: bool,
+            _features: crate::qdrant::IndexFeatures,
         ) -> Result<()> {
             Ok(())
         }
@@ -6195,7 +7167,7 @@ mod tests {
             _collection: &str,
             _vector_size: u64,
             _indexed_fields: &[crate::qdrant::IndexedField],
-            _enable_phrase: bool,
+            _features: crate::qdrant::IndexFeatures,
         ) -> Result<()> {
             *self.ensure_collection_calls.lock().unwrap() += 1;
             Ok(())
@@ -6240,7 +7212,7 @@ mod tests {
             _collection: &str,
             _vector_size: u64,
             _indexed_fields: &[crate::qdrant::IndexedField],
-            _enable_phrase: bool,
+            _features: crate::qdrant::IndexFeatures,
         ) -> Result<()> {
             unreachable!("FixedPointCountStore is only for collection_point_count")
         }
@@ -6297,7 +7269,7 @@ mod tests {
             _collection: &str,
             _vector_size: u64,
             _indexed_fields: &[crate::qdrant::IndexedField],
-            _enable_phrase: bool,
+            _features: crate::qdrant::IndexFeatures,
         ) -> Result<()> {
             Ok(())
         }
@@ -6408,7 +7380,7 @@ mod tests {
             _collection: &str,
             _vector_size: u64,
             _indexed_fields: &[crate::qdrant::IndexedField],
-            _enable_phrase: bool,
+            _features: crate::qdrant::IndexFeatures,
         ) -> Result<()> {
             Ok(())
         }
@@ -6619,10 +7591,15 @@ mod tests {
                 index: i,
                 line_start: i * 10 + 1,
                 line_end: (i + 1) * 10,
+                heading_path: Vec::new(),
+                heading_level: 0,
+                section_line_start: 1,
+                section_line_end: chunk_count * 10,
             })
             .collect();
         PendingFile {
             schema_hash: String::new(),
+            chunking_fingerprint: String::new(),
             file_path: file_path.to_string(),
             frontmatter: HashMap::new(),
             chunks,
@@ -6645,7 +7622,7 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0, 2.0, 3.0]]);
         let store = MockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -6667,7 +7644,7 @@ mod tests {
 
         // Seed state DB with an entry
         state
-            .upsert("data/orphan.md", "hash1", 3, "", 0, 0)
+            .upsert("data/orphan.md", "hash1", 3, "", "", 0, 0)
             .await
             .unwrap();
 
@@ -6697,7 +7674,7 @@ mod tests {
         fm.insert("title".into(), serde_json::json!("Orphan"));
         fm.insert("tags".into(), serde_json::json!(["note", "stale"]));
 
-        state.upsert("gone.md", "h", 1, "", 0, 0).await.unwrap();
+        state.upsert("gone.md", "h", 1, "", "", 0, 0).await.unwrap();
         state
             .upsert_document_metadata("gone.md", &fm, 1, "h", 1)
             .await
@@ -6735,7 +7712,7 @@ mod tests {
 
         // Seed state with a previously-indexed file
         state
-            .upsert("data/test.md", "old-hash", 2, "", 0, 0)
+            .upsert("data/test.md", "old-hash", 2, "", "", 0, 0)
             .await
             .unwrap();
 
@@ -6743,7 +7720,7 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = MockVectorStore::with_upsert_err("upsert failed");
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
 
         assert!(result.is_err());
         // State DB entry should be PRESERVED — old hash still differs, so file will be retried
@@ -6763,7 +7740,7 @@ mod tests {
         let embedder = MockEmbedClient::err("embedding service unavailable");
         let store = MockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
 
         assert!(result.is_err());
         assert!(
@@ -6781,7 +7758,7 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = MockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
 
         assert!(result.is_ok());
         assert!(
@@ -6833,7 +7810,7 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = MockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
         assert!(result.is_ok(), "run failed: {:?}", result.err());
 
         let points = store.upserted_points.lock().unwrap();
@@ -6866,6 +7843,295 @@ mod tests {
         }
     }
 
+    /// #286: `heading_path`/`heading_level`/`heading_prefixes`/
+    /// `section_key`/`section_line_start`/`section_line_end` are written to the
+    /// Qdrant payload only when `chunking.heading_metadata` is on — and, when
+    /// on, the section fields are the chunk's attributed section, file-relative,
+    /// matching `retrieval::outline`'s entry for it.
+    #[tokio::test]
+    async fn upsert_pending_writes_heading_metadata_payload_only_when_the_flag_is_on() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        // target_chunk_size: Some(1) forces "# Root" and "## Section" into
+        // separate chunks regardless of size, same technique `chunk.rs`'s own
+        // nesting tests use — needed here so each chunk gets a DIFFERENT
+        // heading_path to assert on. Frontmatter plus a trailing newline, the
+        // shape of a real file, so the section lines must be shifted by 3.
+        let content = "---\ntitle: T\n---\n# Root\n\n## Section\n\nSection body text.\n";
+        let (_, body) = validate::parse_frontmatter_raw(content);
+        let chunking = crate::config::ChunkingConfig {
+            max_chunk_size: 1500,
+            target_chunk_size: Some(1),
+            prepend_description: false,
+            prepend_heading_path: false,
+            heading_metadata: true,
+        };
+        let mut chunks = chunk::chunk_markdown(&body, None, &chunking);
+        shift_chunks_to_file_lines(&mut chunks, content);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "Root and Section must land in separate chunks"
+        );
+        let outline = crate::retrieval::outline(content);
+        for (chunk, entry) in chunks.iter().zip(&outline) {
+            assert_eq!(
+                (chunk.section_line_start, chunk.section_line_end),
+                (entry.line_start, entry.line_end)
+            );
+        }
+
+        let pf = PendingFile {
+            file_path: "data/test.md".to_string(),
+            frontmatter: HashMap::new(),
+            chunks,
+            body,
+            hash: "abc123".to_string(),
+            old_chunk_count: 0,
+            mtime: 1,
+            size: content.len() as i64,
+            display_mtime: 1,
+            schema_hash: String::new(),
+            chunking_fingerprint: String::new(),
+        };
+        let pending = vec![pf];
+        let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
+
+        // Flag off: none of the new keys reach the payload at all.
+        let store_off = MockVectorStore::all_ok();
+        upsert_pending(&pending, &embedder, &store_off, &state, "test-col", false)
+            .await
+            .unwrap();
+        {
+            let points = store_off.upserted_points.lock().unwrap();
+            assert_eq!(points.len(), 2);
+            for point in points.iter() {
+                assert!(!point.payload.contains_key(crate::qdrant::HEADING_PATH_KEY));
+                assert!(!point.payload.contains_key(crate::qdrant::SECTION_KEY));
+            }
+        }
+
+        // Flag on: every new key is present, and section_key carries the
+        // section's file-relative line range.
+        let store_on = MockVectorStore::all_ok();
+        upsert_pending(&pending, &embedder, &store_on, &state, "test-col", true)
+            .await
+            .unwrap();
+        let points = store_on.upserted_points.lock().unwrap();
+        assert_eq!(points.len(), 2);
+
+        let get_str_array = |p: &crate::qdrant::QdrantPoint, key: &str| -> Vec<String> {
+            p.payload
+                .get(key)
+                .unwrap_or_else(|| panic!("point payload must contain '{key}'"))
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        let get_str = |p: &crate::qdrant::QdrantPoint, key: &str| -> String {
+            p.payload
+                .get(key)
+                .unwrap_or_else(|| panic!("point payload must contain '{key}'"))
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let get_u64 = |p: &crate::qdrant::QdrantPoint, key: &str| -> u64 {
+            p.payload
+                .get(key)
+                .unwrap_or_else(|| panic!("point payload must contain '{key}'"))
+                .as_u64()
+                .unwrap()
+        };
+
+        // Chunk 0: "# Root" — heading_path ["Root"], level 1, attributed to the
+        // whole body (the Root section's subtree covers everything nested
+        // under it).
+        assert_eq!(
+            get_str_array(&points[0], crate::qdrant::HEADING_PATH_KEY),
+            vec!["Root".to_string()]
+        );
+        assert_eq!(get_u64(&points[0], crate::qdrant::HEADING_LEVEL_KEY), 1);
+        assert_eq!(
+            get_str_array(&points[0], crate::qdrant::HEADING_PREFIXES_KEY),
+            vec!["root".to_string()]
+        );
+        assert_eq!(
+            get_u64(&points[0], crate::qdrant::SECTION_LINE_START_KEY),
+            4
+        );
+        assert_eq!(get_u64(&points[0], crate::qdrant::SECTION_LINE_END_KEY), 8);
+        assert_eq!(
+            get_str(&points[0], crate::qdrant::SECTION_KEY),
+            "data/test.md#4-8:Root"
+        );
+
+        // Chunk 1: "## Section" — heading_path ["Root", "Section"], level 2.
+        assert_eq!(
+            get_str_array(&points[1], crate::qdrant::HEADING_PATH_KEY),
+            vec!["Root".to_string(), "Section".to_string()]
+        );
+        assert_eq!(get_u64(&points[1], crate::qdrant::HEADING_LEVEL_KEY), 2);
+        assert_eq!(
+            get_str_array(&points[1], crate::qdrant::HEADING_PREFIXES_KEY),
+            vec![
+                "root".to_string(),
+                "root\u{1f}section".to_string(),
+                "section".to_string()
+            ]
+        );
+        assert_eq!(
+            get_u64(&points[1], crate::qdrant::SECTION_LINE_START_KEY),
+            6
+        );
+        assert_eq!(get_u64(&points[1], crate::qdrant::SECTION_LINE_END_KEY), 8);
+        assert_eq!(
+            get_str(&points[1], crate::qdrant::SECTION_KEY),
+            "data/test.md#6-8:Root\u{1f}Section"
+        );
+    }
+
+    #[test]
+    fn derive_heading_prefixes_matches_a_contiguous_run_at_any_depth() {
+        // #286: a chapter H1 above the section must not force callers to name
+        // it — `["Conditions"]` matches under `Chapter 10: Game Mastering > Conditions >
+        // Blinded`.
+        let path = vec![
+            "Chapter 10: Game Mastering".to_string(),
+            "Conditions".to_string(),
+            "Blinded".to_string(),
+        ];
+        let keys = derive_heading_prefixes(&path);
+        assert_eq!(keys.len(), 6);
+        let key = |segments: &[&str]| crate::heading::heading_prefix_key(segments);
+        for run in [
+            &["Conditions"][..],
+            &["Blinded"],
+            &["Chapter 10: Game Mastering"],
+            &["Chapter 10: Game Mastering", "Conditions"],
+            &["Conditions", "Blinded"],
+            &["chapter 10: game mastering", "CONDITIONS", "blinded"],
+        ] {
+            assert!(
+                keys.contains(&key(run)),
+                "{run:?} must match; keys={keys:?}"
+            );
+        }
+        // Not contiguous, or out of order: no match.
+        for run in [
+            &["Chapter 10: Game Mastering", "Blinded"][..],
+            &["Blinded", "Conditions"],
+        ] {
+            assert!(!keys.contains(&key(run)), "{run:?} must not match");
+        }
+
+        // Depth 6 yields at most 21 keys; a repeated name is stored once.
+        let deep: Vec<String> = (1..=6).map(|i| format!("H{i}")).collect();
+        assert_eq!(derive_heading_prefixes(&deep).len(), 21);
+        let repeated = vec!["A".to_string(), "A".to_string()];
+        assert_eq!(
+            derive_heading_prefixes(&repeated),
+            vec!["a".to_string(), "a\u{1f}a".to_string()]
+        );
+    }
+
+    /// #286: heading text is capped, so a 2 KB paragraph turned into a setext
+    /// heading does not copy itself into the heading payload of every chunk
+    /// under it. Same shape as the measured case: `# Chapter`, the paragraph,
+    /// `---`, then 100 `### Sub i` sections with ~800-byte bodies.
+    #[test]
+    fn long_setext_heading_keeps_the_heading_payload_bounded() {
+        let paragraph = "This paragraph was meant as body text ".repeat(55);
+        assert!(paragraph.len() > 2000);
+        let mut body = format!("# Chapter\n\n{paragraph}\n---\n\n");
+        for i in 0..100 {
+            body.push_str(&format!("### Sub {i}\n\n{}\n\n", "lorem ipsum ".repeat(66)));
+        }
+        let chunking = crate::config::ChunkingConfig {
+            max_chunk_size: 1500,
+            target_chunk_size: Some(1000),
+            prepend_description: false,
+            prepend_heading_path: true,
+            heading_metadata: true,
+        };
+        let chunks = chunk::chunk_markdown(&body, None, &chunking);
+        assert!(chunks.len() >= 100);
+        let mut total = 0usize;
+        for c in &chunks {
+            for segment in &c.heading_path {
+                assert!(segment.chars().count() <= crate::heading::MAX_HEADING_TEXT_CHARS);
+            }
+            let heading_bytes = c.heading_path.iter().map(String::len).sum::<usize>()
+                + derive_heading_prefixes(&c.heading_path)
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>()
+                + section_key("data/test.md", c).len();
+            // Depth 3 here: path ≤ ~420 B, 6 keys ≤ ~1.3 KB, section key ≤ ~450 B.
+            assert!(
+                heading_bytes <= 2500,
+                "chunk {} carries {heading_bytes} B of heading payload",
+                c.index
+            );
+            total += heading_bytes;
+        }
+        // Uncapped, the paragraph alone put ~200 KB into `heading_path`.
+        assert!(total <= 250_000, "total heading payload {total} B");
+    }
+
+    #[test]
+    fn derive_heading_prefixes_normalizes_like_the_search_side() {
+        let path = vec!["Spells".to_string(), "Fire  Ball ".to_string()];
+        let prefixes = derive_heading_prefixes(&path);
+        assert_eq!(
+            prefixes,
+            vec!["spells", "spells\u{1f}fire ball", "fire ball"]
+        );
+        // Byte-identical to what `search`'s heading_prefix lowers to for any
+        // spelling of the same headings — the two sides must never diverge.
+        assert_eq!(
+            prefixes[1],
+            crate::heading::heading_prefix_key(&["SPELLS", " fire ball"])
+        );
+        assert!(derive_heading_prefixes(&[]).is_empty());
+    }
+
+    /// #286: a single heading whose text contains `" > "` must not produce the
+    /// same `heading_prefixes` key or `section_key` path as the two-level path it
+    /// spells out, and a control character in a caller's segment cannot forge the
+    /// separator.
+    #[test]
+    fn heading_keys_do_not_collide_on_separator_like_heading_text() {
+        let single = vec!["Input > Output".to_string()];
+        let nested = vec!["Input".to_string(), "Output".to_string()];
+        assert_ne!(
+            derive_heading_prefixes(&single).last(),
+            derive_heading_prefixes(&nested).last()
+        );
+        assert_ne!(
+            crate::heading::heading_prefix_key(&["input\u{1f}output"]),
+            crate::heading::heading_prefix_key(&["input", "output"])
+        );
+
+        let chunk_with = |heading_path: Vec<String>| chunk::Chunk {
+            text: String::new(),
+            index: 0,
+            line_start: 1,
+            line_end: 2,
+            heading_path,
+            heading_level: 1,
+            section_line_start: 1,
+            section_line_end: 2,
+        };
+        assert_ne!(
+            section_key("a.md", &chunk_with(single)),
+            section_key("a.md", &chunk_with(nested))
+        );
+    }
+
     /// #164: `upsert_pending` must route `mtime` and `display_mtime` to DIFFERENT
     /// destinations — `indexed_files.mtime` (the fs-stat pre-filter baseline) gets
     /// `mtime`; the Qdrant payload and `documents.mtime` (both user/search-facing)
@@ -6885,7 +8151,7 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]]);
         let store = MockVectorStore::all_ok();
 
-        upsert_pending(&pending, &embedder, &store, &state, "test-col")
+        upsert_pending(&pending, &embedder, &store, &state, "test-col", false)
             .await
             .unwrap();
 
@@ -6927,7 +8193,7 @@ mod tests {
         let state = test_state_db(&dir).await;
 
         state
-            .upsert("data/test.md", "old-hash", 2, "", 0, 0)
+            .upsert("data/test.md", "old-hash", 2, "", "", 0, 0)
             .await
             .unwrap();
 
@@ -6935,7 +8201,7 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = TrackingMockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
         assert!(result.is_ok());
         assert!(
             store.delete_by_files_calls.lock().unwrap().is_empty(),
@@ -6953,7 +8219,7 @@ mod tests {
         let state = test_state_db(&dir).await;
 
         state
-            .upsert("data/shrink.md", "old-hash", 3, "", 0, 0)
+            .upsert("data/shrink.md", "old-hash", 3, "", "", 0, 0)
             .await
             .unwrap();
 
@@ -6965,7 +8231,7 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]]);
         let store = TrackingMockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
         assert!(result.is_ok());
 
         let deleted_ids = store.deleted_ids.lock().unwrap().clone();
@@ -6992,7 +8258,7 @@ mod tests {
         let state = test_state_db(&dir).await;
 
         state
-            .upsert("data/grow.md", "old-hash", 1, "", 0, 0)
+            .upsert("data/grow.md", "old-hash", 1, "", "", 0, 0)
             .await
             .unwrap();
 
@@ -7003,7 +8269,7 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = TrackingMockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
         assert!(result.is_ok());
 
         let deleted_ids = store.deleted_ids.lock().unwrap().clone();
@@ -7025,7 +8291,7 @@ mod tests {
         let state = test_state_db(&dir).await;
 
         state
-            .upsert("data/shrink251.md", "old-hash", 5, "", 0, 0)
+            .upsert("data/shrink251.md", "old-hash", 5, "", "", 0, 0)
             .await
             .unwrap();
 
@@ -7037,7 +8303,7 @@ mod tests {
             chunk_sum_at_trim: Mutex::new(None),
         };
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
         assert!(result.is_ok());
 
         let observed = store
@@ -7084,7 +8350,7 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]; 4]);
         let store = TrackingMockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
         assert!(result.is_ok());
 
         let points = store.upserted_points.lock().unwrap();

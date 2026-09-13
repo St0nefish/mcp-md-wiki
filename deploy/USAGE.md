@@ -54,13 +54,13 @@ Documents are split into chunks before embedding. The chunker is **section-aware
 
 ### The Algorithm
 
-1. **Split at headings** — The document body is divided into sections at each line starting with `#`. Each section includes its heading plus all content until the next heading.
+1. **Split at headings** — The document body is divided into sections at each heading, detected the way CommonMark parses markdown (via pulldown-cmark): ATX headings (`## Title`) and setext headings (`Title` on a line above `===` or `---` — so a paragraph directly above a `---` rule becomes a heading) count; `#` lines inside fenced or indented code, HTML blocks, blockquotes or list items do not, and neither do `#tag` lines or runs of 7+ `#`. Each section includes its heading plus all content until the next heading. Heading text (used in breadcrumbs and heading metadata) is the rendered plain text with invisible characters such as soft hyphens removed, capped at 200 characters (zero-width joiners, direction marks and variation selectors, which are kept in the stored text, don't count toward the cap).
 
-2. **Accumulate sections** — Sections are greedily combined into chunks. The chunker adds sections to the current chunk as long as the total stays under `target_chunk_size` (default: 1000 characters).
+2. **Accumulate sections** — Sections are greedily combined into chunks. The chunker adds sections to the current chunk as long as the total stays under `target_chunk_size` (default: 1000 characters). With `chunking.heading_metadata` on, this step is skipped: sections are never combined, so every chunk lies within a single heading's own section (a heading with no text before its first sub-heading becomes a small chunk of its own), and `target_chunk_size` has no effect.
 
 3. **Flush on overflow** — When adding the next section would exceed `target_chunk_size`, the current chunk is finalized and a new one starts.
 
-4. **Force-split oversized sections** — If a single section exceeds `max_chunk_size` (default: 1500 characters), it is split further by a secondary markdown-aware text splitter. Small fragments (under 200 characters, e.g. a lone heading) are merged into adjacent chunks to avoid orphaned headings.
+4. **Force-split oversized sections** — If a single section exceeds `max_chunk_size` (default: 1500 characters), it is split further by a secondary markdown-aware text splitter. Small fragments (under 200 characters, e.g. a lone heading) are merged into adjacent chunks to avoid orphaned headings (with `chunking.heading_metadata` on, only into chunks of the same section).
 
 5. **Prepend description** — If `chunking.prepend_description` is enabled (default: `true`) and the document has a `description` frontmatter field, that description is prepended to every chunk. This gives the embedding model context about what the chunk relates to.
 
@@ -603,10 +603,12 @@ curl -X POST -H "Authorization: Bearer $MCP_BEARER_TOKEN" \
 
 The response reports exactly what happened: settings that took effect immediately,
 settings that need a restart (rate limiting, embedding batch tuning, and anything
-tied to authentication — these are baked into services built once at startup), and
-settings that need `mcp-md-wiki index --full` to be meaningful (`chunking.*` — a new
-chunk size only applies to documents indexed after the change, so the corpus is
-inconsistent until a full reindex rewrites it). A malformed or invalid file is
+tied to authentication — these are baked into services built once at startup),
+settings whose reindex is scheduled automatically (`chunking.*` — every indexed file
+records the chunking config it was built under, so the reconcile the reload queues
+re-chunks and re-embeds affected documents; search serves a mix of old and new chunks
+until it finishes), and settings that need `mcp-md-wiki index --full` to be meaningful
+(`ui.semantic_edges.*`). A malformed or invalid file is
 rejected with the parse/validation error and the running server is left completely
 untouched — same as a failed restart would leave it. See [README.md](../README.md#observability)
 for the full endpoint reference.
