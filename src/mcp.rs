@@ -25,7 +25,7 @@ use crate::{
     },
     schema::SchemaCache,
     state::{DocumentIndex, DocumentQuery, FieldFilter, OrderBy, StateDb},
-    validate,
+    tool_schema, validate,
     write::{
         self, DirectoryMoveError, DirectoryMoveSuccess, FrontmatterEdit, WriteDeps, WriteError,
         WriteOutcome as CoreWriteOutcome, WriteRequest, WriteSuccess,
@@ -5879,7 +5879,9 @@ impl ServerHandler for KbSearchServer {
     // that needs to change at runtime — per `descriptions.rs`'s whole point —
     // cannot be baked into that attribute. These two methods apply this
     // server's live `description_overlay`, then the live per-instance schema
-    // restrictions (`overlay_input_schema`, #286), on top of the
+    // restrictions (`overlay_input_schema`, #286), then the stateless
+    // `tool_schema::self_contained` rewrite that strips `$ref`/`$defs` and
+    // boolean subschemas for llama.cpp-backed clients (#288), on top of the
     // router's own `Tool` entries; `call_tool` is left for the macro to
     // generate unchanged, since dispatch itself does not depend on either.
     async fn list_tools(
@@ -5892,6 +5894,7 @@ impl ServerHandler for KbSearchServer {
             .into_iter()
             .map(|tool| self.overlay_description(tool))
             .map(|tool| self.overlay_input_schema(tool))
+            .map(tool_schema::self_contained)
             .collect();
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -5902,6 +5905,7 @@ impl ServerHandler for KbSearchServer {
             .cloned()
             .map(|tool| self.overlay_description(tool))
             .map(|tool| self.overlay_input_schema(tool))
+            .map(tool_schema::self_contained)
     }
 }
 
@@ -9689,13 +9693,239 @@ mod tests {
         }
     }
 
+    // --- tool_schema::self_contained: llama.cpp-backed clients (#288) ------
+
+    /// Recursively asserts that `schema` (any JSON Schema position — the root,
+    /// or something reached by walking into it) is free of `$ref`, `$defs`/
+    /// `definitions`, and a boolean value standing in for a subschema.
+    /// Reimplements the walk independently of `tool_schema`'s own keyword
+    /// list rather than calling it, so this is a real check on the shape
+    /// `list_tools`/`get_tool` actually produce, not a tautology against the
+    /// code under test.
+    fn assert_schema_is_self_contained(schema: &serde_json::Value, tool_name: &str) {
+        match schema {
+            serde_json::Value::Bool(_) => {
+                panic!(
+                    "tool '{tool_name}' has a bare boolean subschema after \
+                     tool_schema::self_contained: {schema}"
+                );
+            }
+            serde_json::Value::Object(obj) => {
+                for key in ["$ref", "$defs", "definitions"] {
+                    assert!(
+                        !obj.contains_key(key),
+                        "tool '{tool_name}' still has '{key}' after \
+                         tool_schema::self_contained: {schema}"
+                    );
+                }
+                for key in [
+                    "items",
+                    "unevaluatedItems",
+                    "not",
+                    "if",
+                    "then",
+                    "else",
+                    "contains",
+                    "propertyNames",
+                ] {
+                    if let Some(v) = obj.get(key) {
+                        assert_schema_is_self_contained(v, tool_name);
+                    }
+                }
+                for key in ["properties", "patternProperties", "dependentSchemas"] {
+                    if let Some(serde_json::Value::Object(map)) = obj.get(key) {
+                        for v in map.values() {
+                            assert_schema_is_self_contained(v, tool_name);
+                        }
+                    }
+                }
+                for key in ["prefixItems", "anyOf", "oneOf", "allOf"] {
+                    if let Some(serde_json::Value::Array(items)) = obj.get(key) {
+                        for v in items {
+                            assert_schema_is_self_contained(v, tool_name);
+                        }
+                    }
+                }
+                // Left untouched deliberately when boolean (the conventional
+                // `deny_unknown_fields` form) — only recurse when it is
+                // itself a nested schema object.
+                for key in ["additionalProperties", "unevaluatedProperties"] {
+                    if let Some(v @ serde_json::Value::Object(_)) = obj.get(key) {
+                        assert_schema_is_self_contained(v, tool_name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Keyword-agnostic companion to `assert_schema_is_self_contained`: finds
+    /// `key` as an object key at any depth, schema position or not, so a ref
+    /// under a keyword neither walker lists still fails the test. Safe because
+    /// no tool schema carries a data value (`default`/`examples`) with such a key.
+    fn has_key_anywhere(value: &serde_json::Value, key: &str) -> bool {
+        match value {
+            serde_json::Value::Object(obj) => {
+                obj.contains_key(key) || obj.values().any(|v| has_key_anywhere(v, key))
+            }
+            serde_json::Value::Array(items) => items.iter().any(|v| has_key_anywhere(v, key)),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn list_tools_schemas_are_self_contained_for_llama_cpp_backed_clients() {
+        // #288: llama-server turns every tool's `inputSchema` into a GBNF
+        // grammar at `tools/list` time and fails the WHOLE request with HTTP
+        // 400 if any one tool's schema doesn't convert ($ref/$defs, or a
+        // boolean subschema) — this broke Crush and OpenCode against
+        // `search`, `write_document` and `update_schema`. Walks every tool
+        // the real `list_tools` chain produces (`overlay_description` then
+        // `overlay_input_schema` then `tool_schema::self_contained`), with
+        // `chunking.heading_metadata` both on and off, so a new tool or a
+        // newly-recursive parameter type can't regress this silently.
+        for heading_metadata in [false, true] {
+            let config = overlay_test_config(
+                &[
+                    Granularity::Chunk,
+                    Granularity::Document,
+                    Granularity::Section,
+                ],
+                heading_metadata,
+            );
+            let server = make_overlay_test_server_with_config(HashMap::new(), config);
+
+            // Through the production `get_tool`, not a hand-rebuilt chain, so
+            // dropping the `self_contained` step there fails this test;
+            // `get_tool_input_schema_matches_the_list_tools_overlay_path`
+            // pins `list_tools` to the same chain.
+            let tools: Vec<Tool> = KbSearchServer::tool_router()
+                .list_all()
+                .into_iter()
+                .map(|tool| {
+                    server
+                        .get_tool(tool.name.as_ref())
+                        .expect("every router tool resolves through get_tool")
+                })
+                .collect();
+
+            assert_eq!(tools.len(), crate::descriptions::TOOL_NAMES.len());
+            for tool in &tools {
+                let schema = serde_json::Value::Object((*tool.input_schema).clone());
+                assert_schema_is_self_contained(&schema, tool.name.as_ref());
+                for key in ["$ref", "$defs", "definitions"] {
+                    assert!(
+                        !has_key_anywhere(&schema, key),
+                        "tool '{}' has '{key}' somewhere in its schema: {schema}",
+                        tool.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn self_contained_write_document_frontmatter_patch_keeps_its_shape() {
+        // Shape-preservation regression for #288's cycle-cut/boolean-replacement:
+        // `write_document`'s `frontmatter_patch` items must still document
+        // `operation`/`field`/`value`/`values`, and `values`'s element schema
+        // must degrade from the bare `true` schemars emits for
+        // `Vec<serde_json::Value>` to the equivalent `{}` rather than
+        // disappearing.
+        let config = overlay_test_config(&[Granularity::Chunk], false);
+        let server = make_overlay_test_server_with_config(HashMap::new(), config);
+        let tool = server
+            .get_tool("write_document")
+            .expect("write_document tool should be registered");
+
+        let op_schema = &tool.input_schema["properties"]["frontmatter_patch"]["items"];
+        let op_properties = &op_schema["properties"];
+        for key in ["operation", "field", "value", "values"] {
+            assert!(
+                !op_properties[key].is_null(),
+                "frontmatter_patch op is missing '{key}': {op_schema}"
+            );
+        }
+        assert_eq!(
+            op_properties["values"]["items"],
+            serde_json::json!({}),
+            "a bare `true` items schema must become `{{}}`, not disappear: {op_schema}"
+        );
+    }
+
+    #[test]
+    fn self_contained_update_schema_definition_keeps_its_named_properties() {
+        // Shape-preservation regression: `update_schema`'s `definition` must
+        // still advertise every `RawFieldDef` property (including the
+        // recursive `fields` map) at the top level, with
+        // `additionalProperties: false` preserved, even though the def is no
+        // longer reached through `$ref`.
+        let config = overlay_test_config(&[Granularity::Chunk], false);
+        let server = make_overlay_test_server_with_config(HashMap::new(), config);
+        let tool = server
+            .get_tool("update_schema")
+            .expect("update_schema tool should be registered");
+
+        let definition_schema = &tool.input_schema["properties"]["definition"];
+        let object_branch = definition_schema["anyOf"]
+            .as_array()
+            .expect("definition must offer a typed alternative, not a bare {}")
+            .iter()
+            .find(|branch| branch["type"] != serde_json::json!("null"))
+            .expect("definition must have a non-null branch");
+
+        assert_eq!(object_branch["type"], serde_json::json!("object"));
+        assert_eq!(
+            object_branch["additionalProperties"],
+            serde_json::json!(false)
+        );
+        for key in [
+            "type", "required", "indexed", "values", "extend", "default", "open", "fields",
+        ] {
+            assert!(
+                !object_branch["properties"][key].is_null(),
+                "definition schema is missing documented key '{key}': {object_branch}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_contained_search_filters_keeps_its_typed_properties() {
+        // Shape-preservation regression: `search`'s `filters` must still
+        // advertise as a typed object with a real (non-`true`)
+        // `additionalProperties` condition schema once `SearchFilters` is
+        // inlined instead of `$ref`ed.
+        let config = overlay_test_config(&[Granularity::Chunk], false);
+        let server = make_overlay_test_server_with_config(HashMap::new(), config);
+        let tool = server
+            .get_tool("search")
+            .expect("search tool should be registered");
+
+        let filters_schema = &tool.input_schema["properties"]["filters"];
+        let object_branch = filters_schema["anyOf"]
+            .as_array()
+            .expect("filters must offer a typed alternative, not a bare {}")
+            .iter()
+            .find(|branch| branch["type"] != serde_json::json!("null"))
+            .expect("filters must have a non-null branch");
+
+        assert_eq!(object_branch["type"], serde_json::json!("object"));
+        assert_ne!(
+            object_branch["additionalProperties"],
+            serde_json::json!(true),
+            "a bare `additionalProperties: true` tells a client nothing about a \
+             condition's shape: {object_branch}"
+        );
+    }
+
     #[test]
     fn get_tool_input_schema_matches_the_list_tools_overlay_path() {
-        // `list_tools`'s hand-written body applies `overlay_description` then
-        // `overlay_input_schema` to each router `Tool` (#286); `get_tool`
-        // must apply the exact same two steps for a single tool, or a client
-        // calling `tools/get` could see a schema `tools/list` would never
-        // have produced — the schema counterpart to
+        // `list_tools`'s hand-written body applies `overlay_description`,
+        // then `overlay_input_schema` (#286), then `tool_schema::self_contained`
+        // (#288) to each router `Tool`; `get_tool` must apply the exact same
+        // three steps for a single tool, or a client calling `tools/get`
+        // could see a schema `tools/list` would never have produced — the
+        // schema counterpart to
         // `get_tool_returns_the_same_text_as_list_tools_would_for_that_tool`
         // above.
         let config = overlay_test_config(&[Granularity::Chunk, Granularity::Document], false);
@@ -9709,8 +9939,9 @@ mod tests {
             .get("search")
             .cloned()
             .unwrap();
-        let via_list_tools_path =
-            server.overlay_input_schema(server.overlay_description(router_tool));
+        let via_list_tools_path = tool_schema::self_contained(
+            server.overlay_input_schema(server.overlay_description(router_tool)),
+        );
 
         assert_eq!(tool.input_schema, via_list_tools_path.input_schema);
     }
