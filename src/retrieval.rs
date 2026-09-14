@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 
 use crate::{
     embed::QueryEmbedder,
+    heading,
     qdrant::{CHUNK_TEXT_KEY, PATH_ANCESTORS_KEY, RetrievalStore, SearchResult},
     rerank::Reranker,
     state::{
@@ -14,6 +15,7 @@ use crate::{
         OutboundLink, PathMatches,
     },
     status::QUERY_METRICS,
+    validate,
 };
 
 /// How many "did you mean?" suggestions to include when no basename matches.
@@ -797,6 +799,859 @@ pub fn slice_lines(content: &str, range: &LineRange) -> Result<LineSlice, LineRa
     })
 }
 
+// ---------------------------------------------------------------------------
+// Outline / section lookup (#286)
+// ---------------------------------------------------------------------------
+
+/// One heading — or the content preceding the first heading — in a document's
+/// outline. `line_start`/`line_end` cover the entry's **whole subtree**: from
+/// the heading line itself through the line before the next heading at the
+/// same level or shallower (a deeper heading nested underneath does not end
+/// it). Counted from the top of the raw file, matching `get_document`'s own
+/// numbering (`heading::body_line_offset`), not body-relative. Heading
+/// detection and heading text follow `heading`'s module docs.
+///
+/// The entry for content before the document's first heading (if any, and
+/// only ever non-blank) carries `heading: ""`, `heading_path: []`, `level: 0`
+/// and is never widened into a "subtree" the way a real heading is — there is
+/// nothing nested under it by definition, everything after it is a sibling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineEntry {
+    /// The heading's own text. Empty for the preamble entry.
+    pub heading: String,
+    /// Ancestors outermost-first, plus this heading's own text last. Empty
+    /// for the preamble entry.
+    pub heading_path: Vec<String>,
+    /// Heading level (1-6), or `0` for the preamble entry.
+    pub level: u8,
+    pub line_start: usize,
+    pub line_end: usize,
+}
+
+/// Flatten `content` into its heading outline, in document order.
+///
+/// Built from `heading::HeadingTree` over the same frontmatter-stripped body
+/// `chunk::chunk_markdown` chunks, so heading detection, heading text, ancestry
+/// and subtree ranges are one implementation shared with chunking (a chunk's
+/// `section_line_start`/`section_line_end` is exactly one of these entries'
+/// ranges). Line numbers are shifted to file-relative with
+/// `heading::body_line_offset`, the same shift `ingest.rs` applies to chunks.
+pub fn outline(content: &str) -> Vec<OutlineEntry> {
+    let (_frontmatter, body) = validate::parse_frontmatter_raw(content);
+    let offset = heading::body_line_offset(content);
+    let tree = heading::HeadingTree::parse(&body);
+
+    let mut entries: Vec<OutlineEntry> = Vec::with_capacity(tree.headings().len() + 1);
+
+    // Preamble: content before the first heading, only when it is non-blank.
+    let preamble_end = tree.preamble_end();
+    if preamble_end > 0
+        && !body[tree.lines().byte_range(1, preamble_end)]
+            .trim()
+            .is_empty()
+    {
+        entries.push(OutlineEntry {
+            heading: String::new(),
+            heading_path: Vec::new(),
+            level: 0,
+            line_start: 1 + offset,
+            line_end: preamble_end + offset,
+        });
+    }
+
+    for (i, h) in tree.headings().iter().enumerate() {
+        entries.push(OutlineEntry {
+            heading: h.text.clone(),
+            heading_path: tree.path(Some(i)),
+            level: h.level,
+            line_start: h.line + offset,
+            line_end: h.subtree_end + offset,
+        });
+    }
+
+    entries
+}
+
+/// The shared JSON shape for one [`OutlineEntry`] — used by both the MCP
+/// `get_document` tool and the `/api/doc` HTTP endpoint's mirror of it (#286),
+/// so the two transports can't drift on field names for something
+/// that appears in three different places (top-level `outline`, a section's
+/// `outline` fallback, and an `Ambiguous` error's `candidates`).
+pub fn outline_entry_json(entry: &OutlineEntry) -> serde_json::Value {
+    serde_json::json!({
+        "heading": entry.heading,
+        "heading_path": entry.heading_path,
+        "level": entry.level,
+        "line_start": entry.line_start,
+        "line_end": entry.line_end,
+    })
+}
+
+/// How a caller identifies the section `resolve_section` should fetch.
+#[derive(Debug, Clone)]
+pub enum SectionSelector {
+    /// The deepest outline entry whose subtree contains this 1-based file
+    /// line.
+    Line(usize),
+    /// A heading path, matched as a (trimmed, case-insensitive, invisible-
+    /// character-insensitive — see `heading::normalize_heading_text`) **suffix**
+    /// of an entry's own `heading_path` — so `["Fireball"]` matches `["Spells",
+    /// "Fireball"]` without spelling out every ancestor. An exact full-path
+    /// match always wins over a shorter suffix match when both exist.
+    HeadingPath(Vec<String>),
+}
+
+/// One candidate section in a [`SectionError::Ambiguous`] error — enough for
+/// a caller to pick the right one: by `line` (always works, since every
+/// candidate has its own `line_start`), or by a longer `heading_path` when
+/// the candidates' full paths differ.
+#[derive(Debug, Clone)]
+pub struct SectionCandidate {
+    pub heading_path: Vec<String>,
+    pub line_start: usize,
+    pub line_end: usize,
+}
+
+/// Why `resolve_section` could not resolve a single section.
+#[derive(Debug)]
+pub enum SectionError {
+    /// No entry matched. `hint` carries a few top-level headings (cheap to
+    /// compute, since `outline` already built the list) so the caller has
+    /// something to try next without a separate `outline: true` round trip.
+    NotFound { hint: Vec<String> },
+    /// More than one entry's `heading_path` has the requested path as a
+    /// suffix, and none of them is an exact full-path match.
+    Ambiguous { candidates: Vec<SectionCandidate> },
+}
+
+impl SectionError {
+    /// Human-readable message, shared verbatim by the MCP tool and
+    /// `/api/doc` so their wording can't drift apart (#286). Wording
+    /// is transport-neutral (`` `outline` `` rather than `` `outline: true` ``,
+    /// which is MCP-argument syntax the `/api/doc` query-param caller would
+    /// have to translate).
+    pub fn message(&self) -> String {
+        match self {
+            SectionError::NotFound { hint } => {
+                if hint.is_empty() {
+                    "No section matches the given line/heading_path, and this document has no \
+                     headings. Use `outline` to check."
+                        .to_string()
+                } else {
+                    format!(
+                        "No section matches the given line/heading_path. This document's \
+                         top-level headings: {}. Use `outline` to see the full outline.",
+                        hint.join(", ")
+                    )
+                }
+            }
+            SectionError::Ambiguous { candidates } => {
+                // When every candidate's heading_path is the same once
+                // normalized (identical, or differing only by case, whitespace,
+                // or invisible characters — see `heading::normalize_heading_text`),
+                // a *longer* heading_path can never disambiguate them — only
+                // `line` can.
+                let normalized = |c: &SectionCandidate| {
+                    c.heading_path
+                        .iter()
+                        .map(|s| normalize_heading(s))
+                        .collect::<Vec<_>>()
+                };
+                let same_path = candidates
+                    .windows(2)
+                    .all(|w| normalized(&w[0]) == normalized(&w[1]));
+                let advice = if same_path {
+                    "These sections all have the same heading_path; use `line` (see each \
+                     candidate's line_start) to pick one."
+                } else {
+                    "Use a longer heading_path to disambiguate."
+                };
+                format!(
+                    "heading_path matches multiple sections: {}. {advice}",
+                    candidates
+                        .iter()
+                        .map(|c| format!(
+                            "{} (lines {}-{})",
+                            c.heading_path.join(" > "),
+                            c.line_start,
+                            c.line_end
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            }
+        }
+    }
+
+    /// Machine-readable payload backing `message()` — `{"hint": [...]}` or
+    /// `{"candidates": [...]}` — merged into the MCP `McpError`'s `data` and
+    /// the `/api/doc` JSON error body alike.
+    pub fn data(&self) -> serde_json::Value {
+        match self {
+            SectionError::NotFound { hint } => serde_json::json!({ "hint": hint }),
+            SectionError::Ambiguous { candidates } => serde_json::json!({
+                "candidates": candidates.iter().map(|c| serde_json::json!({
+                    "heading_path": c.heading_path,
+                    "line_start": c.line_start,
+                    "line_end": c.line_end,
+                })).collect::<Vec<_>>(),
+            }),
+        }
+    }
+}
+
+/// A few top-level headings (`heading_path.len() == 1`), for `SectionError::
+/// NotFound`'s hint. Capped rather than exhaustive: this is a nudge toward
+/// `outline: true`, not a replacement for it.
+const NOT_FOUND_HINT_CAP: usize = 5;
+
+fn top_level_hint(entries: &[OutlineEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| e.level != 0 && e.heading_path.len() == 1)
+        .map(|e| e.heading.clone())
+        .take(NOT_FOUND_HINT_CAP)
+        .collect()
+}
+
+/// `heading::normalize_heading_text` under the name this module's callers
+/// already use. Applying it to both sides (a caller-supplied `heading_path`
+/// segment and an already-collapsed `OutlineEntry::heading`) is what makes
+/// `"Fire  Ball"`/`"fire ball"` match the same section (#286).
+fn normalize_heading(s: &str) -> String {
+    heading::normalize_heading_text(s)
+}
+
+/// Index of the deepest entry whose subtree contains `line`. "Deepest" is
+/// well-defined because nested entries' ranges are subsets of their
+/// ancestor's, so the highest `level` among the containing entries is always
+/// the most specific match.
+fn find_deepest_containing(entries: &[OutlineEntry], line: usize) -> Option<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.line_start <= line && line <= e.line_end)
+        .max_by_key(|(_, e)| e.level)
+        .map(|(i, _)| i)
+}
+
+fn candidates_for(entries: &[OutlineEntry], indices: &[usize]) -> Vec<SectionCandidate> {
+    indices
+        .iter()
+        .map(|&i| SectionCandidate {
+            heading_path: entries[i].heading_path.clone(),
+            line_start: entries[i].line_start,
+            line_end: entries[i].line_end,
+        })
+        .collect()
+}
+
+/// Index of the entry matching `query` as a suffix of its `heading_path`
+/// (trimmed, whitespace-collapsed, case-insensitive, invisible-character-
+/// insensitive — `normalize_heading`). An exact full-path match wins outright
+/// over any shorter suffix match, but only when it is the *unique* exact
+/// match: two headings sharing the exact
+/// same full path (a common shape in rulebook conversions) are Ambiguous too
+/// rather than silently picking the first one found (#286) — the
+/// document's own advice to "use a longer heading_path" is otherwise
+/// impossible to follow, since a longer path can't distinguish two entries
+/// that already have identical paths.
+fn find_by_heading_path(entries: &[OutlineEntry], query: &[String]) -> Result<usize, SectionError> {
+    let query_norm: Vec<String> = query.iter().map(|s| normalize_heading(s)).collect();
+
+    let mut exact_matches: Vec<usize> = Vec::new();
+    let mut suffix_matches: Vec<usize> = Vec::new();
+
+    for (i, e) in entries.iter().enumerate() {
+        if e.level == 0 {
+            continue; // The preamble has no heading to match against.
+        }
+        let path_norm: Vec<String> = e
+            .heading_path
+            .iter()
+            .map(|s| normalize_heading(s))
+            .collect();
+        if path_norm == query_norm {
+            exact_matches.push(i);
+        } else if path_norm.len() >= query_norm.len()
+            && path_norm[path_norm.len() - query_norm.len()..] == query_norm[..]
+        {
+            suffix_matches.push(i);
+        }
+    }
+
+    match exact_matches.len() {
+        1 => return Ok(exact_matches[0]),
+        n if n > 1 => {
+            return Err(SectionError::Ambiguous {
+                candidates: candidates_for(entries, &exact_matches),
+            });
+        }
+        _ => {}
+    }
+
+    match suffix_matches.len() {
+        0 => Err(SectionError::NotFound {
+            hint: top_level_hint(entries),
+        }),
+        1 => Ok(suffix_matches[0]),
+        _ => Err(SectionError::Ambiguous {
+            candidates: candidates_for(entries, &suffix_matches),
+        }),
+    }
+}
+
+/// Index of `entries[idx]`'s immediate parent: the nearest *preceding* entry
+/// (document order) whose `heading_path` is exactly `entries[idx]`'s own path
+/// with the last element dropped. Searching by path prefix (rather than a
+/// global "any entry with this exact path" lookup) is what keeps two
+/// identically named branches elsewhere in the document from being confused
+/// for each other. `None` for a top-level heading (nothing to climb to) or
+/// the preamble.
+fn find_parent_index(entries: &[OutlineEntry], idx: usize) -> Option<usize> {
+    let path = &entries[idx].heading_path;
+    if path.len() <= 1 {
+        return None;
+    }
+    let parent_len = path.len() - 1;
+    entries[..idx].iter().enumerate().rev().find_map(|(i, e)| {
+        (e.heading_path.len() == parent_len && e.heading_path[..] == path[..parent_len])
+            .then_some(i)
+    })
+}
+
+/// Every entry nested under `entries[idx]`, in document order — its whole
+/// subtree minus itself. Outline entries are in document order and a
+/// subtree's range is contiguous, so these are exactly the entries that
+/// follow `idx` and start inside its range. Empty for the preamble (nothing
+/// is nested under it) and for a heading with no sub-headings.
+fn descendants(entries: &[OutlineEntry], idx: usize) -> &[OutlineEntry] {
+    let parent = &entries[idx];
+    let rest = &entries[idx + 1..];
+    let count = rest
+        .iter()
+        .take_while(|e| e.level != 0 && e.line_start <= parent.line_end)
+        .count();
+    &rest[..count]
+}
+
+/// Resolve `selector` (optionally climbing `levels_up` ancestors) against
+/// `content`'s outline — the entry-level lookup behind
+/// `resolve_document_view`'s section and scoped-outline modes, kept for tests
+/// that check resolution without the size cap on top.
+#[cfg(test)]
+fn resolve_section(
+    content: &str,
+    selector: &SectionSelector,
+    levels_up: usize,
+) -> Result<OutlineEntry, SectionError> {
+    let entries = outline(content);
+    let idx = resolve_section_index(&entries, selector, levels_up)?;
+    Ok(entries[idx].clone())
+}
+
+/// [`resolve_section`] over an already-built outline, returning the entry's
+/// index so callers that need its subtree (outline scoping, the size cap's
+/// fallback) don't parse the document a second time.
+///
+/// Both selectors land on the same entry for the same section: a `line`
+/// anywhere on a section's own heading line or in its intro text (before its
+/// first sub-heading) resolves to that section, and only a line inside a
+/// sub-heading's range resolves to the sub-heading, as the deeper match.
+fn resolve_section_index(
+    entries: &[OutlineEntry],
+    selector: &SectionSelector,
+    levels_up: usize,
+) -> Result<usize, SectionError> {
+    let mut idx = match selector {
+        SectionSelector::Line(line) => {
+            find_deepest_containing(entries, *line).ok_or_else(|| SectionError::NotFound {
+                hint: top_level_hint(entries),
+            })?
+        }
+        SectionSelector::HeadingPath(path) => find_by_heading_path(entries, path)?,
+    };
+
+    // Climbs ancestors, clamping at the top-most heading (or the preamble)
+    // rather than erroring when `levels_up` overshoots.
+    for _ in 0..levels_up {
+        match find_parent_index(entries, idx) {
+            Some(parent_idx) => idx = parent_idx,
+            None => break,
+        }
+    }
+
+    Ok(idx)
+}
+
+/// A resolved, size-capped section view (#286). A section is its heading line
+/// through the end of its subtree. It comes back as one of:
+///
+/// - its text, when that fits in `search.section_max_bytes`;
+/// - its text anyway, flagged `oversized`, when it is too big but has no
+///   sub-headings to narrow into;
+/// - `outline_only`: no text, just the outline of its sub-headings — the
+///   same capped outline `outline` mode gives for the same selector — plus
+///   `intro` when the section has text of its own before its first
+///   sub-heading.
+///
+/// Embeds [`OutlineEntry`] for the resolved section's own identity rather
+/// than redeclaring those fields, so [`outline_entry_json`] is the one JSON
+/// shape for "a heading with a line range" everywhere it appears.
+#[derive(Debug, Clone)]
+pub struct SectionView {
+    pub entry: OutlineEntry,
+    /// `Some` unless `outline_only` is set.
+    pub content: Option<String>,
+    pub outline_only: bool,
+    /// `content` exceeds `section_max_bytes` but was returned in full anyway
+    /// because the section has no sub-headings to narrow into. Never set
+    /// together with `outline_only`.
+    pub oversized: bool,
+    /// `Some` exactly when `outline_only` is set: the section's sub-headings,
+    /// scoped and capped like `outline` mode.
+    pub outline: Option<OutlineView>,
+    /// Set only when `outline_only` is set and the section has non-blank
+    /// content of its own between its heading and its first sub-heading: the
+    /// range from the heading line through the line before that sub-heading.
+    /// A caller reads it as a plain `start_line`/`end_line` range — every
+    /// section selector for a line in that range resolves to this same
+    /// oversized section, by design.
+    pub intro: Option<OutlineEntry>,
+    /// Total lines in the whole document, matching `LineSlice::total_lines` —
+    /// not just this section's own line count.
+    pub total_lines: usize,
+    /// Whether this section is less than the whole document, matching
+    /// `LineSlice::partial`'s definition.
+    pub partial: bool,
+}
+
+/// A resolved, size-capped outline (#286): the whole document's headings, or
+/// just the headings nested under one section. Capped to roughly
+/// `search.section_max_bytes` bytes of serialized entries so a document with
+/// an unbounded number of headings can't hand back an unbounded payload.
+///
+/// The cap keeps the shallowest levels first (see [`cap_outline`]), so a
+/// truncated outline still shows the top of the structure, and a caller goes
+/// deeper by outlining one of the listed sections. `entries` is always
+/// non-empty when `total_entries > 0`.
+#[derive(Debug, Clone)]
+pub struct OutlineView {
+    /// The section this outline is scoped to; `None` for the whole document.
+    /// When set, `entries` holds only that section's sub-headings, not the
+    /// section itself.
+    pub section: Option<OutlineEntry>,
+    pub entries: Vec<OutlineEntry>,
+    /// Total lines in the whole document.
+    pub total_lines: usize,
+    /// The entry count before truncation — lets the caller tell how much was
+    /// left out.
+    pub total_entries: usize,
+    /// `true` when `entries.len() < total_entries`.
+    pub truncated: bool,
+    /// Set exactly when `truncated`: transport-neutral guidance on reaching
+    /// the headings that were left out.
+    pub hint: Option<String>,
+}
+
+/// The resolved `get_document` view, after `parse_document_view_request` has
+/// settled which mode a caller asked for (#286).
+#[derive(Debug)]
+pub enum DocumentView {
+    /// The existing whole-document/range read (`None` range == the whole
+    /// document).
+    Range(LineSlice),
+    Section(SectionView),
+    Outline(OutlineView),
+}
+
+/// Why `resolve_document_view` could not serve the requested view.
+#[derive(Debug)]
+pub enum DocumentViewError {
+    Range(LineRangeError),
+    Section(SectionError),
+}
+
+/// A section selector plus how many ancestors to climb from it.
+#[derive(Debug, Clone)]
+pub struct SectionTarget {
+    pub selector: SectionSelector,
+    pub levels_up: usize,
+}
+
+/// Which `get_document` mode a caller asked for, after
+/// `parse_document_view_request` has settled the mutual-exclusivity checks
+/// across the several parameter surfaces MCP and the web API both expose.
+#[derive(Debug)]
+pub enum DocumentViewRequest {
+    Range(Option<LineRange>),
+    Section(SectionTarget),
+    /// `None` outlines the whole document; `Some` outlines one section's
+    /// subtree.
+    Outline(Option<SectionTarget>),
+}
+
+/// Resolve a caller's `get_document` parameters into exactly one
+/// [`DocumentViewRequest`] — the single place this mode resolution happens,
+/// shared by the MCP `get_document` tool and the `/api/doc` HTTP endpoint
+/// (#286) so their validation and error wording can't drift apart.
+///
+/// `start_line`/`end_line` exclude every other parameter. `line` and
+/// `heading_path` exclude each other; either one (optionally with
+/// `levels_up`) selects a section, and adding `outline` outlines that section
+/// instead of returning it. `levels_up` without a selector is an error; an
+/// explicitly empty `heading_path` is an error (omit it entirely to mean "not
+/// given"); a `heading_path` with an empty or whitespace-only segment is an
+/// error; and `line: 0` is rejected here for the same reason
+/// `start_line: 0`/`end_line: 0` are — lines are 1-based everywhere in this
+/// tool.
+pub fn parse_document_view_request(
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    line: Option<usize>,
+    heading_path: Option<Vec<String>>,
+    levels_up: Option<usize>,
+    outline: bool,
+) -> Result<DocumentViewRequest, String> {
+    let has_range = start_line.is_some() || end_line.is_some();
+    let has_line = line.is_some();
+    let has_heading_path = heading_path.is_some();
+    let has_section = has_line || has_heading_path;
+
+    if has_range && (has_section || outline) {
+        return Err(
+            "start_line/end_line are mutually exclusive with line/heading_path/outline; a \
+             whole-document range read and a section or outline lookup cannot both be \
+             requested. Provide one or the other."
+                .to_string(),
+        );
+    }
+    if has_line && has_heading_path {
+        return Err(
+            "line and heading_path are mutually exclusive; a section is resolved by line \
+             number or by heading path, not both."
+                .to_string(),
+        );
+    }
+    if levels_up.is_some() && !has_section {
+        return Err(
+            "levels_up requires line or heading_path; it climbs from a resolved section, so a \
+             selector must be given too."
+                .to_string(),
+        );
+    }
+    if let Some(hp) = &heading_path
+        && hp.is_empty()
+    {
+        return Err(
+            "heading_path was given but is empty; provide at least one heading name, \
+             or omit heading_path entirely."
+                .to_string(),
+        );
+    }
+    // A segment that normalizes to nothing (empty, or only whitespace or
+    // invisible characters) can never match a heading (heading text always
+    // has a matching character — see `heading`'s module docs) and would
+    // otherwise sail through to a plain NotFound, hiding the real mistake
+    // (e.g. a query string's `?heading_path=` with no value at all).
+    if let Some(hp) = &heading_path
+        && let Some(blank_index) = hp.iter().position(|s| normalize_heading(s).is_empty())
+    {
+        return Err(format!(
+            "heading_path[{blank_index}] is empty or blank; every segment must be a non-blank \
+             heading name (whitespace and invisible characters alone are blank)."
+        ));
+    }
+    // Lines are 1-based, matching `start_line`'s `LineRangeError::ZeroLine`
+    // check — without this, `line: 0` silently passed through to a file
+    // read and came back as a generic NotFound instead of naming the actual
+    // mistake.
+    if line == Some(0) {
+        return Err("line numbers are 1-based; line must be 1 or greater".to_string());
+    }
+
+    let target = match (line, heading_path) {
+        (Some(line), _) => Some(SectionSelector::Line(line)),
+        (None, Some(path)) => Some(SectionSelector::HeadingPath(path)),
+        (None, None) => None,
+    }
+    .map(|selector| SectionTarget {
+        selector,
+        levels_up: levels_up.unwrap_or(0),
+    });
+
+    match (outline, target) {
+        (true, target) => Ok(DocumentViewRequest::Outline(target)),
+        (false, Some(target)) => Ok(DocumentViewRequest::Section(target)),
+        (false, None) => {
+            let range = LineRange::new(start_line, end_line).map_err(|e| e.to_string())?;
+            Ok(DocumentViewRequest::Range(range))
+        }
+    }
+}
+
+/// Cap an outline to roughly `section_max_bytes` bytes of serialized entries
+/// (`outline_entry_json`'s own JSON encoding), so a document with thousands
+/// of headings doesn't hand back an unbounded payload (#286). No separate
+/// config knob: `section_max_bytes` is already the "how much is worth one
+/// response" dial for sections, and an outline is the same kind of response.
+///
+/// Entries are admitted shallowest level first — every top-level entry, then
+/// every entry one level down, and so on, each level in document order — and
+/// admission stops at the first entry that doesn't fit; the kept entries are
+/// then returned in document order. So a truncated outline shows the top of
+/// the structure rather than the first few pages of it, and every omitted
+/// deeper heading sits under a listed one the caller can outline next. At
+/// least one entry is always kept, even if it alone exceeds the budget.
+///
+/// `scope` is the section being outlined (`None` for the whole document); it
+/// only feeds the returned view and the hint's wording.
+fn cap_outline(
+    entries: &[OutlineEntry],
+    scope: Option<OutlineEntry>,
+    total_lines: usize,
+    section_max_bytes: usize,
+) -> OutlineView {
+    let depth = |i: usize| entries[i].heading_path.len();
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| (depth(i), i));
+
+    let mut kept_count = 0usize;
+    let mut used = 0usize;
+    for &i in &order {
+        let size = outline_entry_json(&entries[i]).to_string().len();
+        if used + size > section_max_bytes && kept_count > 0 {
+            break;
+        }
+        used += size;
+        kept_count += 1;
+    }
+
+    let truncated = kept_count < entries.len();
+    let hint = truncated.then(|| {
+        let (kept, omitted) = order.split_at(kept_count);
+        let first_omitted = omitted[0];
+        let cut_depth = depth(first_omitted);
+        let shallowest_kept = kept.iter().map(|&i| depth(i)).min().unwrap_or(0);
+        let siblings_omitted = kept.iter().any(|&i| depth(i) == cut_depth);
+        let nested_omitted = omitted.iter().any(|&i| depth(i) > shallowest_kept);
+        let mut hint = format!(
+            "Showing {kept_count} of {} headings, shallowest levels first.",
+            entries.len()
+        );
+        if nested_omitted {
+            hint.push_str(
+                " To see the headings nested under a listed one, call again with `outline` \
+                 plus that heading's `heading_path` (or `line`).",
+            );
+        }
+        if siblings_omitted {
+            hint.push_str(&format!(
+                " Some headings at the deepest listed level were left out as well, starting \
+                 at line {}: fetch one directly by `heading_path` or `line`, or read the raw \
+                 lines from there with `start_line`/`end_line`.",
+                entries[first_omitted].line_start
+            ));
+        }
+        hint
+    });
+
+    let mut kept: Vec<usize> = order[..kept_count].to_vec();
+    kept.sort_unstable();
+    OutlineView {
+        section: scope,
+        entries: kept.into_iter().map(|i| entries[i].clone()).collect(),
+        total_lines,
+        total_entries: entries.len(),
+        truncated,
+        hint,
+    }
+}
+
+/// Whether `text` — a section's slice from its heading line through the line
+/// before its first sub-heading — holds anything besides the heading itself.
+/// Parsed rather than line-matched so a setext heading's underline (or a
+/// multi-line setext heading) isn't mistaken for intro text, while any other
+/// block (a paragraph, list, quote, code block, table, HTML, rule) counts.
+fn has_content_beyond_heading(text: &str) -> bool {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let mut in_heading = false;
+    for event in Parser::new(text) {
+        match event {
+            Event::Start(Tag::Heading { .. }) => in_heading = true,
+            Event::End(TagEnd::Heading(_)) => in_heading = false,
+            _ if in_heading => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Resolve `request` against `content`, applying the `section_max_bytes` size
+/// cap for section and outline modes. The single function both the MCP
+/// `get_document` tool and `/api/doc` call after `parse_document_view_request`
+/// — see that function's doc comment.
+pub fn resolve_document_view(
+    content: &str,
+    request: &DocumentViewRequest,
+    section_max_bytes: usize,
+) -> Result<DocumentView, DocumentViewError> {
+    match request {
+        DocumentViewRequest::Range(range) => slice_or_whole(content.to_string(), range.as_ref())
+            .map(DocumentView::Range)
+            .map_err(DocumentViewError::Range),
+        DocumentViewRequest::Outline(None) => Ok(DocumentView::Outline(cap_outline(
+            &outline(content),
+            None,
+            count_lines(content),
+            section_max_bytes,
+        ))),
+        DocumentViewRequest::Outline(Some(target)) => {
+            let entries = outline(content);
+            let idx = resolve_section_index(&entries, &target.selector, target.levels_up)
+                .map_err(DocumentViewError::Section)?;
+            Ok(DocumentView::Outline(cap_outline(
+                descendants(&entries, idx),
+                Some(entries[idx].clone()),
+                count_lines(content),
+                section_max_bytes,
+            )))
+        }
+        DocumentViewRequest::Section(target) => {
+            let entries = outline(content);
+            let idx = resolve_section_index(&entries, &target.selector, target.levels_up)
+                .map_err(DocumentViewError::Section)?;
+            let resolved = entries[idx].clone();
+            let total_lines = count_lines(content);
+            let range = LineRange {
+                start: resolved.line_start,
+                end: Some(resolved.line_end),
+            };
+            let slice = slice_lines(content, &range).map_err(DocumentViewError::Range)?;
+            let partial = resolved.line_start > 1 || resolved.line_end < total_lines;
+            let fits = slice.content.len() <= section_max_bytes;
+            let nested = descendants(&entries, idx);
+
+            if fits || nested.is_empty() {
+                // Either it fits, or there is nothing smaller to offer — the
+                // full text either way, flagged when over the cap.
+                return Ok(DocumentView::Section(SectionView {
+                    entry: resolved,
+                    content: Some(slice.content),
+                    outline_only: false,
+                    oversized: !fits,
+                    outline: None,
+                    intro: None,
+                    total_lines,
+                    partial,
+                }));
+            }
+
+            // The first descendant in document order is always a direct
+            // child, and it can never start on the section's own heading
+            // line, so the intro range is well-formed.
+            let intro_end = nested[0].line_start - 1;
+            let intro_range = LineRange {
+                start: resolved.line_start,
+                end: Some(intro_end),
+            };
+            let intro_text = slice_lines(content, &intro_range)
+                .map_err(DocumentViewError::Range)?
+                .content;
+            let intro = has_content_beyond_heading(&intro_text).then(|| OutlineEntry {
+                line_end: intro_end,
+                ..resolved.clone()
+            });
+            let sub_outline = cap_outline(
+                nested,
+                Some(resolved.clone()),
+                total_lines,
+                section_max_bytes,
+            );
+            Ok(DocumentView::Section(SectionView {
+                entry: resolved,
+                content: None,
+                outline_only: true,
+                oversized: false,
+                outline: Some(sub_outline),
+                intro,
+                total_lines,
+                partial,
+            }))
+        }
+    }
+}
+
+/// The view-specific JSON fields of a `get_document` response — everything
+/// but the per-transport envelope (`path`, `content_hash`, and MCP's link
+/// graph). The one place those fields are named, so the MCP tool's
+/// `structured_content` and `/api/doc`'s body cannot drift apart (#286).
+///
+/// - Range: `content`, `start_line`, `end_line`, `total_lines`, `partial`.
+/// - Outline: `outline`, `total_entries`, `truncated`, `total_lines`, plus
+///   `section` when scoped to one, and `hint` when truncated.
+/// - Section with text: `section`, `outline_only: false`, `oversized`,
+///   `content`, `total_lines`, `partial`.
+/// - Section as outline: `section`, `outline_only: true`, the outline fields
+///   above, `intro` (an entry or `null`), `total_lines`, `partial`.
+pub fn document_view_json(view: &DocumentView) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::{Value, json};
+    let mut map = serde_json::Map::new();
+    let mut put = |key: &str, value: Value| {
+        map.insert(key.to_string(), value);
+    };
+    fn outline_fields(view: &OutlineView, put: &mut dyn FnMut(&str, Value)) {
+        put(
+            "outline",
+            Value::Array(view.entries.iter().map(outline_entry_json).collect()),
+        );
+        put("total_entries", json!(view.total_entries));
+        put("truncated", json!(view.truncated));
+        if let Some(hint) = &view.hint {
+            put("hint", json!(hint));
+        }
+    }
+    match view {
+        DocumentView::Range(slice) => {
+            put("content", json!(slice.content));
+            put("start_line", json!(slice.start_line));
+            put("end_line", json!(slice.end_line));
+            put("total_lines", json!(slice.total_lines));
+            put("partial", json!(slice.partial()));
+        }
+        DocumentView::Outline(outline) => {
+            if let Some(section) = &outline.section {
+                put("section", outline_entry_json(section));
+            }
+            outline_fields(outline, &mut put);
+            put("total_lines", json!(outline.total_lines));
+        }
+        DocumentView::Section(section) => {
+            put("section", outline_entry_json(&section.entry));
+            put("outline_only", json!(section.outline_only));
+            match &section.outline {
+                Some(outline) => {
+                    outline_fields(outline, &mut put);
+                    put(
+                        "intro",
+                        section
+                            .intro
+                            .as_ref()
+                            .map_or(Value::Null, outline_entry_json),
+                    );
+                }
+                None => {
+                    put("oversized", json!(section.oversized));
+                    put("content", json!(section.content));
+                }
+            }
+            put("total_lines", json!(section.total_lines));
+            put("partial", json!(section.partial));
+        }
+    }
+    map
+}
+
 /// Structured errors from `search`, distinguishing the failing stage so callers
 /// can surface stage-specific messages.
 #[derive(Debug)]
@@ -1526,6 +2381,84 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
     fields: Option<&[String]>,
     offset: u64,
 ) -> Result<GroupedSearchOutcome, SearchError> {
+    let fetch = fetch_grouped(deps, query, filters, opts, offset, "file_path").await?;
+    let path_prefix_truncated = fetch.path_prefix_truncated;
+    let offset_truncated = fetch.offset_truncated;
+    let results = &fetch.results;
+
+    // Preserve Qdrant's score-descending order through the SQLite round trip below:
+    // record each hit's (relative path, score) here, look summaries up in whatever
+    // order `get_summaries_by_paths` returns them, then re-walk this ranked list to
+    // reassemble the final order — rather than trust the SQL result's row order.
+    let ranked_paths: Vec<(String, f32)> = results
+        .iter()
+        .filter_map(|r| {
+            let raw = r.payload.get("file_path").and_then(|v| v.as_str())?;
+            Some((relative_to_data(raw, deps.data_path), r.score))
+        })
+        .collect();
+
+    let paths: Vec<String> = ranked_paths.iter().map(|(p, _)| p.clone()).collect();
+    let summaries = document_index
+        .get_summaries_by_paths(&paths, fields)
+        .await
+        .map_err(SearchError::Document)?;
+    let mut by_path: HashMap<String, DocumentSummary> = summaries
+        .into_iter()
+        .map(|s| (s.file_path.clone(), s))
+        .collect();
+
+    // A path absent from `by_path` (the metadata index transiently behind Qdrant —
+    // same caveat as `get_document`'s fuzzy fallback) is skipped rather than
+    // fabricated: a document search that can't back its own claim with real
+    // metadata about it.
+    let documents: Vec<GroupedDocument> = ranked_paths
+        .into_iter()
+        .filter_map(|(path, score)| {
+            by_path
+                .remove(&path)
+                .map(|summary| GroupedDocument { score, summary })
+        })
+        .collect();
+
+    let documents = fetch.finish(documents, offset, opts.limit, "grouped");
+
+    Ok(GroupedSearchOutcome {
+        documents,
+        path_prefix_truncated,
+        offset_truncated,
+    })
+}
+
+/// The ranked, filtered Qdrant rows shared by [`search_grouped`] and
+/// [`search_sections`] — everything up to (not including) each caller's own
+/// row mapping — plus what [`GroupedFetch::finish`] needs to page them.
+struct GroupedFetch {
+    /// Score-descending group winners, after `path_prefix` and `min_score`.
+    results: Vec<SearchResult>,
+    page_depth: u64,
+    path_prefix_truncated: bool,
+    offset_truncated: bool,
+    embed_ms: u128,
+    search_ms: u128,
+}
+
+/// The fetch half of a grouped query (#286 factored it out of
+/// [`search_grouped`] so [`search_sections`] shares it): embed the
+/// phrase-flattened query, build the sparse arm, run Qdrant's grouped hybrid
+/// query on `group_by` with `group_size` 1 (each group's single hit IS that
+/// group's best chunk), then apply the `path_prefix` post-filter and
+/// `min_score`. Runs the SAME dense/sparse/phrase retrieval arms as
+/// [`search`] — see [`crate::qdrant::QdrantStore::search_grouped`]'s doc
+/// comment for why grouped and chunk results must differ only in shape.
+async fn fetch_grouped<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &RetrievalDeps<'_, E, Q>,
+    query: &str,
+    filters: &SearchFilters,
+    opts: &SearchOptions,
+    offset: u64,
+    group_by: &str,
+) -> Result<GroupedFetch, SearchError> {
     // See `search_paged`'s identical block above — same phrase-flattening contract.
     let (flat_query, phrases) = if opts.phrase {
         extract_phrases(query)
@@ -1563,9 +2496,9 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
 
     // See `search_paged`'s doc comment for the full reasoning — `page_depth` is
     // how many ranked candidates the funnel needs to produce to serve
-    // `offset + limit`. No reranker exists on this path, so `MAX_OFFSET_DEPTH`
-    // is the only bound (`search_paged`'s other, reranker-specific bound
-    // doesn't apply here).
+    // `offset + limit`. No reranker exists on the grouped paths, so
+    // `MAX_OFFSET_DEPTH` is the only bound (`search_paged`'s other,
+    // reranker-specific bound doesn't apply here).
     let requested_depth = offset.saturating_add(opts.limit);
     let offset_truncated = requested_depth > MAX_OFFSET_DEPTH;
     let page_depth = requested_depth.min(MAX_OFFSET_DEPTH);
@@ -1582,7 +2515,7 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
             &phrases,
             filter_map,
             extra_conditions,
-            "file_path",
+            group_by,
             1,
             fetch_limit,
             opts.rrf_candidates,
@@ -1607,66 +2540,237 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
         results.retain(|r| r.score >= s);
     }
 
-    // Preserve Qdrant's score-descending order through the SQLite round trip below:
-    // record each hit's (relative path, score) here, look summaries up in whatever
-    // order `get_summaries_by_paths` returns them, then re-walk this ranked list to
-    // reassemble the final order — rather than trust the SQL result's row order.
-    let ranked_paths: Vec<(String, f32)> = results
-        .iter()
-        .filter_map(|r| {
-            let raw = r.payload.get("file_path").and_then(|v| v.as_str())?;
-            Some((relative_to_data(raw, deps.data_path), r.score))
-        })
-        .collect();
-
-    let paths: Vec<String> = ranked_paths.iter().map(|(p, _)| p.clone()).collect();
-    let summaries = document_index
-        .get_summaries_by_paths(&paths, fields)
-        .await
-        .map_err(SearchError::Document)?;
-    let mut by_path: HashMap<String, DocumentSummary> = summaries
-        .into_iter()
-        .map(|s| (s.file_path.clone(), s))
-        .collect();
-
-    // A path absent from `by_path` (the metadata index transiently behind Qdrant —
-    // same caveat as `get_document`'s fuzzy fallback) is skipped rather than
-    // fabricated: a document search that can't back its own claim with real
-    // metadata about it.
-    let mut documents: Vec<GroupedDocument> = ranked_paths
-        .into_iter()
-        .filter_map(|(path, score)| {
-            by_path
-                .remove(&path)
-                .map(|summary| GroupedDocument { score, summary })
-        })
-        .collect();
-
-    // `fetch_limit` above may be an over-fetch (path_prefix multiplies it up to
-    // 500, and `page_depth` itself grows for `offset`), and prefix/min_score
-    // filtering can leave more survivors than the caller actually asked for.
-    // Truncate to `page_depth` — not `opts.limit` — first, mirroring
-    // `search_paged`'s own retain-then-paginate split, then apply `offset` as
-    // the very last step now that this list is in its final settled order.
-    documents.truncate(page_depth as usize);
-    let documents = paginate(documents, offset, opts.limit);
-
-    debug!(
-        embed_ms,
-        search_ms,
-        results = documents.len(),
-        "search timing (grouped)"
-    );
-    // #245: this path has no reranker at all, so `rerank` is always `None` —
-    // unlike `search_paged`, `search_grouped` has exactly one return point (no
-    // early "zero candidates" branch, since there is no reranker candidate
-    // pool to be empty), so one call site here covers every query.
-    QUERY_METRICS.record_query(embed_ms as u64, search_ms as u64, None, documents.len());
-
-    Ok(GroupedSearchOutcome {
-        documents,
+    Ok(GroupedFetch {
+        results,
+        page_depth,
         path_prefix_truncated,
         offset_truncated,
+        embed_ms,
+        search_ms,
+    })
+}
+
+impl GroupedFetch {
+    /// Page a caller's mapped rows and record the query. `rows` may be fewer
+    /// than `results` (a row the caller could not map is skipped, not
+    /// fabricated) and is in the same ranked order.
+    ///
+    /// The fetch may be an over-fetch (path_prefix multiplies it up to 500,
+    /// and `page_depth` itself grows for `offset`), and prefix/min_score
+    /// filtering can leave more survivors than the caller actually asked for.
+    /// Truncate to `page_depth` — not `limit` — first, mirroring
+    /// `search_paged`'s own retain-then-paginate split, then apply `offset` as
+    /// the very last step now that the list is in its final settled order.
+    fn finish<T>(&self, mut rows: Vec<T>, offset: u64, limit: u64, label: &str) -> Vec<T> {
+        rows.truncate(self.page_depth as usize);
+        let rows = paginate(rows, offset, limit);
+
+        debug!(
+            embed_ms = self.embed_ms,
+            search_ms = self.search_ms,
+            results = rows.len(),
+            "search timing ({label})"
+        );
+        // #245: the grouped paths have no reranker at all, so `rerank` is always
+        // `None` — and each has exactly one return point (no early "zero
+        // candidates" branch, since there is no reranker candidate pool to be
+        // empty), so this one call covers every query.
+        QUERY_METRICS.record_query(
+            self.embed_ms as u64,
+            self.search_ms as u64,
+            None,
+            rows.len(),
+        );
+        rows
+    }
+}
+
+/// One section from a query+section (grouped by `section_key`) search (#286):
+/// Qdrant's best-scoring chunk within that section, read straight off
+/// its own payload — no `DocumentIndex` hydration, and deliberately **no chunk
+/// text** (the design point of the `section` granularity: a lightweight path a
+/// caller fetches exactly via `get_document`'s section mode, rather than a
+/// document's whole content or one chunk's worth of it). `line_start`/
+/// `line_end` are the section's own subtree range
+/// (`section_line_start`/`section_line_end` in the payload, carried on
+/// `chunk::Chunk` and written by `ingest.rs`'s payload building);
+/// `hit_line_start`/`hit_line_end` are the winning chunk's own (smaller) line
+/// range, so a caller can read just the matched text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SectionHit {
+    pub file_path: String,
+    pub heading_path: Vec<String>,
+    pub line_start: usize,
+    pub line_end: usize,
+    /// First line of the best-scoring chunk in this section (its payload
+    /// `line_start`). With `chunking.heading_metadata` on a chunk never
+    /// crosses a heading, so for a heading with sub-headings this range lies
+    /// in the heading's own text before its first sub-heading.
+    pub hit_line_start: usize,
+    /// Last line of the best-scoring chunk (its payload `line_end`).
+    pub hit_line_end: usize,
+    pub score: f32,
+    /// What kind of range this row is, which decides how a caller fetches it.
+    pub scope: SectionScope,
+}
+
+/// The kind of range a [`SectionHit`] names (#286). Chunking attributes a
+/// chunk to the narrowest section containing all of it, and two of those
+/// have no heading of their own — both with an empty `heading_path`, so the
+/// path alone can't tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionScope {
+    /// A heading's subtree: fetch with `get_document`'s `heading_path` or
+    /// `line`.
+    Section,
+    /// The text before the document's first heading: fetch with `line`.
+    Preamble,
+    /// The whole document: it has no headings (or no longer matches the
+    /// indexed preamble range, having changed since it was indexed). Read it
+    /// whole.
+    WholeDocument,
+}
+
+impl SectionScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SectionScope::Section => "section",
+            SectionScope::Preamble => "preamble",
+            SectionScope::WholeDocument => "whole_document",
+        }
+    }
+}
+
+/// Classify a hit with an empty `heading_path` as the preamble or the whole
+/// document. The payload can't say which (both start on the body's first
+/// line), so this reads the file and checks whether its outline has a
+/// preamble entry with exactly this range *and* at least one heading — a
+/// document with no headings is all preamble, which is the whole document.
+/// Only rows with an empty path pay for the read; an unreadable file (deleted
+/// since indexing) is reported as `WholeDocument`, the scope a plain whole-document
+/// read serves.
+async fn classify_untitled_section(
+    path: &Path,
+    line_start: usize,
+    line_end: usize,
+) -> SectionScope {
+    let Ok(content) = tokio::fs::read_to_string(path).await else {
+        return SectionScope::WholeDocument;
+    };
+    let entries = outline(&content);
+    let has_heading = entries.iter().any(|e| e.level != 0);
+    let is_preamble = entries
+        .iter()
+        .any(|e| e.level == 0 && e.line_start == line_start && e.line_end == line_end);
+    if has_heading && is_preamble {
+        SectionScope::Preamble
+    } else {
+        SectionScope::WholeDocument
+    }
+}
+
+/// The results of [`search_sections`] plus the same two truncation flags
+/// [`GroupedSearchOutcome`] carries — see that type's doc comment.
+#[derive(Debug, Clone)]
+pub struct SectionSearchOutcome {
+    pub sections: Vec<SectionHit>,
+    pub path_prefix_truncated: bool,
+    pub offset_truncated: bool,
+}
+
+/// Semantic search collapsed to one result per SECTION — the `search` tool's
+/// `section` granularity (#286). Shares [`search_grouped`]'s fetch pipeline
+/// (`fetch_grouped`: same dense/sparse/phrase arms, same `path_filter`/offset/
+/// [`MAX_OFFSET_DEPTH`] handling, same "over-fetch, filter, truncate to
+/// `page_depth`, then paginate" shape), but grouped by the
+/// [`crate::qdrant::SECTION_KEY`] payload field instead of `file_path`, and
+/// with no `DocumentIndex` hydration step at all: every field a [`SectionHit`]
+/// needs — `file_path`, `heading_path`, `section_line_start`/
+/// `section_line_end`, the chunk's own `line_start`/`line_end` — already lives
+/// on the winning chunk's own payload, so there is nothing to join.
+///
+/// Requires `chunking.heading_metadata` to be on (documents are re-indexed
+/// automatically once it is) —
+/// callers enforce this before calling in (see `mcp::search`'s granularity
+/// validation); this function itself has no config dependency, same posture as
+/// [`search_grouped`]. A point with no [`crate::qdrant::SECTION_KEY`] payload
+/// field (predates the flag, or was indexed with it off) is left out of
+/// Qdrant's `group_by` results entirely — the same caveat `search_grouped`
+/// already documents for a pre-#130 point missing `path_ancestors`.
+pub async fn search_sections<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &RetrievalDeps<'_, E, Q>,
+    query: &str,
+    filters: &SearchFilters,
+    opts: &SearchOptions,
+    offset: u64,
+) -> Result<SectionSearchOutcome, SearchError> {
+    let fetch = fetch_grouped(
+        deps,
+        query,
+        filters,
+        opts,
+        offset,
+        crate::qdrant::SECTION_KEY,
+    )
+    .await?;
+
+    // A hit missing the structural fields a `SectionHit` needs (a point
+    // indexed before #286, or with the flag off) is skipped rather than
+    // fabricated — same "skip, don't guess" posture `search_grouped` takes
+    // for a metadata-hydration miss.
+    let sections: Vec<SectionHit> = fetch
+        .results
+        .iter()
+        .filter_map(|r| {
+            let file_path_raw = r.payload.get("file_path").and_then(|v| v.as_str())?;
+            let file_path = relative_to_data(file_path_raw, deps.data_path);
+            let heading_path: Vec<String> = r
+                .payload
+                .get(crate::qdrant::HEADING_PATH_KEY)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })?;
+            let line_start = r
+                .payload
+                .get(crate::qdrant::SECTION_LINE_START_KEY)
+                .and_then(|v| v.as_u64())? as usize;
+            let line_end = r
+                .payload
+                .get(crate::qdrant::SECTION_LINE_END_KEY)
+                .and_then(|v| v.as_u64())? as usize;
+            let hit_line_start = r.payload.get("line_start").and_then(|v| v.as_u64())? as usize;
+            let hit_line_end = r.payload.get("line_end").and_then(|v| v.as_u64())? as usize;
+            Some(SectionHit {
+                file_path,
+                heading_path,
+                line_start,
+                line_end,
+                hit_line_start,
+                hit_line_end,
+                score: r.score,
+                scope: SectionScope::Section,
+            })
+        })
+        .collect();
+
+    let mut sections = fetch.finish(sections, offset, opts.limit, "sections");
+    // Only the returned page's heading-less rows need classifying.
+    for hit in sections.iter_mut().filter(|h| h.heading_path.is_empty()) {
+        hit.scope = classify_untitled_section(
+            &deps.data_path.join(&hit.file_path),
+            hit.line_start,
+            hit.line_end,
+        )
+        .await;
+    }
+
+    Ok(SectionSearchOutcome {
+        sections,
+        path_prefix_truncated: fetch.path_prefix_truncated,
+        offset_truncated: fetch.offset_truncated,
     })
 }
 
@@ -2358,6 +3462,10 @@ mod tests {
         last_call: std::sync::Mutex<Option<&'static str>>,
         /// `extra_conditions` captured by whichever method was last invoked.
         received_conditions: std::sync::Mutex<Option<Vec<Condition>>>,
+        /// `group_by` captured by `search_grouped` (None until called) — lets
+        /// `search_sections` tests assert it asked Qdrant to group by
+        /// `section_key`, not `file_path` (#286).
+        received_group_by: std::sync::Mutex<Option<String>>,
     }
 
     impl MockRetrievalStore {
@@ -2370,6 +3478,7 @@ mod tests {
                 received_phrases: std::sync::Mutex::new(Vec::new()),
                 last_call: std::sync::Mutex::new(None),
                 received_conditions: std::sync::Mutex::new(None),
+                received_group_by: std::sync::Mutex::new(None),
             }
         }
         fn with_search_err(msg: &str) -> Self {
@@ -2381,6 +3490,7 @@ mod tests {
                 received_phrases: std::sync::Mutex::new(Vec::new()),
                 last_call: std::sync::Mutex::new(None),
                 received_conditions: std::sync::Mutex::new(None),
+                received_group_by: std::sync::Mutex::new(None),
             }
         }
     }
@@ -2434,7 +3544,7 @@ mod tests {
             phrases: &[String],
             filters: HashMap<String, serde_json::Value>,
             extra_conditions: Vec<Condition>,
-            _group_by: &str,
+            group_by: &str,
             _group_size: u64,
             limit: u64,
             _rrf_candidates: u64,
@@ -2444,6 +3554,7 @@ mod tests {
             *self.received_sparse.lock().unwrap() = sparse;
             *self.received_phrases.lock().unwrap() = phrases.to_vec();
             *self.received_conditions.lock().unwrap() = Some(extra_conditions);
+            *self.received_group_by.lock().unwrap() = Some(group_by.to_string());
             if let Some(ref msg) = self.search_err {
                 anyhow::bail!("{}", msg);
             }
@@ -5506,6 +6617,215 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // search_sections (#286)
+    // -----------------------------------------------------------------------
+
+    fn make_section_hit(
+        file_path: &str,
+        heading_path: &[&str],
+        line_start: u64,
+        line_end: u64,
+        score: f32,
+    ) -> SearchResult {
+        let mut payload = HashMap::new();
+        payload.insert(
+            "file_path".to_string(),
+            serde_json::json!(format!("/data/{file_path}")),
+        );
+        payload.insert(
+            crate::qdrant::HEADING_PATH_KEY.to_string(),
+            serde_json::json!(heading_path),
+        );
+        payload.insert(
+            crate::qdrant::SECTION_LINE_START_KEY.to_string(),
+            serde_json::json!(line_start),
+        );
+        payload.insert(
+            crate::qdrant::SECTION_LINE_END_KEY.to_string(),
+            serde_json::json!(line_end),
+        );
+        // The winning chunk's own range: the whole section unless a test
+        // sets a narrower one.
+        payload.insert("line_start".to_string(), serde_json::json!(line_start));
+        payload.insert("line_end".to_string(), serde_json::json!(line_end));
+        SearchResult {
+            score,
+            pre_rerank_score: None,
+            dense_score: Some(score),
+            sparse_score: None,
+            phrase_score: None,
+            payload,
+        }
+    }
+
+    #[tokio::test]
+    async fn search_sections_groups_by_section_key_not_file_path() {
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(vec![make_section_hit(
+            "docs/a.md",
+            &["Spells", "Fireball"],
+            10,
+            20,
+            0.9,
+        )]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let _ = search_sections(
+            &deps,
+            "query",
+            &SearchFilters::default(),
+            &default_opts(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.received_group_by.lock().unwrap().as_deref(),
+            Some(crate::qdrant::SECTION_KEY),
+            "search_sections must group by section_key, not file_path"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_sections_maps_rows_with_no_text() {
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let mut row = make_section_hit("docs/a.md", &["Spells", "Fireball"], 10, 20, 0.9);
+        row.payload
+            .insert("line_start".to_string(), serde_json::json!(11));
+        row.payload
+            .insert("line_end".to_string(), serde_json::json!(14));
+        let store = MockRetrievalStore::with_results(vec![row]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let outcome = search_sections(
+            &deps,
+            "query",
+            &SearchFilters::default(),
+            &default_opts(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.sections.len(), 1);
+        let hit = &outcome.sections[0];
+        assert_eq!(hit.file_path, "docs/a.md");
+        assert_eq!(
+            hit.heading_path,
+            vec!["Spells".to_string(), "Fireball".to_string()]
+        );
+        assert_eq!(hit.line_start, 10);
+        assert_eq!(hit.line_end, 20);
+        assert_eq!(
+            (hit.hit_line_start, hit.hit_line_end),
+            (11, 14),
+            "the matched chunk's own range, from its payload line_start/line_end"
+        );
+        assert_eq!(hit.score, 0.9);
+    }
+
+    #[tokio::test]
+    async fn search_sections_labels_heading_less_rows_as_preamble_or_whole_document() {
+        // A chunk attributed to the whole document (empty path, whole-body
+        // range) is labelled as the whole document, not as a preamble: a
+        // `heading_path`/`line` fetch can't return it.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("siblings.md"),
+            "---\ntitle: t\n---\n## A\nalpha\n## B\nbeta\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("intro.md"),
+            "---\ntitle: t\n---\nintro para\n\n# A\nalpha\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("flat.md"), "no headings\nat all\n").unwrap();
+        let data_path = tmp.path().to_str().unwrap().to_string();
+        let hit = |file: &str, path: &[&str], start: u64, end: u64| {
+            let mut h = make_section_hit(file, path, start, end, 0.5);
+            h.payload.insert(
+                "file_path".to_string(),
+                serde_json::json!(format!("{data_path}/{file}")),
+            );
+            h
+        };
+        let store = MockRetrievalStore::with_results(vec![
+            hit("siblings.md", &[], 4, 7),
+            hit("intro.md", &[], 4, 5),
+            hit("intro.md", &[], 4, 7),
+            hit("intro.md", &["A"], 6, 7),
+            hit("flat.md", &[], 1, 2),
+            hit("gone.md", &[], 1, 3),
+        ]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let deps = make_deps(&embed, &store, tmp.path(), &gs);
+
+        let outcome = search_sections(
+            &deps,
+            "query",
+            &SearchFilters::default(),
+            &default_opts(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let scopes: Vec<(String, usize, usize, SectionScope)> = outcome
+            .sections
+            .iter()
+            .map(|s| (s.file_path.clone(), s.line_start, s.line_end, s.scope))
+            .collect();
+        assert_eq!(
+            scopes,
+            vec![
+                ("siblings.md".to_string(), 4, 7, SectionScope::WholeDocument),
+                ("intro.md".to_string(), 4, 5, SectionScope::Preamble),
+                ("intro.md".to_string(), 4, 7, SectionScope::WholeDocument),
+                ("intro.md".to_string(), 6, 7, SectionScope::Section),
+                ("flat.md".to_string(), 1, 2, SectionScope::WholeDocument),
+                ("gone.md".to_string(), 1, 3, SectionScope::WholeDocument),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_sections_skips_a_hit_with_no_heading_path_payload() {
+        // A point indexed before #286 (or with the flag off) has no
+        // heading_path/section_line_start/section_line_end at all — skipped
+        // rather than fabricated, mirroring `search_grouped`'s "skip a
+        // metadata-hydration miss" posture.
+        let mut bare = make_grouped_hit("docs/a.md", 0.9); // no heading_path payload
+        bare.payload.remove(crate::qdrant::HEADING_PATH_KEY);
+        let store = MockRetrievalStore::with_results(vec![bare]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let outcome = search_sections(
+            &deps,
+            "query",
+            &SearchFilters::default(),
+            &default_opts(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            outcome.sections.is_empty(),
+            "a hit missing structural section fields must be skipped, not fabricated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Line-range tests
     // -----------------------------------------------------------------------
 
@@ -5744,5 +7064,869 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.content, DOC);
+    }
+
+    // ------------------------------------------------------------------
+    // outline (#286)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn outline_nested_headings_get_whole_subtree_line_ranges() {
+        let content =
+            "# Root\n\nIntro.\n\n## A\n\nBody A.\n\n### A1\n\nBody A1.\n\n## B\n\nBody B.\n";
+        let entries = outline(content);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.heading_path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["Root".to_string()],
+                vec!["Root".to_string(), "A".to_string()],
+                vec!["Root".to_string(), "A".to_string(), "A1".to_string()],
+                vec!["Root".to_string(), "B".to_string()],
+            ]
+        );
+        // Root has no sibling top-level heading, so its subtree is the whole
+        // document.
+        assert_eq!(entries[0].line_start, 1);
+        assert_eq!(entries[0].line_end, 15);
+        // A's subtree runs through its own nested A1, stopping right before
+        // its sibling B (a heading at the same level, not deeper).
+        assert_eq!(entries[1].line_start, 5);
+        assert_eq!(entries[1].line_end, 12);
+        // A1 has no children, so it ends right before B too.
+        assert_eq!(entries[2].line_start, 9);
+        assert_eq!(entries[2].line_end, 12);
+        // B is the last entry — its line_end must be the file's last line.
+        assert_eq!(entries[3].line_start, 13);
+        assert_eq!(entries[3].line_end, 15);
+    }
+
+    #[test]
+    fn outline_skipped_heading_levels_stay_shallow_in_the_ancestry_graph() {
+        // "#### Deep" jumps straight from level 1 to level 4 with nothing in
+        // between — its heading_path must reflect the actual ancestry graph
+        // (one level below Root), not the raw heading level, and a later
+        // shallower heading ("## Shallow") must still end its subtree.
+        let content = "# Root\n\n#### Deep\n\nDeep body.\n\n## Shallow\n\nShallow body.\n";
+        let entries = outline(content);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[1].heading, "Deep");
+        assert_eq!(
+            entries[1].heading_path,
+            vec!["Root".to_string(), "Deep".to_string()]
+        );
+        assert_eq!(entries[1].level, 4);
+        assert_eq!(entries[1].line_end, 6, "Deep's subtree ends before Shallow");
+        assert_eq!(entries[2].heading, "Shallow");
+        assert_eq!(
+            entries[2].heading_path,
+            vec!["Root".to_string(), "Shallow".to_string()]
+        );
+    }
+
+    #[test]
+    fn outline_preamble_becomes_a_level_zero_entry() {
+        let content = "Intro text.\n\n# Heading\n\nBody.\n";
+        let entries = outline(content);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].heading, "");
+        assert_eq!(entries[0].heading_path, Vec::<String>::new());
+        assert_eq!(entries[0].level, 0);
+        assert_eq!(entries[0].line_start, 1);
+        assert_eq!(entries[0].line_end, 2);
+        assert_eq!(entries[1].heading, "Heading");
+    }
+
+    #[test]
+    fn outline_blank_only_preamble_is_not_an_entry() {
+        let content = "\n\n# Heading\n\nBody.\n";
+        let entries = outline(content);
+        assert_eq!(entries.len(), 1, "a blank-only preamble adds no entry");
+        assert_eq!(entries[0].heading, "Heading");
+        assert_eq!((entries[0].line_start, entries[0].line_end), (3, 5));
+    }
+
+    #[test]
+    fn outline_ignores_headings_inside_fenced_code_blocks() {
+        let content = "# Real\n\n```\n# Not a heading\n```\n\nMore text.\n";
+        let entries = outline(content);
+        assert_eq!(
+            entries.len(),
+            1,
+            "the fenced '#' line must not split a new entry"
+        );
+        assert_eq!(entries[0].heading, "Real");
+        assert_eq!(entries[0].line_start, 1);
+        assert_eq!(entries[0].line_end, 7, "the whole document, fence included");
+    }
+
+    #[test]
+    fn outline_shifts_line_numbers_past_frontmatter() {
+        for (content, last_line) in [
+            (
+                "---\ntitle: Test\n---\nIntro text.\n\n# Heading\n\nBody.",
+                8,
+            ),
+            // Trailing newline: the shape of nearly every real file, whose
+            // gray_matter body is not a byte suffix of the raw file.
+            (
+                "---\ntitle: Test\n---\nIntro text.\n\n# Heading\n\nBody.\n",
+                8,
+            ),
+            (
+                "---\ntitle: Test\n---\nIntro text.\n\n# Heading\n\nBody.\n\n",
+                9,
+            ),
+            (
+                "---\r\ntitle: Test\r\n---\r\nIntro text.\r\n\r\n# Heading\r\n\r\nBody.\r\n",
+                8,
+            ),
+        ] {
+            let entries = outline(content);
+            assert_eq!(entries.len(), 2, "{content:?}");
+            // Preamble: body-relative lines 1-2, shifted by the 3-line
+            // frontmatter block to file lines 4-5.
+            assert_eq!((entries[0].line_start, entries[0].line_end), (4, 5));
+            // Heading: file line 6; its subtree runs to the file's last line.
+            assert_eq!(
+                (entries[1].line_start, entries[1].line_end),
+                (6, last_line),
+                "{content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn outline_line_ranges_and_heading_detection_with_trailing_newlines() {
+        // Every case ends in '\n'; frontmatter and leading blank lines shift
+        // the ranges.
+        let a = outline("---\ntitle: x\n---\n# A\nbody\n");
+        assert_eq!((a[0].line_start, a[0].line_end), (4, 5));
+        let a = outline("---\ntitle: x\n---\n\n# A\nbody\n");
+        assert_eq!((a[0].line_start, a[0].line_end), (5, 6));
+        let a = outline("\n\n# A\nbody\n");
+        assert_eq!((a[0].line_start, a[0].line_end), (3, 4));
+        // `#hashtag` is not a heading, and a heading inside nested fences does
+        // not re-parent sections.
+        let e = outline(
+            "# A\n## B\n#hashtag line\nmore\n## C\n````\n```\n# inside4\n```\n````\n## D\nx\n",
+        );
+        let paths: Vec<_> = e
+            .iter()
+            .map(|e| (e.heading_path.join(" > "), e.line_start, e.line_end))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("A".to_string(), 1, 12),
+                ("A > B".to_string(), 2, 4),
+                ("A > C".to_string(), 5, 10),
+                ("A > D".to_string(), 11, 12),
+            ]
+        );
+        // Whitespace-only first line.
+        let e = outline("  \n# A\nbody\n## B\nx\n");
+        assert_eq!(e.len(), 2);
+        assert_eq!((e[0].heading.as_str(), e[0].line_start), ("A", 2));
+        assert_eq!(e[1].heading_path, vec!["A".to_string(), "B".to_string()]);
+        // Closing hashes are stripped.
+        assert_eq!(outline("## Foo ##\n")[0].heading, "Foo");
+    }
+
+    #[test]
+    fn outline_empty_document_has_no_entries() {
+        assert!(outline("").is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_section (#286)
+    // ------------------------------------------------------------------
+
+    const NESTED_DOC: &str = "# Root\n\n## A\n\nBody A.\n\n## B\n\nBody B.\n";
+
+    #[test]
+    fn resolve_section_by_line_picks_the_deepest_containing_entry() {
+        // Line 5 ("Body A.") sits inside both Root's subtree and A's — the
+        // deepest (highest-level) entry must win.
+        let resolved = resolve_section(NESTED_DOC, &SectionSelector::Line(5), 0).unwrap();
+        assert_eq!(
+            resolved.heading_path,
+            vec!["Root".to_string(), "A".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_section_heading_path_matches_as_a_trimmed_case_insensitive_suffix() {
+        let resolved = resolve_section(
+            NESTED_DOC,
+            &SectionSelector::HeadingPath(vec![" a ".to_string()]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.heading_path,
+            vec!["Root".to_string(), "A".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_section_exact_full_path_wins_over_a_shorter_suffix_match() {
+        // "Fireball" is both a top-level heading on its own AND the suffix of
+        // a nested "Spells > Fireball" — the exact match must win rather than
+        // reporting Ambiguous.
+        let content = "# Fireball\n\nTop-level entry named the same.\n\n# Spells\n\n## Fireball\n\nNested spell.\n";
+        let resolved = resolve_section(
+            content,
+            &SectionSelector::HeadingPath(vec!["Fireball".to_string()]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(resolved.heading_path, vec!["Fireball".to_string()]);
+    }
+
+    #[test]
+    fn resolve_section_ambiguous_suffix_match_lists_every_candidate() {
+        let content = "# Spells\n\n## Fireball\n\nA.\n\n# Conditions\n\n## Fireball\n\nB.\n";
+        let err = resolve_section(
+            content,
+            &SectionSelector::HeadingPath(vec!["Fireball".to_string()]),
+            0,
+        )
+        .unwrap_err();
+        match err {
+            SectionError::Ambiguous { candidates } => {
+                let mut paths: Vec<Vec<String>> =
+                    candidates.into_iter().map(|c| c.heading_path).collect();
+                paths.sort();
+                assert_eq!(
+                    paths,
+                    vec![
+                        vec!["Conditions".to_string(), "Fireball".to_string()],
+                        vec!["Spells".to_string(), "Fireball".to_string()],
+                    ]
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_section_not_found_includes_top_level_headings_as_a_hint() {
+        let err = resolve_section(
+            NESTED_DOC,
+            &SectionSelector::HeadingPath(vec!["Nonexistent".to_string()]),
+            0,
+        )
+        .unwrap_err();
+        match err {
+            SectionError::NotFound { hint } => assert_eq!(hint, vec!["Root".to_string()]),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_section_levels_up_climbs_and_clamps_at_the_top() {
+        // Climbing from "Root > A" by 1 lands on "Root"; asking for far more
+        // than the ancestry chain has must clamp there instead of erroring.
+        let resolved = resolve_section(NESTED_DOC, &SectionSelector::Line(5), 1).unwrap();
+        assert_eq!(resolved.heading_path, vec!["Root".to_string()]);
+
+        let clamped = resolve_section(NESTED_DOC, &SectionSelector::Line(5), 50).unwrap();
+        assert_eq!(clamped.heading_path, vec!["Root".to_string()]);
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_document_view — section_max_bytes cap (#286)
+    // ------------------------------------------------------------------
+
+    fn section_request(selector: SectionSelector, levels_up: usize) -> DocumentViewRequest {
+        DocumentViewRequest::Section(SectionTarget {
+            selector,
+            levels_up,
+        })
+    }
+
+    fn heading_path_selector(path: &[&str]) -> SectionSelector {
+        SectionSelector::HeadingPath(path.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn expect_section(view: DocumentView) -> SectionView {
+        match view {
+            DocumentView::Section(s) => s,
+            other => panic!("expected Section, got a different DocumentView variant: {other:?}"),
+        }
+    }
+
+    fn expect_outline(view: DocumentView) -> OutlineView {
+        match view {
+            DocumentView::Outline(v) => v,
+            other => panic!("expected Outline, got a different DocumentView variant: {other:?}"),
+        }
+    }
+
+    fn paths(entries: &[OutlineEntry]) -> Vec<Vec<String>> {
+        entries.iter().map(|e| e.heading_path.clone()).collect()
+    }
+
+    const BIG_WITH_INTRO: &str =
+        "# Guide\n\n## Big\n\nSome body text here.\n\n### Small Child\n\nTiny body.\n";
+
+    #[test]
+    fn resolve_document_view_falls_back_to_an_outline_when_section_exceeds_the_cap() {
+        // section_max_bytes: 10 — trivially smaller than "## Big"'s own text.
+        let s = expect_section(
+            resolve_document_view(
+                BIG_WITH_INTRO,
+                &section_request(heading_path_selector(&["Big"]), 0),
+                10,
+            )
+            .unwrap(),
+        );
+        assert!(s.outline_only);
+        assert!(!s.oversized);
+        assert!(s.content.is_none());
+        let outline = s.outline.expect("outline_only carries the sub-outline");
+        assert_eq!(
+            paths(&outline.entries),
+            vec![vec![
+                "Guide".to_string(),
+                "Big".to_string(),
+                "Small Child".to_string()
+            ]]
+        );
+        assert_eq!(outline.section.as_ref(), Some(&s.entry));
+        // The intro (the heading line through the line before its first
+        // sub-heading) has real text, so it is surfaced.
+        let intro = s
+            .intro
+            .expect("an intro with text of its own must be reported");
+        assert_eq!(
+            intro.heading_path,
+            vec!["Guide".to_string(), "Big".to_string()]
+        );
+        // "## Big" (3), blank (4), "Some body text here." (5), blank (6) —
+        // "### Small Child" starts at line 7.
+        assert_eq!((intro.line_start, intro.line_end), (3, 6));
+        assert!(s.partial);
+        assert_eq!(s.total_lines, count_lines(BIG_WITH_INTRO));
+    }
+
+    #[test]
+    fn resolve_document_view_every_selector_for_an_oversized_section_gives_the_same_view() {
+        // A section is its heading line through its subtree end: its heading
+        // line and its intro text are the section itself, so `line` on either
+        // must resolve exactly like `heading_path` does, and a `levels_up`
+        // climb landing on it too. None of them may silently serve a slice.
+        let by_path = expect_section(
+            resolve_document_view(
+                BIG_WITH_INTRO,
+                &section_request(heading_path_selector(&["Big"]), 0),
+                10,
+            )
+            .unwrap(),
+        );
+        for request in [
+            section_request(SectionSelector::Line(3), 0), // the heading line
+            section_request(SectionSelector::Line(5), 0), // intro text
+            section_request(SectionSelector::Line(6), 0), // blank intro line
+            section_request(heading_path_selector(&["Small Child"]), 1),
+            section_request(SectionSelector::Line(9), 1),
+        ] {
+            let s = expect_section(resolve_document_view(BIG_WITH_INTRO, &request, 10).unwrap());
+            assert!(s.outline_only, "{request:?}");
+            assert_eq!(s.entry, by_path.entry, "{request:?}");
+            assert_eq!(s.intro, by_path.intro, "{request:?}");
+            assert_eq!(
+                s.outline.as_ref().map(|o| paths(&o.entries)),
+                by_path.outline.as_ref().map(|o| paths(&o.entries)),
+                "{request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_document_view_search_hit_line_start_on_an_oversized_parent_is_not_a_bare_heading() {
+        // `# A` with two big children, cap 400. The section search hit's
+        // `line_start` is the heading line (1); fetching by it must return the
+        // oversized section's outline, not just "# A\n" with no signal.
+        let big = "x".repeat(300);
+        let content = format!("# A\n## B\n{big}\n## C\n{big}\n");
+        for request in [
+            section_request(SectionSelector::Line(1), 0),
+            section_request(heading_path_selector(&["A"]), 0),
+            section_request(SectionSelector::Line(1), 1),
+        ] {
+            let s = expect_section(resolve_document_view(&content, &request, 400).unwrap());
+            assert!(s.outline_only, "{request:?}");
+            assert_eq!(s.entry.heading_path, vec!["A".to_string()]);
+            assert!(s.content.is_none());
+            assert_eq!(
+                paths(&s.outline.unwrap().entries),
+                vec![
+                    vec!["A".to_string(), "B".to_string()],
+                    vec!["A".to_string(), "C".to_string()],
+                ]
+            );
+            // The intro is the heading line alone — nothing to report.
+            assert!(s.intro.is_none(), "{request:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_document_view_intro_is_omitted_when_blank_or_heading_only() {
+        let big = "x".repeat(300);
+        for (content, expect_intro) in [
+            // Heading only.
+            (format!("# A\n## B\n{big}\n"), false),
+            // Heading plus blank lines.
+            (format!("# A\n\n\n## B\n{big}\n"), false),
+            // Setext heading: the underline is not intro text.
+            (format!("A\n===\n\n## B\n{big}\n"), false),
+            // Real intro text.
+            (format!("# A\nintro\n## B\n{big}\n"), true),
+            // A list is content too.
+            (format!("# A\n\n- item\n\n## B\n{big}\n"), true),
+        ] {
+            let s = expect_section(
+                resolve_document_view(&content, &section_request(SectionSelector::Line(1), 0), 100)
+                    .unwrap(),
+            );
+            assert!(s.outline_only, "{content:?}");
+            assert_eq!(s.intro.is_some(), expect_intro, "{content:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_document_view_outline_only_is_capped_like_outline_mode() {
+        // `# Spells` + 2000 small children: the `outline_only` view of a 39 KB
+        // section must not list all 2000 children (213 KB).
+        let mut content = String::from("# Spells\n");
+        for i in 0..2000 {
+            content.push_str(&format!("## Spell {i}\nshort\n"));
+        }
+        let cap = 16000;
+        let s = expect_section(
+            resolve_document_view(
+                &content,
+                &section_request(heading_path_selector(&["Spells"]), 0),
+                cap,
+            )
+            .unwrap(),
+        );
+        assert!(s.outline_only);
+        let outline = s.outline.unwrap();
+        assert!(outline.truncated);
+        assert_eq!(outline.total_entries, 2000);
+        let payload =
+            serde_json::Value::Object(document_view_json(&expect_section_view(&content, cap)))
+                .to_string();
+        assert!(
+            payload.len() < cap + 2000,
+            "outline_only payload must stay near the cap, got {} bytes",
+            payload.len()
+        );
+        // Identical to `outline` mode with the same selector.
+        let scoped = expect_outline(
+            resolve_document_view(
+                &content,
+                &DocumentViewRequest::Outline(Some(SectionTarget {
+                    selector: heading_path_selector(&["Spells"]),
+                    levels_up: 0,
+                })),
+                cap,
+            )
+            .unwrap(),
+        );
+        assert_eq!(paths(&scoped.entries), paths(&outline.entries));
+        assert_eq!(scoped.hint, outline.hint);
+        // Flat siblings were cut, so the hint points at where they resume.
+        let hint = outline.hint.unwrap();
+        let first_omitted = 2 + 2 * outline.entries.len();
+        assert!(
+            hint.contains(&format!("starting at line {first_omitted}")),
+            "{hint}"
+        );
+    }
+
+    fn expect_section_view(content: &str, cap: usize) -> DocumentView {
+        resolve_document_view(
+            content,
+            &section_request(heading_path_selector(&["Spells"]), 0),
+            cap,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_document_view_outline_cap_keeps_shallow_levels_first() {
+        // Three top-level sections, each with many sub-headings: a cap that
+        // fits the top level but not everything must keep all three
+        // top-level entries (in document order) and drop sub-headings.
+        let mut content = String::new();
+        for top in ["One", "Two", "Three"] {
+            content.push_str(&format!("# {top}\n"));
+            for i in 0..50 {
+                content.push_str(&format!("## {top} child {i}\nbody\n"));
+            }
+        }
+        let v = expect_outline(
+            resolve_document_view(&content, &DocumentViewRequest::Outline(None), 1000).unwrap(),
+        );
+        assert!(v.truncated);
+        let top_level: Vec<&str> = v
+            .entries
+            .iter()
+            .filter(|e| e.heading_path.len() == 1)
+            .map(|e| e.heading.as_str())
+            .collect();
+        assert_eq!(top_level, vec!["One", "Two", "Three"]);
+        assert!(
+            v.entries
+                .windows(2)
+                .all(|w| w[0].line_start < w[1].line_start),
+            "kept entries must be in document order"
+        );
+        let hint = v.hint.unwrap();
+        assert!(hint.contains("`outline`"), "{hint}");
+    }
+
+    #[test]
+    fn resolve_document_view_outline_scoped_to_a_section_lists_only_its_subtree() {
+        let content = "# Root\n\n## A\n\n### A1\n\n### A2\n\n## B\n\n### B1\n";
+        let v = expect_outline(
+            resolve_document_view(
+                content,
+                &DocumentViewRequest::Outline(Some(SectionTarget {
+                    selector: heading_path_selector(&["A"]),
+                    levels_up: 0,
+                })),
+                16000,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            v.section.as_ref().map(|s| s.heading_path.clone()),
+            Some(vec!["Root".to_string(), "A".to_string()])
+        );
+        assert_eq!(
+            paths(&v.entries),
+            vec![
+                vec!["Root".to_string(), "A".to_string(), "A1".to_string()],
+                vec!["Root".to_string(), "A".to_string(), "A2".to_string()],
+            ]
+        );
+        assert!(!v.truncated);
+        assert!(v.hint.is_none());
+
+        // A leaf section has nothing under it.
+        let leaf = expect_outline(
+            resolve_document_view(
+                content,
+                &DocumentViewRequest::Outline(Some(SectionTarget {
+                    selector: SectionSelector::Line(11),
+                    levels_up: 0,
+                })),
+                16000,
+            )
+            .unwrap(),
+        );
+        assert!(leaf.entries.is_empty());
+        assert_eq!(leaf.total_entries, 0);
+    }
+
+    #[test]
+    fn resolve_document_view_returns_full_text_when_oversized_section_has_no_children() {
+        let content = "# Guide\n\n## Leaf\n\nSome body text with no children at all.\n";
+        let s = expect_section(
+            resolve_document_view(
+                content,
+                &section_request(heading_path_selector(&["Leaf"]), 0),
+                10,
+            )
+            .unwrap(),
+        );
+        assert!(
+            !s.outline_only,
+            "no children to narrow into — text must still be returned"
+        );
+        assert!(s.content.is_some());
+        assert!(s.outline.is_none());
+        assert!(s.oversized, "childless oversized text must be flagged");
+    }
+
+    #[test]
+    fn resolve_document_view_small_section_is_not_flagged_oversized_or_partial_incorrectly() {
+        let content = "# Guide\n\n## Leaf\n\nsmall\n";
+        let request = section_request(heading_path_selector(&["Leaf"]), 0);
+        let view = resolve_document_view(content, &request, 16000).unwrap();
+        match view {
+            DocumentView::Section(s) => {
+                assert!(!s.oversized);
+                assert!(!s.outline_only);
+                assert!(
+                    s.partial,
+                    "a sub-section of the document is still a partial read"
+                );
+                assert_eq!(s.total_lines, count_lines(content));
+            }
+            other => panic!("expected Section, got a different DocumentView variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_document_view_outline_mode_has_no_content() {
+        let view =
+            resolve_document_view(NESTED_DOC, &DocumentViewRequest::Outline(None), 16000).unwrap();
+        match view {
+            DocumentView::Outline(v) => {
+                assert_eq!(v.entries.len(), 3);
+                assert_eq!(v.total_entries, 3);
+                assert!(!v.truncated);
+                assert_eq!(v.total_lines, count_lines(NESTED_DOC));
+            }
+            other => panic!("expected Outline, got a different DocumentView variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_document_view_outline_mode_truncates_past_the_byte_budget() {
+        // An unbounded number of headings must not
+        // produce an unbounded outline payload.
+        let mut content = String::new();
+        for i in 0..200 {
+            content.push_str(&format!("# Heading number {i}\n\nbody\n\n"));
+        }
+        let view =
+            resolve_document_view(&content, &DocumentViewRequest::Outline(None), 200).unwrap();
+        match view {
+            DocumentView::Outline(v) => {
+                assert!(v.truncated);
+                assert_eq!(v.total_entries, 200);
+                assert!(!v.entries.is_empty());
+                assert!(
+                    v.entries.len() < v.total_entries,
+                    "the cap must actually drop entries"
+                );
+            }
+            other => panic!("expected Outline, got a different DocumentView variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_document_view_outline_mode_always_keeps_at_least_one_entry() {
+        // Even a single heading whose own JSON encoding exceeds the budget
+        // must not truncate down to nothing.
+        let content = "# A very very very long heading that exceeds a tiny budget\n\nbody\n";
+        let view = resolve_document_view(content, &DocumentViewRequest::Outline(None), 1).unwrap();
+        match view {
+            DocumentView::Outline(v) => assert_eq!(v.entries.len(), 1),
+            other => panic!("expected Outline, got a different DocumentView variant: {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // find_by_heading_path — duplicate exact matches (#286)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolve_section_duplicate_exact_full_paths_are_ambiguous_not_silently_the_first() {
+        // Two top-level headings with the identical
+        // text must not silently resolve to the first one.
+        let content = "# Notes\none\n# Other\n# Notes\ntwo\n";
+        let err = resolve_section(
+            content,
+            &SectionSelector::HeadingPath(vec!["Notes".to_string()]),
+            0,
+        )
+        .unwrap_err();
+        match err {
+            SectionError::Ambiguous { candidates } => assert_eq!(candidates.len(), 2),
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ambiguous_paths_differing_only_by_case_folding_advise_line() {
+        let content = "# Straße\nx\n# STRASSE\ny\n";
+        let err = resolve_section(
+            content,
+            &SectionSelector::HeadingPath(vec!["strasse".to_string()]),
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SectionError::Ambiguous { .. }), "got {err:?}");
+        let msg = err.message();
+        assert!(msg.contains("line"), "expected `line` advice, got: {msg}");
+        assert!(!msg.contains("longer heading_path"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_section_duplicate_exact_nested_paths_are_ambiguous() {
+        let content = "# S\n## Fireball\na\n## Fireball\nb\n";
+        let err = resolve_section(
+            content,
+            &SectionSelector::HeadingPath(vec!["S".to_string(), "Fireball".to_string()]),
+            0,
+        )
+        .unwrap_err();
+        match err {
+            SectionError::Ambiguous { candidates } => {
+                assert_eq!(candidates.len(), 2);
+                // The message must not advise a longer heading_path when a
+                // longer one can never disambiguate identical full paths.
+                let msg = SectionError::Ambiguous { candidates }.message();
+                assert!(msg.contains("line"), "expected `line` advice, got: {msg}");
+                assert!(!msg.contains("longer heading_path"), "got: {msg}");
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // parse_document_view_request — validation (#286)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_document_view_request_rejects_line_zero() {
+        let err = parse_document_view_request(None, None, Some(0), None, None, false).unwrap_err();
+        assert!(
+            err.contains("1-based") || err.contains("1 or greater"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_document_view_request_rejects_a_blank_heading_path_segment() {
+        for hp in [
+            vec!["".to_string()],
+            vec!["A".to_string(), "  ".to_string()],
+            // Only invisible characters: blank once normalized.
+            vec!["A".to_string(), "\u{200b}".to_string()],
+            vec![" \u{200d}\u{ad} ".to_string()],
+        ] {
+            let err = parse_document_view_request(None, None, None, Some(hp.clone()), None, false)
+                .unwrap_err();
+            assert!(
+                err.contains("heading_path"),
+                "expected an error naming heading_path for {hp:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_document_view_request_accepts_a_non_blank_heading_path() {
+        assert!(
+            parse_document_view_request(None, None, None, Some(vec!["A".to_string()]), None, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn parse_document_view_request_outline_combines_with_a_section_selector() {
+        match parse_document_view_request(None, None, Some(4), None, Some(1), true) {
+            Ok(DocumentViewRequest::Outline(Some(SectionTarget {
+                selector: SectionSelector::Line(4),
+                levels_up: 1,
+            }))) => {}
+            other => panic!("expected a scoped outline, got {other:?}"),
+        }
+        match parse_document_view_request(None, None, None, None, None, true) {
+            Ok(DocumentViewRequest::Outline(None)) => {}
+            other => panic!("expected a whole-document outline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_document_view_request_still_rejects_invalid_combinations() {
+        let hp = || Some(vec!["A".to_string()]);
+        for (args, needle) in [
+            (
+                (Some(1), None, None, None, None, true),
+                "start_line/end_line",
+            ),
+            (
+                (None, Some(2), Some(1), None, None, false),
+                "start_line/end_line",
+            ),
+            (
+                (None, None, Some(1), hp(), None, true),
+                "line and heading_path",
+            ),
+            (
+                (None, None, None, None, Some(1), true),
+                "levels_up requires",
+            ),
+            (
+                (None, None, None, None, Some(1), false),
+                "levels_up requires",
+            ),
+        ] {
+            let (s, e, l, h, u, o) = args;
+            let err = parse_document_view_request(s, e, l, h, u, o).unwrap_err();
+            assert!(err.contains(needle), "expected {needle:?} in: {err}");
+        }
+    }
+
+    #[test]
+    fn document_view_json_names_every_view_field_once() {
+        let content = format!("# A\nintro\n## B\n{}\n", "x".repeat(300));
+        let keys = |view: DocumentView| {
+            let mut k: Vec<String> = document_view_json(&view).keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let outline_only =
+            resolve_document_view(&content, &section_request(SectionSelector::Line(1), 0), 100)
+                .unwrap();
+        assert_eq!(
+            keys(outline_only),
+            [
+                "intro",
+                "outline",
+                "outline_only",
+                "partial",
+                "section",
+                "total_entries",
+                "total_lines",
+                "truncated"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+        let text = resolve_document_view(
+            &content,
+            &section_request(SectionSelector::Line(3), 0),
+            100_000,
+        )
+        .unwrap();
+        assert_eq!(
+            keys(text),
+            [
+                "content",
+                "outline_only",
+                "oversized",
+                "partial",
+                "section",
+                "total_lines"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+        let whole =
+            resolve_document_view(&content, &DocumentViewRequest::Outline(None), 1).unwrap();
+        assert_eq!(
+            keys(whole),
+            [
+                "hint",
+                "outline",
+                "total_entries",
+                "total_lines",
+                "truncated"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
     }
 }

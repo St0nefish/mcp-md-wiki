@@ -20,7 +20,7 @@
 //! counts (documents, points) live in SQLite and Qdrant where they belong.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -322,6 +322,22 @@ struct Inner {
     last_success_unix: Option<i64>,
     payload_indexes: BTreeMap<String, PayloadIndexState>,
     strict_rejected_files: BTreeMap<String, StrictRejection>,
+    /// Sticky latch backing [`IndexStatus::is_bulk_indexing`]'s "results may be
+    /// incomplete" note: true from the moment a reconcile scan
+    /// (`ingest::scan_for_dirty`) finds a non-frozen file chunked under a
+    /// stale fingerprint ([`ReconcileScan::mark_rechunk`]), until
+    /// [`IndexStatus::clear_stale_chunking`] confirms none remain — either a
+    /// later scan finds none, or the run that consumed a scan's worklist
+    /// finishes successfully. Deliberately NOT tied to any single
+    /// [`ReconcileScan`] guard's lifetime (round-6 review, finding L1): a
+    /// guard only spans one scan plus the one run right after it, which left
+    /// the note dark during retry backoff, after a permanent give-up, and
+    /// while a reload's queued reconcile waited for the worker to pick it up.
+    /// A frozen scope's stale files never set this — `scan_for_dirty` skips
+    /// them before the fingerprint check ever runs — so they can never pin
+    /// the note on forever, by design: they are also never re-chunked until
+    /// the schema is fixed, so nothing here is claiming otherwise.
+    stale_chunking: bool,
 }
 
 /// In-memory record of indexing activity for this process.
@@ -530,6 +546,60 @@ impl IndexStatus {
                 Some(PayloadIndexState::Ok)
             )
         })
+    }
+
+    /// True while an indexing run that spans more than one file is in flight:
+    /// a full rebuild, or a run whose path list has more than one entry (a
+    /// reconcile that found many files dirty — e.g. every file after a
+    /// chunking change). Also true from the moment a reconcile scan finds a
+    /// non-frozen file chunked under different chunking settings
+    /// ([`ReconcileScan::mark_rechunk`]) until [`Self::clear_stale_chunking`]
+    /// confirms none remain — so the scan itself, any retry backoff, a
+    /// permanent give-up, and the wait for the next reconcile all keep this
+    /// true with no gap; a routine periodic scan that finds no such file does
+    /// not. A routine single-file reindex from a write or a one-file push is
+    /// excluded: it cannot leave *other* documents' heading metadata
+    /// incomplete, which is what per-request callers use this to warn about
+    /// (#286). Cheap — one read lock, no snapshot clone, no DB query.
+    pub fn is_bulk_indexing(&self) -> bool {
+        self.read(|inner| {
+            inner.stale_chunking
+                || inner
+                    .current
+                    .as_ref()
+                    .is_some_and(|cur| cur.mode == RunMode::Full || cur.files_total > 1)
+        })
+    }
+
+    /// Clear the "stale chunking remains" latch behind [`Self::is_bulk_indexing`].
+    /// Call once no non-frozen file is known to be chunked under a stale
+    /// fingerprint any more: `ingest::scan_and_index` calls this both when a
+    /// reconcile scan itself found nothing to re-chunk (`!scan.rechunk_detected()`)
+    /// and, separately, when the indexing run that consumed a scan's complete
+    /// dirty worklist finishes successfully — either is sufficient on its own,
+    /// so it is safe (and cheap — the same single write lock as any other
+    /// update here) to call redundantly from both. A failed run must NOT call
+    /// this: the note stays lit through retry backoff and a permanent
+    /// give-up, since the files that scan found are still stale until an
+    /// indexing run actually succeeds.
+    pub fn clear_stale_chunking(&self) {
+        self.with(|inner| inner.stale_chunking = false);
+    }
+
+    /// Start tracking one reconcile scan (`ingest::scan_for_dirty`) for
+    /// [`Self::is_bulk_indexing`]. Pass the guard to `scan_for_dirty` so
+    /// [`ReconcileScan::mark_rechunk`] can record whether THIS scan found a
+    /// stale file — the guard's own state, independent of the sticky
+    /// `IndexStatus`-wide latch `mark_rechunk` also sets (see
+    /// [`ReconcileScan::rechunk_detected`]).
+    #[must_use = "the returned guard is how `mark_rechunk` records whether this scan \
+                  found a stale file; binding it to `_` drops it before `scan_for_dirty` \
+                  can ever use it"]
+    pub fn begin_reconcile_scan(&self) -> ReconcileScan<'_> {
+        ReconcileScan {
+            status: self,
+            rechunk: AtomicBool::new(false),
+        }
     }
 
     pub fn snapshot(&self) -> StatusSnapshot {
@@ -950,6 +1020,45 @@ impl Drop for RunGuard<'_> {
     }
 }
 
+/// One reconcile scan in flight, from [`IndexStatus::begin_reconcile_scan`].
+/// [`Self::mark_rechunk`] sets [`IndexStatus`]'s sticky `stale_chunking`
+/// latch behind [`IndexStatus::is_bulk_indexing`] — deliberately NOT reversed
+/// when this guard drops (round-6 review, finding L1): only
+/// [`IndexStatus::clear_stale_chunking`] clears it, so the note survives past
+/// this one scan-and-run cycle when the run fails or is still retrying. This
+/// guard's own [`Self::rechunk_detected`] is separate bookkeeping — whether
+/// THIS scan specifically found a stale file — that `ingest::scan_and_index`
+/// reads to decide whether a clean scan should clear the latch.
+pub struct ReconcileScan<'a> {
+    status: &'a IndexStatus,
+    /// Atomic rather than a `Cell` so `&ReconcileScan` can be held across an
+    /// `.await` in a `Send` future.
+    rechunk: AtomicBool,
+}
+
+impl ReconcileScan<'_> {
+    /// Record that the scan found a non-frozen file whose stored chunking
+    /// fingerprint differs from the current one: a chunking change (or an
+    /// upgrade) is about to re-chunk it, and while that happens documents not
+    /// yet reached lack current heading metadata. Idempotent. Never called
+    /// for a frozen scope's files — `scan_for_dirty` skips those before this
+    /// check ever runs, since they are never re-chunked until the schema is
+    /// fixed, and this latch must not stay on forever over a file that will
+    /// never be touched.
+    pub fn mark_rechunk(&self) {
+        if !self.rechunk.swap(true, Ordering::Relaxed) {
+            self.status.with(|inner| inner.stale_chunking = true);
+        }
+    }
+
+    /// Whether [`Self::mark_rechunk`] has been called on this specific guard
+    /// — i.e. whether this scan (not some other, earlier one) found a
+    /// fingerprint-stale file.
+    pub fn rechunk_detected(&self) -> bool {
+        self.rechunk.load(Ordering::Relaxed)
+    }
+}
+
 /// Process-wide indexing status. See the module docs for why this is global.
 pub static INDEX_STATUS: LazyLock<IndexStatus> = LazyLock::new(IndexStatus::new);
 
@@ -993,6 +1102,133 @@ mod tests {
         assert_eq!(snap.runs_total, 1);
         assert_eq!(snap.runs_failed, 0);
         assert!(snap.last_run.expect("last run").success);
+    }
+
+    #[test]
+    fn is_bulk_indexing_ignores_single_file_runs() {
+        let s = IndexStatus::new();
+        assert!(!s.is_bulk_indexing(), "idle");
+
+        let run = s.begin(RunMode::Incremental, Trigger::Worker);
+        s.set_files_total(1);
+        assert!(!s.is_bulk_indexing(), "a one-file reindex is routine");
+        s.set_files_total(40);
+        assert!(
+            s.is_bulk_indexing(),
+            "a many-file run may re-chunk the corpus"
+        );
+        run.finish(None);
+        assert!(!s.is_bulk_indexing(), "finished");
+
+        let full = s.begin(RunMode::Full, Trigger::Cli);
+        assert!(s.is_bulk_indexing(), "a full rebuild always counts");
+        full.finish(None);
+    }
+
+    #[test]
+    fn is_bulk_indexing_covers_a_scan_that_found_a_chunking_change() {
+        // #286: right after a chunking change the reconcile scan runs before
+        // any indexing run has begun; the note must already show.
+        let s = IndexStatus::new();
+        let routine = s.begin_reconcile_scan();
+        assert!(
+            !s.is_bulk_indexing(),
+            "a scan that found nothing to re-chunk is routine"
+        );
+        assert!(!routine.rechunk_detected());
+
+        let scan = s.begin_reconcile_scan();
+        scan.mark_rechunk();
+        scan.mark_rechunk();
+        assert!(scan.rechunk_detected());
+        assert!(s.is_bulk_indexing(), "scanning, no run yet");
+        // The run consuming the scan's worklist starts while the guard lives:
+        // no gap, even before it records a file count.
+        let run = s.begin(RunMode::Incremental, Trigger::Worker);
+        assert!(s.is_bulk_indexing(), "run started, file count not yet set");
+        s.set_files_total(1);
+        assert!(s.is_bulk_indexing(), "still inside the scan's guard");
+        run.finish(None);
+        assert!(
+            s.is_bulk_indexing(),
+            "round-6 L1: the scan/run finishing must NOT clear the note by itself — the \
+             run above could just as easily have failed, and only an explicit \
+             `clear_stale_chunking` call may turn it off"
+        );
+        s.clear_stale_chunking();
+        assert!(
+            !s.is_bulk_indexing(),
+            "cleared once the caller confirms the run processed everything successfully"
+        );
+    }
+
+    #[test]
+    fn stale_chunking_note_survives_a_failed_run_and_the_retry_backoff_after_it() {
+        // #286 round-6 L1: an indexing run failing (an embeddings outage, say)
+        // must not turn the note off — the files the scan found are still
+        // chunked under stale settings, and `reindex::run_with_retry` may now
+        // sleep for up to its backoff ceiling, or give up entirely, before
+        // trying again. `ingest::scan_and_index` must never call
+        // `clear_stale_chunking` on this path.
+        let s = IndexStatus::new();
+        let scan = s.begin_reconcile_scan();
+        scan.mark_rechunk();
+        let run = s.begin(RunMode::Incremental, Trigger::Worker);
+        run.finish(Some("embeddings outage".into()));
+        assert!(
+            s.is_bulk_indexing(),
+            "a failed run leaves the stale files unfixed; the note must stay on"
+        );
+        // No run in flight at all now (simulating the backoff sleep, or a
+        // permanent give-up) — still on, since nothing has confirmed a fix.
+        assert!(
+            s.is_bulk_indexing(),
+            "still on with no run active — this is the backoff/give-up window"
+        );
+    }
+
+    #[test]
+    fn stale_chunking_note_clears_when_a_later_scan_finds_nothing() {
+        // Covers the case a successful-run confirmation can miss: the flagged
+        // files got fixed some other way (e.g. reindexed individually by a
+        // write) between the failed run and the next reconcile. The next
+        // scan finding nothing is its own, independent confirmation.
+        let s = IndexStatus::new();
+        let scan = s.begin_reconcile_scan();
+        scan.mark_rechunk();
+        assert!(s.is_bulk_indexing());
+
+        let clean = s.begin_reconcile_scan();
+        assert!(
+            !clean.rechunk_detected(),
+            "this scan itself found nothing stale"
+        );
+        s.clear_stale_chunking();
+        assert!(!s.is_bulk_indexing());
+    }
+
+    #[test]
+    fn a_scan_that_finds_a_stale_file_does_not_clear_a_concurrent_scans_note() {
+        // Two `ReconcileScan` guards can be live at once (in principle); a
+        // clean one must not silently undo a concurrent scan's finding, so
+        // `clear_stale_chunking` is only ever called by the scan owner after
+        // checking its OWN guard's `rechunk_detected`, never unconditionally.
+        let s = IndexStatus::new();
+        let dirty_scan = s.begin_reconcile_scan();
+        dirty_scan.mark_rechunk();
+        assert!(s.is_bulk_indexing());
+
+        let clean_scan = s.begin_reconcile_scan();
+        assert!(!clean_scan.rechunk_detected());
+        // A caller that (correctly) checks its own guard before clearing
+        // does nothing here, leaving the other scan's finding intact.
+        if clean_scan.rechunk_detected() {
+            s.clear_stale_chunking();
+        }
+        assert!(
+            s.is_bulk_indexing(),
+            "the concurrent dirty scan's note must still be on"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod document_fields;
 mod embed;
 mod eval;
 mod git;
+mod heading;
 mod ingest;
 mod mcp;
 mod oauth;

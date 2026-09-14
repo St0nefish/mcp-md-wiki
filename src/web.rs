@@ -646,6 +646,18 @@ struct ApiSearchResult {
     text: String,
     line_start: Option<i64>,
     line_end: Option<i64>,
+    /// Always present in the payload (see `ingest::upsert_pending`); optional
+    /// here only because a legacy pre-#130-style payload could in principle
+    /// lack it — the UI ignores unknown/missing fields either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_index: Option<i64>,
+    /// Present only when `chunking.heading_metadata` was on at index time
+    /// (#286) — omitted from the response entirely when absent, rather
+    /// than serialized as `null`, matching this struct's existing
+    /// unconditional-field convention for a field that may not exist yet on
+    /// an unreindexed corpus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heading_path: Option<Vec<String>>,
 }
 
 fn to_api_result(r: &SearchResult, data_path: &Path) -> ApiSearchResult {
@@ -671,6 +683,16 @@ fn to_api_result(r: &SearchResult, data_path: &Path) -> ApiSearchResult {
             .to_string(),
         line_start: r.payload.get("line_start").and_then(|v| v.as_i64()),
         line_end: r.payload.get("line_end").and_then(|v| v.as_i64()),
+        chunk_index: r.payload.get("chunk_index").and_then(|v| v.as_i64()),
+        heading_path: r
+            .payload
+            .get(crate::qdrant::HEADING_PATH_KEY)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            }),
     }
 }
 
@@ -854,31 +876,70 @@ fn get_doc_error_response(
     }
 }
 
-/// Optional `?start_line=&end_line=` on `GET /api/doc/{*path}`.
+/// Scalar query params on `GET /api/doc/{*path}` — the same modes
+/// `GetDocumentParams` exposes over MCP (#286). All absent is the whole
+/// document — the shape every existing caller (the UI's doc view and editor)
+/// sends, so every mode below is purely additive.
 ///
-/// Both absent is the whole document — the shape every existing caller (the UI's
-/// doc view and editor) sends, so the range is purely additive here.
+/// `heading_path` is deliberately not a field here. This struct is extracted
+/// with plain `axum::extract::Query` (`serde_urlencoded`-backed), like every
+/// other query-param struct in this file, which keeps this endpoint's
+/// range-param behavior as it was before #286: `?start_line=` is rejected
+/// with a 400 naming the field, a duplicate key is rejected as a duplicate
+/// field, and so on. A struct field cannot collect a repeated key, so
+/// `heading_path`'s repeated-key support comes from a second, separate
+/// `Query<Vec<(String, String)>>` extraction in `get_doc_handler` — also plain
+/// `axum::extract::Query`, which deserializes a sequence of raw pairs natively.
 #[derive(Debug, Deserialize)]
 struct DocQueryParams {
     #[serde(default)]
     start_line: Option<usize>,
     #[serde(default)]
     end_line: Option<usize>,
+    #[serde(default)]
+    line: Option<usize>,
+    #[serde(default)]
+    levels_up: Option<usize>,
+    #[serde(default)]
+    outline: Option<bool>,
 }
 
 async fn get_doc_handler(
     State(state): State<UiState>,
     AxumPath(raw_path): AxumPath<String>,
     Query(params): Query<DocQueryParams>,
+    Query(raw_pairs): Query<Vec<(String, String)>>,
 ) -> Response {
+    // Repeated `?heading_path=...` occurrences, in order. Empty (the
+    // "omitted" case, since a query string cannot distinguish "omitted" from
+    // "given zero times", and a lone `?heading_path=` gives one empty-string
+    // element rather than zero) is treated as "not given"; an occurrence with
+    // a blank value is caught below by `parse_document_view_request`'s own
+    // blank-segment check, same as it would be over MCP (#286).
+    let heading_path: Vec<String> = raw_pairs
+        .into_iter()
+        .filter(|(k, _)| k == "heading_path")
+        .map(|(_, v)| v)
+        .collect();
+    let heading_path = (!heading_path.is_empty()).then_some(heading_path);
+
     // Checked before the path is resolved, matching the MCP tool: a malformed
-    // range is wrong no matter which document it was aimed at.
-    let range = match retrieval::LineRange::new(params.start_line, params.end_line) {
-        Ok(range) => range,
-        Err(e) => {
+    // combination of parameters is wrong no matter which document it was
+    // aimed at. `retrieval::parse_document_view_request` is the single place
+    // this validation happens, shared with the MCP tool.
+    let request = match retrieval::parse_document_view_request(
+        params.start_line,
+        params.end_line,
+        params.line,
+        heading_path,
+        params.levels_up,
+        params.outline.unwrap_or(false),
+    ) {
+        Ok(request) => request,
+        Err(msg) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()})),
+                Json(serde_json::json!({"error": msg})),
             )
                 .into_response();
         }
@@ -898,37 +959,43 @@ async fn get_doc_handler(
 
     match retrieval::get_document(&state.deps(), index, &raw_path).await {
         Ok(doc) => {
-            // Always over the whole file, never the slice: this is the hash the
-            // editor sends back as `expected_hash` on POST, which guards the
-            // document on disk. Same contract as the MCP tool.
+            // Always over the whole file, never a slice/section: this is the
+            // hash the editor sends back as `expected_hash` on POST, which
+            // guards the document on disk. Same contract as the MCP tool.
             let content_hash = crate::ingest::compute_hash_from_bytes(doc.content.as_bytes());
             let rel = retrieval::relative_to_data(
                 &doc.path.to_string_lossy(),
                 &state.canonical_data_path,
             );
-            let slice = match retrieval::slice_or_whole(doc.content, range.as_ref()) {
-                Ok(slice) => slice,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                        .into_response();
+            let section_max_bytes = state.config().search.section_max_bytes;
+            match retrieval::resolve_document_view(&doc.content, &request, section_max_bytes) {
+                Ok(view) => {
+                    // The view-specific fields are shared with the MCP tool's
+                    // structured_content (`retrieval::document_view_json`);
+                    // only the envelope is added here.
+                    let mut body = retrieval::document_view_json(&view);
+                    body.insert("path".to_string(), serde_json::json!(rel));
+                    body.insert("content_hash".to_string(), serde_json::json!(content_hash));
+                    (StatusCode::OK, Json(serde_json::Value::Object(body))).into_response()
                 }
-            };
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "path": rel,
-                    "content": slice.content,
-                    "content_hash": content_hash,
-                    "start_line": slice.start_line,
-                    "end_line": slice.end_line,
-                    "total_lines": slice.total_lines,
-                    "partial": slice.partial(),
-                })),
-            )
-                .into_response()
+                Err(retrieval::DocumentViewError::Range(e)) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+                Err(retrieval::DocumentViewError::Section(e)) => {
+                    // Merge SectionError's structured `data()` (`hint` or
+                    // `candidates`) alongside `error`, matching this
+                    // endpoint's existing NotFound/Ambiguous body shape
+                    // (`{"error": ..., "suggestions"/"matches": [...]}` in
+                    // `get_doc_error_response` below).
+                    let mut body = e.data();
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("error".to_string(), serde_json::Value::String(e.message()));
+                    }
+                    (StatusCode::BAD_REQUEST, Json(body)).into_response()
+                }
+            }
         }
         Err(e) => {
             let (status, body) = get_doc_error_response(&e, &raw_path);
@@ -2228,6 +2295,30 @@ mod tests {
         assert_eq!(results[0].line_start, None);
     }
 
+    #[test]
+    fn api_search_result_omits_heading_path_when_the_payload_has_none() {
+        let mut result = SearchResult {
+            score: 0.5,
+            pre_rerank_score: None,
+            dense_score: None,
+            sparse_score: None,
+            phrase_score: None,
+            payload: HashMap::new(),
+        };
+        let bare = serde_json::to_value(to_api_result(&result, Path::new("/data"))).unwrap();
+        assert!(
+            bare.get("heading_path").is_none(),
+            "no heading_path key (not even null) without heading metadata: {bare}"
+        );
+
+        result.payload.insert(
+            crate::qdrant::HEADING_PATH_KEY.to_string(),
+            serde_json::json!(["Guide"]),
+        );
+        let with_path = serde_json::to_value(to_api_result(&result, Path::new("/data"))).unwrap();
+        assert_eq!(with_path["heading_path"], serde_json::json!(["Guide"]));
+    }
+
     // ------------------------------------------------------------------
     // get_doc error mapping (pure)
     // ------------------------------------------------------------------
@@ -2751,6 +2842,65 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    // #286: pin `axum::extract::Query`'s rejection behavior for
+    // `DocQueryParams`, unchanged from before #286 — an empty value fails to
+    // parse (rather than being treated as "omitted"), and a duplicate key is
+    // rejected outright (rather than keeping the last one). A query extractor
+    // with different semantics would silently change both.
+
+    #[tokio::test]
+    async fn get_doc_handler_rejects_an_empty_start_line_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        std::fs::write(canonical.join("range_doc.md"), RANGE_DOC).unwrap();
+
+        let app = ui_router(test_state(&canonical));
+        let req = Request::builder()
+            .uri("/api/doc/range_doc.md?start_line=")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an empty start_line value must fail to parse, not be treated as absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_rejects_a_duplicate_start_line_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        std::fs::write(canonical.join("range_doc.md"), RANGE_DOC).unwrap();
+
+        let app = ui_router(test_state(&canonical));
+        let req = Request::builder()
+            .uri("/api/doc/range_doc.md?start_line=1&start_line=5")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_rejects_an_empty_heading_path_query_value() {
+        // `?heading_path=` (present with no value) must give the same
+        // "empty or blank segment" validation error a caller gets over MCP
+        // for `heading_path: [""]`, not a bare NotFound.
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_section(&canonical, 16000, "?heading_path=").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            json["error"].as_str().unwrap().contains("heading_path"),
+            "expected an error naming heading_path, got: {json}"
+        );
+    }
+
     #[tokio::test]
     async fn get_doc_handler_not_found_reports_suggestions() {
         let dir = tempfile::tempdir().unwrap();
@@ -2779,6 +2929,344 @@ mod tests {
                 .iter()
                 .any(|s| s == "alpha.md"),
             "{json}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // /api/doc section/outline modes (#286) — parity with the MCP
+    // `get_document` tool's equivalent tests in mcp.rs.
+    // ------------------------------------------------------------------
+
+    const SECTION_DOC: &str = "# Guide\n\n## Alpha\n\nAlpha body.\n\n### Alpha Sub\n\nAlpha sub body.\n\n## Beta\n\nBeta body.\n";
+
+    fn test_state_with_section_max_bytes(
+        canonical_data_path: &Path,
+        section_max_bytes: usize,
+    ) -> UiState {
+        let mut config = (*test_config(canonical_data_path)).clone();
+        config.search.section_max_bytes = section_max_bytes;
+        let config = Arc::new(config);
+        UiState::new(
+            crate::config::shared_config(Arc::clone(&config)),
+            Arc::new(QdrantStore::new(&config.qdrant).expect("client construction is lazy")),
+            Arc::new(EmbedClient::new(&config.embedding)),
+            config.qdrant.collection.clone(),
+            canonical_data_path.to_path_buf(),
+            &["**/*.md".to_string()],
+            None,
+            test_schema_cache(&config),
+            Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(crate::reindex::ReindexQueue::new()),
+        )
+    }
+
+    /// `GET /api/doc/section_doc.md` with a raw query string, decoded.
+    async fn get_doc_section(
+        canonical: &Path,
+        section_max_bytes: usize,
+        query: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        std::fs::write(canonical.join("section_doc.md"), SECTION_DOC).unwrap();
+        let app = ui_router(test_state_with_section_max_bytes(
+            canonical,
+            section_max_bytes,
+        ));
+        let req = Request::builder()
+            .uri(format!("/api/doc/section_doc.md{query}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        (status, body_json(resp).await)
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_rejects_mutually_exclusive_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        // A query string can't express "heading_path given but *zero*
+        // elements" the way an MCP caller can send `heading_path: []` — any
+        // occurrence of the key produces at least one (possibly empty-string)
+        // element. That empty-string-element case (`?heading_path=`) is
+        // covered separately by `get_doc_handler_rejects_an_empty_heading_path_query_value`,
+        // since the blank-segment check does make it reachable here.
+        for query in [
+            "?start_line=1&line=3",
+            "?end_line=2&outline=true",
+            "?line=3&heading_path=Alpha",
+            "?line=3&heading_path=Alpha&outline=true",
+            "?levels_up=1",
+            "?levels_up=1&outline=true",
+        ] {
+            let (status, json) = get_doc_section(&canonical, 16000, query).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{query} should be a 400, got {json}"
+            );
+            assert!(!json["error"].as_str().unwrap().is_empty(), "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_section_by_line_matches_the_mcp_tool_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_section(&canonical, 16000, "?line=7").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["section"]["heading_path"],
+            serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
+        );
+        assert_eq!(json["section"]["level"], 3);
+        assert_eq!(json["outline_only"], false);
+        assert!(
+            json["content"]
+                .as_str()
+                .unwrap()
+                .contains("Alpha sub body.")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_section_by_repeated_heading_path_query_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        // Two repeated `heading_path` occurrences — the case plain
+        // `axum::extract::Query` cannot deserialize into a Vec.
+        let (status, json) = get_doc_section(
+            &canonical,
+            16000,
+            "?heading_path=Alpha&heading_path=Alpha+Sub",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["section"]["heading_path"],
+            serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
+        );
+        assert!(
+            json["content"]
+                .as_str()
+                .unwrap()
+                .contains("Alpha sub body.")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_section_levels_up_climbs_to_the_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) =
+            get_doc_section(&canonical, 16000, "?heading_path=Alpha+Sub&levels_up=1").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["section"]["heading_path"],
+            serde_json::json!(["Guide", "Alpha"])
+        );
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_section_not_found_reports_a_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_section(&canonical, 16000, "?heading_path=Nonexistent").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["hint"], serde_json::json!(["Guide"]));
+        assert!(!json["error"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_section_exceeding_the_cap_falls_back_to_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_section(&canonical, 10, "?heading_path=Alpha").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["outline_only"], true);
+        assert!(json.get("content").is_none());
+        let outline = json["outline"].as_array().unwrap();
+        assert_eq!(outline.len(), 1);
+        assert_eq!(
+            outline[0]["heading_path"],
+            serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
+        );
+        // The intro — "## Alpha" through "Alpha body." — is surfaced and
+        // readable as a plain range, matching the MCP tool.
+        assert_eq!(
+            json["intro"]["heading_path"],
+            serde_json::json!(["Guide", "Alpha"])
+        );
+        let intro_start = json["intro"]["line_start"].as_u64().unwrap();
+        let intro_end = json["intro"]["line_end"].as_u64().unwrap();
+        let (status, intro_json) = get_doc_section(
+            &canonical,
+            10,
+            &format!("?start_line={intro_start}&end_line={intro_end}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(intro_json["content"], "## Alpha\n\nAlpha body.\n\n");
+        // A line inside the intro is the same section: same response.
+        let (_, by_line) =
+            get_doc_section(&canonical, 10, &format!("?line={}", intro_start + 2)).await;
+        assert_eq!(by_line, json);
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_body_is_the_shared_view_json_plus_the_envelope() {
+        // Parity with the MCP tool, structurally: both adapters must emit
+        // exactly `retrieval::document_view_json` plus their envelope, so
+        // checking each against the shared core pins them to each other
+        // (mcp.rs has the mirror test).
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let hash = crate::ingest::compute_hash_from_bytes(SECTION_DOC.as_bytes());
+        for (cap, query, request) in [
+            (
+                16000,
+                "",
+                retrieval::parse_document_view_request(None, None, None, None, None, false),
+            ),
+            (
+                16000,
+                "?start_line=2&end_line=4",
+                retrieval::parse_document_view_request(Some(2), Some(4), None, None, None, false),
+            ),
+            (
+                16000,
+                "?line=7",
+                retrieval::parse_document_view_request(None, None, Some(7), None, None, false),
+            ),
+            (
+                10,
+                "?heading_path=Alpha",
+                retrieval::parse_document_view_request(
+                    None,
+                    None,
+                    None,
+                    Some(vec!["Alpha".into()]),
+                    None,
+                    false,
+                ),
+            ),
+            (
+                10,
+                "?heading_path=Beta",
+                retrieval::parse_document_view_request(
+                    None,
+                    None,
+                    None,
+                    Some(vec!["Beta".into()]),
+                    None,
+                    false,
+                ),
+            ),
+            (
+                16000,
+                "?outline=true",
+                retrieval::parse_document_view_request(None, None, None, None, None, true),
+            ),
+            (
+                1,
+                "?outline=true",
+                retrieval::parse_document_view_request(None, None, None, None, None, true),
+            ),
+            (
+                16000,
+                "?line=3&outline=true&levels_up=1",
+                retrieval::parse_document_view_request(None, None, Some(3), None, Some(1), true),
+            ),
+        ] {
+            let (status, json) = get_doc_section(&canonical, cap, query).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {json}");
+            let view =
+                retrieval::resolve_document_view(SECTION_DOC, &request.unwrap(), cap).unwrap();
+            let mut expected = retrieval::document_view_json(&view);
+            expected.insert("path".into(), serde_json::json!("section_doc.md"));
+            expected.insert("content_hash".into(), serde_json::json!(hash));
+            assert_eq!(json, serde_json::Value::Object(expected), "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_section_exceeding_the_cap_with_no_children_returns_full_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_section(&canonical, 10, "?heading_path=Beta").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["outline_only"], false);
+        assert!(json["content"].as_str().unwrap().contains("Beta body."));
+        // Text served past the cap because there is nothing smaller to
+        // narrow into must say so.
+        assert_eq!(json["oversized"], true);
+        assert_eq!(json["partial"], true);
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_outline_mode_returns_no_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_section(&canonical, 16000, "?outline=true").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json.get("content").is_none());
+        let outline = json["outline"].as_array().unwrap();
+        assert_eq!(outline.len(), 4);
+        assert_eq!(outline[0]["heading_path"], serde_json::json!(["Guide"]));
+        assert_eq!(json["total_entries"], 4);
+        assert_eq!(json["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_section_duplicate_exact_heading_path_is_ambiguous() {
+        // Two sections with the identical heading_path must
+        // not silently resolve to the first one over the web API either.
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            canonical.join("dup.md"),
+            "# S\n## Fireball\na\n## Fireball\nb\n",
+        )
+        .unwrap();
+        let app = ui_router(test_state_with_section_max_bytes(&canonical, 16000));
+        let req = Request::builder()
+            .uri("/api/doc/dup.md?heading_path=Fireball")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let json = body_json(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let candidates = json["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_section_content_hash_matches_range_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (_, whole) = get_doc_section(&canonical, 16000, "").await;
+        let (_, section) = get_doc_section(&canonical, 16000, "?line=7").await;
+
+        assert_eq!(
+            whole["content_hash"], section["content_hash"],
+            "content_hash must always describe the whole file, matching the MCP tool"
         );
     }
 

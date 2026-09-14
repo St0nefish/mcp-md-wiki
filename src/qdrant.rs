@@ -16,6 +16,34 @@ use tracing::{debug, error, info, warn};
 use crate::config::ResolvedQdrantConfig;
 use crate::state::FieldFilter;
 
+/// Which optional payload indexes [`VectorStore::ensure_collection`] creates.
+/// A struct rather than adjacent positional bools so a call site reads by
+/// name; production callers build it with [`IndexFeatures::from_config`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexFeatures {
+    /// The phrase-matching text index on the `text` field (`search.phrase`).
+    /// Creation failure — an older Qdrant server rejecting `phrase_matching` —
+    /// is logged and tolerated like every other payload index: it never fails
+    /// startup, and the caller-visible effect is `status::INDEX_STATUS`'s
+    /// "text" entry going to `Failed`, which gates phrase matching off for the
+    /// process (see `status::IndexStatus::phrase_matching_available`).
+    pub phrase: bool,
+    /// Keyword indexes on [`HEADING_PREFIXES_KEY`]/[`SECTION_KEY`]
+    /// (`chunking.heading_metadata`, #286) — created only when the flag is on,
+    /// since those payload fields are only ever written when it is.
+    pub heading_metadata: bool,
+}
+
+impl IndexFeatures {
+    /// The features a live config asks for.
+    pub fn from_config(config: &crate::config::ResolvedConfig) -> Self {
+        Self {
+            phrase: config.search.phrase,
+            heading_metadata: config.chunking.heading_metadata,
+        }
+    }
+}
+
 pub trait VectorStore: Send + Sync {
     async fn upsert_points(&self, collection: &str, points: Vec<QdrantPoint>) -> Result<()>;
     async fn delete_by_files(&self, collection: &str, file_paths: &[&str]) -> Result<()>;
@@ -29,19 +57,13 @@ pub trait VectorStore: Send + Sync {
     /// `indexed_fields` (plus the standing `mtime` range index). In the trait for
     /// the same reason as `drop_collection` above.
     ///
-    /// `enable_phrase` gates creating the phrase-matching text index on the `text`
-    /// field (`search.phrase`, config-controlled). When `true`, index creation
-    /// failure — an older Qdrant server rejecting `phrase_matching` — is logged and
-    /// tolerated exactly like every other payload index above: it never fails
-    /// startup, and the caller-visible effect is `status::INDEX_STATUS`'s "text"
-    /// entry going to `Failed`, which is what gates phrase matching off for the
-    /// process (see `status::IndexStatus::phrase_matching_available`).
+    /// `features` gates the optional payload indexes — see [`IndexFeatures`].
     async fn ensure_collection(
         &self,
         collection: &str,
         vector_size: u64,
         indexed_fields: &[IndexedField],
-        enable_phrase: bool,
+        features: IndexFeatures,
     ) -> Result<()>;
     /// Exact point count for `collection` (`0` if the collection does not exist), for
     /// #155's active self-heal: `ingest::scan_and_index` compares this against
@@ -244,6 +266,57 @@ pub const CHUNK_TEXT_KEY: &str = "text";
 /// into a Qdrant condition (currently `retrieval::path_filter_condition`) must go
 /// through this constant instead of a string literal.
 pub const PATH_ANCESTORS_KEY: &str = "path_ancestors";
+
+/// The Qdrant payload key under which a chunk's structured heading breadcrumb
+/// (`chunk::Chunk::heading_path`) is stored, as a JSON string array — written
+/// only when `chunking.heading_metadata` is on (#286). One writer
+/// (`ingest::upsert_pending`); readers (`mcp::build_chunk_search_payload`,
+/// `retrieval::search_sections`) go through this constant rather than a string
+/// literal, same discipline as [`CHUNK_TEXT_KEY`] and for the same reason (the
+/// #61 regression this project has already been burned by once).
+pub const HEADING_PATH_KEY: &str = "heading_path";
+
+/// The Qdrant payload key under which a chunk's CommonMark heading level
+/// (`chunk::Chunk::heading_level`, 1-6, or 0) is stored — see
+/// [`HEADING_PATH_KEY`]'s doc comment for the writer/reader discipline this
+/// follows.
+pub const HEADING_LEVEL_KEY: &str = "heading_level";
+
+/// The Qdrant payload key under which a chunk's keyword array of joined
+/// heading-path runs is stored (#286): one key per contiguous run of
+/// `heading_path` segments starting at any depth — e.g. for a `heading_path`
+/// of `["Spells", "Fireball"]`: `["spells", "spells\u{1f}fireball",
+/// "fireball"]` (each segment through `heading::normalize_heading_text`,
+/// joined with `heading::HEADING_KEY_SEPARATOR` so heading text containing
+/// `" > "` cannot collide with a deeper path), built by
+/// `ingest::derive_heading_prefixes`. `search`'s `heading_prefix` parameter
+/// lowers to `Condition::matches(HEADING_PREFIXES_KEY, joined)`, so it matches
+/// a run of consecutive headings anywhere in the path — see
+/// [`HEADING_PATH_KEY`]'s doc comment for the writer/reader discipline.
+pub const HEADING_PREFIXES_KEY: &str = "heading_prefixes";
+
+/// The Qdrant payload key identifying which SECTION a chunk was attributed to
+/// (#286) — `"{file_path}#{section_line_start}-{section_line_end}:{heading_path
+/// joined with heading::HEADING_KEY_SEPARATOR}"` (built by `ingest::section_key`),
+/// unique even across
+/// duplicate heading names (which share a `heading_path` but not a line
+/// range). This is the
+/// `group_by` field `retrieval::search_sections` (#286) groups on to
+/// collapse multiple chunk hits within one section down to its single
+/// best-scoring hit — see [`HEADING_PATH_KEY`]'s doc comment for the
+/// writer/reader discipline.
+pub const SECTION_KEY: &str = "section_key";
+
+/// The Qdrant payload key under which the attributed section's own
+/// file-relative subtree start line is stored (`chunk::Chunk::
+/// section_line_start`, equal to the matching `retrieval::OutlineEntry::
+/// line_start`) — see
+/// [`HEADING_PATH_KEY`]'s doc comment for the writer/reader discipline.
+pub const SECTION_LINE_START_KEY: &str = "section_line_start";
+
+/// The Qdrant payload key under which the attributed section's own
+/// file-relative subtree end line is stored — see [`SECTION_LINE_START_KEY`].
+pub const SECTION_LINE_END_KEY: &str = "section_line_end";
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
@@ -722,8 +795,12 @@ impl QdrantStore {
         collection: &str,
         vector_size: u64,
         indexed_fields: &[IndexedField],
-        enable_phrase: bool,
+        features: IndexFeatures,
     ) -> Result<()> {
+        let IndexFeatures {
+            phrase: enable_phrase,
+            heading_metadata: enable_heading_metadata,
+        } = features;
         let exists = self
             .client
             .collection_exists(collection)
@@ -965,6 +1042,42 @@ impl QdrantStore {
             }
         }
 
+        // Keyword indexes on `heading_prefixes`/`section_key` (#286),
+        // created only when `chunking.heading_metadata` is on — unlike
+        // `path_ancestors` above, these payload fields are themselves only ever
+        // written when the flag is on, so an index with nothing to index is
+        // pure waste on a deployment that never enables it. Follows the same
+        // non-fatal tolerate-and-record pattern as every index above: Qdrant
+        // filters/groups correctly without the index, just by an unindexed
+        // scan, so a creation failure degrades performance, not correctness.
+        if enable_heading_metadata {
+            for key in [HEADING_PREFIXES_KEY, SECTION_KEY] {
+                match self
+                    .client
+                    .create_field_index(CreateFieldIndexCollectionBuilder::new(
+                        collection,
+                        key,
+                        FieldType::Keyword,
+                    ))
+                    .await
+                {
+                    Ok(_) => crate::status::INDEX_STATUS.record_payload_index(key, None),
+                    Err(e) => {
+                        error!(
+                            "Could not ensure the keyword index on '{}' in collection '{}': \
+                             {:#}. heading_prefix filtering / section-granularity search may be \
+                             slow until this is resolved.",
+                            key, collection, e
+                        );
+                        crate::status::INDEX_STATUS.record_payload_index(
+                            key,
+                            Some(crate::status::redact_error(&format!("{e:#}"))),
+                        );
+                    }
+                }
+            }
+        }
+
         info!(
             collection,
             fields = indexed_fields.len(),
@@ -1094,9 +1207,9 @@ impl VectorStore for QdrantStore {
         collection: &str,
         vector_size: u64,
         indexed_fields: &[IndexedField],
-        enable_phrase: bool,
+        features: IndexFeatures,
     ) -> Result<()> {
-        QdrantStore::ensure_collection(self, collection, vector_size, indexed_fields, enable_phrase)
+        QdrantStore::ensure_collection(self, collection, vector_size, indexed_fields, features)
             .await
     }
 
@@ -1783,7 +1896,12 @@ mod tests {
 
         let vector_size = 4;
         store
-            .ensure_collection(&config.collection, vector_size, &[], false)
+            .ensure_collection(
+                &config.collection,
+                vector_size,
+                &[],
+                IndexFeatures::default(),
+            )
             .await
             .unwrap();
 
@@ -1883,7 +2001,7 @@ mod tests {
             // Create the collection at dimension 4 — as if indexed by an older embedding
             // model.
             store
-                .ensure_collection(&config.collection, 4, &[], false)
+                .ensure_collection(&config.collection, 4, &[], IndexFeatures::default())
                 .await
                 .unwrap();
 
@@ -1891,7 +2009,7 @@ mod tests {
             // a different dimension, with no `drop_collection` in between — exactly what
             // `index --full` would do, and a plain `serve` restart never does.
             let result = store
-                .ensure_collection(&config.collection, 8, &[], false)
+                .ensure_collection(&config.collection, 8, &[], IndexFeatures::default())
                 .await;
 
             assert!(
@@ -1917,14 +2035,14 @@ mod tests {
             // ordinary scoped indexing run calls `ensure_collection` again) and must not
             // regress.
             store
-                .ensure_collection(&config.collection, 4, &[], false)
+                .ensure_collection(&config.collection, 4, &[], IndexFeatures::default())
                 .await
                 .expect("a matching dimension must not be rejected");
         })
         .await;
     }
 
-    /// Integration test: `ensure_collection(enable_phrase: true)` creates a working
+    /// Integration test: `ensure_collection` with `IndexFeatures { phrase: true }` creates a working
     /// phrase-matching text index, a phrase-filtered *fused* (RRF) query ranks the
     /// chunk containing the exact phrase above one that merely contains the same
     /// words in a different order, and — #133 — the identical phrase condition
@@ -1984,7 +2102,15 @@ mod tests {
 
         let vector_size = 4;
         store
-            .ensure_collection(&config.collection, vector_size, &[], true)
+            .ensure_collection(
+                &config.collection,
+                vector_size,
+                &[],
+                IndexFeatures {
+                    phrase: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -2170,7 +2296,7 @@ mod tests {
                 &config.collection,
                 vector_size,
                 &[IndexedField::keyword("file_path")],
-                false,
+                IndexFeatures::default(),
             )
             .await
             .unwrap();
@@ -2440,7 +2566,7 @@ mod tests {
                 &config.collection,
                 4,
                 &[IndexedField::keyword("domain")],
-                false,
+                IndexFeatures::default(),
             )
             .await
             .unwrap();
@@ -2497,6 +2623,132 @@ mod tests {
             assert_eq!(values.len(), 2, "should have 2 distinct domains");
             assert!(values.contains(&"networking".to_string()));
             assert!(values.contains(&"docker".to_string()));
+        })
+        .await;
+    }
+
+    /// Integration test (#286): upsert points carrying `section_key`, then
+    /// confirm `search_grouped(group_by: SECTION_KEY)` collapses multiple chunk
+    /// hits within the same section down to that section's single best-scoring
+    /// hit — the mechanism `retrieval::search_sections` depends on Qdrant's
+    /// server-side grouping to provide.
+    ///
+    /// Stays live-only for the same reason `facet_values_returns_distinct_strings`
+    /// does just above: the thing under test is Qdrant's own server-side
+    /// `group_by` collapsing behavior, which no fake `RetrievalStore` can stand
+    /// in for without just re-asserting the grouping logic.
+    ///
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test search_grouped_by_section_key_collapses_to_best_hit_per_section -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn search_grouped_by_section_key_collapses_to_best_hit_per_section() {
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: live_test_collection(
+                "search_grouped_by_section_key_collapses_to_best_hit_per_section",
+            ),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+
+        let _ = store.client.delete_collection(&config.collection).await;
+
+        let vector_size = 4;
+        store
+            .ensure_collection(
+                &config.collection,
+                vector_size,
+                &[],
+                IndexFeatures {
+                    heading_metadata: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        with_collection_cleanup(&store, &config.collection, || async {
+            let make_point = |id: &str, section_key: &str, vec: Vec<f32>| {
+                let mut payload = HashMap::new();
+                payload.insert(SECTION_KEY.into(), serde_json::json!(section_key));
+                payload.insert("file_path".into(), serde_json::json!("/data/spells.md"));
+                QdrantPoint {
+                    id: id.into(),
+                    vector: vec,
+                    sparse: None,
+                    payload,
+                }
+            };
+
+            // Two chunks of the SAME section ("sec-a") plus one chunk of a
+            // different section ("sec-b") — all near-parallel to the query
+            // vector so every point is a real candidate, not merely present.
+            // Keys use `ingest::section_key`'s real format; "sec-b" is a second
+            // heading with the same path, told apart only by its line range.
+            let points = vec![
+                make_point(
+                    "00000000-0000-0000-0000-000000000001",
+                    "spells.md#1-19:Spells\u{1f}Fireball",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-000000000002",
+                    "spells.md#1-19:Spells\u{1f}Fireball",
+                    vec![0.9, 0.1, 0.0, 0.0],
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-000000000003",
+                    "spells.md#20-30:Spells\u{1f}Fireball",
+                    vec![0.8, 0.2, 0.0, 0.0],
+                ),
+            ];
+            store
+                .upsert_points(&config.collection, points)
+                .await
+                .unwrap();
+
+            // Poll instead of a single fixed sleep -- see retry_until's doc
+            // comment for why (#231).
+            let results = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    store
+                        .search_grouped(
+                            &config.collection,
+                            vec![1.0, 0.0, 0.0, 0.0],
+                            None,
+                            &[],
+                            HashMap::new(),
+                            Vec::new(),
+                            SECTION_KEY,
+                            1,
+                            10,
+                            50,
+                        )
+                        .await
+                        .unwrap()
+                },
+                |results| !results.is_empty(),
+            )
+            .await;
+
+            assert_eq!(
+                results.len(),
+                2,
+                "two distinct section_key values must collapse to two groups, \
+                 even though one of them ('sec-a', spelled out above as \
+                 spells.md#1-19:...) had two chunk-level hits"
+            );
+            let winning_ids: Vec<f32> = results.iter().map(|r| r.score).collect();
+            // The best-scoring hit of the two-chunk "sec-a" group (vector
+            // [1.0,0,0,0], an exact match against the query) must be the one
+            // that survives grouping, not the weaker [0.9,0.1,0,0] sibling.
+            assert!(
+                winning_ids.iter().any(|s| (*s - 1.0).abs() < 0.01),
+                "the best-scoring hit within a group must be the one that survives \
+                 collapsing, got scores: {winning_ids:?}"
+            );
         })
         .await;
     }
@@ -2710,7 +2962,7 @@ mod tests {
                 &config.collection,
                 vector_size,
                 &[IndexedField::keyword("file_path")],
-                false,
+                IndexFeatures::default(),
             )
             .await
             .unwrap();
@@ -2833,7 +3085,7 @@ mod tests {
                 &config.collection,
                 vector_size,
                 &[IndexedField::keyword("file_path")],
-                false,
+                IndexFeatures::default(),
             )
             .await
             .unwrap();
@@ -3170,7 +3422,12 @@ mod tests {
 
         let indexed_fields = [IndexedField::keyword("tags")];
         store
-            .ensure_collection(&config.collection, 4, &indexed_fields, false)
+            .ensure_collection(
+                &config.collection,
+                4,
+                &indexed_fields,
+                IndexFeatures::default(),
+            )
             .await
             .unwrap();
 

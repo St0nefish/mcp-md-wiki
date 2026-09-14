@@ -77,10 +77,11 @@ The MCP port (8001) is the only externally exposed port. This service is designe
 | `main.rs` | CLI entrypoint (clap subcommands), startup wiring |
 | `config.rs` | Config deserialization (`config.yaml` + env-var overrides) |
 | `ingest.rs` | Indexing pipeline: discover → hash → validate → chunk → embed → upsert |
-| `chunk.rs` | Section-aware markdown chunker |
+| `heading.rs` | The heading model shared by `chunk.rs` and `retrieval.rs`'s outline/section modes, so chunk attribution and `get_document` cannot disagree: `HeadingTree::parse` detects headings with pulldown-cmark (top-level ATX and setext headings; not inside code, HTML blocks, blockquotes, lists or footnotes), stores each heading's rendered plain text (invisible characters that never affect rendering removed, joiners/direction marks/variation selectors kept, whitespace collapsed, capped at 200 characters), level, parent and section/subtree line ranges; `normalize_heading_text`/`heading_prefix_key` are the one normalization (every invisible format character dropped, plus Unicode case folding, re-capped after folding) behind `get_document`'s `heading_path` and `search`'s `heading_prefix`; `body_line_offset` maps body lines to raw-file lines past the frontmatter |
+| `chunk.rs` | Section-aware markdown chunker over `heading::HeadingTree`. With `chunking.heading_metadata` off, small consecutive sections merge up to `target_chunk_size`; with it on, no chunk crosses a heading boundary, so every chunk is attributed to exactly one heading's section or the preamble |
 | `embed.rs` | Embedding API client (async-openai, batched, exponential backoff) |
 | `qdrant.rs` | Qdrant gRPC operations: upsert, delete, search, facet fetch |
-| `state.rs` | SQLite state DB (sqlx): tracks relative path → content hash + chunk count + schema fingerprint, plus the `documents`/`document_fields` metadata index and the `document_links` graph-edge table (see [State Model](#state-model)) |
+| `state.rs` | SQLite state DB (sqlx): tracks relative path → content hash + chunk count + schema fingerprint + chunking fingerprint, plus the `documents`/`document_fields` metadata index and the `document_links` graph-edge table (see [State Model](#state-model)) |
 | `document_fields.rs` | Projects frontmatter JSON into filterable `document_fields` rows (dot-path flattening, array expansion, numeric coercion) |
 | `schema.rs` | `.kb-schema.yaml` cascade: parsing, cascade merge, `SchemaCache` tree walk + resolution, type/value checking, schema fingerprinting |
 | `retrieval.rs` | Shared retrieval core: `search`, `get_document`, and `list_documents`, consumed by `mcp.rs`, `web.rs`, and the `search`/`get` CLI subcommands alike |
@@ -93,7 +94,7 @@ The MCP port (8001) is the only externally exposed port. This service is designe
 | `web.rs` | The knowledge-base web UI — docs browser, semantic search, Cytoscape graph view, and a create/edit/move/delete editor — served straight from the binary and deliberately unauthenticated (see [Web UI](#web-ui)) |
 | `server.rs` | Axum server: MCP route, webhook route, `/health`/`/status`/`/metrics`/`POST /admin/reload`, and the unauthenticated web UI routes from `web.rs`, all merged in before the rate-limit `GovernorLayer` wrap; spawns the reindex worker and the periodic reconcile-sweep timer (`indexing.reconcile_interval_secs`) |
 | `webhook.rs` | Webhook handler: provider signature verification, branch filter, `git fetch` + `git merge --ff-only`, then diffs the pulled range and marks exactly those paths dirty on the `ReindexQueue` — it never indexes inline (see [Webhook Flow](#webhook-flow)) |
-| `reload.rs` | `POST /admin/reload`: re-reads and re-validates `config.yaml`, swaps it into the live `SharedConfig`, and classifies each changed setting as `applied` (read fresh on next use), `restart_required` (baked into a startup-built value), or `reindex_required` (`chunking.*`) |
+| `reload.rs` | `POST /admin/reload`: re-reads and re-validates `config.yaml`, swaps it into the live `SharedConfig`, and classifies each changed setting as `applied` (read fresh on next use), `restart_required` (baked into a startup-built value), `reindex_scheduled` (`chunking.*`, re-chunked automatically via the per-file chunking fingerprint), or `reindex_required` (`ui.semantic_edges.*`) |
 | `status.rs` | Process-global indexing run state (`INDEX_STATUS`) backing `/status` and `/metrics`: in-flight phase/progress, last-run outcome and counters, payload-index health |
 | `validate.rs` | Frontmatter validation against the resolved `.kb-schema.yaml` cascade for each file's path (falls back to the `frontmatter` config as the implicit root schema) |
 | `git.rs` | Git subprocess helpers: token injection, URL redaction, fetch/merge with timeout, serialized by `GIT_LOCK` |
@@ -110,6 +111,7 @@ discover files (relative paths)
  compute SHA256 hash
         │
    unchanged? ──── yes ──► skip (increment skipped counter)
+   (same hash, schema fingerprint and chunking fingerprint)
         │ no
         ▼
  validate frontmatter
@@ -132,7 +134,8 @@ discover files (relative paths)
  file shrank? ─── yes ──► delete tail points (old_count - new_count)
         │
         ▼
- update SQLite state (relative_path → hash + chunk_count)
+ update SQLite state (relative_path → hash + chunk_count
+                      + schema and chunking fingerprints)
         │
         ▼ (after all files)
  orphan removal: delete Qdrant points + state rows
@@ -164,6 +167,7 @@ Written to `<source.data_path>/state.db` — by default `/data/state.db`, which 
 | `content_hash` | TEXT | SHA256 hex digest of file content |
 | `chunk_count` | INTEGER | Number of chunks produced on last index |
 | `schema_hash` | TEXT | Fingerprint of the `.kb-schema.yaml` cascade the file was last validated against (see [Schema Cascade](#schema-cascade)); added via a guarded `ALTER TABLE ... ADD COLUMN`, since there is no migration runner |
+| `chunking_fingerprint` | TEXT | Fingerprint of every `chunking.*` setting (except `target_chunk_size` while `heading_metadata` is on, where it has no effect) plus the code-level `CHUNKER_VERSION` the file was last chunked under (`ingest::chunking_fingerprint`). The reconcile scan and the indexer's skip check treat a mismatch as dirty, so a chunking change re-chunks automatically. Added the same guarded way, defaulting to `''`, which never matches — so rows from before the column existed are re-chunked once (#286). Files under a frozen schema scope are skipped before this check and keep their old chunks until the schema is fixed |
 
 ### Document metadata index (`documents`, `document_fields`)
 
@@ -223,8 +227,13 @@ Each indexed chunk is stored as a Qdrant point with this payload:
 | `file_path` | keyword | yes | Relative path from `data_path` |
 | `chunk_index` | integer | no | 0-based chunk position within the file |
 | `text` | text | no | Chunk content (used in search results) |
-| `line_start` | integer | no | First line of the chunk in the source file |
-| `line_end` | integer | no | Last line of the chunk in the source file |
+| `line_start` | integer | no | First line of the chunk in the source file, counted from the top of the raw file (frontmatter included), matching `get_document` |
+| `line_end` | integer | no | Last line of the chunk in the source file, same numbering |
+| `heading_path` | keyword array | no | Only with `chunking.heading_metadata` (#286). Heading texts from the top-level heading down to the chunk's attributed heading; `[]` before the first heading |
+| `heading_level` | integer | no | Only with `chunking.heading_metadata`. Level (1-6) of the attributed heading, `0` when `heading_path` is empty |
+| `heading_prefixes` | keyword array | yes (when the flag is on) | Only with `chunking.heading_metadata`. One key per run of consecutive headings in `heading_path` (each segment normalized by `heading::normalize_heading_text`, joined with U+001F) — what `search`'s `heading_prefix` filter matches exactly |
+| `section_key` | keyword | yes (when the flag is on) | Only with `chunking.heading_metadata`. `file#start-end:path` identity of the attributed section; `search`'s `section` granularity groups by it |
+| `section_line_start` / `section_line_end` | integer | no | Only with `chunking.heading_metadata`. Line range of the attributed section: the heading's whole subtree, or the preamble |
 | `mtime` | integer | yes | File modification time as Unix timestamp |
 | frontmatter fields | keyword / array | yes | Fields listed in `frontmatter.indexed_fields` (e.g. `type`, `domain`, `tags`, `title`) |
 
@@ -234,7 +243,7 @@ Keyword and array fields listed in `frontmatter.indexed_fields` get Qdrant keywo
 
 ## Retrieval
 
-`retrieval.rs` provides three shared functions consumed by `mcp.rs`: `search` and `get_document` as before, plus `list_documents` — the exhaustive, no-embedding-call enumeration that used to be its own MCP tool. The MCP `search` tool now covers both: its handler dispatches to `list_documents` when the caller omits `query`, and to `search` (ranked, top-k) otherwise; `granularity` (`chunk` or `document`, defaulting per `query`'s presence) then picks the result shape. `get_document` remains its own separate MCP tool.
+`retrieval.rs` provides three shared functions consumed by `mcp.rs`: `search` and `get_document` as before, plus `list_documents` — the exhaustive, no-embedding-call enumeration that used to be its own MCP tool. The MCP `search` tool now covers both: its handler dispatches to `list_documents` when the caller omits `query`, and to `search` (ranked, top-k) otherwise; `granularity` (`chunk` or `document`, defaulting per `query`'s presence, or `section` — see `search_sections` — when `chunking.heading_metadata` is on) then picks the result shape. `get_document` remains its own separate MCP tool.
 
 **`search`** — embeds the query, builds a Qdrant filter map from the `filters` map (any frontmatter field with a payload index; an unindexed field is rejected by name, not silently unfiltered), runs the retrieval (see below), applies an optional `min_score` floor, and returns raw results. Timing (embed + search ms) is logged at `debug`.
 
@@ -327,7 +336,7 @@ The queue itself is what used to be a single-flight `REINDEX_LOCK` (`Arc<tokio::
 
 `web.rs` serves a docs-first web UI on the *same port* as MCP (8001) — it is a second router merged into the one Axum app `server::run_server` builds, not a separate service. Its shell (`assets/ui/`) and every script it loads — Cytoscape.js plus its `layout-base`/`cose-base`/`fcose` layout plugins, `marked`/`dompurify` for rendering markdown safely, `edit.js` for the editor — are embedded into the binary via `include_str!` and served from `/assets/*`, so there are no filesystem reads or external fetches at request time.
 
-**Routes:** `/` (the shell), `/assets/*`, `/api/graph` (nodes from `StateDb::all_document_summaries`, edges from `StateDb::all_links` — see [Link graph](#link-graph) above — filtered to the current node set), `/api/search` (a thin wrapper over `retrieval::search`), `/api/schema/{*path}`, and `/api/doc/{*path}`, which carries all three HTTP methods on one route: `GET` (via `retrieval::get_document`, with the same `?start_line=&end_line=` slicing contract as the MCP tool and the CLI's `get`), `POST` (create, full-replace edit, or move — `write::write_document`), and `DELETE` (`write::delete_document`).
+**Routes:** `/` (the shell), `/assets/*`, `/api/graph` (nodes from `StateDb::all_document_summaries`, edges from `StateDb::all_links` — see [Link graph](#link-graph) above — filtered to the current node set), `/api/search` (a thin wrapper over `retrieval::search`), `/api/schema/{*path}`, and `/api/doc/{*path}`, which carries all three HTTP methods on one route: `GET` (via `retrieval::get_document`, with the same `?start_line=&end_line=` slicing contract as the MCP tool and the CLI's `get`, plus the MCP tool's `line`/`heading_path`/`levels_up`/`outline` section and outline modes, parsed, resolved and serialized by the same `retrieval.rs` functions so the two transports return identical JSON), `POST` (create, full-replace edit, or move — `write::write_document`), and `DELETE` (`write::delete_document`).
 
 The UI itself is docs-first: a sidebar document tree and a semantic-search results panel are the primary views, hash-routed (home/browse/doc); the Cytoscape graph — full-KB or a per-document neighborhood, `fcose` layout, hover/zoom-gated labels — is reachable but secondary. A full create/edit/move/delete editor rides on top of the same `/api/doc/{*path}` route the read view uses.
 

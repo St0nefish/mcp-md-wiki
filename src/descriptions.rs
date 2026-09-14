@@ -20,6 +20,7 @@
 //! Extensions are APPEND-ONLY: they can never suppress or contradict a
 //! compiled or config-derived sentence, only add to it.
 
+use crate::config::Granularity;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -90,6 +91,221 @@ pub fn retrieval_mode_sentence(hybrid: bool, phrase: bool) -> &'static str {
     }
 }
 
+/// The config-derived text documenting `search`'s `granularity` parameter
+/// (#286): which values this server accepts, what each returns, and what an
+/// omitted `granularity` defaults to. Describes ONLY the currently-enabled
+/// granularities — a disabled one is never even mentioned, since
+/// `KbSearchServer::overlay_input_schema` has already removed it from the
+/// tool's schema `enum`. `effective` is
+/// `ResolvedConfig::effective_granularities`'s output.
+///
+/// Used verbatim in two places so they cannot diverge: as the `granularity`
+/// property's description in the tool's input schema (`overlay_input_schema`)
+/// and, via [`granularity_sentence`], in the composed tool description.
+///
+/// Each default clause must match `mcp::resolve_search_granularity`: with a
+/// query, the first enabled of chunk → document → section; without one,
+/// `document` or an error. `mcp`'s
+/// `granularity_description_matches_resolution_for_every_effective_set` test
+/// checks every non-empty subset against that function. The seven cases are
+/// enumerated as deliberately-worded prose rather than templated.
+pub fn granularity_description(effective: &[Granularity]) -> String {
+    const SECTION: &str = "a heading path, two line ranges and `scope` per match, no text — \
+                           requires a query. The path names the deepest heading containing the \
+                           match; `line_start`/`line_end` cover that heading and everything nested \
+                           under it, and `hit_line_start`/`hit_line_end` are the matched text \
+                           alone. A row for a heading that has sub-headings matched in the \
+                           heading's own text before its first sub-heading (each sub-heading gets \
+                           rows of its own). Read just the match with `get_document`'s \
+                           `start_line`/`end_line`, or the whole row: a `scope: section` row with \
+                           `heading_path` or `line`; a `scope: preamble` row (text before the \
+                           first heading) with `line`; a `scope: whole_document` row (a document \
+                           with no headings to select by, or one changed since it was indexed) by \
+                           reading the whole document";
+    let chunk = effective.contains(&Granularity::Chunk);
+    let document = effective.contains(&Granularity::Document);
+    let section = effective.contains(&Granularity::Section);
+
+    match (chunk, document, section) {
+        (true, true, true) => format!(
+            "`granularity` decides what a result is: `document` (one row each), `chunk` \
+             (scored snippets, several per document), or `section` ({SECTION}). Defaults to \
+             `chunk` with a query, `document` without; `section` is only ever explicit."
+        ),
+        (true, true, false) => "`granularity` decides what a result is: `document` (one row \
+             each) or `chunk` (scored snippets, several per document). Defaults to `chunk` \
+             with a query, `document` without."
+            .to_string(),
+        (true, false, true) => format!(
+            "`granularity` decides what a result is: `chunk` (scored snippets, several per \
+             document) or `section` ({SECTION}). Defaults to `chunk`; every search needs a \
+             query on this server."
+        ),
+        (false, true, true) => format!(
+            "`granularity` decides what a result is: `document` (one row each) or `section` \
+             ({SECTION}). Defaults to `document`; `section` is only ever explicit."
+        ),
+        (true, false, false) => "`granularity` is fixed to `chunk` (scored snippets, several \
+             per document) on this server; every search needs a query."
+            .to_string(),
+        (false, true, false) => {
+            "`granularity` is fixed to `document` (one row each) on this server.".to_string()
+        }
+        (false, false, true) => format!(
+            "`granularity` is fixed to `section` ({SECTION}) on this server; every search \
+             needs a query."
+        ),
+        // Rejected at config load (`search.granularities leaves no granularity
+        // enabled`), so unreachable from a validated config; still worded rather
+        // than empty in case a test or future caller builds one by hand.
+        (false, false, false) => "No `granularity` is currently enabled on this server — \
+             every `search` call will fail. This is a deployment configuration problem \
+             (search.granularities / chunking.heading_metadata), not something a caller can \
+             work around."
+            .to_string(),
+    }
+}
+
+/// The `heading_prefix` sentence appended to `search`'s description when
+/// `chunking.heading_metadata` is on. Kept in step with the
+/// `SearchParams::heading_prefix` doc comment (the schema property
+/// description) and `mcp::heading_prefix_condition`'s behavior.
+pub const HEADING_PREFIX_SENTENCE: &str = "`heading_prefix` restricts query results to \
+     everything under a run of consecutive headings, which can start at any level. Each \
+     segment is a complete heading name, not a prefix of one: `[\"Conditions\"]`, \
+     `[\"Chapter 10: Game Mastering\", \"Conditions\"]` and `[\"Conditions\", \"Blinded\"]` all \
+     match text under `Chapter 10: Game Mastering > Conditions > Blinded`, but \
+     `[\"Chapter 10\", \"Conditions\"]` matches nothing there (matched ignoring case, \
+     whitespace and invisible characters). It requires a `query`.";
+
+/// Whether any enabled granularity can serve a `search` without a query
+/// (enumeration). When none can, every sentence and schema property that
+/// only makes sense for enumeration is dropped or rewritten, so a caller is
+/// never told about a mode it cannot use (#286).
+pub fn enumeration_available(effective: &[Granularity]) -> bool {
+    effective.iter().any(|g| g.supports_no_query())
+}
+
+/// `search`'s enumeration paragraph, included only when
+/// [`enumeration_available`]. Kept out of the compiled `search.md` for that
+/// reason.
+pub const ENUMERATION_SENTENCE: &str = "Without a `query`, every match is returned in a stable \
+     order with an exact total — use that when you need a *complete* set rather than the best \
+     few. That listing is exhaustive: `offset` pages it as deep as you like, and `path_prefix` \
+     is the same substring match there.";
+
+/// Effective-set-aware descriptions for `search`'s schema properties whose
+/// static doc comments assume every granularity and mode is available
+/// (#286): `(property, Some(description))` to replace a description,
+/// `(property, None)` to remove a property that no enabled granularity can
+/// use. Applied by `KbSearchServer::overlay_input_schema` on every
+/// `list_tools`/`get_tool`, alongside the `granularity` property's own text.
+/// Never names a granularity that isn't enabled.
+pub fn search_property_descriptions(
+    effective: &[Granularity],
+) -> Vec<(&'static str, Option<String>)> {
+    let enumeration = enumeration_available(effective);
+    let text = |s: &str| Some(s.to_string());
+    let mut out = Vec::new();
+    if enumeration {
+        out.push(("query", text("Semantic query. Omit to list every match.")));
+        out.push((
+            "offset",
+            text(
+                "Number to skip, for paging. Exhaustive (no depth limit) without a query. \
+                 With a query, pages over the already-ranked results, so `offset + limit` is \
+                 capped at reranking.candidate_limit when reranking is enabled, or a fixed \
+                 depth otherwise — a request past that bound gets `offset_truncated: true` in \
+                 the response instead of a silently short or empty page.",
+            ),
+        ));
+        out.push((
+            "order_by",
+            text("Sort key when listing without a query: path/title/mtime/indexed_at."),
+        ));
+        out.push((
+            "descending",
+            text("Sort descending (when listing without a query)."),
+        ));
+        out.push(("min_score", text("Relevance floor (with a query).")));
+    } else {
+        out.push(("query", text("Semantic query. Required on this server.")));
+        out.push((
+            "offset",
+            text(
+                "Number to skip, for paging over the already-ranked results: `offset + limit` \
+                 is capped at reranking.candidate_limit when reranking is enabled, or a fixed \
+                 depth otherwise — a request past that bound gets `offset_truncated: true` in \
+                 the response instead of a silently short or empty page.",
+            ),
+        ));
+        out.push(("order_by", None));
+        out.push(("descending", None));
+        out.push(("min_score", text("Relevance floor.")));
+    }
+    if effective.contains(&Granularity::Chunk) {
+        out.push((
+            "explain",
+            text(
+                "Add a score-breakdown line per result. Only `chunk` granularity results \
+                 carry one; any other granularity rejects it.",
+            ),
+        ));
+    } else {
+        out.push(("explain", None));
+    }
+    if effective.contains(&Granularity::Document) {
+        out.push((
+            "fields",
+            text(
+                "Frontmatter fields to include per result (dot-paths). Only `document` \
+                 granularity results carry them; any other granularity rejects it.",
+            ),
+        ));
+    } else {
+        out.push(("fields", None));
+    }
+    out
+}
+
+/// The server-instructions sentence naming the knowledge base's top-level
+/// areas, pointing at `search` + `path_prefix` to explore one — as an
+/// exhaustive listing only when [`enumeration_available`].
+pub fn top_level_areas_sentence(areas: &[String], effective: &[Granularity]) -> String {
+    let how = if enumeration_available(effective) {
+        "Use search with path_prefix (and no query, for an exhaustive listing) to enumerate one."
+    } else {
+        "Use search with a query and path_prefix to explore one."
+    };
+    format!(
+        "Top-level areas of this knowledge base: {}. {how}",
+        areas.join(", ")
+    )
+}
+
+/// The config-derived sentence(s) for `search`'s tool description:
+/// [`ENUMERATION_SENTENCE`] when [`enumeration_available`], then
+/// [`granularity_description`], plus, when `heading_metadata` is on,
+/// [`HEADING_PREFIX_SENTENCE`] — gated independently of which granularities
+/// are enabled, since the filter applies to every query granularity, not
+/// just `section`.
+///
+/// Same role as [`retrieval_mode_sentence`] — a pure function of live config
+/// bits, no I/O.
+pub fn granularity_sentence(effective: &[Granularity], heading_metadata: bool) -> String {
+    let mut sentence = String::new();
+    if enumeration_available(effective) {
+        sentence.push_str(ENUMERATION_SENTENCE);
+        sentence.push_str("\n\n");
+    }
+    sentence.push_str(&granularity_description(effective));
+    if heading_metadata {
+        sentence.push_str("\n\n");
+        sentence.push_str(HEADING_PREFIX_SENTENCE);
+    }
+    sentence
+}
+
 /// Join non-empty, trimmed sections with a blank line between them, then
 /// trim the result's trailing whitespace. Shared by every composition
 /// function so the append rule (blank line between sections, no trailing
@@ -115,18 +331,25 @@ pub fn compose_server_mechanics(hybrid: bool, phrase: bool) -> String {
 }
 
 /// Compose one tool's final description: its compiled base, the
-/// phrase-syntax sentence when applicable, then the KB's extension for that
-/// tool. Returns `None` for a name outside [`TOOL_NAMES`].
+/// phrase-syntax sentence when applicable, the granularity/heading_prefix
+/// sentence when applicable (#286, `search` only — see
+/// [`granularity_sentence`]), then the KB's extension for that tool.
+/// Returns `None` for a name outside [`TOOL_NAMES`].
 pub fn compose_tool_description(
     tool: &str,
     phrase_effective: bool,
+    effective_granularities: &[Granularity],
+    heading_metadata: bool,
     extension: Option<&str>,
 ) -> Option<String> {
     let base = compiled_tool_base(tool)?;
     let phrase_sentence = (tool == "search" && phrase_effective).then_some(PHRASE_SYNTAX_SENTENCE);
+    let granularity_text =
+        (tool == "search").then(|| granularity_sentence(effective_granularities, heading_metadata));
     Some(join_sections(
         std::iter::once(base)
             .chain(phrase_sentence)
+            .chain(granularity_text.as_deref())
             .chain(extension),
     ))
 }
@@ -146,13 +369,21 @@ pub fn append_extension(base: &str, extension: Option<&str>) -> String {
 pub fn compose_tool_descriptions(
     extensions_dir: Option<&Path>,
     phrase_effective: bool,
+    effective_granularities: &[Granularity],
+    heading_metadata: bool,
 ) -> HashMap<String, String> {
     TOOL_NAMES
         .iter()
         .filter_map(|&tool| {
             let extension = load_tool_extension(extensions_dir, tool);
-            compose_tool_description(tool, phrase_effective, extension.as_deref())
-                .map(|desc| (tool.to_string(), desc))
+            compose_tool_description(
+                tool,
+                phrase_effective,
+                effective_granularities,
+                heading_metadata,
+                extension.as_deref(),
+            )
+            .map(|desc| (tool.to_string(), desc))
         })
         .collect()
 }
@@ -346,6 +577,7 @@ fn is_symlink(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const ALL: [Granularity; 3] = Granularity::ALL;
 
     // --- compiled bases ------------------------------------------------
 
@@ -381,7 +613,9 @@ mod tests {
 
     #[test]
     fn extension_appends_after_base_with_blank_line() {
-        let desc = compose_tool_description("get_schema", false, Some("Extra KB policy.")).unwrap();
+        let desc =
+            compose_tool_description("get_schema", false, &ALL, false, Some("Extra KB policy."))
+                .unwrap();
         let base = compiled_tool_base("get_schema").unwrap().trim();
         assert!(desc.starts_with(base));
         assert!(desc.ends_with("Extra KB policy."));
@@ -390,13 +624,13 @@ mod tests {
 
     #[test]
     fn missing_extension_yields_base_alone() {
-        let desc = compose_tool_description("delete_document", false, None).unwrap();
+        let desc = compose_tool_description("delete_document", false, &ALL, false, None).unwrap();
         assert_eq!(desc, compiled_tool_base("delete_document").unwrap().trim());
     }
 
     #[test]
     fn compose_tool_description_unknown_tool_is_none() {
-        assert!(compose_tool_description("bogus", false, None).is_none());
+        assert!(compose_tool_description("bogus", false, &ALL, false, None).is_none());
     }
 
     #[test]
@@ -417,15 +651,15 @@ mod tests {
 
     #[test]
     fn search_description_includes_phrase_syntax_only_when_effective() {
-        let with_phrase = compose_tool_description("search", true, None).unwrap();
-        let without_phrase = compose_tool_description("search", false, None).unwrap();
+        let with_phrase = compose_tool_description("search", true, &ALL, false, None).unwrap();
+        let without_phrase = compose_tool_description("search", false, &ALL, false, None).unwrap();
         assert!(with_phrase.contains("double quotes"));
         assert!(!without_phrase.contains("double quotes"));
     }
 
     #[test]
     fn non_search_tools_never_get_the_phrase_sentence() {
-        let desc = compose_tool_description("get_document", true, None).unwrap();
+        let desc = compose_tool_description("get_document", true, &ALL, false, None).unwrap();
         assert!(!desc.contains("double quotes"));
     }
 
@@ -652,7 +886,7 @@ mod tests {
 
     #[test]
     fn compose_tool_descriptions_covers_every_tool() {
-        let overlay = compose_tool_descriptions(None, false);
+        let overlay = compose_tool_descriptions(None, false, &ALL, false);
         assert_eq!(overlay.len(), TOOL_NAMES.len());
         for tool in TOOL_NAMES {
             assert!(
@@ -673,10 +907,105 @@ mod tests {
         )
         .unwrap();
 
-        let overlay = compose_tool_descriptions(Some(tmp.path()), false);
+        let overlay = compose_tool_descriptions(Some(tmp.path()), false, &ALL, false);
         assert!(overlay["search"].ends_with("Search-only note."));
         assert!(overlay["get_document"].ends_with("get_document-only note."));
         assert!(!overlay["search"].contains("get_document-only note."));
         assert!(!overlay["delete_document"].contains("note."));
+    }
+
+    // --- granularity_sentence (#286) --------------------------------------
+
+    #[test]
+    fn granularity_sentence_all_three_mentions_every_value_and_the_default_rule() {
+        let s = granularity_sentence(&ALL, false);
+        assert!(s.contains("`chunk`"));
+        assert!(s.contains("`document`"));
+        assert!(s.contains("`section`"));
+        assert!(s.contains("Defaults to `chunk` with a query"));
+        assert!(
+            !s.contains("heading_prefix"),
+            "heading_prefix must be gated on heading_metadata alone: {s}"
+        );
+    }
+
+    #[test]
+    fn granularity_sentence_omits_disabled_values() {
+        // `section` disabled: must not appear at all, not even to say it's
+        // unavailable — a caller/model should never be told about a choice
+        // it cannot make.
+        let s = granularity_sentence(&[Granularity::Chunk, Granularity::Document], false);
+        assert!(s.contains("`chunk`"));
+        assert!(s.contains("`document`"));
+        assert!(
+            !s.contains("`section`"),
+            "a disabled granularity must not be mentioned: {s}"
+        );
+    }
+
+    #[test]
+    fn granularity_sentence_single_value_says_fixed() {
+        let s = granularity_sentence(&[Granularity::Document], false);
+        assert!(s.contains("fixed to `document`"));
+        assert!(!s.contains("`chunk`"));
+        assert!(!s.contains("`section`"));
+    }
+
+    #[test]
+    fn granularity_sentence_empty_effective_names_the_configuration_problem() {
+        // Unreachable from a validated config (config load rejects an empty
+        // effective set), but the sentence must still say something rather
+        // than silently describing nothing.
+        let s = granularity_sentence(&[], false);
+        assert!(s.contains("No `granularity` is currently enabled"));
+    }
+
+    #[test]
+    fn granularity_sentence_includes_heading_prefix_only_when_heading_metadata_is_on() {
+        let off = granularity_sentence(&ALL, false);
+        let on = granularity_sentence(&ALL, true);
+        assert!(!off.contains("heading_prefix"));
+        assert!(on.contains("`heading_prefix`"));
+        assert!(on.contains("`[\"Conditions\"]`"));
+    }
+
+    #[test]
+    fn granularity_sentence_heading_prefix_gating_is_independent_of_section() {
+        // heading_prefix applies at every query granularity (see
+        // SearchParams::heading_prefix), so it must appear even when
+        // `section` itself is disabled, as long as heading_metadata is on.
+        let s = granularity_sentence(&[Granularity::Chunk, Granularity::Document], true);
+        assert!(s.contains("`heading_prefix`"));
+    }
+
+    // --- composed `search` description mentions only enabled values ------
+
+    #[test]
+    fn composed_search_description_mentions_only_enabled_granularities() {
+        let full = compose_tool_description("search", false, &ALL, false, None).unwrap();
+        let restricted = compose_tool_description(
+            "search",
+            false,
+            &[Granularity::Chunk, Granularity::Document],
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(full.contains("`section`"));
+        assert!(
+            !restricted.contains("`section`"),
+            "search's composed description must not mention a disabled granularity: \
+             {restricted}"
+        );
+        assert!(restricted.contains("`chunk`"));
+        assert!(restricted.contains("`document`"));
+    }
+
+    #[test]
+    fn composed_non_search_descriptions_never_carry_the_granularity_sentence() {
+        let desc = compose_tool_description("get_document", false, &ALL, true, None).unwrap();
+        assert!(!desc.contains("`granularity`"));
+        assert!(!desc.contains("heading_prefix"));
     }
 }

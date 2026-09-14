@@ -45,11 +45,11 @@
 #      indexed chunks carry no heading-ancestry signal yet.
 #   2. Deploy this change. `chunking.prepend_heading_path` defaults to true,
 #      so no config edit is required.
-#   3. `mcp-md-wiki index --full` — REQUIRED. `chunking.*` settings are
-#      reindex-required (see `ChunkingConfig::prepend_heading_path`'s doc
-#      comment and, once added, `reload.rs`'s diff entry for it): existing
-#      Qdrant chunks keep their pre-#166 text, prefix and all, until a full
-#      reindex re-chunks them.
+#   3. Wait for the reindex to finish. Since #286, a per-file chunking
+#      fingerprint (`ingest::chunking_fingerprint`, `CHUNKER_VERSION`) makes
+#      the next reconcile re-chunk every file indexed under different
+#      chunking settings or chunker version; `mcp-md-wiki index --full`
+#      still forces it immediately.
 #   4. Re-run the same `eval` command against the now-reindexed corpus and
 #      compare recall@k/MRR to step 1. An improvement on cases like these
 #      specifically — and no regression on a broader, unrelated eval file —

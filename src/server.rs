@@ -1503,6 +1503,7 @@ async fn build_instructions(
     data_path: &Path,
     schemas: &SchemaCache,
     frontmatter: &FrontmatterConfig,
+    effective_granularities: &[config::Granularity],
 ) -> String {
     const MAX_VALUES_PER_FIELD: usize = 50;
     /// Cap on scoped-schema directories listed, so instruction size stays bounded
@@ -1513,11 +1514,12 @@ async fn build_instructions(
 
     let areas = top_level_areas(data_path);
     if !areas.is_empty() {
-        instructions.push_str(&format!(
-            "\nTop-level areas of this knowledge base: {}. \
-             Use search with path_prefix (and no query, for an exhaustive listing) \
-             to enumerate one.",
-            areas.join(", ")
+        // Only offers an exhaustive no-query listing when an enabled
+        // granularity can serve one (#286).
+        instructions.push('\n');
+        instructions.push_str(&descriptions::top_level_areas_sentence(
+            &areas,
+            effective_granularities,
         ));
     }
 
@@ -1621,7 +1623,7 @@ async fn build_instructions(
 /// once — this is what makes `mcp.extensions_path`, `mcp.instructions`,
 /// `search.hybrid`, and `search.phrase` observe a `POST /admin/reload` within
 /// `mcp.metadata_refresh_secs` instead of requiring a restart.
-async fn compose_server_instructions(
+pub(crate) async fn compose_server_instructions(
     config: &ResolvedConfig,
     qdrant: &QdrantStore,
     data_path: &Path,
@@ -1641,6 +1643,7 @@ async fn compose_server_instructions(
         data_path,
         schemas,
         &config.frontmatter,
+        &config.effective_granularities(),
     )
     .await;
 
@@ -1678,7 +1681,17 @@ fn compose_tool_overlay(config: &ResolvedConfig, data_path: &Path) -> HashMap<St
         descriptions::resolve_extensions_dir(data_path, &config.mcp.extensions_path);
     let phrase_effective =
         config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available();
-    descriptions::compose_tool_descriptions(extensions_dir.as_deref(), phrase_effective)
+    // Same effective set `KbSearchServer::overlay_input_schema` computes for
+    // the `search` tool's schema `enum` — see
+    // `ResolvedConfig::effective_granularities`'s doc comment for why the
+    // schema and this composed description must never derive it separately.
+    let effective_granularities = config.effective_granularities();
+    descriptions::compose_tool_descriptions(
+        extensions_dir.as_deref(),
+        phrase_effective,
+        &effective_granularities,
+        config.chunking.heading_metadata,
+    )
 }
 
 /// Supervises `reindex::run_worker` — the single task that drains `reindex_queue` and
@@ -2091,7 +2104,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
             &config.qdrant.collection,
             config.embedding.vector_size,
             &crate::qdrant::all_indexed_fields(&config, &schemas),
-            config.search.phrase,
+            crate::qdrant::IndexFeatures::from_config(&config),
         )
         .await
         .context("Failed to ensure Qdrant collection")?;
@@ -2930,7 +2943,9 @@ mod tests {
         db.upsert_document_metadata("food/a.md", &fm, 1700, "h", 1)
             .await
             .unwrap();
-        db.upsert("food/a.md", "h", 1, "sh", 0, 0).await.unwrap();
+        db.upsert("food/a.md", "h", 1, "sh", "", 0, 0)
+            .await
+            .unwrap();
 
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
@@ -2980,7 +2995,7 @@ mod tests {
             .await
             .unwrap();
         for path in ["a.md", "b.md", "c.md"] {
-            db.upsert(path, "h", 1, "sh", 0, 0).await.unwrap();
+            db.upsert(path, "h", 1, "sh", "", 0, 0).await.unwrap();
         }
 
         let state = StatusState {
@@ -3011,8 +3026,8 @@ mod tests {
         let db = crate::state::StateDb::new(std::path::Path::new(&config.state_db_path()))
             .await
             .unwrap();
-        db.upsert("a.md", "h1", 3, "sh", 0, 0).await.unwrap();
-        db.upsert("b.md", "h2", 5, "sh", 0, 0).await.unwrap();
+        db.upsert("a.md", "h1", 3, "sh", "", 0, 0).await.unwrap();
+        db.upsert("b.md", "h2", 5, "sh", "", 0, 0).await.unwrap();
 
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
@@ -3229,7 +3244,7 @@ mod tests {
         let db = crate::state::StateDb::new(std::path::Path::new(&config.state_db_path()))
             .await
             .unwrap();
-        db.upsert("a.md", "h", 1, "sh", 0, 0).await.unwrap();
+        db.upsert("a.md", "h", 1, "sh", "", 0, 0).await.unwrap();
 
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
@@ -3244,7 +3259,7 @@ mod tests {
 
         // A change the cache must not yet reflect: one request costs ~24 queries plus a
         // Qdrant round trip, so a scrape burst has to collapse into one refresh.
-        db.upsert("b.md", "h", 1, "sh", 0, 0).await.unwrap();
+        db.upsert("b.md", "h", 1, "sh", "", 0, 0).await.unwrap();
         let second = cached_status(&state).await;
         assert_eq!(second.store.indexed_files, Some(1), "served from cache");
 
@@ -3951,6 +3966,7 @@ mod tests {
             dir.path(),
             &schemas,
             &frontmatter,
+            &config::Granularity::ALL,
         )
         .await;
 
@@ -4398,7 +4414,10 @@ mod tests {
             None,
             Arc::clone(&reindex_queue),
             Arc::new(RwLock::new(descriptions::compose_tool_descriptions(
-                None, false,
+                None,
+                false,
+                &config.effective_granularities(),
+                config.chunking.heading_metadata,
             ))),
         )
         .unwrap();
@@ -4950,6 +4969,9 @@ mod tests {
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 
+        let test_config = crate::mcp::make_test_resolved_config(tmp.path());
+        let effective_granularities = test_config.effective_granularities();
+
         let handler = KbSearchServer::new(
             embed,
             qdrant,
@@ -4957,12 +4979,15 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             instructions,
-            config::shared_config(crate::mcp::make_test_resolved_config(tmp.path())),
+            config::shared_config(Arc::clone(&test_config)),
             crate::mcp::empty_test_schema_cache(),
             None,
             Arc::new(crate::reindex::ReindexQueue::new()),
             Arc::new(RwLock::new(descriptions::compose_tool_descriptions(
-                None, false,
+                None,
+                false,
+                &effective_granularities,
+                test_config.chunking.heading_metadata,
             ))),
         )
         .unwrap();
@@ -5097,14 +5122,24 @@ mod tests {
         // `descriptions::compose_tool_descriptions`. This is the end-to-end
         // half of the overlay contract; `mcp.rs`'s unit tests exercise
         // `overlay_description`/`get_tool` directly.
+        // Same defaults `test_mcp_router_with_hosts` built the handler's overlay
+        // from (`make_test_resolved_config`): heading_metadata off, all three
+        // granularities configured, so `section` drops out of the effective set.
+        let default_config = crate::mcp::make_test_resolved_config(&std::env::temp_dir());
+        let effective_granularities = default_config.effective_granularities();
         for tool in tools {
             let name = tool["name"].as_str().unwrap();
             let description = tool["description"]
                 .as_str()
                 .unwrap_or_else(|| panic!("tool '{name}' has no description in tools/list"));
-            let expected_description =
-                crate::descriptions::compose_tool_description(name, false, None)
-                    .unwrap_or_else(|| panic!("no compiled description for tool '{name}'"));
+            let expected_description = crate::descriptions::compose_tool_description(
+                name,
+                false,
+                &effective_granularities,
+                default_config.chunking.heading_metadata,
+                None,
+            )
+            .unwrap_or_else(|| panic!("no compiled description for tool '{name}'"));
             assert_eq!(
                 description, expected_description,
                 "tool '{name}' description should match the composed overlay"

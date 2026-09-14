@@ -2,6 +2,33 @@
 //! boundaries, sized against `chunking.max_chunk_size`/`target_chunk_size`,
 //! with an optional `description` (frontmatter) prefix.
 //!
+//! Section boundaries, heading text, levels and ancestry all come from
+//! [`crate::heading::HeadingTree`], the same model `retrieval::outline` reads,
+//! so a chunk's `heading_path`/section range and `get_document`'s outline
+//! cannot disagree.
+//!
+//! ## Merging across headings (`chunking.heading_metadata`, #286)
+//!
+//! With `heading_metadata` off, small consecutive sections are accumulated
+//! into one chunk up to `target_chunk_size`, and the merged chunk is attributed
+//! to the deepest heading all of its pieces share ([`SectionId::merge`]) — which
+//! can be a distant ancestor, or the whole document ([`SectionId::Root`]).
+//!
+//! With `heading_metadata` on, chunking never merges content across a heading
+//! boundary: every chunk lies within one heading's own section (its heading
+//! line through the line before the next heading of any level) or within the
+//! preamble. That holds for the accumulate-to-target merge and for the
+//! small-fragment merges inside an oversized section alike; an oversized
+//! section still splits into several chunks. So every chunk is attributed to
+//! exactly `Heading(i)` or `Preamble`, never `Root`, and a `section` search row
+//! names the heading whose text actually matched rather than a parent covering
+//! dozens of short siblings. A heading with no body of its own (a chapter
+//! heading directly followed by its first sub-heading) becomes its own small
+//! chunk holding just the heading line: folding it into the first child would
+//! put the child's heading line inside a chunk attributed elsewhere, and
+//! dropping it would make the heading's text unsearchable except through the
+//! breadcrumbs of its children.
+//!
 //! ## Heading-breadcrumb prefix (fix #166)
 //!
 //! `chunking.prepend_heading_path` (default on) additionally prepends each
@@ -16,18 +43,17 @@
 //!   require `chunk_markdown` to take a new parameter, rippling into every
 //!   caller (`ingest.rs`, and the dedup-query alignment test in `mcp.rs`) that
 //!   this change's scope does not touch. Heading ancestry needs nothing beyond
-//!   the section structure this module already parses — and for the common
+//!   the heading structure this module already parses — and for the common
 //!   single-root-H1 document, the root heading naturally becomes the top of
 //!   every subsection's breadcrumb, subsuming most of what a separate "title"
-//!   would have added anyway. See [`Section`] and [`annotate_heading_paths`].
+//!   would have added anyway.
 //! - **Never restates a heading already visible in the chunk's own text.** A
-//!   chunk that begins with its section's own heading line gets only the
-//!   *ancestors* of that heading (`Section::ancestor_path`); a continuation
-//!   fragment of a split oversized section — which carries no heading line of
-//!   its own — gets the full chain including that heading
-//!   (`Section::full_path`). Restating a heading that is already the chunk's
-//!   own first line would waste budget on a literal duplicate for no
-//!   retrieval benefit.
+//!   piece of text that begins with its section's own heading line gets only
+//!   the *ancestors* of that heading; a continuation fragment of a split
+//!   oversized section — which carries no heading line of its own — gets the
+//!   full chain including that heading. When pieces are merged into one chunk,
+//!   the chunk's breadcrumb is the deepest heading common to the breadcrumbs
+//!   each piece would have had on its own (#286).
 //! - **Budget-reserved, not appended on top.** The breadcrumb is capped
 //!   ([`heading_path_budget`]) and that cap is reserved out of
 //!   `max_chunk_size`/`target_chunk_size` *before* section-splitting decisions
@@ -40,14 +66,41 @@
 use text_splitter::MarkdownSplitter;
 
 use crate::config::ChunkingConfig;
+use crate::heading::{HeadingTree, SectionId};
 
 pub struct Chunk {
     pub text: String,
     pub index: usize,
-    /// 1-based line number where this chunk starts in the original body.
+    /// 1-based line number where this chunk starts. Body-relative, i.e.
+    /// counted from the top of the frontmatter-stripped body this module was
+    /// handed. `ingest.rs` shifts it (and every other line field here) to
+    /// file-relative with `heading::body_line_offset` (#286).
     pub line_start: usize,
-    /// 1-based line number where this chunk ends (inclusive).
+    /// 1-based line number where this chunk ends (inclusive). Body-relative.
     pub line_end: usize,
+    /// Heading path of the section this chunk is attributed to: the deepest
+    /// heading whose subtree contains every piece merged into the chunk,
+    /// including a leading heading's own text (unlike the rendered
+    /// `prepend_heading_path` breadcrumb, which leaves out a heading the chunk
+    /// already starts with). Always computed; `ingest.rs` decides whether it
+    /// reaches the Qdrant payload. With `chunking.heading_metadata` on no chunk
+    /// spans a heading boundary (see the module docs), so this is always the
+    /// path of the one heading whose section holds the chunk. Empty when the
+    /// chunk is attributed to the preamble or to the whole document.
+    pub heading_path: Vec<String>,
+    /// CommonMark level (1-6) of the attributed heading, or `0` when
+    /// `heading_path` is empty. Taken from the heading itself rather than
+    /// `heading_path.len()`: a document that jumps from `#` to `###` has a
+    /// 2-element path whose last level is 3.
+    pub heading_level: u8,
+    /// Line range of the attributed section (#286): the attributed heading's
+    /// whole subtree, the preamble when the chunk is only preamble content, or
+    /// the whole body when the merged pieces share no heading. Always covers
+    /// `line_start..=line_end`. Body-relative, and equal to the range
+    /// `retrieval::outline` reports for the same section.
+    pub section_line_start: usize,
+    /// Inclusive end of `section_line_start`'s range. Body-relative.
+    pub section_line_end: usize,
 }
 
 /// When the MarkdownSplitter breaks up an oversized section, merge any
@@ -75,143 +128,46 @@ fn heading_path_budget(max_chunk_size: usize) -> usize {
     MAX_HEADING_PATH_CHARS.min(max_chunk_size / 4)
 }
 
-/// A section of markdown with its line range in the original body, plus the
-/// heading-ancestry context needed to build `chunking.prepend_heading_path`'s
-/// breadcrumb (fix #166).
-///
-/// `ancestor_path` is the chain of headings strictly *above* this section's own
-/// leading heading (outermost first), e.g. for a `### GPU Backends` section
-/// nested under `# ares` > `## Hardware`, `ancestor_path` is `["ares",
-/// "Hardware"]`. It deliberately excludes the section's own heading text: every
-/// section's `text` already starts with that heading line verbatim (see
-/// `split_sections`), so re-stating it in the prefix would just burn budget on
-/// a literal duplicate of the chunk's own first line for no retrieval benefit.
-///
-/// `full_path` is `ancestor_path` plus the section's own heading appended, for
-/// the (only) case where that duplication concern does not apply: a
-/// continuation fragment produced when an oversized section is broken up by
-/// `MarkdownSplitter` (see the oversized-section branch of `chunk_markdown`).
-/// Every fragment after the first carries none of the section's own heading
-/// text, so for those `full_path` is the correct, non-redundant breadcrumb.
-///
-/// A section with no leading heading at all (body content preceding the
-/// document's first `#` line) gets `ancestor_path == full_path ==` whatever
-/// ancestry was already open (typically empty, since that can only happen
-/// before any heading has been seen).
-struct Section {
-    text: String,
+/// A run of body lines between heading boundaries: either one heading's own
+/// section (its heading line through the line before the next heading of any
+/// level) or the non-blank preamble before the first heading.
+struct Section<'a> {
+    /// The section's lines, verbatim from the body.
+    text: &'a str,
+    /// Byte offset of `text` within the body.
+    byte_start: usize,
     /// 1-based start line.
     line_start: usize,
     /// 1-based end line (inclusive).
     line_end: usize,
-    ancestor_path: Vec<String>,
-    full_path: Vec<String>,
+    /// Index of the section's heading in the tree; `None` for the preamble.
+    heading: Option<usize>,
 }
 
-/// Parse the heading level and text off a section's leading line, if it has
-/// one. `level` is simply the count of leading `#` characters — this
-/// deliberately matches `split_sections`'s own permissive `starts_with('#')`
-/// heading detection rather than validating CommonMark's level<=6-plus-space
-/// rule, since a section can only ever begin with a line that already passed
-/// that same check (or, for the document's very first section, may not be a
-/// heading at all, handled by returning `None`).
-fn parse_leading_heading(section_text: &str) -> Option<(usize, String)> {
-    let first_line = section_text.lines().next()?;
-    let trimmed = first_line.trim_start();
-    if !trimmed.starts_with('#') {
-        return None;
-    }
-    let level = trimmed.chars().take_while(|&c| c == '#').count();
-    let text = trimmed[level..].trim();
-    if text.is_empty() {
-        // A bare "#" (or "##", ...) with no title text carries nothing worth
-        // breadcrumbing — treat it as if this section had no heading at all
-        // rather than pushing an empty string onto the ancestor stack.
-        return None;
-    }
-    Some((level, text.to_string()))
-}
-
-/// Walk `sections` in document order, maintaining a stack of currently-open
-/// ancestor headings, and fill in each section's `ancestor_path`/`full_path`.
-///
-/// The stack-pop rule — pop any open heading whose level is `>=` this one —
-/// is what makes this heading *ancestry* rather than a flat "every heading
-/// seen so far" list: a second `## B` sibling closes out a first `## A`'s
-/// scope (and anything nested under it), and a `# ` back at the top level
-/// closes every deeper heading currently open. Two sibling top-level `# `
-/// sections (as several tests below use) never nest, so both get an empty
-/// `ancestor_path` — there is no single document "title" to invent when the
-/// document itself does not have one.
-fn annotate_heading_paths(sections: &mut [Section]) {
-    let mut stack: Vec<(usize, String)> = Vec::new();
-    for section in sections.iter_mut() {
-        match parse_leading_heading(&section.text) {
-            Some((level, text)) => {
-                while stack
-                    .last()
-                    .is_some_and(|(top_level, _)| *top_level >= level)
-                {
-                    stack.pop();
-                }
-                section.ancestor_path = stack.iter().map(|(_, t)| t.clone()).collect();
-                let mut full = section.ancestor_path.clone();
-                full.push(text.clone());
-                section.full_path = full;
-                stack.push((level, text));
-            }
-            None => {
-                let path: Vec<String> = stack.iter().map(|(_, t)| t.clone()).collect();
-                section.full_path = path.clone();
-                section.ancestor_path = path;
-            }
-        }
-    }
-}
-
-/// Split markdown into sections at heading boundaries.
-/// Each section includes its heading line plus all content until the next heading.
-fn split_sections(body: &str) -> Vec<Section> {
-    let mut sections: Vec<Section> = Vec::new();
-    let mut current = String::new();
-    let mut section_start: usize = 1;
-    let mut last_line_num: usize = 0;
-
-    let mut in_fence = false;
-    for (i, line) in body.lines().enumerate() {
-        let line_num = i + 1; // 1-based
-        last_line_num = line_num;
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-        }
-        if !in_fence && line.starts_with('#') && !current.trim().is_empty() {
-            let line_end = line_num - 1;
-            sections.push(Section {
-                text: current,
-                line_start: section_start,
-                line_end,
-                ancestor_path: Vec::new(),
-                full_path: Vec::new(),
-            });
-            current = String::new();
-            section_start = line_num;
-        }
-        if !current.is_empty() {
-            current.push('\n');
-        }
-        current.push_str(line);
-    }
-    if !current.trim().is_empty() {
+/// Split `body` into sections at `tree`'s heading boundaries. A preamble of
+/// only blank lines is dropped (it carries nothing to embed), so the first
+/// heading's section still starts with its heading line.
+fn split_sections<'a>(body: &'a str, tree: &HeadingTree) -> Vec<Section<'a>> {
+    let lines = tree.lines();
+    let mut sections = Vec::with_capacity(tree.headings().len() + 1);
+    let mut push = |first: usize, last: usize, heading: Option<usize>| {
+        let range = lines.byte_range(first, last);
         sections.push(Section {
-            text: current,
-            line_start: section_start,
-            line_end: last_line_num,
-            ancestor_path: Vec::new(),
-            full_path: Vec::new(),
+            text: &body[range.clone()],
+            byte_start: range.start,
+            line_start: first,
+            line_end: last,
+            heading,
         });
+    };
+
+    let preamble_end = tree.preamble_end();
+    if preamble_end > 0 && !body[lines.byte_range(1, preamble_end)].trim().is_empty() {
+        push(1, preamble_end, None);
     }
-    annotate_heading_paths(&mut sections);
+    for (i, heading) in tree.headings().iter().enumerate() {
+        push(heading.line, heading.section_end, Some(i));
+    }
     sections
 }
 
@@ -220,23 +176,34 @@ struct RawChunk {
     text: String,
     line_start: usize,
     line_end: usize,
-    /// The heading breadcrumb to prepend for this chunk when `chunking.
-    /// prepend_heading_path` is on — either a section's `ancestor_path` (when
-    /// this raw chunk's `text` already starts with that section's own heading
-    /// line, so re-stating it would be redundant) or its `full_path` (when it
-    /// does not, e.g. a continuation fragment of a split oversized section).
-    /// See [`Section`]'s doc comment for the full accounting. Fixed at
-    /// creation time and left untouched by `append`: everything appended after
-    /// the fact is additional body text whose own headings (if any) are
-    /// already inline in the chunk, not missing context that needs restating.
-    heading_path: Vec<String>,
+    /// The heading whose path is rendered as this chunk's
+    /// `prepend_heading_path` breadcrumb (`None`: no breadcrumb). Seeded with
+    /// the breadcrumb of the first piece and narrowed by every `append` — see
+    /// the module docs.
+    breadcrumb: Option<usize>,
+    /// The section this chunk is attributed to, becoming `Chunk::heading_path`,
+    /// `heading_level` and the section range.
+    section: SectionId,
 }
 
 impl RawChunk {
-    fn append(&mut self, text: &str, line_end: usize) {
+    /// Append another piece of text. `breadcrumb` and `section` are the values
+    /// that piece would have had as a chunk of its own; the merged chunk keeps
+    /// what both have in common, compared by heading identity rather than
+    /// text.
+    fn append(
+        &mut self,
+        text: &str,
+        line_end: usize,
+        breadcrumb: Option<usize>,
+        section: SectionId,
+        tree: &HeadingTree,
+    ) {
         self.text.push_str("\n\n");
         self.text.push_str(text);
         self.line_end = line_end;
+        self.breadcrumb = tree.common_ancestor(self.breadcrumb, breadcrumb);
+        self.section = self.section.merge(section, tree);
     }
 }
 
@@ -245,7 +212,9 @@ impl RawChunk {
 /// prepend), which is what keeps this a no-op for every chunk whose section
 /// has no open ancestry — flat single-level documents (a document's own H1,
 /// or sibling top-level headings, as in `sections_split_at_headings` below)
-/// included.
+/// included. Also `None` for a zero budget (a `max_chunk_size` too small to
+/// reserve any breadcrumb characters), so a chunk never starts with an empty
+/// breadcrumb followed by the `"\n\n"` separator.
 ///
 /// The truncation is a hard character-count cut, deliberately matching
 /// `write::build_dedup_query`'s `DEDUP_QUERY_CHAR_LIMIT` truncation style
@@ -253,7 +222,7 @@ impl RawChunk {
 /// this is a budget backstop for a pathological document, not something
 /// expected to fire in normal use, so simplicity wins over a prettier cut.
 fn format_heading_path(path: &[String], budget_chars: usize) -> Option<String> {
-    if path.is_empty() {
+    if path.is_empty() || budget_chars == 0 {
         return None;
     }
     let joined = path.join(" > ");
@@ -291,8 +260,12 @@ pub fn chunk_markdown(
     let heading_path_chars = heading_reserve.saturating_sub(2);
     let effective_max = max.saturating_sub(heading_reserve);
     let effective_target = target.saturating_sub(heading_reserve);
+    // With `heading_metadata` on, no chunk crosses a heading boundary — see the
+    // module docs.
+    let isolate_sections = config.heading_metadata;
 
-    let sections = split_sections(body);
+    let tree = HeadingTree::parse(body);
+    let sections = split_sections(body, &tree);
 
     // Greedily accumulate sections into chunks up to target size.
     // If a single section exceeds max, use MarkdownSplitter to break it down.
@@ -300,6 +273,15 @@ pub fn chunk_markdown(
     let mut current: Option<RawChunk> = None;
 
     for section in sections {
+        // A piece that starts with the section's heading line gets the
+        // heading's ancestors as its breadcrumb; a piece that does not gets
+        // the heading itself. The preamble has neither.
+        let leading_breadcrumb = section.heading.and_then(|i| tree.headings()[i].parent);
+        let continuation_breadcrumb = section.heading;
+        let section_id = section
+            .heading
+            .map_or(SectionId::Preamble, SectionId::Heading);
+
         if section.text.trim().len() > effective_max {
             // Flush current accumulator first
             if let Some(cur) = current.take() {
@@ -310,34 +292,38 @@ pub fn chunk_markdown(
             // so they stay attached to the content they introduce.
             let splitter = MarkdownSplitter::new(effective_max);
             let mut pending: Option<RawChunk> = None;
-            // Use chunk_indices to get each fragment's byte offset within
-            // section.text.  MarkdownSplitter trims leading/trailing whitespace
-            // from fragments (TRIM::PreserveIndentation), so the byte offset
-            // points to the first non-whitespace character of each fragment.
-            // Counting newlines in section.text[..byte_offset] gives the number
-            // of lines before the fragment starts — this is approximate when the
-            // splitter drops blank lines at boundaries, but it is monotonically
-            // increasing and far more useful than every sub-chunk sharing the
-            // same section-wide range.
+            // `chunk_indices` yields each fragment's byte offset within
+            // `section.text`. MarkdownSplitter trims leading/trailing
+            // whitespace from fragments, so the offset points at the
+            // fragment's first non-whitespace character and the body's line
+            // index gives its exact first and last line.
             //
-            // byte_offset == 0 identifies the very first fragment, which is the
-            // only one that can carry the section's own leading heading line
+            // Only the first fragment contains the section's own heading line
             // (the "always merge a tiny pending fragment forward" rule below
-            // guarantees it stays attached whenever the splitter would
-            // otherwise have isolated it) — so only that fragment uses
-            // `ancestor_path`; every later fragment uses `full_path` to restate
-            // the section's own heading, since it is not otherwise present in
-            // that fragment's text.
-            for (byte_offset, part) in splitter.chunk_indices(&section.text) {
-                // Compute per-fragment line range relative to section.line_start.
-                let lines_before = section.text[..byte_offset].matches('\n').count();
-                let frag_line_start = section.line_start + lines_before;
-                let frag_line_end =
-                    (frag_line_start + part.matches('\n').count()).min(section.line_end);
-                let frag_heading_path = if byte_offset == 0 {
-                    section.ancestor_path.clone()
+            // keeps it attached to content), so only it takes the leading
+            // breadcrumb.
+            for (frag_idx, (byte_offset, part)) in splitter.chunk_indices(section.text).enumerate()
+            {
+                let abs_start = section.byte_start + byte_offset;
+                let frag_line_start = tree.lines().line_of(abs_start);
+                // Clamped to the section and to the fragment's own start so the
+                // range can never invert, whatever the splitter reports (#286).
+                let frag_line_end = tree
+                    .lines()
+                    .line_of(abs_start + part.len().saturating_sub(1))
+                    .min(section.line_end)
+                    .max(frag_line_start);
+                let frag_breadcrumb = if frag_idx == 0 {
+                    leading_breadcrumb
                 } else {
-                    section.full_path.clone()
+                    continuation_breadcrumb
+                };
+                let new_chunk = || RawChunk {
+                    text: part.to_string(),
+                    line_start: frag_line_start,
+                    line_end: frag_line_end,
+                    breadcrumb: frag_breadcrumb,
+                    section: section_id,
                 };
 
                 if let Some(mut prev) = pending.take() {
@@ -348,7 +334,7 @@ pub fn chunk_markdown(
                     // Only reject the merge when prev is already a substantial chunk
                     // and combining would exceed max.
                     if combined <= effective_max || prev_len < MIN_MERGE_SIZE {
-                        prev.append(part, frag_line_end);
+                        prev.append(part, frag_line_end, frag_breadcrumb, section_id, &tree);
                         if prev.text.trim().len() < MIN_MERGE_SIZE {
                             pending = Some(prev);
                         } else {
@@ -359,43 +345,36 @@ pub fn chunk_markdown(
                         // prev as-is, then handle part independently.
                         chunks.push(prev);
                         if part.trim().len() < MIN_MERGE_SIZE {
-                            pending = Some(RawChunk {
-                                text: part.to_string(),
-                                line_start: frag_line_start,
-                                line_end: frag_line_end,
-                                heading_path: frag_heading_path,
-                            });
+                            pending = Some(new_chunk());
                         } else {
-                            chunks.push(RawChunk {
-                                text: part.to_string(),
-                                line_start: frag_line_start,
-                                line_end: frag_line_end,
-                                heading_path: frag_heading_path,
-                            });
+                            chunks.push(new_chunk());
                         }
                     }
                 } else if part.trim().len() < MIN_MERGE_SIZE {
-                    pending = Some(RawChunk {
-                        text: part.to_string(),
-                        line_start: frag_line_start,
-                        line_end: frag_line_end,
-                        heading_path: frag_heading_path,
-                    });
+                    pending = Some(new_chunk());
                 } else {
-                    chunks.push(RawChunk {
-                        text: part.to_string(),
-                        line_start: frag_line_start,
-                        line_end: frag_line_end,
-                        heading_path: frag_heading_path,
-                    });
+                    chunks.push(new_chunk());
                 }
             }
-            // Trailing small fragment — append to last chunk if it fits
+            // Trailing small fragment — append to last chunk if it fits.
+            // `last` is normally an earlier fragment of this section, but can
+            // be the previous section's chunk when no fragment of this one was
+            // pushed (only possible with a tiny `max_chunk_size`); `append`
+            // narrows correctly either way. With `isolate_sections` the tail
+            // only joins a chunk of its own section: every section has a
+            // distinct `SectionId`, so comparing ids is enough.
             if let Some(tail) = pending.take() {
                 if let Some(last) = chunks.last_mut() {
                     let combined = last.text.trim().len() + 2 + tail.text.trim().len();
-                    if combined <= effective_max {
-                        last.append(&tail.text, tail.line_end);
+                    let same_section = last.section == tail.section;
+                    if combined <= effective_max && (same_section || !isolate_sections) {
+                        last.append(
+                            &tail.text,
+                            tail.line_end,
+                            tail.breadcrumb,
+                            tail.section,
+                            &tree,
+                        );
                     } else {
                         chunks.push(tail);
                     }
@@ -412,29 +391,34 @@ pub fn chunk_markdown(
             section.text.trim().len()
         };
 
-        if combined_len <= effective_target {
-            // Fits within target — accumulate
-            if let Some(ref mut cur) = current {
-                cur.append(&section.text, section.line_end);
-            } else {
-                current = Some(RawChunk {
-                    text: section.text,
-                    line_start: section.line_start,
-                    line_end: section.line_end,
-                    heading_path: section.ancestor_path.clone(),
-                });
+        let seeded = || RawChunk {
+            text: section.text.to_string(),
+            line_start: section.line_start,
+            line_end: section.line_end,
+            breadcrumb: leading_breadcrumb,
+            section: section_id,
+        };
+        if combined_len <= effective_target && !isolate_sections {
+            // Fits within target — accumulate. `cur` and `section` can be
+            // different sections under different parents, so this is where
+            // narrowing usually does something.
+            match current {
+                Some(ref mut cur) => cur.append(
+                    section.text,
+                    section.line_end,
+                    leading_breadcrumb,
+                    section_id,
+                    &tree,
+                ),
+                None => current = Some(seeded()),
             }
         } else {
-            // Would exceed target — flush and start new chunk
+            // Would exceed target, or sections are isolated — flush and start
+            // a new chunk.
             if let Some(cur) = current.take() {
                 chunks.push(cur);
             }
-            current = Some(RawChunk {
-                text: section.text,
-                line_start: section.line_start,
-                line_end: section.line_end,
-                heading_path: section.ancestor_path.clone(),
-            });
+            current = Some(seeded());
         }
     }
 
@@ -455,28 +439,28 @@ pub fn chunk_markdown(
             // the same text `prepend_description` alone always has, which is
             // exactly what keeps this change from disturbing the existing
             // description-prepend behavior and its tests.
-            let with_desc = if config.prepend_description {
-                if let Some(desc) = description {
-                    format!("{}\n\n{}", desc, raw.text)
-                } else {
-                    raw.text
-                }
-            } else {
-                raw.text
+            let with_desc = match (config.prepend_description, description) {
+                (true, Some(desc)) => format!("{}\n\n{}", desc, raw.text),
+                _ => raw.text,
             };
             let text = if config.prepend_heading_path {
-                match format_heading_path(&raw.heading_path, heading_path_chars) {
+                match format_heading_path(&tree.path(raw.breadcrumb), heading_path_chars) {
                     Some(prefix) => format!("{}\n\n{}", prefix, with_desc),
                     None => with_desc,
                 }
             } else {
                 with_desc
             };
+            let (section_line_start, section_line_end) = raw.section.line_range(&tree);
             Chunk {
                 text,
                 index,
                 line_start: raw.line_start,
                 line_end: raw.line_end,
+                heading_path: raw.section.path(&tree),
+                heading_level: raw.section.level(&tree),
+                section_line_start,
+                section_line_end,
             }
         })
         .collect()
@@ -497,6 +481,9 @@ mod tests {
             target_chunk_size: target,
             prepend_description,
             prepend_heading_path,
+            // Off: the merge-across-headings behavior most tests here pin.
+            // `cfg_isolated` turns it on for the no-merge tests.
+            heading_metadata: false,
         }
     }
 
@@ -636,7 +623,8 @@ mod tests {
     #[test]
     fn split_sections_basic() {
         let body = "# A\n\nContent A\n\n## B\n\nContent B";
-        let sections = split_sections(body);
+        let tree = HeadingTree::parse(body);
+        let sections = split_sections(body, &tree);
         assert_eq!(sections.len(), 2);
         // # A        = line 1
         // (blank)    = line 2
@@ -869,7 +857,7 @@ mod tests {
         // chunk-text alignment using a body of exactly this flat, unnested shape
         // under `ChunkingConfig::default()` (both prepend knobs on). Since this
         // body's only heading has no ancestors — it IS the top of its own
-        // (trivial) hierarchy, per `annotate_heading_paths`'s doc comment — the
+        // (trivial) hierarchy (`heading::Heading::parent` is `None`) — the
         // heading-path prefix must stay empty here, or that alignment (and its
         // test, outside this module's scope) breaks.
         let body = "## Heading\n\nSome body content.";
@@ -915,16 +903,19 @@ mod tests {
         // not "max_chunk_size plus the prefix", which is what a naive
         // unconditional prepend (like `prepend_description`'s, a pre-existing
         // and deliberately separate concern) would produce.
+        //
+        // Ancestors use CommonMark's real levels 1-5 under a level-6 section
+        // (7+ `#` is paragraph text, not a heading, so it cannot nest deeper).
         let max = 1000;
         let mut body = String::new();
-        for level in 1..=10 {
+        for level in 1..=5 {
             body.push_str(&"#".repeat(level));
             body.push_str(&format!(
-                " AncestorLevel{level:02}WithSomeExtraPaddingToBeLong\n\n"
+                " AncestorLevel{level:02}WithSomeExtraPaddingToBeLongEnough\n\n"
             ));
         }
         let filler = "Y ".repeat(375); // ~750 chars — large but not oversized
-        body.push_str(&"#".repeat(11));
+        body.push_str(&"#".repeat(6));
         body.push_str(" DeepSection\n\n");
         body.push_str(&filler);
 
@@ -959,7 +950,19 @@ mod tests {
             prefix,
         );
         assert!(
-            rest.starts_with(&"#".repeat(11)),
+            prefix.starts_with("AncestorLevel01WithSomeExtraPaddingToBeLongEnough > "),
+            "breadcrumb must be the ancestor chain, got: {prefix:?}"
+        );
+        let untruncated = (1..=5)
+            .map(|l| format!("AncestorLevel{l:02}WithSomeExtraPaddingToBeLongEnough"))
+            .collect::<Vec<_>>()
+            .join(" > ");
+        assert!(
+            untruncated.chars().count() > heading_path_budget(max),
+            "fixture must actually exercise truncation"
+        );
+        assert!(
+            rest.starts_with("###### DeepSection"),
             "body must still start with the deep section's own heading line, got: {:?}",
             rest
         );
@@ -972,9 +975,10 @@ mod tests {
         // fragment carries the section's own "### Big" heading line verbatim
         // (per the "always merge a tiny pending fragment forward" rule this
         // mirrors); every fragment after that is pure body text with no
-        // heading of its own, so it needs `full_path` (which restates "Big")
-        // rather than `ancestor_path` (which would leave that fragment with no
-        // indication at all of which section it belongs to) — this is also
+        // heading of its own, so its breadcrumb is the section's full path
+        // (restating "Big") rather than only the heading's ancestors (which
+        // would leave that fragment with no indication at all of which
+        // section it belongs to) — this is also
         // exactly the case the MIN_MERGE_SIZE small-fragment-merging logic
         // still has to behave correctly under, since it runs unmodified against
         // `effective_max` here.
@@ -993,7 +997,7 @@ mod tests {
         assert!(chunks[0].text.starts_with("# Root"));
 
         // chunks[1]: the first fragment of "### Big" — carries the heading line
-        // itself, so the breadcrumb excludes "Big" (ancestor_path only).
+        // itself, so the breadcrumb excludes "Big" (ancestors only).
         assert!(
             chunks[1].text.starts_with("Root > Section\n\n### Big"),
             "got: {:?}",
@@ -1001,7 +1005,7 @@ mod tests {
         );
 
         // chunks[2]: a later fragment — no heading line in its own text, so
-        // the breadcrumb must restate "Big" too (full_path).
+        // the breadcrumb must restate "Big" too (the full path).
         assert!(
             !chunks[2].text.contains("### Big"),
             "later fragment should be pure body text with no heading line, got: {:?}",
@@ -1011,6 +1015,579 @@ mod tests {
             chunks[2].text.starts_with("Root > Section > Big\n\n"),
             "got: {:?}",
             chunks[2].text
+        );
+    }
+
+    // ── merged-chunk breadcrumb narrowing (#286) ────────────────────────────
+
+    #[test]
+    fn merged_chunk_breadcrumb_narrows_to_shared_ancestor() {
+        // "### Blinded" (nested under "## Conditions", itself under "# Root")
+        // is small enough to merge forward with the following "## Actions"
+        // section — a sibling of "## Conditions", not "### Blinded" itself.
+        // Before the #286 fix, the merged chunk kept only the ancestors of
+        // "### Blinded" ("Root > Conditions"), misattributing the
+        // "## Actions" content it now also carries to a heading it was never
+        // under. The fix narrows the breadcrumb to the deepest heading both
+        // merged sections actually share: "Root".
+        let filler = "Word ".repeat(60); // ~300 chars, forces Root/Conditions to flush separately
+        let body = format!(
+            "# Root\n\n## Conditions\n\n{filler}\n\n### Blinded\n\nBlinded is bad.\n\n## Actions\n\nActions cost."
+        );
+        let chunks = chunk_markdown(&body, None, &cfg(1500, Some(300), false, true));
+        assert_eq!(
+            chunks.len(),
+            3,
+            "expected Root, Conditions, and a merged Blinded+Actions chunk, got: {:?}",
+            chunks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        let merged = &chunks[2];
+        assert!(
+            merged.text.starts_with("Root\n\n### Blinded"),
+            "breadcrumb should narrow to the shared ancestor \"Root\", got: {:?}",
+            merged.text
+        );
+        assert!(
+            merged.text.contains("## Actions"),
+            "merged chunk should still carry the Actions section, got: {:?}",
+            merged.text
+        );
+    }
+
+    #[test]
+    fn sibling_merge_leaves_breadcrumb_unchanged() {
+        // "## A" and "## B" are true siblings — both nested directly under
+        // "# Root" with no heading of their own between them — so merging
+        // them must leave the breadcrumb exactly as it was for "## A" alone:
+        // narrowing against an identical set of ancestors is a no-op.
+        let filler = "Word ".repeat(60); // ~300 chars, forces Root to flush before A/B
+        let body = format!("# Root\n\n{filler}\n\n## A\n\nSmall A.\n\n## B\n\nSmall B.");
+        let chunks = chunk_markdown(&body, None, &cfg(1500, Some(300), false, true));
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected the Root chunk and a merged A+B chunk, got: {:?}",
+            chunks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        let merged = &chunks[1];
+        assert!(
+            merged.text.starts_with("Root\n\n## A"),
+            "sibling merge must not change the breadcrumb, got: {:?}",
+            merged.text
+        );
+        assert!(merged.text.contains("## B"));
+    }
+
+    #[test]
+    fn raw_chunk_append_narrows_by_heading_identity() {
+        // White-box test of `RawChunk::append`. Root > Conditions > Blinded,
+        // then Root > Actions: both the breadcrumb and the section narrow to
+        // Root.
+        let body = "# Root\n## Conditions\n### Blinded\nBlinded is bad.\n## Actions\nActions cost.";
+        let tree = HeadingTree::parse(body);
+        let mut chunk = RawChunk {
+            text: "### Blinded\nBlinded is bad.".to_string(),
+            line_start: 3,
+            line_end: 4,
+            breadcrumb: Some(1),
+            section: SectionId::Heading(2),
+        };
+        chunk.append(
+            "## Actions\nActions cost.",
+            6,
+            Some(0),
+            SectionId::Heading(3),
+            &tree,
+        );
+        assert_eq!(chunk.breadcrumb, Some(0));
+        assert_eq!(chunk.section, SectionId::Heading(0));
+        assert_eq!(chunk.line_end, 6);
+    }
+
+    #[test]
+    fn level_seven_hashes_are_section_text_not_a_boundary() {
+        // Regression (#286): seven `#` is paragraph text in CommonMark, so it
+        // neither splits the section nor re-parents anything.
+        let body = "## Real Heading\n\n####### Not a heading\n\nSome text.";
+        let tree = HeadingTree::parse(body);
+        let sections = split_sections(body, &tree);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].line_end, 5);
+        let chunks = chunk_markdown(body, None, &cfg(1000, None, false, false));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, vec!["Real Heading".to_string()]);
+    }
+
+    // ── attribution regressions (#286) ──────────────────────────────────────
+
+    /// Asserts the invariant ingest relies on: the attributed section range
+    /// always covers the chunk.
+    fn assert_sections_cover_chunks(chunks: &[Chunk]) {
+        for c in chunks {
+            assert!(
+                c.section_line_start <= c.line_start && c.line_end <= c.section_line_end,
+                "chunk {} lines {}-{} not covered by its section {}-{}",
+                c.index,
+                c.line_start,
+                c.line_end,
+                c.section_line_start,
+                c.section_line_end
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_fragments_merged_together_keep_the_sections_own_heading() {
+        // #286: a small continuation paragraph merged with the next one keeps
+        // the section's own heading in its breadcrumb ("R > Big", not just the
+        // ancestors' "R"), as #166 requires for continuation fragments.
+        let long_a = format!("Alpha {}", "alpha ".repeat(115)); // ~700 chars
+        let short = format!("Short {}", "short ".repeat(15)); // ~100 chars
+        let long_b = format!("Beta {}", "beta ".repeat(139)); // ~700 chars
+        let body = format!("# R\n\n## Big\n\n{long_a}\n\n{short}\n\n{long_b}");
+        let chunks = chunk_markdown(&body, None, &cfg(1000, Some(800), false, true));
+        assert_sections_cover_chunks(&chunks);
+
+        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        // The tiny "# R" section is flushed on its own when the oversized
+        // "## Big" section is reached.
+        assert_eq!(chunks.len(), 3, "got: {texts:?}");
+        assert_eq!(chunks[0].text, "# R\n");
+        assert!(
+            chunks[1].text.starts_with("R\n\n## Big\n\nAlpha"),
+            "got: {:?}",
+            chunks[1].text
+        );
+        let merged = &chunks[2];
+        assert!(
+            merged.text.contains("Short ") && merged.text.contains("Beta "),
+            "the short paragraph must merge forward into the next one; got: {texts:?}"
+        );
+        assert!(
+            merged.text.starts_with("R > Big\n\nShort "),
+            "got: {:?}",
+            merged.text
+        );
+        for c in &chunks[1..] {
+            assert_eq!(c.heading_path, vec!["R".to_string(), "Big".to_string()]);
+        }
+    }
+
+    #[test]
+    fn merge_narrowing_uses_identity_not_text_for_same_named_headings() {
+        // #286: `### C` then a *different* `## C`. Narrowing is by heading
+        // identity, so the merged chunk is attributed to their common ancestor
+        // `A`, not to either `C`.
+        let filler = "Word ".repeat(60);
+        let body = format!("# A\n\n{filler}\n\n### C\n\nsmall\n\n## C\n\nsmall2");
+        let chunks = chunk_markdown(&body, None, &cfg(1500, Some(300), false, false));
+        assert_sections_cover_chunks(&chunks);
+        let merged = chunks.last().unwrap();
+        assert!(merged.text.starts_with("### C") && merged.text.contains("## C"));
+        assert_eq!(merged.heading_path, vec!["A".to_string()]);
+        assert_eq!(merged.heading_level, 1);
+        assert_eq!(
+            (merged.section_line_start, merged.section_line_end),
+            (1, 11)
+        );
+        assert_eq!((merged.line_start, merged.line_end), (5, 11));
+
+        // #286: `## X` merged with a second, unrelated `# R`.
+        let body = format!("# R\n\n{filler}\n\n## X\n\nsmall x\n\n# R\n\nsmall r2");
+        let chunks = chunk_markdown(&body, None, &cfg(1500, Some(300), false, true));
+        assert_sections_cover_chunks(&chunks);
+        let merged = chunks.last().unwrap();
+        assert!(
+            merged.text.starts_with("## X"),
+            "no shared heading, so no breadcrumb; got: {:?}",
+            merged.text
+        );
+        assert!(merged.heading_path.is_empty());
+        assert_eq!(merged.heading_level, 0);
+        assert_eq!(
+            (merged.section_line_start, merged.section_line_end),
+            (1, 11)
+        );
+    }
+
+    #[test]
+    fn preamble_merged_with_sections_is_attributed_to_the_whole_body() {
+        // #286: a chunk holding the preamble and later sections is attributed
+        // to the whole body, not to the preamble's own 1-2 range.
+        let body = "Intro text.\n\n# A\n\nA body.\n\n## B\n\nB body.";
+        let chunks = chunk_markdown(body, None, &cfg(1000, None, false, false));
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].heading_path.is_empty());
+        assert_eq!((chunks[0].line_start, chunks[0].line_end), (1, 9));
+        assert_eq!(
+            (chunks[0].section_line_start, chunks[0].section_line_end),
+            (1, 9)
+        );
+    }
+
+    #[test]
+    fn preamble_alone_is_attributed_to_the_preamble() {
+        let filler = "Word ".repeat(60);
+        let body = format!("Intro {filler}\n\n# A\n\n{filler}");
+        let chunks = chunk_markdown(&body, None, &cfg(1500, Some(300), false, false));
+        assert_sections_cover_chunks(&chunks);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].heading_path.is_empty());
+        assert_eq!(
+            (chunks[0].section_line_start, chunks[0].section_line_end),
+            (1, 2)
+        );
+        assert_eq!(chunks[1].heading_path, vec!["A".to_string()]);
+        assert_eq!(
+            (chunks[1].section_line_start, chunks[1].section_line_end),
+            (3, 5)
+        );
+    }
+
+    #[test]
+    fn blank_preamble_does_not_hide_the_first_heading() {
+        // Regression (#286): a whitespace-only first line must not swallow the
+        // first heading into an unnamed section.
+        let body = "  \n# A\nbody\n## B\nx";
+        let chunks = chunk_markdown(body, None, &cfg(1000, Some(1), false, true));
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].text.starts_with("# A"));
+        assert_eq!(chunks[0].line_start, 2);
+        assert_eq!(chunks[0].heading_path, vec!["A".to_string()]);
+        assert!(
+            chunks[1].text.starts_with("A\n\n## B"),
+            "got: {:?}",
+            chunks[1].text
+        );
+        assert_eq!(
+            chunks[1].heading_path,
+            vec!["A".to_string(), "B".to_string()]
+        );
+    }
+
+    #[test]
+    fn fenced_and_hashtag_lines_do_not_split_chunks() {
+        // Regressions (#286): `#tag` and a `~~~` line inside a ``` fence.
+        let body = "# A\n\n#tag not heading\n\n```\n~~~\n# not\n~~~\n```\n\n## B\n\nb";
+        let chunks = chunk_markdown(body, None, &cfg(1000, Some(1), false, false));
+        let paths: Vec<_> = chunks.iter().map(|c| c.heading_path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                vec!["A".to_string()],
+                vec!["A".to_string(), "B".to_string()]
+            ]
+        );
+        assert_eq!((chunks[1].line_start, chunks[1].line_end), (11, 13));
+    }
+
+    #[test]
+    fn sections_cover_chunks_across_shapes_and_sizes() {
+        let para = |n: usize| format!("Para{n} {}", "lorem ipsum ".repeat(n * 7));
+        let body = format!(
+            "Preamble {p1}\n\n# One\n\n{p2}\n\n## Two\n\n{p3}\n\n```\n# fenced\n```\n\n\
+             ### Three\n\n{p9}\n\n## Two\n\n{p1}\n\nSetext\n------\n\n{p5}\n\n# One\n\n{p2}\n",
+            p1 = para(1),
+            p2 = para(2),
+            p3 = para(3),
+            p5 = para(5),
+            p9 = para(9),
+        );
+        for max in [120, 300, 700, 2000] {
+            for target in [Some(1), Some(max / 2), None] {
+                for prepend in [false, true] {
+                    let chunks = chunk_markdown(&body, None, &cfg(max, target, false, prepend));
+                    assert!(!chunks.is_empty());
+                    assert_sections_cover_chunks(&chunks);
+                    for w in chunks.windows(2) {
+                        assert!(w[0].line_start <= w[1].line_start);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Chunk::heading_path / heading_level (#286) ──────────────────────────
+
+    #[test]
+    fn chunk_with_no_heading_at_all_has_empty_heading_path_and_zero_level() {
+        let chunks = chunk_markdown("Hello world", None, &cfg(1000, None, false, false));
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].heading_path.is_empty());
+        assert_eq!(chunks[0].heading_level, 0);
+    }
+
+    #[test]
+    fn heading_path_and_level_on_a_single_flat_chunk() {
+        // A lone "## Heading" section with no ancestors: heading_path is always
+        // the FULL path including the section's own heading — unlike the
+        // rendered breadcrumb (which excludes it here to avoid duplicating the
+        // chunk's own first line), `Chunk::heading_path` is computed the same
+        // way regardless of `prepend_heading_path`.
+        let chunks = chunk_markdown(
+            "## Heading\n\nSome body content.",
+            None,
+            &cfg(1000, None, false, false),
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, vec!["Heading".to_string()]);
+        assert_eq!(chunks[0].heading_level, 2);
+    }
+
+    #[test]
+    fn heading_path_and_level_across_nesting_levels() {
+        // Same body/config as `heading_path_prepended_across_nesting_levels`,
+        // but pinning the structured `heading_path`/`heading_level` fields
+        // rather than the rendered text breadcrumb.
+        let body = "# ares\n\n## Hardware\n\n### GPU Backends\n\nROCm and Vulkan notes.";
+        let chunks = chunk_markdown(body, None, &cfg(1500, Some(1), false, false));
+        assert_eq!(chunks.len(), 3);
+
+        assert_eq!(chunks[0].heading_path, vec!["ares".to_string()]);
+        assert_eq!(chunks[0].heading_level, 1);
+
+        assert_eq!(
+            chunks[1].heading_path,
+            vec!["ares".to_string(), "Hardware".to_string()]
+        );
+        assert_eq!(chunks[1].heading_level, 2);
+
+        assert_eq!(
+            chunks[2].heading_path,
+            vec![
+                "ares".to_string(),
+                "Hardware".to_string(),
+                "GPU Backends".to_string()
+            ]
+        );
+        assert_eq!(chunks[2].heading_level, 3);
+    }
+
+    #[test]
+    fn heading_path_and_level_on_oversized_section_fragments() {
+        // Same scenario as
+        // `oversized_section_continuation_fragment_gets_full_heading_path`: the
+        // first fragment AND every later continuation fragment carry the full
+        // attributed path (unlike the rendered breadcrumb, which differs
+        // between them), since `Chunk::heading_path` is always the attributed
+        // section's full path.
+        let filler = "Lorem ipsum dolor sit amet consectetur. ".repeat(80);
+        let body = format!("# Root\n\n## Section\n\n### Big\n\n{filler}");
+        let chunks = chunk_markdown(&body, None, &cfg(1000, Some(800), false, false));
+        assert!(chunks.len() >= 3);
+
+        let expected_path = vec!["Root".to_string(), "Section".to_string(), "Big".to_string()];
+        assert_eq!(chunks[1].heading_path, expected_path);
+        assert_eq!(chunks[1].heading_level, 3);
+        assert_eq!(chunks[2].heading_path, expected_path);
+        assert_eq!(chunks[2].heading_level, 3);
+    }
+
+    #[test]
+    fn heading_path_and_level_narrow_on_a_merged_chunk() {
+        // Same scenario as `merged_chunk_breadcrumb_narrows_to_shared_ancestor`:
+        // the merged chunk's `heading_path`/`heading_level` narrow to "Root"
+        // (level 1), the deepest heading both merged sections actually share —
+        // not "### Blinded" (level 3), which only the FIRST merged section sat
+        // under.
+        let filler = "Word ".repeat(60);
+        let body = format!(
+            "# Root\n\n## Conditions\n\n{filler}\n\n### Blinded\n\nBlinded is bad.\n\n## Actions\n\nActions cost."
+        );
+        let chunks = chunk_markdown(&body, None, &cfg(1500, Some(300), false, false));
+        assert_eq!(chunks.len(), 3);
+        let merged = &chunks[2];
+        assert_eq!(merged.heading_path, vec!["Root".to_string()]);
+        assert_eq!(merged.heading_level, 1);
+    }
+
+    // ── chunking.heading_metadata: no merging across headings (#286) ───────
+
+    fn cfg_isolated(
+        max: usize,
+        target: Option<usize>,
+        prepend_heading_path: bool,
+    ) -> ChunkingConfig {
+        ChunkingConfig {
+            heading_metadata: true,
+            ..cfg(max, target, false, prepend_heading_path)
+        }
+    }
+
+    fn s(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// `# Chapter` > `## Level 1` > 40 short `###` feats.
+    fn sibling_feats_body() -> String {
+        let mut body = String::from("# Chapter\n\nChapter intro.\n\n## Level 1\n\n");
+        for i in 0..40 {
+            body.push_str(&format!(
+                "### Feat {i}\n\n**Traits** General\n\nYou do thing number {i}.\n\n"
+            ));
+        }
+        body
+    }
+
+    #[test]
+    fn heading_metadata_on_never_merges_sibling_sections() {
+        let body = sibling_feats_body();
+        let tree = HeadingTree::parse(&body);
+        for (max, target) in [
+            (1500, None),
+            (1500, Some(1000)),
+            (300, Some(200)),
+            (60, Some(1)),
+        ] {
+            for prepend in [false, true] {
+                let chunks = chunk_markdown(&body, None, &cfg_isolated(max, target, prepend));
+                crate::heading::tests::assert_chunks_stay_within_one_section(&body, &chunks);
+                for i in 0..40 {
+                    let name = format!("Feat {i}");
+                    let feat = tree
+                        .headings()
+                        .iter()
+                        .find(|h| h.text == name)
+                        .expect("feat heading");
+                    let own: Vec<&Chunk> = chunks
+                        .iter()
+                        .filter(|c| c.heading_path.last() == Some(&name))
+                        .collect();
+                    assert!(!own.is_empty(), "{name} has no chunk of its own");
+                    for c in own {
+                        assert_eq!(c.heading_path, s(&["Chapter", "Level 1", &name]));
+                        assert_eq!(c.heading_level, 3);
+                        assert_eq!(
+                            (c.section_line_start, c.section_line_end),
+                            (feat.line, feat.subtree_end)
+                        );
+                    }
+                }
+            }
+        }
+
+        // At the default sizes every section fits one chunk: the chapter (with
+        // its intro), the heading-only `## Level 1`, and one chunk per feat.
+        let chunks = chunk_markdown(&body, None, &cfg_isolated(1500, None, true));
+        assert_eq!(chunks.len(), 42);
+        assert_eq!(chunks[0].heading_path, s(&["Chapter"]));
+        assert_eq!(chunks[1].heading_path, s(&["Chapter", "Level 1"]));
+        assert_eq!(
+            chunks[2].text,
+            "Chapter > Level 1\n\n### Feat 0\n\n**Traits** General\n\nYou do thing number 0.\n"
+        );
+    }
+
+    #[test]
+    fn heading_metadata_off_still_merges_sibling_sections() {
+        let body = sibling_feats_body();
+        let chunks = chunk_markdown(&body, None, &cfg(1500, None, false, true));
+        assert!(chunks.len() < 10, "got {} chunks", chunks.len());
+        assert_sections_cover_chunks(&chunks);
+        assert!(
+            chunks.iter().any(|c| c.heading_path.len() < 3),
+            "merged feats are attributed to an ancestor"
+        );
+    }
+
+    #[test]
+    fn heading_only_sections_become_their_own_chunks_when_isolated() {
+        // A heading directly followed by its first sub-heading has no body.
+        // With heading_metadata on it is its own chunk holding the heading
+        // line, not folded into the child (which would put the child's heading
+        // inside a chunk attributed to the parent).
+        let body = "# Chapter\n\n## Level 1\n\n### Feat\n\nFeat body.";
+        let chunks = chunk_markdown(body, None, &cfg_isolated(1500, None, true));
+        let summary: Vec<_> = chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.text.as_str(),
+                    c.heading_path.clone(),
+                    (c.line_start, c.line_end),
+                    (c.section_line_start, c.section_line_end),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("# Chapter\n", s(&["Chapter"]), (1, 2), (1, 7)),
+                (
+                    "Chapter\n\n## Level 1\n",
+                    s(&["Chapter", "Level 1"]),
+                    (3, 4),
+                    (3, 7)
+                ),
+                (
+                    "Chapter > Level 1\n\n### Feat\n\nFeat body.",
+                    s(&["Chapter", "Level 1", "Feat"]),
+                    (5, 7),
+                    (5, 7)
+                ),
+            ]
+        );
+        // Off: the three tiny sections merge into one chunk attributed to the
+        // chapter.
+        let merged = chunk_markdown(body, None, &cfg(1500, None, false, true));
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].heading_path, s(&["Chapter"]));
+    }
+
+    #[test]
+    fn isolated_preamble_is_never_merged_into_the_first_section() {
+        let body = "Intro text.\n\n# A\n\nA body.\n\n## B\n\nB body.";
+        let chunks = chunk_markdown(body, None, &cfg_isolated(1000, None, false));
+        crate::heading::tests::assert_chunks_stay_within_one_section(body, &chunks);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks[0].heading_path.is_empty());
+        assert_eq!(
+            (chunks[0].section_line_start, chunks[0].section_line_end),
+            (1, 2)
+        );
+    }
+
+    #[test]
+    fn isolated_trailing_fragment_does_not_join_the_previous_section() {
+        // A tiny `max_chunk_size` makes every section oversized, so a small
+        // trailing fragment would otherwise be appended to whatever chunk came
+        // last — the previous section's — when none of this section's own
+        // fragments were pushed.
+        for max in [1, 7, 11, 20, 40] {
+            let body = "# A\n\nalpha beta gamma\n\n## B\n\nx\n\n## C\n\ndelta epsilon";
+            for prepend in [false, true] {
+                let chunks = chunk_markdown(body, None, &cfg_isolated(max, Some(1), prepend));
+                crate::heading::tests::assert_chunks_stay_within_one_section(body, &chunks);
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_max_chunk_size_never_prepends_an_empty_breadcrumb() {
+        // #286: below 12, the breadcrumb budget is 0 characters. A nested
+        // continuation chunk must not start with an empty breadcrumb plus
+        // "\n\n".
+        let body = "# Root\n\n## Section\n\nsome body words here and more";
+        for max in 1..12 {
+            for heading_metadata in [false, true] {
+                let config = ChunkingConfig {
+                    heading_metadata,
+                    ..cfg(max, None, false, true)
+                };
+                for c in chunk_markdown(body, None, &config) {
+                    assert!(
+                        !c.text.starts_with('\n'),
+                        "max {max}: chunk {} is {:?}",
+                        c.index,
+                        c.text
+                    );
+                }
+            }
+        }
+        assert_eq!(format_heading_path(&s(&["A", "B"]), 0), None);
+        assert_eq!(
+            format_heading_path(&s(&["A", "B"]), 3),
+            Some("A >".to_string())
         );
     }
 }
