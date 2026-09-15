@@ -19,6 +19,7 @@ mod server;
 mod sparse;
 mod state;
 mod status;
+mod tool_schema;
 mod validate;
 mod web;
 mod webhook;

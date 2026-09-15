@@ -167,6 +167,16 @@ sample rather than an exhaustive list.
 
 ### Server hardening
 
+- **Self-contained tool input schemas** (#288): `tools/list` now returns
+  schemas with no `$ref`, no `$defs`/`definitions`, and no boolean
+  `true`/`false` subschema, fixing llama.cpp-backed clients (Crush, OpenCode)
+  that turn a tool's schema into a grammar and fail the whole request if it
+  doesn't convert. `$ref`s are inlined recursively; a ref back to a type
+  already being expanded (`update_schema`'s recursive `RawFieldDef.fields`)
+  is cut to a plain object one level in rather than expanding forever, so
+  nested `update_schema` `fields` entries advertise as plain objects instead
+  of their named property list — the server still deserializes and validates
+  them exactly as before. No config change, no reindex.
 - **Breaking (config key rename):** `rate_limit.per_second` is now
   `rate_limit.requests_per_second`, and it finally means what it says. The old key
   was passed straight to `tower_governor`'s `GovernorConfigBuilder::per_second`,
