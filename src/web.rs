@@ -3082,7 +3082,53 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["hint"], serde_json::json!(["Guide"]));
+        assert_eq!(
+            json["candidates"],
+            serde_json::json!([]),
+            "nothing plausibly matches 'Nonexistent'"
+        );
         assert!(!json["error"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_section_subsequence_matches_a_skipped_middle_segment() {
+        // "Guide" > "Alpha" > "Alpha Sub" — ["Guide", "Alpha Sub"] skips
+        // "Alpha" in the middle, a shape the suffix tier alone can't resolve
+        // (fix #291).
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_section(
+            &canonical,
+            16000,
+            "?heading_path=Guide&heading_path=Alpha+Sub",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["section"]["heading_path"],
+            serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
+        );
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_section_not_found_candidates_use_substring_but_never_resolve() {
+        // "Alpha S" is a substring of "Alpha Sub", not an exact segment
+        // match at any tier — it must appear as a suggestion, never resolve
+        // directly (fix #291).
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_section(&canonical, 16000, "?heading_path=Alpha+S").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let candidates = json["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0]["heading_path"],
+            serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
+        );
     }
 
     #[tokio::test]
