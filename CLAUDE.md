@@ -110,6 +110,15 @@ ruleset and the details below are what changed:
 - Branches auto-delete after merge.
 - Pre-commit hook enforces `cargo fmt` + `cargo clippy` (activate with
   `./scripts/setup-dev.sh` after cloning).
+- **Batch related changes into one PR.** Every merge to `master` runs
+  `release.yml`, which builds a new image and pokes Watchtower to restart the
+  live service — so N small PRs cost N builds and N restarts, and they
+  serialize on the single self-hosted runner. Splitting a fix from the doc
+  correction that belongs with it, or opening a second PR for something that
+  could have been another commit on a branch already in flight, is pure
+  churn. If several must land separately anyway, set the `DEPLOY_HOLD` repo
+  variable to `true`, let them accumulate, then ship the batch with one
+  `workflow_dispatch` run (`force=true`).
 
 ## Issue tracking
 
