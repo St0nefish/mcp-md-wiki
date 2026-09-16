@@ -1219,11 +1219,13 @@ fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
 pub struct GetDocumentParams {
     /// Relative path, unique basename, or absolute path.
     pub path: String,
-    /// First line to return (1-based, inclusive). Not combinable with
+    /// First line to return (1-based, inclusive). A range you name yourself is
+    /// served in full, however large. Not combinable with
     /// `line`/`heading_path`/`outline`.
     #[serde(default)]
     pub start_line: Option<usize>,
-    /// Last line to return (1-based, inclusive). Not combinable with
+    /// Last line to return (1-based, inclusive). A range you name yourself is
+    /// served in full, however large. Not combinable with
     /// `line`/`heading_path`/`outline`.
     #[serde(default)]
     pub end_line: Option<usize>,
@@ -1260,7 +1262,15 @@ pub struct GetDocumentParams {
 /// hint, so the text block never repeats the JSON payload.
 fn render_document_view_text(view: retrieval::DocumentView, section_max_bytes: usize) -> String {
     match view {
-        retrieval::DocumentView::Range(slice) => slice.content,
+        retrieval::DocumentView::Range(slice) => {
+            if !slice.truncated {
+                return slice.content;
+            }
+            let note = truncation_note(slice.end_line, slice.total_lines, section_max_bytes);
+            let mut text = slice.content;
+            text.push_str(&note);
+            text
+        }
         retrieval::DocumentView::Outline(outline) => {
             let mut text = match &outline.section {
                 Some(section) => format!(
@@ -1269,13 +1279,33 @@ fn render_document_view_text(view: retrieval::DocumentView, section_max_bytes: u
                     section.line_start,
                     section.line_end
                 ),
+                // A whole-document read too large to serve as text (#290).
+                None if outline.document_oversized => format!(
+                    "This document is larger than this server's {section_max_bytes}-byte read \
+                     limit, so here is its outline instead of its text. Fetch a section by its \
+                     heading_path or line, or read raw lines with start_line/end_line.\n\n"
+                ),
                 None => String::new(),
             };
             text.push_str(&render_outline_body(&outline));
+            if let Some(intro) = &outline.intro {
+                text.push_str(&format!(
+                    "\n\nThe document also has text before its first heading (lines {}-{}); read \
+                     it with start_line: {}, end_line: {}.",
+                    intro.line_start, intro.line_end, intro.line_start, intro.line_end
+                ));
+            }
             text
         }
         retrieval::DocumentView::Section(section) => match &section.outline {
-            None => section.content.unwrap_or_default(),
+            None => {
+                let note = section.truncated.then(|| {
+                    truncation_note(section.end_line, section.entry.line_end, section_max_bytes)
+                });
+                let mut text = section.content.unwrap_or_default();
+                text.push_str(note.as_deref().unwrap_or_default());
+                text
+            }
             Some(outline) => {
                 let mut text = format!(
                     "Section \"{}\" (lines {}-{}) is larger than this server's {}-byte section \
@@ -1298,6 +1328,19 @@ fn render_document_view_text(view: retrieval::DocumentView, section_max_bytes: u
             }
         },
     }
+}
+
+/// The trailer appended to a text block the server cut at its size limit
+/// (#290), naming the last line served and how to read on. Text-only clients
+/// see nothing but the text itself, so without this a truncated read would
+/// look like a complete one; `structured_content` carries the same facts as
+/// `truncated`/`end_line`.
+fn truncation_note(end_line: usize, last_line: usize, section_max_bytes: usize) -> String {
+    format!(
+        "\n\n[Cut at this server's {section_max_bytes}-byte read limit: lines through {end_line} \
+         of {last_line}. Read on with start_line: {}.]",
+        end_line + 1
+    )
 }
 
 /// An outline's heading lines (relative to its scope) plus its truncation
@@ -10371,6 +10414,9 @@ mod tests {
         let hash = crate::ingest::compute_hash_from_bytes(SECTION_DOC.as_bytes());
         let cases: Vec<(usize, GetDocumentParams)> = vec![
             (16000, GetDocumentParams::default()),
+            // A whole-document read over the cap, which degrades to the
+            // document's outline (#290).
+            (10, GetDocumentParams::default()),
             (
                 16000,
                 GetDocumentParams {
@@ -10797,7 +10843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_document_section_exceeding_the_cap_with_no_children_returns_full_text() {
+    async fn get_document_section_exceeding_the_cap_with_no_children_is_truncated() {
         let tmp = tempfile::tempdir().unwrap();
         let server = section_test_server(&tmp, 10);
 
@@ -10812,12 +10858,139 @@ mod tests {
         .unwrap();
 
         assert_eq!(structured["outline_only"], false);
-        assert!(text.contains("Beta body."));
-        assert_eq!(structured["content"], text);
-        // Text served past the cap because there is nothing smaller to
-        // narrow into must be flagged, not indistinguishable from a normal read.
+        // Nothing smaller to narrow into, so text comes back — but bounded by
+        // the cap, flagged, and reporting where it stops so the caller can
+        // page on with start_line (#290).
         assert_eq!(structured["oversized"], true);
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["content"], "## Beta\n\n");
+        assert_eq!(structured["end_line"], 12);
+        assert_eq!(structured["section"]["line_end"], 13);
         assert_eq!(structured["partial"], true);
+        // The text block is the same content, plus a trailer naming the cut —
+        // a text-only client can't see `truncated`.
+        assert!(text.starts_with("## Beta\n\n"), "{text}");
+        assert!(!text.contains("Beta body."), "{text}");
+        assert!(text.contains("start_line: 13"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_document_whole_document_over_the_cap_degrades_to_an_outline() {
+        // The default call shape on a document too big to serve as text:
+        // its outline, marked as a degraded read, never silent full text (#290).
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 10);
+
+        let (text, structured) =
+            get_document_result(&server, section_doc_params(Default::default()))
+                .await
+                .unwrap();
+
+        assert_eq!(structured["outline_only"], true);
+        assert!(structured.get("content").is_none(), "{structured}");
+        assert_eq!(structured["outline"][0]["heading"], "Guide");
+        assert_eq!(structured["total_entries"], 4);
+        // SECTION_DOC opens on its first heading, so there is no intro.
+        assert!(structured["intro"].is_null());
+        assert!(text.contains("10-byte read limit"), "{text}");
+        assert!(text.contains("# Guide (lines 1-13)"), "{text}");
+        assert!(!text.contains("text before its first heading"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_document_whole_document_over_the_cap_reports_its_preamble_as_intro() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 10);
+        std::fs::write(
+            tmp.path().join("preamble.md"),
+            "Preamble text.\n\n# Guide\n\nbody\n",
+        )
+        .unwrap();
+
+        let (text, structured) = get_document_result(
+            &server,
+            GetDocumentParams {
+                path: "preamble.md".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(structured["outline_only"], true);
+        assert_eq!(structured["intro"]["line_start"], 1);
+        assert_eq!(structured["intro"]["line_end"], 2);
+        assert!(text.contains("start_line: 1, end_line: 2"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_document_whole_document_over_the_cap_without_headings_is_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 10);
+        std::fs::write(
+            tmp.path().join("flat.md"),
+            "one line\ntwo line\nthree line\n",
+        )
+        .unwrap();
+
+        let (text, structured) = get_document_result(
+            &server,
+            GetDocumentParams {
+                path: "flat.md".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // No headings to navigate by, so the text is cut on a line boundary
+        // and the response says where it stopped (#290).
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["content"], "one line\n");
+        assert_eq!(structured["end_line"], 1);
+        assert_eq!(structured["total_lines"], 3);
+        assert_eq!(structured["partial"], true);
+        assert!(text.starts_with("one line\n"), "{text}");
+        assert!(text.contains("start_line: 2"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_document_whole_document_within_the_cap_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+
+        let (text, structured) =
+            get_document_result(&server, section_doc_params(Default::default()))
+                .await
+                .unwrap();
+
+        assert_eq!(text, SECTION_DOC);
+        assert_eq!(structured["content"], SECTION_DOC);
+        assert_eq!(structured["partial"], false);
+        assert!(structured.get("truncated").is_none(), "{structured}");
+        assert!(structured.get("outline_only").is_none(), "{structured}");
+    }
+
+    #[tokio::test]
+    async fn get_document_explicit_range_over_the_cap_is_served_whole() {
+        // The caller named the bounds, so the cap does not apply (#290).
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 10);
+
+        let (text, structured) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                start_line: Some(1),
+                end_line: Some(13),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(text, SECTION_DOC);
+        assert_eq!(structured["content"], SECTION_DOC);
+        assert!(structured.get("truncated").is_none(), "{structured}");
     }
 
     #[tokio::test]

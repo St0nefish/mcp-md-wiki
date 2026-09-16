@@ -726,6 +726,12 @@ pub struct LineSlice {
     pub start_line: usize,
     pub end_line: usize,
     pub total_lines: usize,
+    /// The server cut this slice short at `search.section_max_bytes` (#290).
+    /// Only [`resolve_document_view`]'s whole-document path sets it;
+    /// [`slice_lines`] and [`slice_or_whole`] always leave it `false`, since a
+    /// caller-named range is served exactly as asked. `end_line` already
+    /// reports what was served either way.
+    pub truncated: bool,
 }
 
 impl LineSlice {
@@ -773,6 +779,7 @@ pub fn slice_or_whole(
                 start_line: 1,
                 end_line: total_lines,
                 total_lines,
+                truncated: false,
             })
         }
     }
@@ -796,6 +803,7 @@ pub fn slice_lines(content: &str, range: &LineRange) -> Result<LineSlice, LineRa
         start_line: range.start,
         end_line,
         total_lines,
+        truncated: false,
     })
 }
 
@@ -1330,8 +1338,9 @@ fn resolve_section_index(
 /// through the end of its subtree. It comes back as one of:
 ///
 /// - its text, when that fits in `search.section_max_bytes`;
-/// - its text anyway, flagged `oversized`, when it is too big but has no
-///   sub-headings to narrow into;
+/// - text anyway, flagged `oversized`, when it is too big but has no
+///   sub-headings to narrow into — cut to the budget on a line boundary,
+///   flagged `truncated`, with `end_line` naming where it stops (#290);
 /// - `outline_only`: no text, just the outline of its sub-headings — the
 ///   same capped outline `outline` mode gives for the same selector — plus
 ///   `intro` when the section has text of its own before its first
@@ -1346,10 +1355,17 @@ pub struct SectionView {
     /// `Some` unless `outline_only` is set.
     pub content: Option<String>,
     pub outline_only: bool,
-    /// `content` exceeds `section_max_bytes` but was returned in full anyway
-    /// because the section has no sub-headings to narrow into. Never set
-    /// together with `outline_only`.
+    /// The section exceeds `section_max_bytes` but has no sub-headings to
+    /// narrow into, so text came back anyway — cut to the budget on a line
+    /// boundary (`truncated`). Never set together with `outline_only`.
     pub oversized: bool,
+    /// `content` was cut short at `section_max_bytes` (#290). Only ever set
+    /// together with `oversized`: a section that fits is served whole.
+    pub truncated: bool,
+    /// The last document line present in `content` — `entry.line_end` unless
+    /// `truncated`, in which case it is where the text stops, so a caller can
+    /// read on from `end_line + 1` with `start_line`/`end_line` (#290).
+    pub end_line: usize,
     /// `Some` exactly when `outline_only` is set: the section's sub-headings,
     /// scoped and capped like `outline` mode.
     pub outline: Option<OutlineView>,
@@ -1369,7 +1385,9 @@ pub struct SectionView {
 }
 
 /// A resolved, size-capped outline (#286): the whole document's headings, or
-/// just the headings nested under one section. Capped to roughly
+/// just the headings nested under one section. Also what a whole-document
+/// read over `section_max_bytes` degrades to when the document has headings
+/// (`document_oversized`, #290). Capped to roughly
 /// `search.section_max_bytes` bytes of serialized entries so a document with
 /// an unbounded number of headings can't hand back an unbounded payload.
 ///
@@ -1394,6 +1412,16 @@ pub struct OutlineView {
     /// Set exactly when `truncated`: transport-neutral guidance on reaching
     /// the headings that were left out.
     pub hint: Option<String>,
+    /// This outline stands in for a whole-document read that exceeded
+    /// `section_max_bytes` (#290), rather than one the caller asked for. Only
+    /// ever set on a whole-document outline (`section: None`).
+    pub document_oversized: bool,
+    /// Set only when `document_oversized` and the document has content of its
+    /// own before its first heading: line 1 (frontmatter included — the
+    /// caller asked for the whole file) through the line before that heading.
+    /// Read it with `start_line`/`end_line`, the same contract as a section's
+    /// `intro`.
+    pub intro: Option<OutlineEntry>,
 }
 
 /// The resolved `get_document` view, after `parse_document_view_request` has
@@ -1607,7 +1635,45 @@ fn cap_outline(
         total_entries: entries.len(),
         truncated,
         hint,
+        document_oversized: false,
+        intro: None,
     }
+}
+
+/// Cut `content` — a slice that starts at document line `start_line` — to at
+/// most `max_bytes`, on a whole-line boundary. Returns the kept text, the
+/// document line it ends on, and whether anything was dropped (#290).
+///
+/// Splitting on `split_inclusive('\n')` and re-concatenating keeps the result
+/// a byte-exact prefix of `content`: CRLF terminators and an unterminated
+/// last line survive, the same guarantee [`slice_lines`] gives, so what comes
+/// back is still a substring of the file. At least one line is always kept,
+/// even when that line alone blows the budget — same posture as
+/// [`cap_outline`], which always keeps one entry: a caller is better served
+/// by an over-budget line it can see than by an empty response.
+fn truncate_to_line_budget(
+    content: &str,
+    start_line: usize,
+    max_bytes: usize,
+) -> (String, usize, bool) {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let mut kept = 0usize;
+    let mut used = 0usize;
+    for line in &lines {
+        if used + line.len() > max_bytes && kept > 0 {
+            break;
+        }
+        used += line.len();
+        kept += 1;
+    }
+    let truncated = kept < lines.len();
+    (
+        lines[..kept].concat(),
+        // `kept` is at least 1 whenever there is a line to keep, so the end
+        // line never runs behind `start_line`.
+        start_line + kept.saturating_sub(1),
+        truncated,
+    )
 }
 
 /// Whether `text` — a section's slice from its heading line through the line
@@ -1630,18 +1696,69 @@ fn has_content_beyond_heading(text: &str) -> bool {
 }
 
 /// Resolve `request` against `content`, applying the `section_max_bytes` size
-/// cap for section and outline modes. The single function both the MCP
-/// `get_document` tool and `/api/doc` call after `parse_document_view_request`
-/// — see that function's doc comment.
+/// cap. The single function both the MCP `get_document` tool and `/api/doc`
+/// call after `parse_document_view_request` — see that function's doc comment.
+///
+/// The cap covers every read the caller did not bound itself: a section, an
+/// outline, and — since #290 — a whole-document read, which degrades to the
+/// document's own outline (plus an `intro` range for anything before the
+/// first heading) when it has headings to navigate by, and to a truncated
+/// slice when it has none. An explicit `start_line`/`end_line` range is
+/// served uncapped: the caller named the bounds, so the size is its own
+/// decision to make.
 pub fn resolve_document_view(
     content: &str,
     request: &DocumentViewRequest,
     section_max_bytes: usize,
 ) -> Result<DocumentView, DocumentViewError> {
     match request {
-        DocumentViewRequest::Range(range) => slice_or_whole(content.to_string(), range.as_ref())
-            .map(DocumentView::Range)
-            .map_err(DocumentViewError::Range),
+        DocumentViewRequest::Range(range) => {
+            let slice = slice_or_whole(content.to_string(), range.as_ref())
+                .map_err(DocumentViewError::Range)?;
+            if range.is_some() || slice.content.len() <= section_max_bytes {
+                return Ok(DocumentView::Range(slice));
+            }
+
+            let entries = outline(content);
+            let first_heading = entries.iter().find(|e| e.level > 0);
+            let Some(first_heading_line) = first_heading.map(|e| e.line_start) else {
+                // No headings: nothing smaller to navigate by, so cut the
+                // text on a line boundary and report where it stops (#290).
+                let (text, end_line, truncated) =
+                    truncate_to_line_budget(&slice.content, slice.start_line, section_max_bytes);
+                return Ok(DocumentView::Range(LineSlice {
+                    content: text,
+                    end_line,
+                    truncated,
+                    ..slice
+                }));
+            };
+
+            let total_lines = slice.total_lines;
+            let mut view = cap_outline(&entries, None, total_lines, section_max_bytes);
+            view.document_oversized = true;
+            // Everything above the first heading, frontmatter included: the
+            // caller asked for the whole file, and this is the only part of
+            // it no heading covers. An empty range (a document opening on its
+            // first heading) has nothing to offer.
+            if first_heading_line > 1 {
+                let intro_range = LineRange {
+                    start: 1,
+                    end: Some(first_heading_line - 1),
+                };
+                let intro_text = slice_lines(content, &intro_range)
+                    .map_err(DocumentViewError::Range)?
+                    .content;
+                view.intro = has_content_beyond_heading(&intro_text).then(|| OutlineEntry {
+                    heading: String::new(),
+                    heading_path: Vec::new(),
+                    level: 0,
+                    line_start: 1,
+                    line_end: first_heading_line - 1,
+                });
+            }
+            Ok(DocumentView::Outline(view))
+        }
         DocumentViewRequest::Outline(None) => Ok(DocumentView::Outline(cap_outline(
             &outline(content),
             None,
@@ -1675,13 +1792,21 @@ pub fn resolve_document_view(
             let nested = descendants(&entries, idx);
 
             if fits || nested.is_empty() {
-                // Either it fits, or there is nothing smaller to offer — the
-                // full text either way, flagged when over the cap.
+                // Either it fits — served whole — or it is over the cap with
+                // no sub-headings to narrow into, in which case it is cut to
+                // the budget and reports the line its text stops on (#290).
+                let (text, end_line, truncated) = if fits {
+                    (slice.content, slice.end_line, false)
+                } else {
+                    truncate_to_line_budget(&slice.content, slice.start_line, section_max_bytes)
+                };
                 return Ok(DocumentView::Section(SectionView {
                     entry: resolved,
-                    content: Some(slice.content),
+                    content: Some(text),
                     outline_only: false,
                     oversized: !fits,
+                    truncated,
+                    end_line,
                     outline: None,
                     intro: None,
                     total_lines,
@@ -1711,10 +1836,12 @@ pub fn resolve_document_view(
                 section_max_bytes,
             );
             Ok(DocumentView::Section(SectionView {
+                end_line: resolved.line_end,
                 entry: resolved,
                 content: None,
                 outline_only: true,
                 oversized: false,
+                truncated: false,
                 outline: Some(sub_outline),
                 intro,
                 total_lines,
@@ -1729,13 +1856,21 @@ pub fn resolve_document_view(
 /// graph). The one place those fields are named, so the MCP tool's
 /// `structured_content` and `/api/doc`'s body cannot drift apart (#286).
 ///
-/// - Range: `content`, `start_line`, `end_line`, `total_lines`, `partial`.
+/// - Range: `content`, `start_line`, `end_line`, `total_lines`, `partial`,
+///   plus `truncated: true` when a whole-document read was cut at
+///   `section_max_bytes` (#290).
 /// - Outline: `outline`, `total_entries`, `truncated`, `total_lines`, plus
-///   `section` when scoped to one, and `hint` when truncated.
+///   `section` when scoped to one, and `hint` when truncated. A whole-document
+///   read that degraded to an outline adds `outline_only: true` and `intro`
+///   (an entry or `null`) (#290).
 /// - Section with text: `section`, `outline_only: false`, `oversized`,
-///   `content`, `total_lines`, `partial`.
+///   `content`, `total_lines`, `partial`, plus `truncated: true` and
+///   `end_line` (the last line of `content`) when the text was cut (#290).
 /// - Section as outline: `section`, `outline_only: true`, the outline fields
 ///   above, `intro` (an entry or `null`), `total_lines`, `partial`.
+///
+/// The #290 keys appear only on responses that could not exist before it, so
+/// every shape that predates it is unchanged byte for byte.
 pub fn document_view_json(view: &DocumentView) -> serde_json::Map<String, serde_json::Value> {
     use serde_json::{Value, json};
     let mut map = serde_json::Map::new();
@@ -1760,12 +1895,27 @@ pub fn document_view_json(view: &DocumentView) -> serde_json::Map<String, serde_
             put("end_line", json!(slice.end_line));
             put("total_lines", json!(slice.total_lines));
             put("partial", json!(slice.partial()));
+            if slice.truncated {
+                put("truncated", json!(true));
+            }
         }
         DocumentView::Outline(outline) => {
             if let Some(section) = &outline.section {
                 put("section", outline_entry_json(section));
             }
+            if outline.document_oversized {
+                put("outline_only", json!(true));
+            }
             outline_fields(outline, &mut put);
+            if outline.document_oversized {
+                put(
+                    "intro",
+                    outline
+                        .intro
+                        .as_ref()
+                        .map_or(Value::Null, outline_entry_json),
+                );
+            }
             put("total_lines", json!(outline.total_lines));
         }
         DocumentView::Section(section) => {
@@ -1785,6 +1935,10 @@ pub fn document_view_json(view: &DocumentView) -> serde_json::Map<String, serde_
                 None => {
                     put("oversized", json!(section.oversized));
                     put("content", json!(section.content));
+                    if section.truncated {
+                        put("truncated", json!(true));
+                        put("end_line", json!(section.end_line));
+                    }
                 }
             }
             put("total_lines", json!(section.total_lines));
@@ -7785,7 +7939,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_document_view_returns_full_text_when_oversized_section_has_no_children() {
+    fn resolve_document_view_truncates_an_oversized_section_with_no_children() {
         let content = "# Guide\n\n## Leaf\n\nSome body text with no children at all.\n";
         let s = expect_section(
             resolve_document_view(
@@ -7799,9 +7953,14 @@ mod tests {
             !s.outline_only,
             "no children to narrow into — text must still be returned"
         );
-        assert!(s.content.is_some());
         assert!(s.outline.is_none());
         assert!(s.oversized, "childless oversized text must be flagged");
+        // Nothing smaller to offer is not the same as no limit (#290): the
+        // text is cut on a line boundary and says where it stopped.
+        assert!(s.truncated);
+        assert_eq!(s.content.as_deref(), Some("## Leaf\n\n"));
+        assert_eq!(s.end_line, 4);
+        assert_eq!(s.entry.line_end, 5);
     }
 
     #[test]
@@ -7872,6 +8031,217 @@ mod tests {
             DocumentView::Outline(v) => assert_eq!(v.entries.len(), 1),
             other => panic!("expected Outline, got a different DocumentView variant: {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_document_view — whole-document reads over the cap (#290)
+    // ------------------------------------------------------------------
+
+    fn expect_range(view: DocumentView) -> LineSlice {
+        match view {
+            DocumentView::Range(slice) => slice,
+            other => panic!("expected Range, got a different DocumentView variant: {other:?}"),
+        }
+    }
+
+    /// A document larger than the caps used below, with `headings` headings
+    /// and `preamble` lines of text before the first one.
+    fn big_document(preamble: &str, headings: usize) -> String {
+        let mut content = preamble.to_string();
+        for i in 0..headings {
+            content.push_str(&format!(
+                "## Heading {i}\n\n{}\n\n",
+                "body text ".repeat(40)
+            ));
+        }
+        content
+    }
+
+    #[test]
+    fn resolve_document_view_whole_document_over_the_cap_becomes_an_outline_with_an_intro() {
+        let content = big_document("Some preamble text.\n\n", 5);
+        let view = expect_outline(
+            resolve_document_view(&content, &DocumentViewRequest::Range(None), 400).unwrap(),
+        );
+        assert!(
+            view.document_oversized,
+            "a degraded whole-document read must be distinguishable from a requested outline"
+        );
+        assert!(view.section.is_none(), "the scope is the whole document");
+        assert_eq!(view.total_lines, count_lines(&content));
+        // The whole-document outline, exactly as `Outline(None)` builds it.
+        let requested = expect_outline(
+            resolve_document_view(&content, &DocumentViewRequest::Outline(None), 400).unwrap(),
+        );
+        assert_eq!(view.entries, requested.entries);
+        assert_eq!(view.total_entries, requested.total_entries);
+        let intro = view.intro.expect("the preamble is readable text");
+        assert_eq!((intro.line_start, intro.line_end), (1, 2));
+        assert_eq!(intro.level, 0);
+        assert_eq!(
+            slice_lines(
+                &content,
+                &LineRange {
+                    start: intro.line_start,
+                    end: Some(intro.line_end)
+                }
+            )
+            .unwrap()
+            .content,
+            "Some preamble text.\n\n"
+        );
+    }
+
+    #[test]
+    fn resolve_document_view_whole_document_over_the_cap_has_no_intro_without_a_preamble() {
+        let content = big_document("", 5);
+        let view = expect_outline(
+            resolve_document_view(&content, &DocumentViewRequest::Range(None), 400).unwrap(),
+        );
+        assert!(view.document_oversized);
+        assert!(
+            view.intro.is_none(),
+            "a document opening on its first heading has nothing above it to read"
+        );
+        assert!(document_view_json(&DocumentView::Outline(view))["intro"].is_null());
+    }
+
+    #[test]
+    fn resolve_document_view_whole_document_over_the_cap_offers_the_frontmatter_as_its_intro() {
+        // Line 1 through the line before the first heading, frontmatter
+        // included: the caller asked for the whole file, and this is the only
+        // part of it no heading covers (#290).
+        let content = format!("---\ntitle: T\n---\n{}", big_document("", 5));
+        let view = expect_outline(
+            resolve_document_view(&content, &DocumentViewRequest::Range(None), 400).unwrap(),
+        );
+        let intro = view.intro.expect("frontmatter is readable text");
+        assert_eq!((intro.line_start, intro.line_end), (1, 3));
+    }
+
+    #[test]
+    fn resolve_document_view_whole_document_over_the_cap_with_no_headings_is_truncated() {
+        let content = "line of text\n".repeat(100);
+        let slice = expect_range(
+            resolve_document_view(&content, &DocumentViewRequest::Range(None), 100).unwrap(),
+        );
+        assert!(slice.truncated);
+        assert_eq!(slice.start_line, 1);
+        assert_eq!(slice.end_line, 7, "13 bytes a line fits 7 under a 100 cap");
+        assert_eq!(slice.content, "line of text\n".repeat(7));
+        assert_eq!(slice.total_lines, 100);
+        assert!(slice.partial());
+        let json = document_view_json(&DocumentView::Range(slice));
+        assert_eq!(json["truncated"], serde_json::json!(true));
+        assert_eq!(json["end_line"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn resolve_document_view_whole_document_truncation_always_keeps_one_line() {
+        let content = "x".repeat(500);
+        let slice = expect_range(
+            resolve_document_view(&content, &DocumentViewRequest::Range(None), 10).unwrap(),
+        );
+        assert_eq!(slice.content, content, "one over-budget line beats none");
+        assert_eq!(slice.end_line, 1);
+        assert!(
+            !slice.truncated,
+            "the only line there is was served in full"
+        );
+    }
+
+    #[test]
+    fn resolve_document_view_whole_document_within_the_cap_is_served_whole() {
+        let content = "# A\n\nshort body\n";
+        let slice = expect_range(
+            resolve_document_view(content, &DocumentViewRequest::Range(None), 16000).unwrap(),
+        );
+        assert_eq!(slice.content, content);
+        assert!(!slice.truncated);
+        assert!(!slice.partial());
+        assert_eq!(
+            serde_json::Value::Object(document_view_json(&DocumentView::Range(slice))),
+            serde_json::json!({
+                "content": content,
+                "start_line": 1,
+                "end_line": 3,
+                "total_lines": 3,
+                "partial": false,
+            }),
+            "an in-budget read's JSON must be byte-for-byte what it always was"
+        );
+    }
+
+    #[test]
+    fn resolve_document_view_explicit_range_over_the_cap_is_not_capped() {
+        // The caller named the bounds, so the size is its own decision (#290).
+        let content = big_document("Some preamble text.\n\n", 5);
+        for range in [
+            LineRange {
+                start: 1,
+                end: None,
+            },
+            LineRange {
+                start: 1,
+                end: Some(count_lines(&content)),
+            },
+        ] {
+            let slice = expect_range(
+                resolve_document_view(&content, &DocumentViewRequest::Range(Some(range)), 10)
+                    .unwrap(),
+            );
+            assert_eq!(slice.content, content, "{range:?}");
+            assert!(!slice.truncated, "{range:?}");
+        }
+    }
+
+    #[test]
+    fn truncate_to_line_budget_cuts_on_a_line_boundary_preserving_exact_bytes() {
+        let content = "alpha\r\nbeta\r\ngamma";
+        let (text, end_line, truncated) = truncate_to_line_budget(content, 4, 8);
+        assert_eq!(
+            text, "alpha\r\n",
+            "CRLF survives, and no partial line is cut"
+        );
+        assert_eq!(end_line, 4, "the first line of a slice starting at line 4");
+        assert!(truncated);
+
+        // An unterminated last line stays unterminated, and nothing is cut
+        // when everything fits.
+        let (text, end_line, truncated) = truncate_to_line_budget(content, 1, 1000);
+        assert_eq!(text, content);
+        assert_eq!(end_line, 3);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_to_line_budget_keeps_one_over_budget_line() {
+        let (text, end_line, truncated) = truncate_to_line_budget("aaaaaaaa\nbbbb\n", 2, 3);
+        assert_eq!(text, "aaaaaaaa\n");
+        assert_eq!(end_line, 2);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn document_view_json_degraded_document_read_is_an_outline_marked_as_one() {
+        let content = big_document("Some preamble text.\n\n", 5);
+        let view = resolve_document_view(&content, &DocumentViewRequest::Range(None), 400).unwrap();
+        let json = document_view_json(&view);
+        assert_eq!(json["outline_only"], serde_json::json!(true));
+        assert_eq!(json["intro"]["line_start"], serde_json::json!(1));
+        assert!(json["outline"].as_array().is_some_and(|o| !o.is_empty()));
+        assert!(
+            json.get("content").is_none(),
+            "an outline carries no text: {json:?}"
+        );
+
+        // A requested outline of the same document is unchanged — neither key
+        // appears on it.
+        let requested = document_view_json(
+            &resolve_document_view(&content, &DocumentViewRequest::Outline(None), 400).unwrap(),
+        );
+        assert!(requested.get("outline_only").is_none());
+        assert!(requested.get("intro").is_none());
     }
 
     // ------------------------------------------------------------------
@@ -8224,6 +8594,72 @@ mod tests {
                 "hint",
                 "outline",
                 "total_entries",
+                "total_lines",
+                "truncated"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+        let range =
+            resolve_document_view(&content, &DocumentViewRequest::Range(None), 100_000).unwrap();
+        assert_eq!(
+            keys(range),
+            [
+                "content",
+                "end_line",
+                "partial",
+                "start_line",
+                "total_lines"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+        // The #290 shapes: a degraded whole-document read, a truncated
+        // heading-less one, and a truncated childless section.
+        let degraded =
+            resolve_document_view(&content, &DocumentViewRequest::Range(None), 100).unwrap();
+        assert_eq!(
+            keys(degraded),
+            [
+                "hint",
+                "intro",
+                "outline",
+                "outline_only",
+                "total_entries",
+                "total_lines",
+                "truncated"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+        let headingless =
+            resolve_document_view(&"xxx\n".repeat(75), &DocumentViewRequest::Range(None), 100)
+                .unwrap();
+        assert_eq!(
+            keys(headingless),
+            [
+                "content",
+                "end_line",
+                "partial",
+                "start_line",
+                "total_lines",
+                "truncated"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+        let cut_section =
+            resolve_document_view(&content, &section_request(SectionSelector::Line(3), 0), 100)
+                .unwrap();
+        assert_eq!(
+            keys(cut_section),
+            [
+                "content",
+                "end_line",
+                "outline_only",
+                "oversized",
+                "partial",
+                "section",
                 "total_lines",
                 "truncated"
             ]

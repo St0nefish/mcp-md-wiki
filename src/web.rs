@@ -3184,6 +3184,13 @@ mod tests {
                 "",
                 retrieval::parse_document_view_request(None, None, None, None, None, false),
             ),
+            // A whole-document read over the cap, which degrades to the
+            // document's outline (#290).
+            (
+                10,
+                "",
+                retrieval::parse_document_view_request(None, None, None, None, None, false),
+            ),
             (
                 16000,
                 "?start_line=2&end_line=4",
@@ -3246,7 +3253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_doc_handler_section_exceeding_the_cap_with_no_children_returns_full_text() {
+    async fn get_doc_handler_section_exceeding_the_cap_with_no_children_is_truncated() {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
 
@@ -3254,11 +3261,85 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["outline_only"], false);
-        assert!(json["content"].as_str().unwrap().contains("Beta body."));
-        // Text served past the cap because there is nothing smaller to
-        // narrow into must say so.
+        // Nothing smaller to narrow into, so text comes back — bounded by the
+        // cap, flagged, and reporting where it stops (#290).
         assert_eq!(json["oversized"], true);
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["content"], "## Beta\n\n");
+        assert_eq!(json["end_line"], 12);
         assert_eq!(json["partial"], true);
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_whole_document_over_the_cap_degrades_to_an_outline() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_section(&canonical, 10, "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["outline_only"], true);
+        assert!(json.get("content").is_none(), "{json}");
+        assert_eq!(json["total_entries"], 4);
+        // SECTION_DOC opens on its first heading, so there is no intro (#290).
+        assert!(json["intro"].is_null());
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_whole_document_over_the_cap_without_headings_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            canonical.join("flat.md"),
+            "one line\ntwo line\nthree line\n",
+        )
+        .unwrap();
+        let app = ui_router(test_state_with_section_max_bytes(&canonical, 10));
+        let req = Request::builder()
+            .uri("/api/doc/flat.md")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let json = body_json(resp).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["content"], "one line\n");
+        assert_eq!(json["end_line"], 1);
+        assert_eq!(json["total_lines"], 3);
+        assert_eq!(json["partial"], true);
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_whole_document_within_the_cap_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_section(&canonical, 16000, "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["content"], SECTION_DOC);
+        assert_eq!(json["partial"], false);
+        assert!(json.get("truncated").is_none(), "{json}");
+        assert!(json.get("outline_only").is_none(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_explicit_range_over_the_cap_is_served_whole() {
+        // The caller named the bounds, so the cap does not apply (#290).
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        // `?start_line=1` is what the web UI sends for a document it means to
+        // display or edit in full — a save posts the whole body back, so a
+        // capped read there would truncate the file on disk.
+        for query in ["?start_line=1", "?start_line=1&end_line=13"] {
+            let (status, json) = get_doc_section(&canonical, 10, query).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            assert_eq!(json["content"], SECTION_DOC, "{query}");
+            assert!(json.get("truncated").is_none(), "{query}: {json}");
+        }
     }
 
     #[tokio::test]

@@ -6,7 +6,12 @@
  *
  * Talks to the write pipeline via the fixed HTTP API contract:
  *   GET    api/schema/<path>  -> schema hints panel + new-document template
- *   GET    api/doc/<path>     -> load content + content_hash for editing
+ *   GET    api/doc/<path>?start_line=1
+ *                             -> load content + content_hash for editing.
+ *                                The range is what makes the read exempt from
+ *                                the server's section_max_bytes cap (#290);
+ *                                without it a large document comes back as an
+ *                                outline and a save would truncate the file.
  *   POST   api/doc/<path>     -> create/edit/move
  *                                {content, commit_message, create, expected_hash?, new_path?}
  *                                `new_path` turns the same POST into an atomic
@@ -173,7 +178,9 @@
       // belt-and-suspenders guard for non-click save paths (Cmd/Ctrl+S).
       disableSave("Waiting for the document to load before you can save.");
       try {
-        const res = await fetch(`api/doc/${window.KBViz.encodePathForApi(path)}`);
+        const res = await fetch(
+          `api/doc/${window.KBViz.encodePathForApi(path)}?start_line=1`
+        );
         const data = await safeJson(res);
         if (!res.ok) {
           els.textarea.value = "";
@@ -183,9 +190,17 @@
             }`
           );
           disableSave("The document failed to load — reload before saving.");
+        } else if (typeof data.content !== "string" || data.truncated) {
+          // A save posts the whole textarea as the document body, so anything
+          // short of the complete file would truncate it on disk (#290).
+          els.textarea.value = data.content || "";
+          showError(
+            "The server returned only part of this document, so it cannot be edited here."
+          );
+          disableSave("Only part of the document loaded — editing it here would truncate it.");
         } else {
           originalHash = data.content_hash;
-          els.textarea.value = data.content || "";
+          els.textarea.value = data.content;
           enableSave();
         }
       } catch (err) {
@@ -540,7 +555,9 @@
     // Re-fetch to pick up the fresh content_hash for any further save in
     // this session, and to reflect any server-side normalization.
     try {
-      const res = await fetch(`api/doc/${window.KBViz.encodePathForApi(path)}`);
+      const res = await fetch(
+        `api/doc/${window.KBViz.encodePathForApi(path)}?start_line=1`
+      );
       if (res.ok) {
         const doc = await res.json();
         originalHash = doc.content_hash;

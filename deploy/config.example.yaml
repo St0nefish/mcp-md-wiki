@@ -629,13 +629,17 @@ search:
   # sentences drop out of the tool schema and descriptions too.
   # granularities: [chunk, document, section]
 
-  # Size cap, in bytes, on what get_document's section and outline modes
-  # return. A selected section (`line`/`heading_path`) larger than this comes
+  # Size cap, in bytes, on every get_document read the caller did not bound
+  # itself. A selected section (`line`/`heading_path`) larger than this comes
   # back as an outline of its sub-headings instead (`outline_only: true`) so
-  # the caller can narrow further; a section with no sub-headings is returned
-  # in full regardless, since there's nothing smaller to offer. Outlines
-  # (including that one) are capped to roughly this many bytes of entries,
-  # shallowest levels first.
+  # the caller can narrow further; a section with no sub-headings has nothing
+  # smaller to offer, so its text is returned (`oversized: true`) but cut to
+  # this budget on a line boundary (`truncated: true`, with `end_line` naming
+  # the last line served). A whole-document read over the cap comes back as
+  # the document's outline the same way, or — when the document has no
+  # headings — as truncated text. An explicit `start_line`/`end_line` range is
+  # exempt: the caller named the bounds. Outlines are capped to roughly this
+  # many bytes of entries, shallowest levels first.
   section_max_bytes: 16000
 
 
