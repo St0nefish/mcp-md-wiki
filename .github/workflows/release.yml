@@ -13,6 +13,26 @@ on:
         type: boolean
         default: false
 
+# One deploy at a time, repo-wide. Two release runs overlapping on separate
+# runners race on a shared mutable target: both read :latest's digest, both
+# `imagetools create` it, and the last writer wins — so the *older* commit can
+# end up as :latest, and both pokes reach Watchtower, restarting the live
+# service twice for one intended deploy. The group is a constant, not keyed by
+# ref or sha, because the thing being serialized is the deployment, of which
+# there is exactly one regardless of what triggered the run.
+#
+# `cancel-in-progress: false` — superseded runs queue, they do not get killed:
+#   - every master commit must still publish its `:<merge_sha>` tag, which is
+#     what makes a rollback target findable from master's history (see the
+#     "Tag as latest" step); cancelling a superseded run would leave that
+#     commit with no image anybody can name.
+#   - a deliberate `workflow_dispatch` batch deploy must not be cancelled by an
+#     incidental push that lands while it runs.
+# Deploy churn is DEPLOY_HOLD's job (see the gate below), not this knob's.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: self-hosted
