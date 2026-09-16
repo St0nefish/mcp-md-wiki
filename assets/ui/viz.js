@@ -721,7 +721,10 @@
     const bodyEl = document.getElementById("detail-body");
     bodyEl.innerHTML = '<p class="muted">Loading…</p>';
     try {
-      const res = await fetch(`api/doc/${encodePathForApi(id)}`);
+      // `?start_line=1` is the whole document: a caller-named range is
+      // exempt from the server's read cap, which would otherwise hand back
+      // an outline instead of the text for a document over it (#290).
+      const res = await fetch(`api/doc/${encodePathForApi(id)}?start_line=1`);
       if (token !== docFetchToken) return;
       if (!res.ok) {
         bodyEl.innerHTML = `<p class="muted">Could not load document (HTTP ${res.status}).</p>`;

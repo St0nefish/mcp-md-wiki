@@ -18,6 +18,24 @@ sample rather than an exhaustive list.
 
 ### Retrieval
 
+- **Whole-document reads and heading-less sections are capped** (#290).
+  `search.section_max_bytes` (default 16000 bytes) now governs every
+  `get_document` read the caller did not bound itself, not just section and
+  outline modes. A bare `get_document` on a document over the cap returns the
+  document's own outline instead of its text — `outline_only: true` plus
+  `intro`, the range from line 1 (frontmatter included) through the line
+  before the first heading, or `null` when there is nothing there — so the
+  caller narrows with `heading_path`/`line`. With no headings to narrow into,
+  the text is cut on a line boundary and flagged `truncated: true` with
+  `end_line` naming the last line served; the same now applies to an
+  `oversized` section with no sub-headings, which previously returned
+  unbounded text. An explicit `start_line`/`end_line` range is still served in
+  full, however large. No new config key, no reindex. The new keys appear only
+  on responses that were impossible before, so existing response shapes are
+  unchanged; both MCP `structured_content` and `/api/doc` get them, and MCP's
+  text block carries a trailing note when it was cut. The web UI reads
+  `/api/doc/{path}?start_line=1` so its viewer and editor always hold the
+  whole file (the editor refuses to save anything it did not load in full).
 - **`get_document` `heading_path` accepts a skipped middle segment, and
   suggests candidates when nothing resolves** (fix #291), extending #286's
   exact-path and suffix tiers with a third: an ordered, not-necessarily-

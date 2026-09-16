@@ -1,9 +1,20 @@
 Read a document by path — repo-relative (`sysadmin/docker/foo.md`) or a unique
-basename. Returns the complete markdown, frontmatter included.
+basename. Returns the complete markdown, frontmatter included, as long as the
+document fits this server's size limit.
 
-Pass `start_line`/`end_line` to read part of a long document. The returned
-`content_hash` always covers the whole file — hand it to `write_document` as
-`expected_hash` to guard against editing content that moved under you.
+A document over that limit is not returned whole: if it has headings you get
+its outline instead of its text (`outline_only: true`, plus `intro` — the
+range above the first heading, frontmatter included — or `intro: null` when
+there is nothing there), so you can fetch the section you want by
+`heading_path` or `line`. If it has no headings there is nothing to navigate
+by, so the text is cut on a line boundary and flagged `truncated: true`, with
+`end_line` naming the last line you got: read on from `end_line + 1`.
+
+Pass `start_line`/`end_line` to read part of a long document. A range you name
+yourself is served in full, however large — the size limit only applies to
+reads you did not bound. The returned `content_hash` always covers the whole
+file — hand it to `write_document` as `expected_hash` to guard against editing
+content that moved under you.
 
 For a long, heading-structured document, navigate by section. A section is a
 heading line through the end of everything nested under it. Select one with
@@ -54,8 +65,10 @@ range is reported as `intro`; read it with `start_line`/`end_line`. A `search`
 `section` row for a heading with sub-headings matched in that heading's own
 text before its first sub-heading (its heading line, and the `intro` range if
 any); the row's `hit_line_start`/`hit_line_end` name the matched lines. A section
-with no sub-headings is returned in full regardless of size, flagged
-`oversized: true`, since there is nothing smaller to offer.
+with no sub-headings has nothing smaller to offer, so its text comes back
+flagged `oversized: true`, cut to the size limit on a line boundary when it
+exceeds it — then `truncated: true` and `end_line` (the last line of the text
+you got) say so, and you read on from `end_line + 1`.
 
 Section and outline responses report `total_lines` (the whole document's line
 count) and `partial`, on the same contract as a range read. Outlines are capped
