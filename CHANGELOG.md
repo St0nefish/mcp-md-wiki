@@ -18,6 +18,20 @@ sample rather than an exhaustive list.
 
 ### Retrieval
 
+- **`get_document` `heading_path` accepts a skipped middle segment, and
+  suggests candidates when nothing resolves** (fix #291), extending #286's
+  exact-path and suffix tiers with a third: an ordered, not-necessarily-
+  contiguous subsequence match, so `["Feats", "Dual Wielding"]` now resolves
+  against `Feats > Combat > Dual Wielding` even though it skips "Combat".
+  Segment comparison stays exact at all three tiers, and each still resolves
+  only when it names exactly one section — several matches at the same tier
+  is `Ambiguous`, same as before. When no tier matches, the `NotFound` error
+  now also carries `candidates`: sections the query matches as an ordered
+  subsequence under a looser, substring-per-segment comparison (so
+  `["Dual Wield"]` still surfaces a `Dual Wielding` section, without ever
+  resolving to it), capped at 10 and ordered by fewest skipped segments then
+  document order. The existing `hint` (a few top-level headings) remains for
+  when there is nothing to suggest.
 - **Small-to-big section retrieval** (#286): `get_document` gains `line`/
   `heading_path` (select the section containing a line, or matching a
   suffix of a heading path — two ways to name the same section) with

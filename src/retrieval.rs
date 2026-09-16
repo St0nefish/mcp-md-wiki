@@ -893,11 +893,21 @@ pub enum SectionSelector {
     /// The deepest outline entry whose subtree contains this 1-based file
     /// line.
     Line(usize),
-    /// A heading path, matched as a (trimmed, case-insensitive, invisible-
-    /// character-insensitive — see `heading::normalize_heading_text`) **suffix**
-    /// of an entry's own `heading_path` — so `["Fireball"]` matches `["Spells",
-    /// "Fireball"]` without spelling out every ancestor. An exact full-path
-    /// match always wins over a shorter suffix match when both exist.
+    /// A heading path, resolved against entries' own `heading_path`s by
+    /// `find_by_heading_path`'s tiers, tried in order and each resolving
+    /// only when it names exactly one entry (#291): an exact full-path
+    /// match; then a (trimmed, case-insensitive, invisible-character-
+    /// insensitive — see `heading::normalize_heading_text`) contiguous
+    /// **suffix** match, so `["Fireball"]` matches `["Spells", "Fireball"]`
+    /// without spelling out every ancestor; then an ordered, not
+    /// necessarily contiguous **subsequence** match, which may also skip a
+    /// *middle* segment, so `["Feats", "Fireball"]` matches `["Feats",
+    /// "Spells", "Fireball"]`. Segment comparison is exact at every one of
+    /// these tiers. A query several entries match at the same tier is
+    /// `SectionError::Ambiguous`, never a silent pick of the first one; a
+    /// query nothing matches at any tier is `SectionError::NotFound`, whose
+    /// `candidates` are built with a looser, substring per-segment
+    /// comparison used only to suggest, never to resolve.
     HeadingPath(Vec<String>),
 }
 
@@ -915,12 +925,20 @@ pub struct SectionCandidate {
 /// Why `resolve_section` could not resolve a single section.
 #[derive(Debug)]
 pub enum SectionError {
-    /// No entry matched. `hint` carries a few top-level headings (cheap to
-    /// compute, since `outline` already built the list) so the caller has
-    /// something to try next without a separate `outline: true` round trip.
-    NotFound { hint: Vec<String> },
-    /// More than one entry's `heading_path` has the requested path as a
-    /// suffix, and none of them is an exact full-path match.
+    /// No entry matched at any tier of `find_by_heading_path`. `hint`
+    /// carries a few top-level headings (cheap to compute, since `outline`
+    /// already built the list) so the caller has something to try next
+    /// without a separate `outline: true` round trip. `candidates` (#291)
+    /// carries entries the query plausibly meant — an ordered subsequence
+    /// match using a looser, substring per-segment comparison than the tiers
+    /// that resolve — empty when nothing matches even that. `hint` is the
+    /// fallback wording when `candidates` is empty.
+    NotFound {
+        hint: Vec<String>,
+        candidates: Vec<SectionCandidate>,
+    },
+    /// More than one entry matched at the same tier (suffix or subsequence),
+    /// and none of them is an exact full-path match.
     Ambiguous { candidates: Vec<SectionCandidate> },
 }
 
@@ -932,8 +950,24 @@ impl SectionError {
     /// have to translate).
     pub fn message(&self) -> String {
         match self {
-            SectionError::NotFound { hint } => {
-                if hint.is_empty() {
+            SectionError::NotFound { hint, candidates } => {
+                if !candidates.is_empty() {
+                    format!(
+                        "No section matches the given line/heading_path. Did you mean: {}? Pick \
+                         one with `line` (see each candidate's line_start), or adjust \
+                         heading_path to its full path.",
+                        candidates
+                            .iter()
+                            .map(|c| format!(
+                                "{} (lines {}-{})",
+                                c.heading_path.join(" > "),
+                                c.line_start,
+                                c.line_end
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )
+                } else if hint.is_empty() {
                     "No section matches the given line/heading_path, and this document has no \
                      headings. Use `outline` to check."
                         .to_string()
@@ -988,7 +1022,14 @@ impl SectionError {
     /// the `/api/doc` JSON error body alike.
     pub fn data(&self) -> serde_json::Value {
         match self {
-            SectionError::NotFound { hint } => serde_json::json!({ "hint": hint }),
+            SectionError::NotFound { hint, candidates } => serde_json::json!({
+                "hint": hint,
+                "candidates": candidates.iter().map(|c| serde_json::json!({
+                    "heading_path": c.heading_path,
+                    "line_start": c.line_start,
+                    "line_end": c.line_end,
+                })).collect::<Vec<_>>(),
+            }),
             SectionError::Ambiguous { candidates } => serde_json::json!({
                 "candidates": candidates.iter().map(|c| serde_json::json!({
                     "heading_path": c.heading_path,
@@ -1004,6 +1045,10 @@ impl SectionError {
 /// NotFound`'s hint. Capped rather than exhaustive: this is a nudge toward
 /// `outline: true`, not a replacement for it.
 const NOT_FOUND_HINT_CAP: usize = 5;
+
+/// Cap on `SectionError::NotFound`'s `candidates` list (#291) — a vague
+/// query must not dump hundreds of sections.
+const NOT_FOUND_CANDIDATE_CAP: usize = 10;
 
 fn top_level_hint(entries: &[OutlineEntry]) -> Vec<String> {
     entries
@@ -1046,21 +1091,98 @@ fn candidates_for(entries: &[OutlineEntry], indices: &[usize]) -> Vec<SectionCan
         .collect()
 }
 
-/// Index of the entry matching `query` as a suffix of its `heading_path`
-/// (trimmed, whitespace-collapsed, case-insensitive, invisible-character-
-/// insensitive — `normalize_heading`). An exact full-path match wins outright
-/// over any shorter suffix match, but only when it is the *unique* exact
-/// match: two headings sharing the exact
-/// same full path (a common shape in rulebook conversions) are Ambiguous too
-/// rather than silently picking the first one found (#286) — the
-/// document's own advice to "use a longer heading_path" is otherwise
+/// Whether `query`'s elements appear in `path`, in the same order, not
+/// necessarily contiguously, under `eq` (#291): greedily advance through
+/// `query` as `path` is scanned once, so this is O(`path.len()`) — bounded
+/// by heading depth, not by how many entries the document has. An empty
+/// `query` trivially matches (nothing left to find), same as `path_norm ==
+/// query_norm` already does for the exact tier.
+fn ordered_subsequence_match(
+    path: &[String],
+    query: &[String],
+    eq: impl Fn(&str, &str) -> bool,
+) -> bool {
+    let mut qi = 0;
+    for p in path {
+        if qi == query.len() {
+            break;
+        }
+        if eq(p, &query[qi]) {
+            qi += 1;
+        }
+    }
+    qi == query.len()
+}
+
+/// Entries the query plausibly meant, for `SectionError::NotFound`'s
+/// suggestion list (#291): the query's normalized segments must match the
+/// entry's normalized `heading_path` as an ordered subsequence, same as tier
+/// 3, but the per-segment comparison here is *substring* (a normalized query
+/// segment inside a normalized path segment — so `Dual Wield` suggests
+/// `Dual Wielding`) rather than the exact comparison tiers 1-3 use to
+/// resolve, so this only ever suggests, never silently resolves. Ordered by
+/// fewest skipped path segments (a tighter match first), then document
+/// order, and capped at `NOT_FOUND_CANDIDATE_CAP`.
+fn subsequence_candidates(
+    entries: &[OutlineEntry],
+    query_norm: &[String],
+) -> Vec<SectionCandidate> {
+    if query_norm.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, usize)> = Vec::new(); // (skipped segments, entry index)
+    for (i, e) in entries.iter().enumerate() {
+        if e.level == 0 || e.heading_path.len() < query_norm.len() {
+            continue; // The preamble has no heading, and a shorter path can't hold the query.
+        }
+        let path_norm: Vec<String> = e
+            .heading_path
+            .iter()
+            .map(|s| normalize_heading(s))
+            .collect();
+        if ordered_subsequence_match(&path_norm, query_norm, |p, q| p.contains(q)) {
+            scored.push((path_norm.len() - query_norm.len(), i));
+        }
+    }
+    scored.sort_by_key(|&(skipped, i)| (skipped, i));
+    let indices: Vec<usize> = scored
+        .into_iter()
+        .take(NOT_FOUND_CANDIDATE_CAP)
+        .map(|(_, i)| i)
+        .collect();
+    candidates_for(entries, &indices)
+}
+
+/// Index of the entry matching `query` against its `heading_path`, tried
+/// tier by tier (#291), each resolving only when it names exactly one entry:
+///
+/// 1. exact full-path match (`path_norm == query_norm`);
+/// 2. contiguous **suffix** match, so `["Fireball"]` matches `["Spells",
+///    "Fireball"]` without spelling out every ancestor;
+/// 3. ordered, not-necessarily-contiguous **subsequence** match, which may
+///    also skip a *middle* segment, so `["Feats", "Fireball"]` matches
+///    `["Feats", "Spells", "Fireball"]` (`["Fireball", "Feats"]`, out of
+///    order, would not).
+///
+/// Segment comparison is exact (`normalize_heading`: trimmed, whitespace-
+/// collapsed, case-insensitive, invisible-character-insensitive) at every
+/// tier — what silently resolves never gets looser. Two headings sharing the
+/// exact same full path (a common shape in rulebook conversions) are
+/// Ambiguous too rather than silently picking the first one found (#286) —
+/// the document's own advice to "use a longer heading_path" is otherwise
 /// impossible to follow, since a longer path can't distinguish two entries
-/// that already have identical paths.
+/// that already have identical paths; the same reasoning carries to the
+/// suffix and subsequence tiers.
+///
+/// When no tier resolves, the `NotFound` error carries `candidates` built
+/// with a looser, substring per-segment comparison — see
+/// `subsequence_candidates` — purely to suggest, never to resolve.
 fn find_by_heading_path(entries: &[OutlineEntry], query: &[String]) -> Result<usize, SectionError> {
     let query_norm: Vec<String> = query.iter().map(|s| normalize_heading(s)).collect();
 
     let mut exact_matches: Vec<usize> = Vec::new();
     let mut suffix_matches: Vec<usize> = Vec::new();
+    let mut subsequence_matches: Vec<usize> = Vec::new();
 
     for (i, e) in entries.iter().enumerate() {
         if e.level == 0 {
@@ -1077,6 +1199,8 @@ fn find_by_heading_path(entries: &[OutlineEntry], query: &[String]) -> Result<us
             && path_norm[path_norm.len() - query_norm.len()..] == query_norm[..]
         {
             suffix_matches.push(i);
+        } else if ordered_subsequence_match(&path_norm, &query_norm, |p, q| p == q) {
+            subsequence_matches.push(i);
         }
     }
 
@@ -1091,14 +1215,29 @@ fn find_by_heading_path(entries: &[OutlineEntry], query: &[String]) -> Result<us
     }
 
     match suffix_matches.len() {
-        0 => Err(SectionError::NotFound {
-            hint: top_level_hint(entries),
-        }),
-        1 => Ok(suffix_matches[0]),
-        _ => Err(SectionError::Ambiguous {
-            candidates: candidates_for(entries, &suffix_matches),
-        }),
+        1 => return Ok(suffix_matches[0]),
+        n if n > 1 => {
+            return Err(SectionError::Ambiguous {
+                candidates: candidates_for(entries, &suffix_matches),
+            });
+        }
+        _ => {}
     }
+
+    match subsequence_matches.len() {
+        1 => return Ok(subsequence_matches[0]),
+        n if n > 1 => {
+            return Err(SectionError::Ambiguous {
+                candidates: candidates_for(entries, &subsequence_matches),
+            });
+        }
+        _ => {}
+    }
+
+    Err(SectionError::NotFound {
+        hint: top_level_hint(entries),
+        candidates: subsequence_candidates(entries, &query_norm),
+    })
 }
 
 /// Index of `entries[idx]`'s immediate parent: the nearest *preceding* entry
@@ -1165,8 +1304,11 @@ fn resolve_section_index(
 ) -> Result<usize, SectionError> {
     let mut idx = match selector {
         SectionSelector::Line(line) => {
+            // No heading_path to suggest candidates from — a line number
+            // beyond the document has no "did you mean" (#291).
             find_deepest_containing(entries, *line).ok_or_else(|| SectionError::NotFound {
                 hint: top_level_hint(entries),
+                candidates: Vec::new(),
             })?
         }
         SectionSelector::HeadingPath(path) => find_by_heading_path(entries, path)?,
@@ -7321,7 +7463,13 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            SectionError::NotFound { hint } => assert_eq!(hint, vec!["Root".to_string()]),
+            SectionError::NotFound { hint, candidates } => {
+                assert_eq!(hint, vec!["Root".to_string()]);
+                assert!(
+                    candidates.is_empty(),
+                    "no entry's heading_path plausibly matches 'Nonexistent': {candidates:?}"
+                );
+            }
             other => panic!("expected NotFound, got {other:?}"),
         }
     }
@@ -7782,6 +7930,160 @@ mod tests {
             }
             other => panic!("expected Ambiguous, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // find_by_heading_path — subsequence tier and NotFound candidates (#291)
+    // ------------------------------------------------------------------
+
+    const FEATS_DOC: &str = "# Feats\n\n## Combat\n\n### Dual Wielding\n\nText.\n";
+
+    #[test]
+    fn resolve_section_subsequence_matches_a_skipped_middle_segment() {
+        // ["Feats", "Dual Wielding"] skips "Combat" — a shape the suffix
+        // tier alone can't resolve, since "Combat" isn't the given path's
+        // leading segment.
+        let resolved = resolve_section(
+            FEATS_DOC,
+            &SectionSelector::HeadingPath(vec!["Feats".to_string(), "Dual Wielding".to_string()]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.heading_path,
+            vec![
+                "Feats".to_string(),
+                "Combat".to_string(),
+                "Dual Wielding".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_section_subsequence_requires_segment_order() {
+        // The same segments, reversed, must not match — subsequence order
+        // matters, it isn't a bag of segments.
+        let err = resolve_section(
+            FEATS_DOC,
+            &SectionSelector::HeadingPath(vec!["Dual Wielding".to_string(), "Feats".to_string()]),
+            0,
+        )
+        .unwrap_err();
+        match err {
+            SectionError::NotFound { candidates, .. } => assert!(
+                candidates.is_empty(),
+                "out-of-order segments must not even suggest the section: {candidates:?}"
+            ),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_section_subsequence_ambiguous_lists_every_candidate() {
+        let content = "# Feats\n\n## Combat\n\n### Dual Wielding\n\nA.\n\n## Social\n\n### Dual Wielding\n\nB.\n";
+        let err = resolve_section(
+            content,
+            &SectionSelector::HeadingPath(vec!["Feats".to_string(), "Dual Wielding".to_string()]),
+            0,
+        )
+        .unwrap_err();
+        match err {
+            SectionError::Ambiguous { candidates } => {
+                let mut paths: Vec<Vec<String>> =
+                    candidates.into_iter().map(|c| c.heading_path).collect();
+                paths.sort();
+                assert_eq!(
+                    paths,
+                    vec![
+                        vec![
+                            "Feats".to_string(),
+                            "Combat".to_string(),
+                            "Dual Wielding".to_string()
+                        ],
+                        vec![
+                            "Feats".to_string(),
+                            "Social".to_string(),
+                            "Dual Wielding".to_string()
+                        ],
+                    ]
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_section_not_found_candidates_use_substring_but_never_resolve() {
+        // "Dual Wield" is a substring of "Dual Wielding", not an exact
+        // segment match — it must surface the section as a candidate
+        // without ever resolving to it directly.
+        let err = resolve_section(
+            FEATS_DOC,
+            &SectionSelector::HeadingPath(vec!["Dual Wield".to_string()]),
+            0,
+        )
+        .unwrap_err();
+        match err {
+            SectionError::NotFound { candidates, .. } => {
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(
+                    candidates[0].heading_path,
+                    vec![
+                        "Feats".to_string(),
+                        "Combat".to_string(),
+                        "Dual Wielding".to_string()
+                    ]
+                );
+                let msg = SectionError::NotFound {
+                    hint: Vec::new(),
+                    candidates,
+                }
+                .message();
+                assert!(msg.contains("Dual Wielding"), "{msg}");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_section_not_found_candidates_are_capped() {
+        let content: String = (1..=15)
+            .map(|n| format!("# Section {n}\n\nBody.\n"))
+            .collect();
+        let err = resolve_section(
+            &content,
+            &SectionSelector::HeadingPath(vec!["Sectio".to_string()]),
+            0,
+        )
+        .unwrap_err();
+        match err {
+            SectionError::NotFound { candidates, .. } => {
+                assert_eq!(candidates.len(), NOT_FOUND_CANDIDATE_CAP);
+                // Every candidate here skips the same number of segments
+                // (0), so the tie-break — document order — decides: the
+                // first 10 sections, not an arbitrary 10.
+                assert_eq!(candidates[0].heading_path, vec!["Section 1".to_string()]);
+                assert_eq!(candidates[9].heading_path, vec!["Section 10".to_string()]);
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_section_exact_match_wins_even_with_an_independent_subsequence_match_elsewhere() {
+        // A top-level "Dual Wielding" is an exact match for the query; a
+        // second, unrelated "Dual Wielding" nested under "Feats > Combat"
+        // would also satisfy the suffix and subsequence tiers on its own —
+        // but the exact tier is checked first and resolves uniquely, so the
+        // other entry must never be considered.
+        let content = "# Feats\n\n## Combat\n\n### Dual Wielding\n\nA.\n\n# Dual Wielding\n\nB.\n";
+        let resolved = resolve_section(
+            content,
+            &SectionSelector::HeadingPath(vec!["Dual Wielding".to_string()]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(resolved.heading_path, vec!["Dual Wielding".to_string()]);
     }
 
     // ------------------------------------------------------------------

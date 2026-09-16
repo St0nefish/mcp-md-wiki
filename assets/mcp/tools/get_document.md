@@ -9,14 +9,19 @@ For a long, heading-structured document, navigate by section. A section is a
 heading line through the end of everything nested under it. Select one with
 `line` (any line in it — a line on its heading or in the text before its first
 sub-heading is the section itself; a line inside a sub-heading's range is that
-sub-heading) or `heading_path` (e.g. `["Spells", "Fireball"]` — a trailing
-suffix of the full path is enough; each segment is a complete heading name, and
-matching ignores case, invisible characters such as soft hyphens, and
-differences in whitespace, but not Unicode normalization form — a precomposed
-accented character (`é`) does not match a decomposed spelling of the same text
-(`e` + combining acute accent)), and optionally `levels_up` to climb that many
-parent headings (a heading's parent is the nearest heading above it with a
-lower level, whatever the level gap). Heading text longer than 200 characters is cut to its
+sub-heading) or `heading_path` (e.g. `["Spells", "Fireball"]`). `heading_path`
+resolves in tiers, each only when it names exactly one section: the full path;
+then a trailing suffix (`["Fireball"]` alone is enough); then an ordered match
+that may also skip a *middle* segment (`["Feats", "Dual Wielding"]` matches
+`Feats > Combat > Dual Wielding`, dropping "Combat"). Each segment is a
+complete heading name, and matching ignores case, invisible characters such as
+soft hyphens, and differences in whitespace, but not Unicode normalization
+form — a precomposed accented character (`é`) does not match a decomposed
+spelling of the same text (`e` + combining acute accent). Segments must still
+appear in order — `["Dual Wielding", "Feats"]` does not match the same
+section. Optionally pass `levels_up` to climb that many parent headings (a
+heading's parent is the nearest heading above it with a lower level, whatever
+the level gap). Heading text longer than 200 characters is cut to its
 first 200 in outlines and paths (zero-width joiners, direction marks and variation
 selectors don't count toward the cap); passing the full text still matches. `line` and
 `heading_path` are two ways to name the same section, never a different read.
@@ -27,11 +32,19 @@ document's on its own, or just the sub-headings of the section you select with
 `line`, `heading_path` or `outline`. `line` must be 1 or greater, and
 `heading_path` may not contain an empty or blank segment.
 
-If more than one section has the exact `heading_path` you asked for (common in
-rulebook conversions with repeated section names), the response is an error
-listing every candidate's line range — pick one with `line` instead of a longer
-`heading_path`, since a longer path can't distinguish two sections that already
-have identical paths.
+If `heading_path` names more than one section — the exact path is duplicated
+(common in rulebook conversions with repeated section names), or the given
+segments match more than one section in order — the response is an error
+listing every candidate's line range: pick one with `line` when the
+candidates' full paths are identical (a longer `heading_path` can't
+distinguish two sections that already have the same one), or a longer or
+reordered `heading_path` otherwise.
+
+If nothing resolves, the error may still suggest candidates: sections whose
+path the given segments match in order using a looser, per-segment substring
+comparison (so `["Dual Wield"]` surfaces a `Dual Wielding` section) — these
+are suggestions only, never a resolved read. Adjust `heading_path` to one of
+them exactly, or fetch it by its `line`.
 
 A selected section larger than the configured size limit comes back as
 `outline_only: true`: no text, just its sub-heading outline — the same one

@@ -10644,8 +10644,59 @@ mod tests {
         assert!(err.to_string().contains("Guide"));
         assert_eq!(
             err.data,
-            Some(serde_json::json!({ "hint": ["Guide"] })),
-            "the McpError data payload should carry the structured hint"
+            Some(serde_json::json!({ "hint": ["Guide"], "candidates": [] })),
+            "the McpError data payload should carry the structured hint, and an empty \
+             candidates list when nothing plausibly matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_section_subsequence_matches_a_skipped_middle_segment() {
+        // "Guide" > "Alpha" > "Alpha Sub" — asking for ["Guide", "Alpha Sub"]
+        // skips "Alpha" in the middle, a shape the suffix tier alone can't
+        // resolve (fix #291).
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+
+        let (_, structured) = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                heading_path: Some(vec!["Guide".to_string(), "Alpha Sub".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            structured["section"]["heading_path"],
+            serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_section_not_found_candidates_use_substring_but_never_resolve() {
+        // "Alpha S" is a substring of "Alpha Sub", not an exact segment
+        // match at any tier — it must appear as a suggestion, never resolve
+        // directly (fix #291).
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 16000);
+
+        let err = get_document_result(
+            &server,
+            section_doc_params(GetDocumentParams {
+                heading_path: Some(vec!["Alpha S".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        let data = err.data.expect("NotFound must carry structured data");
+        let candidates = data["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0]["heading_path"],
+            serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
         );
     }
 
