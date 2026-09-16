@@ -115,6 +115,15 @@ ruleset and the details below are what changed:
   push, to catch the rare semantic conflict that non-strict merging permits
   (two PRs each green against an older base, broken once combined). It is
   **not** a required check — it runs after the merge, not before.
+- **Watching a PR means watching it through release.** "Merged" is not the
+  finish line. A watch covers the whole chain and is not done until the last
+  link reports a terminal state: `ci-pass` → auto-merge → `post-merge.yml` on
+  the combined tree → `release.yml` (retag `:latest` + trigger Watchtower).
+  Report each one's outcome, not just the final merge. A green `release` run
+  is not by itself a deploy: a merge touching nothing in `ci.yml`'s
+  `CODE_PATHS` builds no image and the retag and Watchtower steps skip, so
+  check that the retag actually ran and that Watchtower reported `failed: 0`
+  before calling anything deployed.
 - `fix #N` in the merge commit auto-closes GitHub issues.
 - Branches auto-delete after merge.
 - Pre-commit hook enforces `cargo fmt` + `cargo clippy` (activate with
