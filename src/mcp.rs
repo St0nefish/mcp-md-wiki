@@ -10307,6 +10307,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_document_accepts_start_line_1_against_an_empty_document() {
+        // #298, regression from #290: start_line=1 must not 404/error against a
+        // 0-byte document — the same request the web UI sends for every doc.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("empty.md"), "").unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let result = server
+            .get_document(Parameters(GetDocumentParams {
+                path: "empty.md".into(),
+                start_line: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected a text content block, got {other:?}"),
+        };
+        let structured = result.structured_content.unwrap();
+
+        assert_eq!(text, "");
+        assert_eq!(structured["start_line"], 1);
+        assert_eq!(structured["end_line"], 0);
+        assert_eq!(structured["total_lines"], 0);
+        assert_eq!(structured["partial"], false);
+    }
+
+    #[tokio::test]
     async fn get_document_validates_the_range_before_resolving_the_path() {
         let tmp = tempfile::tempdir().unwrap();
         let server = range_test_server(&tmp);
