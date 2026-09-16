@@ -38,7 +38,7 @@ Docs are part of the change, not a follow-up. Any change to behavior, a tool par
 - `README.md` (tool parameter tables, configuration, reindex behavior)
 - `deploy/config.example.yaml` (every config key, with its real default)
 - `CHANGELOG.md` `[Unreleased]` (including upgrade/reindex consequences)
-- this file's architecture notes and module table, and `ARCHITECTURE.md`
+- this file's architecture notes and module table, and `docs/ARCHITECTURE.md` (note the `docs/` prefix — it is not at the repo root)
 
 Check each claim against the code rather than the plan that preceded it. Code comments explain the code as it is: cite issue numbers (`#286`), never local plan/review labels ("Step 3", "Batch B") or narration of how the change evolved.
 
