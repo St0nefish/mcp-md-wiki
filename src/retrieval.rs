@@ -656,8 +656,11 @@ pub enum LineRangeError {
     ZeroLine,
     /// `end` is before `start`.
     Inverted { start: usize, end: usize },
-    /// `start` is past the last line — including every range against an empty
-    /// document, which has no line 1 to anchor to.
+    /// `start` is past the last line. `start == 1` is exempt and always
+    /// valid, even against an empty document (`total_lines == 0`): reading
+    /// from the beginning of a document is meaningful even when there is
+    /// nothing there, and yields an empty slice rather than this error
+    /// (#298, regression from #290).
     StartPastEnd { start: usize, total_lines: usize },
 }
 
@@ -785,11 +788,16 @@ pub fn slice_or_whole(
     }
 }
 
+/// `range.start` past the last line is rejected, except `start == 1`, which is
+/// always valid — reading from the beginning of a document is meaningful even
+/// when there is nothing there. Against an empty document (`total_lines == 0`)
+/// that yields an empty `LineSlice` (`end_line: 0`) rather than an error
+/// (#298, regression from #290).
 pub fn slice_lines(content: &str, range: &LineRange) -> Result<LineSlice, LineRangeError> {
     let lines: Vec<&str> = content.split_inclusive('\n').collect();
     let total_lines = lines.len();
 
-    if range.start > total_lines {
+    if range.start > total_lines && range.start != 1 {
         return Err(LineRangeError::StartPastEnd {
             start: range.start,
             total_lines,
@@ -7260,18 +7268,56 @@ mod tests {
     }
 
     #[test]
-    fn slice_lines_rejects_any_range_against_an_empty_document() {
+    fn slice_lines_accepts_start_1_against_an_empty_document_with_no_end() {
+        let s = slice_lines(
+            "",
+            &LineRange {
+                start: 1,
+                end: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(s.content, "");
+        assert_eq!(s.start_line, 1);
+        assert_eq!(s.end_line, 0);
+        assert_eq!(s.total_lines, 0);
+        assert!(!s.truncated);
+        assert!(
+            !s.partial(),
+            "nothing was withheld from an empty document; an empty slice IS the whole document"
+        );
+    }
+
+    #[test]
+    fn slice_lines_accepts_start_1_end_1_against_an_empty_document() {
+        let s = slice_lines(
+            "",
+            &LineRange {
+                start: 1,
+                end: Some(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.content, "");
+        assert_eq!(s.start_line, 1);
+        assert_eq!(s.end_line, 0);
+        assert_eq!(s.total_lines, 0);
+        assert!(!s.partial());
+    }
+
+    #[test]
+    fn slice_lines_still_rejects_start_2_against_an_empty_document() {
         assert_eq!(
             slice_lines(
                 "",
                 &LineRange {
-                    start: 1,
-                    end: Some(1)
+                    start: 2,
+                    end: None
                 }
             )
             .unwrap_err(),
             LineRangeError::StartPastEnd {
-                start: 1,
+                start: 2,
                 total_lines: 0
             }
         );

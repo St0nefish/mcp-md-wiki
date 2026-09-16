@@ -18,6 +18,16 @@ sample rather than an exhaustive list.
 
 ### Retrieval
 
+- **`start_line: 1` is valid against an empty document** (fix #298), a
+  regression from #290: `get_document`/`/api/doc` now serve `start_line: 1`
+  against a 0-byte document as `content: ""`, `end_line: 0`, `partial: false`
+  instead of a `start_line past the end of the document` error, since reading
+  from the beginning is meaningful even when there is nothing there. This is
+  what let the web UI's `?start_line=1` viewer/editor fetch (added by #290)
+  404 on an empty document; that call site is unchanged, the server now
+  answers it correctly. `start_line: 2` or higher against an empty document
+  is still an error, as is any out-of-range `start_line` against a non-empty
+  document.
 - **Whole-document reads and heading-less sections are capped** (#290).
   `search.section_max_bytes` (default 16000 bytes) now governs every
   `get_document` read the caller did not bound itself, not just section and

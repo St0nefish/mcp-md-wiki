@@ -2719,6 +2719,30 @@ mod tests {
         assert!(!json["content_hash"].as_str().unwrap().is_empty());
     }
 
+    /// `?start_line=1` against a 0-byte document must succeed (#298, regression
+    /// from #290): it is the exact request the UI's viewer and editor send for
+    /// every document, including one with nothing in it yet.
+    #[tokio::test]
+    async fn get_doc_handler_serves_start_line_1_against_an_empty_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        std::fs::write(canonical.join("empty.md"), "").unwrap();
+
+        let app = ui_router(test_state(&canonical));
+        let req = Request::builder()
+            .uri("/api/doc/empty.md?start_line=1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["content"], "");
+        assert_eq!(json["start_line"], 1);
+        assert_eq!(json["end_line"], 0);
+        assert_eq!(json["total_lines"], 0);
+        assert_eq!(json["partial"], false);
+    }
+
     /// Numbered lines so a failed assertion names the line it actually got.
     const RANGE_DOC: &str = "l1\nl2\nl3\nl4\nl5\n";
 
