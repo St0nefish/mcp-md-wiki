@@ -91,6 +91,15 @@ ruleset and the details below are what changed:
   `ci-pass` is green. The `auto-merge` job only runs for PRs authored by the
   owner (`St0nefish`); other contributors' PRs still run full CI but require
   a manual review and merge — they never land unattended.
+- **Auto-merge is the workflow, not an escalation.** An owner PR landing on
+  green CI without a human reading the diff first is the intended, configured
+  behavior — CI is the gate. Do not disable auto-merge on a PR, do not open
+  one as a draft to dodge it, and do not ask whether it should be left armed:
+  the answer is always yes. Review happens before the PR is opened (the
+  author, agent or human, verifies its own diff) and after it lands
+  (`post-merge.yml`, plus `/code-review` on demand). If a change is genuinely
+  too risky for that, the fix is to say so and not open the PR yet — not to
+  open one and hold it.
 - The ruleset's required-status-checks rule has
   `strict_required_status_checks_policy: false` — PR branches do **not** need
   to be up to date with `master` before merging. This is deliberate and
