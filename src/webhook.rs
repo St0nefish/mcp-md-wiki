@@ -12,7 +12,7 @@ use axum::{
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{SharedConfig, WebhookProvider};
 use crate::git::GIT_TIMEOUT;
@@ -296,13 +296,31 @@ pub async fn handle_webhook(
             }
         };
 
+        // Filter the diffed paths through the same include/exclude/exclude_files
+        // predicate a full reconcile applies (`ingest::discover_files`), so a push
+        // touching a non-indexable path (e.g. the default-excluded `README.md`)
+        // doesn't get marked dirty, indexed, and counted as invalid the way a
+        // reconcile would never do (#278). `ingest::partition_indexable` also
+        // fails open on a glob-build error rather than 500ing an otherwise-
+        // successful pull.
+        let (indexable, filtered_out) =
+            crate::ingest::partition_indexable(&config.indexing, changed);
+
+        if !filtered_out.is_empty() {
+            debug!(
+                filtered = filtered_out.len(),
+                paths = ?filtered_out,
+                "Webhook diff included non-indexable paths; skipping"
+            );
+        }
+
         info!(
             provider = ?provider,
             branch = %branch,
-            changed = changed.len(),
+            changed = indexable.len(),
             "Webhook pull applied; marking changed paths dirty"
         );
-        state.reindex_queue.mark_paths(changed);
+        state.reindex_queue.mark_paths(indexable);
     } else {
         // No git_url configured, so there was nothing to fetch and therefore no range
         // to diff. Fall back to a full reconcile so the webhook still causes the
@@ -866,6 +884,41 @@ mod tests {
         reindex::test_support::assert_marked_dirty(
             &queue,
             &["webhook-diff/added-1.md", "webhook-diff/added-2.md"],
+        );
+    }
+
+    /// #278 regression: a push that touches a non-indexable path (here,
+    /// `README.md`, which is in the default `indexing.exclude_files`) alongside
+    /// an ordinary includable file must only mark the includable one dirty — a
+    /// full reconcile would never have indexed `README.md` either, and the
+    /// webhook's diff-driven path must not disagree with it.
+    #[tokio::test]
+    async fn handle_webhook_filters_non_indexable_paths_out_of_the_diff() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let local = crate::git::tests::clone_bare_repo(bare.path(), "master");
+
+        push_file_from_a_fresh_clone(bare.path(), "master", "webhook-diff/keep.md", "keep");
+        push_file_from_a_fresh_clone(bare.path(), "master", "README.md", "readme");
+
+        let secret = "test-secret";
+        let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
+        let sig = compute_hmac(secret, body);
+        let config = git_backed_config(bare.path(), local.path());
+        let queue = Arc::new(reindex::ReindexQueue::new());
+
+        let status = deliver_webhook(config, secret, &sig, &queue).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The merge still pulls both files into the local clone...
+        assert!(local.path().join("webhook-diff/keep.md").exists());
+        assert!(local.path().join("README.md").exists());
+
+        // ...but only the includable one reaches the queue.
+        reindex::test_support::assert_marked_dirty(&queue, &["webhook-diff/keep.md"]);
+        let pending = queue.snapshot_paths();
+        assert!(
+            !pending.contains(&std::path::PathBuf::from("README.md")),
+            "README.md is in the default exclude_files list and must not be marked dirty"
         );
     }
 

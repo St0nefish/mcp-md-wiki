@@ -525,7 +525,7 @@ POST to `/hooks/reindex` triggers:
 1. HMAC signature verification (Gitea/GitHub/GitLab)
 2. Branch matching against `source.branch`
 3. `git fetch` + `git merge --ff-only` (if `source.git_url` is configured)
-4. The changed paths from that pull are marked dirty and the handler returns immediately — it does not reindex inline. A single background worker drains that queue and does the actual indexing asynchronously, off the request path (see [Architecture](docs/ARCHITECTURE.md#webhook-flow) for the full design). If `source.git_url` isn't configured, there's nothing to fetch or diff, so the webhook instead marks the whole corpus for a full reconcile.
+4. The changed paths from that pull are filtered through `indexing.include`/`exclude`/`exclude_files` — the same predicate a full reconcile applies, so a push touching a non-indexable path (e.g. the default-excluded `README.md`) is never marked dirty — and the survivors are marked dirty as the handler returns immediately; it does not reindex inline. A single background worker drains that queue and does the actual indexing asynchronously, off the request path (see [Architecture](docs/ARCHITECTURE.md#webhook-flow) for the full design). If `source.git_url` isn't configured, there's nothing to fetch or diff, so the webhook instead marks the whole corpus for a full reconcile.
 
 The webhook endpoint is only available if `WEBHOOK_SECRET` is set to a non-empty value.
 

@@ -219,6 +219,7 @@ impl UiState {
             canonical_data_path: &self.canonical_data_path,
             schema_cache: &self.schema_cache,
             validation: &config.validation,
+            indexing: &config.indexing,
             prepend_description: config.chunking.prepend_description,
             dedup_enabled: config.write.dedup_enabled,
             dedup_threshold: config.write.dedup_threshold,

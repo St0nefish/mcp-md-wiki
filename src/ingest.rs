@@ -139,24 +139,88 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     Ok(builder.build()?)
 }
 
+/// The include/exclude/exclude-filenames predicate from [`IndexingConfig`],
+/// shared by every producer that decides whether a repo-relative path should
+/// ever reach the indexer: [`discover_files`]'s full-corpus walk, the webhook
+/// handler's push diff, and `write.rs`'s rebase-pulled-in paths (#278). A
+/// single implementation means those producers cannot silently disagree with
+/// what a reconcile would have indexed.
+pub(crate) struct PathFilter {
+    include_set: GlobSet,
+    exclude_set: Option<GlobSet>,
+    exclude_filenames: HashSet<String>,
+}
+
+impl PathFilter {
+    /// Build the filter from `indexing`'s `include`/`exclude`/`exclude_files`.
+    pub(crate) fn from_config(indexing: &IndexingConfig) -> Result<Self> {
+        let include_set =
+            build_globset(&indexing.include).context("Failed to build include glob set")?;
+
+        let exclude_set = if indexing.exclude.is_empty() {
+            None
+        } else {
+            Some(build_globset(&indexing.exclude).context("Failed to build exclude glob set")?)
+        };
+
+        let exclude_filenames: HashSet<String> = indexing.exclude_files.iter().cloned().collect();
+
+        Ok(Self {
+            include_set,
+            exclude_set,
+            exclude_filenames,
+        })
+    }
+
+    /// Whether `rel_path` (relative to the corpus root) should be indexed:
+    /// not an excluded filename, matches at least one include pattern, and
+    /// matches no exclude pattern — the same order [`walk_dir`] applies.
+    pub(crate) fn is_indexable(&self, rel_path: &str) -> bool {
+        if let Some(file_name) = Path::new(rel_path).file_name().and_then(|n| n.to_str())
+            && self.exclude_filenames.contains(file_name)
+        {
+            debug!("Skipping excluded filename: {}", rel_path);
+            return false;
+        }
+
+        if !self.include_set.is_match(rel_path) {
+            return false;
+        }
+
+        if let Some(excl) = &self.exclude_set
+            && excl.is_match(rel_path)
+        {
+            return false;
+        }
+
+        true
+    }
+}
+
+/// Partition `paths` into `(indexable, filtered_out)` using `indexing`'s
+/// [`PathFilter`], the shared entry point for every producer that marks paths
+/// dirty from outside a reconcile — the webhook handler's push diff and
+/// `write.rs`'s own-target/rewritten/rebased paths (#278) — so the "build the
+/// filter, then fail open and log loudly on a glob-build error rather than
+/// failing the webhook or the write" handling lives in exactly one place
+/// instead of being re-implemented per caller.
+pub(crate) fn partition_indexable(
+    indexing: &IndexingConfig,
+    paths: Vec<PathBuf>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    match PathFilter::from_config(indexing) {
+        Ok(f) => paths
+            .into_iter()
+            .partition(|p| f.is_indexable(&p.to_string_lossy())),
+        Err(e) => {
+            error!("Failed to build indexing path filter, marking paths dirty unfiltered: {e:#}");
+            (paths, Vec::new())
+        }
+    }
+}
+
 pub fn discover_files(data_path: &Path, indexing: &IndexingConfig) -> Result<Vec<PathBuf>> {
-    let include_set =
-        build_globset(&indexing.include).context("Failed to build include glob set")?;
-
-    let exclude_set = if indexing.exclude.is_empty() {
-        None
-    } else {
-        Some(build_globset(&indexing.exclude).context("Failed to build exclude glob set")?)
-    };
-
-    let exclude_filenames: HashSet<&str> =
-        indexing.exclude_files.iter().map(|s| s.as_str()).collect();
-
-    let filter = WalkFilter {
-        include_set: &include_set,
-        exclude_set: &exclude_set,
-        exclude_filenames: &exclude_filenames,
-    };
+    let filter = PathFilter::from_config(indexing)?;
 
     let mut matched: Vec<PathBuf> = Vec::new();
 
@@ -185,31 +249,21 @@ pub(crate) fn walk_dir_unfiltered(root: &Path, dir: &Path) -> Result<Vec<PathBuf
     Ok(matched)
 }
 
-/// The include/exclude filter `walk_dir` applies to each regular file it visits.
-/// Grouped into one struct so `walk_dir` takes a single `Option<&WalkFilter>`
-/// rather than three separate optional parameters that would all need to be
-/// `Some`/`None` in lockstep.
-struct WalkFilter<'a> {
-    include_set: &'a GlobSet,
-    exclude_set: &'a Option<GlobSet>,
-    exclude_filenames: &'a HashSet<&'a str>,
-}
-
 /// Recursively walk `dir`, collecting every regular file's absolute path into
 /// `matched`. Symlinks are always skipped (this walker underlies both the
 /// indexer's file discovery and `write::move_directory`'s subtree scan, and a
 /// symlink loop or a hostile symlink target is unwelcome in either).
 ///
 /// `filter` is `None` for an unfiltered walk (every regular file matches — see
-/// [`walk_dir_unfiltered`]) or `Some` to additionally require the entry match
-/// `include_set` and not match `exclude_set`/`exclude_filenames`, relative to
-/// `root` (see [`discover_files`]). A single implementation for both modes
-/// means a future fix to symlink-loop or entry-error handling here reaches
-/// both callers instead of only whichever one it was made in.
+/// [`walk_dir_unfiltered`]) or `Some` to additionally require [`PathFilter::is_indexable`]
+/// on the entry's path relative to `root` (see [`discover_files`]). A single
+/// implementation for both modes means a future fix to symlink-loop or
+/// entry-error handling here reaches both callers instead of only whichever
+/// one it was made in.
 fn walk_dir(
     root: &Path,
     dir: &Path,
-    filter: Option<&WalkFilter>,
+    filter: Option<&PathFilter>,
     matched: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let entries = std::fs::read_dir(dir)
@@ -241,28 +295,11 @@ fn walk_dir(
             continue;
         };
 
-        // Check exclude_files by filename
-        if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-            && filter.exclude_filenames.contains(file_name)
-        {
-            debug!("Skipping excluded filename: {}", path.display());
-            continue;
-        }
-
-        // Build relative path for glob matching
+        // Build relative path for filtering, relative to `root`.
         let rel = path.strip_prefix(root).unwrap_or(&path);
-
         let rel_str = rel.to_string_lossy();
 
-        // Must match at least one include pattern
-        if !filter.include_set.is_match(rel_str.as_ref()) {
-            continue;
-        }
-
-        // Must not match any exclude pattern
-        if let Some(excl) = filter.exclude_set
-            && excl.is_match(rel_str.as_ref())
-        {
+        if !filter.is_indexable(&rel_str) {
             debug!("Excluding file: {}", path.display());
             continue;
         }
@@ -6972,6 +7009,58 @@ mod tests {
         let files = discover_files(dir.path(), &indexing).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("keep.md"));
+    }
+
+    #[test]
+    fn path_filter_is_indexable_include_match() {
+        let indexing = IndexingConfig {
+            include: vec!["**/*.md".into()],
+            exclude: vec![],
+            exclude_files: vec![],
+            reconcile_interval_secs: 60,
+        };
+        let filter = PathFilter::from_config(&indexing).unwrap();
+        assert!(filter.is_indexable("doc.md"));
+        assert!(filter.is_indexable("sub/nested.md"));
+    }
+
+    #[test]
+    fn path_filter_is_indexable_no_include_match() {
+        let indexing = IndexingConfig {
+            include: vec!["**/*.md".into()],
+            exclude: vec![],
+            exclude_files: vec![],
+            reconcile_interval_secs: 60,
+        };
+        let filter = PathFilter::from_config(&indexing).unwrap();
+        assert!(!filter.is_indexable("other.txt"));
+    }
+
+    #[test]
+    fn path_filter_is_indexable_exclude_glob() {
+        let indexing = IndexingConfig {
+            include: vec!["**/*.md".into()],
+            exclude: vec!["archive/**".into()],
+            exclude_files: vec![],
+            reconcile_interval_secs: 60,
+        };
+        let filter = PathFilter::from_config(&indexing).unwrap();
+        assert!(filter.is_indexable("keep.md"));
+        assert!(!filter.is_indexable("archive/old.md"));
+    }
+
+    #[test]
+    fn path_filter_is_indexable_exclude_filename() {
+        let indexing = IndexingConfig {
+            include: vec!["**/*.md".into()],
+            exclude: vec![],
+            exclude_files: vec!["README.md".into()],
+            reconcile_interval_secs: 60,
+        };
+        let filter = PathFilter::from_config(&indexing).unwrap();
+        assert!(filter.is_indexable("keep.md"));
+        assert!(!filter.is_indexable("README.md"));
+        assert!(!filter.is_indexable("sub/README.md"));
     }
 
     // -----------------------------------------------------------------------

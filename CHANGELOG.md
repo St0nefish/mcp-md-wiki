@@ -243,6 +243,14 @@ sample rather than an exhaustive list.
 
 ### Indexing and retrieval correctness
 
+- Webhook pushes, MCP/HTTP writes, and concurrent-write rebases now respect
+  `indexing.include`/`exclude`/`exclude_files` the same way a full reconcile does
+  (fix #278): a push, a write's own target path, or a rebase-pulled-in commit
+  touching a non-indexable path (e.g. the default-excluded `README.md`) is no
+  longer marked dirty, indexed, and counted as invalid — it is filtered out
+  before it ever reaches the reindex queue, exactly as a reconcile would have
+  ignored it. A glob-build error fails open (marks the paths unfiltered,
+  logged loudly) rather than failing the webhook or the write.
 - Strict-mode indexing no longer drops an entire batch when one rejection occurs, and
   embedding-dimension mismatches are now caught rather than silently corrupting the
   collection (fix #156, fix #159).
