@@ -213,6 +213,18 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     pub canonical_data_path: &'a Path,
     pub schema_cache: &'a SharedSchemaCache,
     pub validation: &'a ValidationConfig,
+    /// The same `indexing.include`/`exclude`/`exclude_files` predicate a full
+    /// reconcile applies (`ingest::discover_files`), used here to filter every
+    /// path a write is about to mark dirty — this write's own target path(s),
+    /// any rewritten referencing documents, and `commit_outcome.rebased_paths`
+    /// (paths pulled in from OTHER commits during this write's own git
+    /// fetch/rebase/push) — before they reach `queue.mark_paths` (#278).
+    /// `check_include_pattern` only checks `indexing.include`, never
+    /// `exclude`/`exclude_files`, so a write's own target can match `include`
+    /// (e.g. the default-excluded `README.md` against the default `**/*.md`)
+    /// and still not be reconcile-indexable; this filter is what keeps that
+    /// path out of the reindex queue the same way a reconcile would.
+    pub indexing: &'a crate::config::IndexingConfig,
     /// Mirrors `chunking.prepend_description` — the dedup query must be built on
     /// the same textual basis the indexer embeds.
     pub prepend_description: bool,
@@ -251,6 +263,17 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     /// `StateDb` available via their own `Arc<OnceCell<StateDb>>` and MUST
     /// pass `Some` here so production writes always rewrite incoming links.
     pub state: Option<&'a StateDb>,
+}
+
+/// Filter `paths` down to the ones `indexing`'s include/exclude/exclude_files
+/// predicate ([`crate::ingest::PathFilter`]) would actually index — applied to
+/// every path a write is about to mark dirty (its own target(s), rewritten
+/// referencing documents, and `commit_outcome.rebased_paths`) before they
+/// reach `queue.mark_paths` (#278). Fails open (returns `paths` unfiltered) on
+/// a glob-build error, logging loudly, rather than dropping otherwise-
+/// legitimate paths because of a config problem this write did not cause.
+fn filter_indexable(indexing: &crate::config::IndexingConfig, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    crate::ingest::partition_indexable(indexing, paths).0
 }
 
 /// A create or edit request against the write pipeline.
@@ -1334,9 +1357,13 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
             // status, so the local index should too. `rebased_paths` is empty
             // here — the rebase never ran (fetch/rebase/push all happen after the
             // commit, so any of them failing means we never got as far as a
-            // trustworthy rebase diff).
-            deps.queue
-                .mark_paths(std::iter::once(PathBuf::from(rel_path)));
+            // trustworthy rebase diff). Still filtered through `filter_indexable`
+            // (#278): this write's own target can match `include` and still be
+            // excluded, same as the success path below.
+            deps.queue.mark_paths(filter_indexable(
+                deps.indexing,
+                vec![PathBuf::from(rel_path)],
+            ));
 
             return Ok(WriteSuccess {
                 outcome: WriteOutcome::CommittedPendingSync,
@@ -1357,10 +1384,12 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     // actual chunk/embed/upsert work out of band; this call never blocks on it,
     // which is the whole point — embedding is far slower than a caller's request
     // timeout on a large document.
-    deps.queue.mark_paths(
+    deps.queue.mark_paths(filter_indexable(
+        deps.indexing,
         std::iter::once(PathBuf::from(rel_path))
-            .chain(commit_outcome.rebased_paths.iter().cloned()),
-    );
+            .chain(commit_outcome.rebased_paths.iter().cloned())
+            .collect(),
+    ));
 
     Ok(WriteSuccess {
         outcome: WriteOutcome::Synced,
@@ -1966,12 +1995,17 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
             //     as local git history is concerned, so this is left alone (not
             //     rolled back) and reported as sync-pending, same as every other
             //     post-commit failure in this pipeline. `rebased_paths` is empty
-            //     for the same reason as elsewhere: the rebase never ran.
-            deps.queue.mark_paths(
+            //     for the same reason as elsewhere: the rebase never ran. Still
+            //     filtered through `filter_indexable` (#278): the source/dest
+            //     path(s) can match `include` and still be excluded, same as the
+            //     success path below.
+            deps.queue.mark_paths(filter_indexable(
+                deps.indexing,
                 [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
                     .into_iter()
-                    .chain(rewritten_paths.iter().map(PathBuf::from)),
-            );
+                    .chain(rewritten_paths.iter().map(PathBuf::from))
+                    .collect(),
+            ));
 
             return Ok(WriteSuccess {
                 outcome: WriteOutcome::CommittedPendingSync,
@@ -1993,12 +2027,14 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     //     document (whose `document_links` rows self-heal from its new body in
     //     the same pass); all of them need to be in the same worklist for the
     //     worker to do that in one sweep.
-    deps.queue.mark_paths(
+    deps.queue.mark_paths(filter_indexable(
+        deps.indexing,
         [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
             .into_iter()
             .chain(rewritten_paths.iter().map(PathBuf::from))
-            .chain(commit_outcome.rebased_paths.iter().cloned()),
-    );
+            .chain(commit_outcome.rebased_paths.iter().cloned())
+            .collect(),
+    ));
 
     Ok(WriteSuccess {
         outcome: WriteOutcome::Synced,
@@ -2765,8 +2801,13 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                 written.len(),
                 source
             );
-            deps.queue
-                .mark_paths(written.iter().map(|(p, _)| PathBuf::from(p)));
+            // Still filtered through `filter_indexable` (#278): a written path
+            // can match `include` and still be excluded, same as the success
+            // path below.
+            deps.queue.mark_paths(filter_indexable(
+                deps.indexing,
+                written.iter().map(|(p, _)| PathBuf::from(p)).collect(),
+            ));
             let documents = requests
                 .iter()
                 .map(|req| BatchDocumentResult {
@@ -2785,12 +2826,14 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
         }
     };
 
-    deps.queue.mark_paths(
+    deps.queue.mark_paths(filter_indexable(
+        deps.indexing,
         written
             .iter()
             .map(|(p, _)| PathBuf::from(p))
-            .chain(commit_outcome.rebased_paths.iter().cloned()),
-    );
+            .chain(commit_outcome.rebased_paths.iter().cloned())
+            .collect(),
+    ));
 
     let documents = requests
         .iter()
@@ -3937,12 +3980,17 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 source_dir, dest_dir, sha, source_err
             );
 
-            deps.queue.mark_paths(
+            // Still filtered through `filter_indexable` (#278): a moved path can
+            // match `include` and still be excluded, same as the success path
+            // below.
+            deps.queue.mark_paths(filter_indexable(
+                deps.indexing,
                 all_moves
                     .iter()
                     .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
-                    .chain(rewritten_paths.iter().map(PathBuf::from)),
-            );
+                    .chain(rewritten_paths.iter().map(PathBuf::from))
+                    .collect(),
+            ));
 
             return Ok(DirectoryMoveSuccess {
                 outcome: WriteOutcome::CommittedPendingSync,
@@ -3963,13 +4011,15 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // force the shared `SchemaCache` to rebuild before this unit is next
     // indexed — see that function's doc comment; nothing further is needed
     // here for the post-commit self-correction this move depends on.
-    deps.queue.mark_paths(
+    deps.queue.mark_paths(filter_indexable(
+        deps.indexing,
         all_moves
             .iter()
             .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
             .chain(rewritten_paths.iter().map(PathBuf::from))
-            .chain(commit_outcome.rebased_paths.iter().cloned()),
-    );
+            .chain(commit_outcome.rebased_paths.iter().cloned())
+            .collect(),
+    ));
 
     Ok(DirectoryMoveSuccess {
         outcome: WriteOutcome::Synced,
@@ -4173,9 +4223,13 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
             );
 
             // The file is already gone from local disk regardless of push status,
-            // so the local index should reflect that regardless too.
-            deps.queue
-                .mark_paths(std::iter::once(PathBuf::from(rel_path)));
+            // so the local index should reflect that regardless too. Still
+            // filtered through `filter_indexable` (#278): an excluded path was
+            // never indexed, so there is nothing to purge for it either.
+            deps.queue.mark_paths(filter_indexable(
+                deps.indexing,
+                vec![PathBuf::from(rel_path)],
+            ));
 
             return Ok(WriteSuccess {
                 outcome: WriteOutcome::CommittedPendingSync,
@@ -4199,10 +4253,12 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     // missing-file branch of `ingest::index_paths`), so there is no separate
     // purge to do here — this is "one reindex path" applied to deletes too, not a
     // special case.
-    deps.queue.mark_paths(
+    deps.queue.mark_paths(filter_indexable(
+        deps.indexing,
         std::iter::once(PathBuf::from(rel_path))
-            .chain(commit_outcome.rebased_paths.iter().cloned()),
-    );
+            .chain(commit_outcome.rebased_paths.iter().cloned())
+            .collect(),
+    ));
 
     Ok(WriteSuccess {
         outcome: WriteOutcome::Synced,
@@ -4846,6 +4902,7 @@ mod tests {
                 canonical_data_path: &self.canonical_data_path,
                 schema_cache: &self.schema_cache,
                 validation: &self.config.validation,
+                indexing: &self.config.indexing,
                 prepend_description: self.config.chunking.prepend_description,
                 dedup_enabled: self.config.write.dedup_enabled,
                 dedup_threshold: self.config.write.dedup_threshold,
@@ -5199,6 +5256,112 @@ mod tests {
         // embedding service before we ever reach the commit.
         Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
         Harness::new(work, config)
+    }
+
+    /// Push a new file directly to `bare_path`'s `branch` from a throwaway
+    /// clone, simulating a concurrent commit landing in the remote after
+    /// `work` (this test's own `Harness` clone) was already checked out —
+    /// exactly the situation `git::commit_and_sync`'s fetch+rebase step
+    /// exists for. Mirrors `webhook.rs`'s identical helper.
+    fn push_file_from_a_fresh_clone(
+        bare_path: &std::path::Path,
+        branch: &str,
+        rel_path: &str,
+        contents: &str,
+    ) {
+        let clone = crate::git::tests::clone_bare_repo(bare_path, branch);
+        let file_path = clone.path().join(rel_path);
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&file_path, contents).unwrap();
+        git_commit_all(&clone, rel_path, &format!("add {rel_path}"));
+        std::process::Command::new("git")
+            .args(["push", "origin", branch])
+            .current_dir(clone.path())
+            .output()
+            .unwrap();
+    }
+
+    /// #278 regression: `commit_outcome.rebased_paths` — paths pulled in from a
+    /// CONCURRENT commit by this write's own fetch+rebase, not this write's own
+    /// target — must be filtered through the same `indexing.include`/`exclude`/
+    /// `exclude_files` predicate a full reconcile applies before reaching
+    /// `queue.mark_paths`. Mirrors `git.rs`'s
+    /// `commit_and_sync_reports_paths_pulled_in_by_the_rebase` for how the
+    /// concurrent commit is simulated, but asserts on what actually reaches the
+    /// dirty queue rather than on `commit_and_sync`'s own return value.
+    #[tokio::test]
+    async fn write_document_filters_non_indexable_rebased_paths_out_of_the_queue_mark() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+
+        // Lands in the remote AFTER `work` was cloned, so this write's own
+        // commit_and_sync must fetch + rebase to pull it in. `README.md` is in
+        // the default `indexing.exclude_files`.
+        push_file_from_a_fresh_clone(bare.path(), "master", "README.md", "readme");
+
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        {
+            let c = Arc::get_mut(&mut config).unwrap();
+            c.write.dedup_enabled = false;
+            c.source.git_url = Some(format!("file://{}", bare.path().to_str().unwrap()));
+        }
+        let harness = Harness::new(&work, config);
+        let req = make_req(
+            "docs/new.md",
+            "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n",
+            true,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+
+        // The rebase really did pull README.md in — `rebased_paths` still
+        // reports it in full, unfiltered, for the caller's own reporting.
+        assert_eq!(
+            success.rebased_paths,
+            vec![std::path::PathBuf::from("README.md")],
+            "the rebase should have pulled in the concurrent README.md commit"
+        );
+
+        // ...but only this write's own target path reached the queue: README.md
+        // is excluded and must not have been marked dirty, even though the
+        // rebase pulled it in.
+        crate::reindex::test_support::assert_marked_dirty(&harness.reindex_queue, &["docs/new.md"]);
+        let pending = harness.reindex_queue.snapshot_paths();
+        assert!(
+            !pending.contains(&std::path::PathBuf::from("README.md")),
+            "README.md is in the default exclude_files list and must not be marked \
+             dirty, even though the rebase pulled it in"
+        );
+    }
+
+    /// #278 (own-target gap): a write's OWN target path — not just
+    /// `commit_outcome.rebased_paths` — must also be filtered through
+    /// `indexing.include`/`exclude`/`exclude_files` before it reaches
+    /// `queue.mark_paths`. `check_include_pattern` only checks `include`, so a
+    /// path that matches the default `**/*.md` include glob but is ALSO in the
+    /// default `exclude_files` (here, `README.md`) still passes eligibility
+    /// and commits successfully — but a full reconcile would never index it,
+    /// so it must never be marked dirty either.
+    #[tokio::test]
+    async fn write_document_does_not_mark_its_own_excluded_target_path_dirty() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let harness = git_backed_harness(&work);
+
+        // `create_bare_repo` already seeds a `README.md` at the repo root, so
+        // this is an edit, not a create.
+        let req = make_req("README.md", "# Test repo\n\nUpdated.\n", false);
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+
+        let pending = harness.reindex_queue.snapshot_paths();
+        assert!(
+            pending.is_empty(),
+            "README.md is in the default exclude_files list and must not be marked \
+             dirty, even though it is its own write's target: {pending:?}"
+        );
     }
 
     #[tokio::test]

@@ -268,26 +268,52 @@ const DIFF_TABLE: &[DiffField] = &[
                        (mcp.rs build_include_globset, invoked from KbSearchServer::new); \
                        get_document keeps filtering against the old patterns until restart.",
             },
+            ConsumerEntry {
+                effect: ReloadEffect::Applied,
+                setting: "indexing.include (webhook / write dirty-path filter)",
+                note: "webhook.rs's push-diff filter and write.rs's mark-dirty filter (#278) \
+                       both build an ingest::PathFilter fresh via PathFilter::from_config on \
+                       every webhook delivery and every write, so a reload is picked up \
+                       immediately, independent of the two consumers above.",
+            },
         ],
     },
     DiffField {
         path: "indexing.exclude",
         get: |c| Some(d(&c.indexing.exclude)),
-        consumers: &[ConsumerEntry {
-            effect: ReloadEffect::Applied,
-            setting: "indexing.exclude",
-            note: "read fresh per indexing run by ingest::discover_files (ingest.rs); \
-                   unlike indexing.include, no MCP path filter bakes this in.",
-        }],
+        consumers: &[
+            ConsumerEntry {
+                effect: ReloadEffect::Applied,
+                setting: "indexing.exclude",
+                note: "read fresh per indexing run by ingest::discover_files (ingest.rs); \
+                       unlike indexing.include, no MCP path filter bakes this in.",
+            },
+            ConsumerEntry {
+                effect: ReloadEffect::Applied,
+                setting: "indexing.exclude (webhook / write dirty-path filter)",
+                note: "webhook.rs's push-diff filter and write.rs's mark-dirty filter (#278) \
+                       both build an ingest::PathFilter fresh via PathFilter::from_config on \
+                       every webhook delivery and every write.",
+            },
+        ],
     },
     DiffField {
         path: "indexing.exclude_files",
         get: |c| Some(d(&c.indexing.exclude_files)),
-        consumers: &[ConsumerEntry {
-            effect: ReloadEffect::Applied,
-            setting: "indexing.exclude_files",
-            note: "read fresh per indexing run by ingest::discover_files (ingest.rs).",
-        }],
+        consumers: &[
+            ConsumerEntry {
+                effect: ReloadEffect::Applied,
+                setting: "indexing.exclude_files",
+                note: "read fresh per indexing run by ingest::discover_files (ingest.rs).",
+            },
+            ConsumerEntry {
+                effect: ReloadEffect::Applied,
+                setting: "indexing.exclude_files (webhook / write dirty-path filter)",
+                note: "webhook.rs's push-diff filter and write.rs's mark-dirty filter (#278) \
+                       both build an ingest::PathFilter fresh via PathFilter::from_config on \
+                       every webhook delivery and every write.",
+            },
+        ],
     },
     DiffField {
         path: "indexing.reconcile_interval_secs",
@@ -1180,11 +1206,21 @@ mod tests {
         new.indexing.include = vec!["**/*.mdx".into()];
 
         let report = diff(&old, &new);
-        assert_eq!(report.applied.len(), 1);
+        // Two `Applied` consumers now: the reconcile-scan filter (pre-existing)
+        // and the webhook/write dirty-path filter (#278) — both read
+        // `config.indexing` fresh, so both take effect immediately on reload.
+        assert_eq!(report.applied.len(), 2);
         assert!(
-            report.applied[0]
-                .setting
-                .contains("scan / reconcile filtering")
+            report
+                .applied
+                .iter()
+                .any(|c| c.setting.contains("scan / reconcile filtering"))
+        );
+        assert!(
+            report
+                .applied
+                .iter()
+                .any(|c| c.setting.contains("webhook / write dirty-path filter"))
         );
         assert_eq!(report.restart_required.len(), 1);
         assert!(
