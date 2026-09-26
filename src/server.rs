@@ -1139,7 +1139,13 @@ impl AuthState {
         let oauth = self.oauth.as_ref()?;
         Some(match rejection {
             TokenRejection::InsufficientScope => oauth.insufficient_scope_challenge(),
-            TokenRejection::Invalid(_) => oauth.invalid_token_challenge(),
+            // A request with NO credential gets the same `invalid_token` challenge
+            // as a bad one. RFC 6750 §3.1 says a server SHOULD NOT send an error
+            // code then, but this is the challenge claude.ai and Claude Code have
+            // been starting the flow from since #273, and the part they depend on
+            // — `resource_metadata` — is present either way. Deliberately left
+            // as-is; the distinction lives in the log level only.
+            TokenRejection::Invalid(_) | TokenRejection::Missing => oauth.invalid_token_challenge(),
         })
     }
 }
@@ -1159,7 +1165,7 @@ impl AuthState {
 fn auth_rejection(auth: &AuthState, rejection: TokenRejection) -> Response {
     let status = match rejection {
         TokenRejection::InsufficientScope => StatusCode::FORBIDDEN,
-        TokenRejection::Invalid(_) => StatusCode::UNAUTHORIZED,
+        TokenRejection::Invalid(_) | TokenRejection::Missing => StatusCode::UNAUTHORIZED,
     };
     let mut response = Response::builder().status(status);
     if let Some(challenge) = auth.challenge(&rejection)
@@ -1201,9 +1207,10 @@ async fn bearer_auth(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
+    let token = bearer_credential(auth_header);
 
     if let Some(ref expected_token) = auth.bearer_token
+        && !token.is_empty()
         && token.as_bytes().ct_eq(expected_token.as_bytes()).into()
     {
         return next.run(request).await;
@@ -1221,6 +1228,7 @@ async fn bearer_auth(
         Ok(claims) => {
             debug!(
                 path = %path,
+                principal = ?claims.principal,
                 subject = ?claims.subject,
                 scopes = ?claims.scopes,
                 "OAuth bearer auth accepted"
@@ -1236,10 +1244,89 @@ async fn bearer_auth(
             request.extensions_mut().insert(claims);
             next.run(request).await
         }
+        // A request with no credential at all is how every OAuth client starts
+        // (401 → read `resource_metadata` → authorize), so it is not worth a warning.
+        Err(TokenRejection::Missing) => {
+            debug!(path = %path, "No bearer credential presented");
+            auth_rejection(&auth, TokenRejection::Missing)
+        }
         Err(rejection) => {
             warn!(path = %path, reason = ?rejection, "OAuth bearer auth rejected");
             auth_rejection(&auth, rejection)
         }
+    }
+}
+
+/// The credential from an `Authorization: Bearer <token>` header, or `""`.
+///
+/// The auth-scheme is matched case-insensitively (RFC 9110 §11.1, RFC 6750 §2.1
+/// examples notwithstanding) — `bearer x` is the same credential as `Bearer x`,
+/// and refusing it would be a spurious 401 for a client that lower-cases scheme
+/// names. The token itself is taken verbatim, minus surrounding spaces.
+fn bearer_credential(header: &str) -> &str {
+    match header.split_once(' ') {
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
+        _ => "",
+    }
+}
+
+/// Decide the static bearer token `AuthState` holds, from the env var's value
+/// (`env_value`, read by the caller so this stays a pure, testable function) and
+/// the RESOLVED OAuth config. Errors when the result would leave the protected
+/// routes with no authentication and `mcp.allow_unauthenticated` was not set.
+///
+/// `oauth` is the resolved config — `Some` only when OAuth is genuinely on —
+/// never the mere presence of the YAML block, so neither `accept_static_bearer:
+/// false` nor an OAuth block with `enabled: false` can be the thing that leaves a
+/// server open.
+fn static_bearer_token(
+    env_name: &str,
+    env_value: Option<String>,
+    oauth: Option<&crate::config::ResolvedOAuthConfig>,
+    allow_unauthenticated: bool,
+) -> Result<Option<String>> {
+    let env_value = env_value.filter(|v| !v.is_empty());
+    match (env_value, oauth) {
+        // `mcp.oauth.accept_static_bearer: false`: OAuth-only even with the env
+        // var set.
+        (Some(_), Some(o)) if !o.accept_static_bearer => {
+            info!(
+                "'{env_name}' is set but mcp.oauth.accept_static_bearer is false — the \
+                 static bearer token is IGNORED; only OAuth access tokens are accepted"
+            );
+            Ok(None)
+        }
+        (Some(token), Some(_)) => Ok(Some(token)),
+        (Some(token), None) => {
+            // OAuth-first: a shared static secret is still supported, but it
+            // is one leaked string away from full access (writes included) and
+            // cannot be scoped, expired or attributed to a person. Said once at
+            // startup, never per request. The listener always binds 0.0.0.0 (see
+            // `run_server`), so there is no loopback-only case to exempt.
+            warn!(
+                "Only a static bearer token ('{env_name}') protects /mcp. It works, but \
+                 OAuth (mcp.oauth) is the recommended setup: per-user, expiring, \
+                 revocable tokens from your identity provider. See docs/oauth.md."
+            );
+            Ok(Some(token))
+        }
+        (None, Some(_)) => {
+            info!(
+                "No static bearer token configured ('{env_name}' unset) — OAuth access \
+                 tokens are the only accepted credential"
+            );
+            Ok(None)
+        }
+        (None, None) if allow_unauthenticated => {
+            warn!("{}", unauthenticated_mcp_warning(env_name));
+            Ok(None)
+        }
+        (None, None) => anyhow::bail!(
+            "Environment variable '{env_name}' is not set or empty. Enable mcp.oauth \
+             (recommended — see docs/oauth.md), set it to a bearer token, or set \
+             mcp.allow_unauthenticated: true in config.yaml to explicitly opt out of \
+             authentication."
+        ),
     }
 }
 
@@ -2366,49 +2453,36 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
             info!(
                 issuer = %oauth_config.issuer,
                 resource = %oauth_config.resource,
+                audiences = ?oauth_config.accepted_audiences(),
+                jwks_uri = %if oauth_config.jwks_uri.is_empty() {
+                    "(discovered from the issuer)"
+                } else {
+                    oauth_config.jwks_uri.as_str()
+                },
                 required_scope = %oauth_config.required_scope,
-                "OAuth resource-server validation enabled (accepted alongside the static \
-                 bearer token, not instead of it)"
+                scope_claims = ?oauth_config.scope_claims,
+                static_bearer_accepted = oauth_config.accept_static_bearer,
+                "OAuth resource-server validation enabled"
             );
-            Some(Arc::new(
+            let validator = Arc::new(
                 OAuthValidator::new(oauth_config).context("Failed to build the OAuth validator")?,
-            ))
+            );
+            // Loads the keys now (and hourly after), so a wrong issuer/JWKS shows up
+            // as one clear warning at boot rather than as 401s on first use — but
+            // without making startup depend on the authorization server being up.
+            validator.spawn_background_refresh();
+            Some(validator)
         }
         None => None,
     };
 
     // Bearer token for MCP auth
-    let bearer_token = match std::env::var(&config.mcp.bearer_token_env) {
-        Ok(val) if !val.is_empty() => Some(val),
-        _ => {
-            // OAuth alone is a complete authentication story, so it satisfies this
-            // gate the same way a static token does — but only actual OAuth, never
-            // the mere presence of the config block, which is why this reads the
-            // resolved `oauth` rather than `config.mcp.oauth`.
-            if !config.mcp.allow_unauthenticated && oauth.is_none() {
-                anyhow::bail!(
-                    "Environment variable '{}' is not set or empty. \
-                     Set it to a bearer token, enable mcp.oauth, or set \
-                     mcp.allow_unauthenticated: true in config.yaml to explicitly opt out \
-                     of authentication.",
-                    config.mcp.bearer_token_env
-                );
-            }
-            if oauth.is_none() {
-                warn!(
-                    "{}",
-                    unauthenticated_mcp_warning(&config.mcp.bearer_token_env)
-                );
-            } else {
-                info!(
-                    "No static bearer token configured ('{}' unset) — OAuth access tokens \
-                     are the only accepted credential",
-                    config.mcp.bearer_token_env
-                );
-            }
-            None
-        }
-    };
+    let bearer_token = static_bearer_token(
+        &config.mcp.bearer_token_env,
+        std::env::var(&config.mcp.bearer_token_env).ok(),
+        config.mcp.oauth.as_ref(),
+        config.mcp.allow_unauthenticated,
+    )?;
     let auth_state = AuthState {
         bearer_token,
         oauth,
@@ -4605,17 +4679,7 @@ mod tests {
     use crate::oauth::testing as oauth_testing;
 
     fn test_oauth_validator(jwks_uri: &str) -> Arc<OAuthValidator> {
-        Arc::new(
-            OAuthValidator::new(&crate::config::ResolvedOAuthConfig {
-                issuer: oauth_testing::ISSUER.to_string(),
-                jwks_uri: jwks_uri.to_string(),
-                audience: oauth_testing::AUDIENCE.to_string(),
-                resource: oauth_testing::RESOURCE.to_string(),
-                required_scope: "mcp:read".to_string(),
-                scopes_supported: vec!["mcp:read".to_string(), "mcp:write".to_string()],
-            })
-            .unwrap(),
-        )
+        Arc::new(OAuthValidator::new(&oauth_testing::resolved_config(jwks_uri)).unwrap())
     }
 
     /// A bare `/test` route behind the real `bearer_auth`, for asserting on status
@@ -4792,6 +4856,84 @@ mod tests {
             "Bearer error=\"insufficient_scope\", scope=\"mcp:read\", \
              resource_metadata=\"https://kb.example.test\
              /.well-known/oauth-protected-resource/mcp\""
+        );
+    }
+
+    #[tokio::test]
+    async fn an_authelia_style_scp_token_is_accepted_through_the_middleware() {
+        // End to end: before the `scp` fallback, this exact shape was a 403 with
+        // `present=[]`, because only `scope` was read.
+        let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
+        let app = oauth_test_app(None, Some(test_oauth_validator(&jwks.url)));
+        let token = oauth_testing::mint_with(
+            jsonwebtoken::Algorithm::RS256,
+            Some(oauth_testing::KID_A),
+            Some("at+jwt"),
+            serde_json::json!({
+                "iss": oauth_testing::ISSUER, "aud": [oauth_testing::AUDIENCE],
+                "exp": oauth_testing::now() + 3600, "nbf": oauth_testing::now(),
+                "sub": "44726d41-0000-4000-8000-000000000000",
+                "scp": ["mcp:read", "mcp:write"],
+            }),
+        );
+        let resp = get_with_auth(&app, Some(&format!("Bearer {token}"))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_bearer_scheme_is_case_insensitive_for_both_credentials() {
+        let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
+        let app = oauth_test_app(Some("secret".into()), Some(test_oauth_validator(&jwks.url)));
+        for header in [
+            "bearer secret".to_string(),
+            "BEARER secret".to_string(),
+            format!("bearer {}", oauth_testing::valid_token()),
+        ] {
+            assert_eq!(
+                get_with_auth(&app, Some(&header)).await.status(),
+                StatusCode::OK,
+                "{header:.20}"
+            );
+        }
+        // A different scheme is not a bearer credential at all.
+        for header in ["Basic secret", "Bearersecret", "secret"] {
+            assert_eq!(
+                get_with_auth(&app, Some(header)).await.status(),
+                StatusCode::UNAUTHORIZED,
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_bearer_token_resolution_matrix() {
+        let mut oauth = oauth_testing::resolved_config("http://127.0.0.1:1/jwks");
+        let tok = || Some("secret".to_string());
+
+        // Original behaviour, unchanged: dual mode, static-only, OAuth-only.
+        assert_eq!(
+            static_bearer_token("T", tok(), Some(&oauth), false).unwrap(),
+            tok()
+        );
+        assert_eq!(static_bearer_token("T", tok(), None, false).unwrap(), tok());
+        assert_eq!(
+            static_bearer_token("T", None, Some(&oauth), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            static_bearer_token("T", Some(String::new()), Some(&oauth), false).unwrap(),
+            None
+        );
+        // No credential of either kind: refuse to start unless explicitly opted out.
+        let err = static_bearer_token("T", None, None, false).unwrap_err();
+        assert!(err.to_string().contains("mcp.oauth"), "{err}");
+        assert_eq!(static_bearer_token("T", None, None, true).unwrap(), None);
+
+        // `accept_static_bearer: false` drops a set token when OAuth is on.
+        oauth.accept_static_bearer = false;
+        assert_eq!(
+            static_bearer_token("T", tok(), Some(&oauth), false).unwrap(),
+            None
         );
     }
 

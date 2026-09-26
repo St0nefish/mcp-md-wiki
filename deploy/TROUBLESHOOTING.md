@@ -122,9 +122,21 @@ export QDRANT_URL=http://localhost:6334
 
 ### `MCP_BEARER_TOKEN` not set
 
-The server refuses to start without an MCP bearer token (unless `mcp.allow_unauthenticated: true` is set in config).
+The server refuses to start with no authentication at all: OAuth is not enabled and no static bearer token is set (unless `mcp.allow_unauthenticated: true` is set in config).
 
-**Fix:** Set `MCP_BEARER_TOKEN` in your `.env` file.
+**Fix:** Enable `mcp.oauth` (recommended, see [docs/oauth.md](../docs/oauth.md)), or set `MCP_BEARER_TOKEN` in your `.env` file.
+
+### `mcp.oauth.enabled is true but the OAuth config is not usable`
+
+The error lists every problem at once, one per line. The common ones:
+
+- an empty `issuer`/`resource`/`audience`;
+- an `issuer`/`resource`/`jwks_uri` that is not an absolute http(s) URL;
+- `HS256` or `none` in `algorithms` (never allowed);
+- a `required_scope` containing a space;
+- `leeway_secs` above 300.
+
+**Fix:** Correct the named keys. [docs/oauth.md](../docs/oauth.md#configuration) has the full table.
 
 ### `destination path '.' already exists and is not an empty directory`
 
@@ -484,6 +496,29 @@ Passing a bearer token doesn't change the outcome. This was confirmed against th
 
 If you want `/health` and `/status` reachable from the LAN without a proxy hop or an SSO session at all, that's exactly what the LAN-only posture in [Deployment Posture: Network Exposure and Access Control](USAGE.md#deployment-posture-network-exposure-and-access-control) documents — publishing the port to a specific interface trades the SSO gate for LAN reachability as the access control, with the write-surface trade-off spelled out there.
 
+## OAuth
+
+Start with the startup log. `OAuth: authorization server signing keys loaded` means
+the issuer and JWKS are fine. `OAuth: could not load the authorization server's
+signing keys` carries the reason. The usual one is `metadata issuer … does not
+match mcp.oauth.issuer`: the configured issuer differs from the provider's by a
+trailing slash or a path. Copy it exactly from the provider's discovery document.
+
+When a request is refused, the `OAuth bearer auth rejected` warning gives the
+reason. To see what the token actually carries, decode its middle segment
+(base64url JSON).
+
+| Reason in the log | Meaning and fix |
+|---|---|
+| `credential is not a JWT` | The token is opaque: Authelia's default, and some other providers'. Configure the provider to issue JWT access tokens (Authelia: `access_token_signed_response_alg: 'RS256'` on the client). Also seen when a mistyped static token is sent while OAuth is on. |
+| `token rejected: InvalidAudience` | The token's `aud` is not in `audience`/`audiences`. Put the value your provider actually stamps there: the resource URL or the client_id. See [Choosing the audience](../docs/oauth.md#choosing-the-audience). |
+| `token rejected: InvalidIssuer` / `token iss is not a single string…` | `issuer` does not match the token's `iss` byte for byte. Check for a trailing slash. |
+| `token rejected: ExpiredSignature` / `ImmatureSignature` | The token has expired, or it is not valid yet (`nbf`). Check clock sync on both hosts. `leeway_secs` absorbs small drift. |
+| `token algorithm … is not in mcp.oauth.algorithms` | The provider signs with an algorithm you excluded, or with HS256. HS256 cannot be verified by a resource server; give the provider an asymmetric signing key. |
+| `token typ … is not accepted` | The header `typ` is `JWT` or missing while `require_at_jwt` is on, or it is a different kind of JWT altogether. |
+| `no … key for kid …` | No key in the JWKS matches. Either the provider rotated its keys (the next refetch, at most a minute later, picks the new one up), or the token comes from a different issuer or client. Kanidm, for example, has a separate issuer and JWKS per client. |
+| `InsufficientScope` (403) | The token is valid but lacks `required_scope`. The info line `OAuth token is valid but lacks the required scope` lists the scopes it has (`present=[…]`). Grant the scope to the user or client at the provider. If the scopes are in a claim other than `scope`/`scp`, add that claim to `scope_claims`. |
+
 ## Model / Vector Issues
 
 ### Qdrant dimension mismatch after model change
@@ -507,7 +542,9 @@ Set `RUST_LOG` in your `.env` file or compose environment. The server warns on s
 
 ### Key log events and how to find them
 
-`Bearer auth rejected` (WARN) — every request rejected by MCP bearer-token auth. A flood of these means a client is using the wrong token.
+`Bearer auth rejected` (WARN) — every request rejected by MCP bearer-token auth when OAuth is off. A flood of these means a client is using the wrong token.
+
+`OAuth bearer auth rejected` (WARN) — a request refused with OAuth on, with the reason (`reason=Invalid("…")` or `InsufficientScope`). See [OAuth](#oauth) for what each reason means. A request with no credential at all is logged only at DEBUG (`No bearer credential presented`), because every OAuth client's first request looks like that.
 
 `Webhook signature verification failed` (WARN) — HMAC mismatch between the forge secret and `WEBHOOK_SECRET`, logged with the provider name.
 

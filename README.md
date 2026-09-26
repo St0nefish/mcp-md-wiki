@@ -8,6 +8,7 @@ Built as a single Rust binary for type safety, small Docker images, and simple d
 
 - [`deploy/USAGE.md`](deploy/USAGE.md) — Setup guide, configuration, frontmatter, chunking
 - [`deploy/TROUBLESHOOTING.md`](deploy/TROUBLESHOOTING.md) — Common issues and fixes
+- [`docs/oauth.md`](docs/oauth.md) — OAuth setup (recommended auth): how it works, provider recipes marked by what was actually tested, a checklist for any other provider
 - [`deploy/config.example.yaml`](deploy/config.example.yaml) — Full annotated config reference
 - [`deploy/ci-examples/`](deploy/ci-examples/) — Sample CI workflows for webhook-triggered reindex
 
@@ -18,7 +19,8 @@ Built as a single Rust binary for type safety, small Docker images, and simple d
 git clone https://github.com/St0nefish/mcp-md-wiki.git
 cd mcp-md-wiki
 cp deploy/.env.example .env
-# Edit .env: set MCP_BEARER_TOKEN and MODEL_PATH/MODEL_FILE
+# Edit .env: set MODEL_PATH/MODEL_FILE, and MCP_BEARER_TOKEN unless you use
+# OAuth only (recommended: configure mcp.oauth — see docs/oauth.md)
 # (GIT_PULL_TOKEN is optional — only needed to clone/fetch a private knowledge-base repo)
 
 # Download the embedding model (see "Embedding Models" below)
@@ -37,6 +39,25 @@ claude mcp add --transport http kb-search \
   https://your-host:8001/mcp \
   --header "Authorization: Bearer $TOKEN"
 ```
+
+### Authentication: OAuth (recommended)
+
+Enable `mcp.oauth` in `config.yaml` and point it at your identity provider. Clients
+then log in through that provider and present short-lived, per-user access tokens
+instead of sharing one static secret. claude.ai, Claude Desktop and the mobile apps
+can only connect this way. With OAuth on, register a client with your provider and
+add the server to Claude Code with that client id:
+
+```bash
+claude mcp add --transport http --client-id <client-id> --callback-port <port> \
+  kb-search https://your-host:8001/mcp
+```
+
+[docs/oauth.md](docs/oauth.md) covers how it works, recipes for the providers it has
+been tested against (Authentik and Authelia end to end, and Kanidm's token shape),
+and a checklist for any other. The
+static bearer token keeps working alongside OAuth unless you turn it off
+(`mcp.oauth.accept_static_bearer: false`).
 
 ### Claude Desktop
 
@@ -146,7 +167,7 @@ See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 - **embedding** — OpenAI-compatible endpoint (works with llama.cpp, vLLM, etc.)
 - **validation** — Strict/lenient mode, optional lint command
 - **webhook** — HMAC verification for Gitea/GitHub/GitLab (disabled if `WEBHOOK_SECRET` is unset)
-- **mcp** — Server port, bearer token authentication, and `extensions_path` (where per-KB tool/server description policy lives in the served knowledge base; `instructions` is a deprecated narrative override — see [MCP Tools](#mcp-tools) below)
+- **mcp** — Server port, authentication (OAuth resource server — recommended, see [docs/oauth.md](docs/oauth.md) — and/or a static bearer token), and `extensions_path` (where per-KB tool/server description policy lives in the served knowledge base; `instructions` is a deprecated narrative override — see [MCP Tools](#mcp-tools) below)
 - **write** — Behaviour of the write tools: near-duplicate detection (`dedup_enabled`, `dedup_threshold`) and the git commit identity
 - **search** — Retrieval behaviour: hybrid sparse+dense search with RRF fusion (`hybrid`, default `true`) and per-arm candidate count (`rrf_candidates`). Set `hybrid: false` for legacy dense-only search. See the migration note below. Also `phrase` (default `true`) — exact-phrase matching for double-quoted spans in a `search` query, fused as a third RRF arm. `granularities` (default: all of `chunk`, `document`, `section`) restricts which `search` granularity values this instance exposes — the effective set additionally drops `section` whenever `chunking.heading_metadata` is off and must not end up empty (config load fails; explicitly listing `section` while the flag is off logs a warning — the default, which never names `section` in `config.yaml`, does not), and disabled values are removed from the MCP tool schema/description, not just rejected at call time. The same goes for everything that only applies to a disabled granularity or, when `document` is disabled, to searching without a query: `explain`/`fields`/`order_by`/`descending` drop out of the schema, the no-query sentences drop out of the tool and server descriptions, and rejection errors never suggest a disabled granularity. `section_max_bytes` (default `16000`) is the size cap on every `get_document` read the caller did not bound itself: a resolved section falls back to an outline of its children past it, a whole-document read falls back to the document's own outline (or truncated text when the document has no headings), and outlines are capped to roughly that many bytes of entries. An explicit `start_line`/`end_line` range is exempt.
 - **reranking** — Optional cross-encoder reranking pass over the top hybrid candidates (`enabled`, default `false`; `candidate_limit`, default `50`). Requires `RERANKING_BASE_URL`/`RERANKING_MODEL` when enabled — see [Configuration](#configuration) above and `deploy/config.example.yaml`
@@ -463,11 +484,11 @@ Four HTTP endpoints, with different audiences and different auth:
 | Endpoint | Auth | Purpose |
 |---|---|---|
 | `/health` | open | Liveness/readiness. Reports Qdrant and embedding-service reachability only. Returns 503 when either is down. |
-| `/status` | bearer | Full runtime state as JSON. |
-| `/metrics` | bearer | The same data in Prometheus text exposition format. |
-| `POST /admin/reload` | bearer | Re-read and re-validate `config.yaml` and swap it in, without a restart. See [Config reload](#config-reload). |
+| `/status` | bearer / OAuth | Full runtime state as JSON. |
+| `/metrics` | bearer / OAuth | The same data in Prometheus text exposition format. |
+| `POST /admin/reload` | bearer / OAuth | Re-read and re-validate `config.yaml` and swap it in, without a restart. See [Config reload](#config-reload). |
 
-`/status`, `/metrics`, and `/admin/reload` require the same bearer token as `/mcp` (`MCP_BEARER_TOKEN`), because unlike `/health` they enumerate tag vocabularies, area names and document counts (`/status`/`/metrics`) or can change how the write tools authenticate content and which webhook provider is trusted (`/admin/reload`) — none of that gets a weaker gate than `/mcp` itself. Scrape `/status`/`/metrics` with an `authorization` stanza:
+`/status`, `/metrics`, and `/admin/reload` require the same credential as `/mcp` — the static bearer token (`MCP_BEARER_TOKEN`) or, with `mcp.oauth` enabled, a valid OAuth access token — because unlike `/health` they enumerate tag vocabularies, area names and document counts (`/status`/`/metrics`) or can change how the write tools authenticate content and which webhook provider is trusted (`/admin/reload`) — none of that gets a weaker gate than `/mcp` itself. Scrape `/status`/`/metrics` with an `authorization` stanza:
 
 ```yaml
 scrape_configs:
@@ -506,7 +527,7 @@ curl -X POST -H "Authorization: Bearer $MCP_BEARER_TOKEN" http://localhost:8001/
 The response reports exactly what happened, bucketed by whether the change actually took effect:
 
 - **`applied`** — read fresh by the code that uses it (an MCP tool call, a webhook request, the reindex worker's next drain, a periodic timer's next tick), so the very next read observes the new value. `search.*`, `write.*`, `webhook.provider`, `indexing.include`/`exclude`, `frontmatter.*`, `validation.*`, `mcp.instructions`, `mcp.extensions_path`, and more fall here.
-- **`restart_required`** — baked into a value or service built once at server startup (the embedding client's `reqwest::Client` timeout, the MCP path-filter `GlobSet`, the rate limiter, anything security-critical like the bearer token or `allow_unauthenticated`). The swap updates what everything else sees, but this particular consumer keeps behaving exactly as it did before the reload.
+- **`restart_required`** — baked into a value or service built once at server startup (the embedding client's `reqwest::Client` timeout, the MCP path-filter `GlobSet`, the rate limiter, anything security-critical like the bearer token, `allow_unauthenticated` or any `mcp.oauth` key). The swap updates what everything else sees, but this particular consumer keeps behaving exactly as it did before the reload.
 - **`reindex_scheduled`** — `chunking.*`. Every indexed file records a fingerprint of the chunking config (plus the chunker's code version) it was chunked under, so the full reconcile the reload queues re-chunks and re-embeds every document built under the old value automatically — no `index --full` needed (`target_chunk_size` is the exception while `heading_metadata` is on: it has no effect then and is not fingerprinted). Expect one re-embed of the affected corpus; search may serve a mix of old and new chunks until that reconcile finishes. The same happens on restart after editing `chunking.*`.
 - **`reindex_required`** — `ui.semantic_edges.*`. The indexer reads the new value on its next run, but only for documents that run re-embeds; existing semantic edges are unchanged otherwise. Run `mcp-md-wiki index --full` for a consistent graph.
 

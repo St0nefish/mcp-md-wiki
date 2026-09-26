@@ -656,8 +656,9 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.jwks_uri",
             note: "stored on the OAuthValidator alongside its in-memory key cache \
-                   (oauth.rs) — a new URL would also have to invalidate that cache, so it \
-                   is deliberately restart-only.",
+                   (oauth.rs), or discovered once from the issuer when empty — a new URL \
+                   would also have to invalidate that cache, so it is deliberately \
+                   restart-only.",
         }],
     },
     DiffField {
@@ -667,8 +668,83 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.audience",
             note: "baked into the jsonwebtoken Validation at OAuthValidator construction \
-                   (oauth.rs) — this is the OAuth client_id, not the resource URL; see \
-                   config.rs OAuthConfig::audience.",
+                   (oauth.rs), together with mcp.oauth.audiences; see config.rs \
+                   OAuthConfig::audience for which value a given authorization server \
+                   needs.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.audiences",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.audiences)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.audiences",
+            note: "unioned with mcp.oauth.audience into the jsonwebtoken Validation at \
+                   OAuthValidator construction (oauth.rs) — security-critical, \
+                   deliberately not made live.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.scope_claims",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.scope_claims)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.scope_claims",
+            note: "held by the OAuthValidator built at startup (oauth.rs) — which claims \
+                   are read decides whether the required scope is found, so it follows \
+                   mcp.oauth.required_scope's restart-only posture.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.principal_claims",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.principal_claims)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.principal_claims",
+            note: "held by the OAuthValidator built at startup (oauth.rs); logging only, \
+                   but it lives on the same startup-built value as every other \
+                   mcp.oauth key.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.algorithms",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.algorithms)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.algorithms",
+            note: "the allowlist, and every cached key's permitted algorithms, are fixed \
+                   when the OAuthValidator and its JWKS cache are built (oauth.rs).",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.leeway_secs",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.leeway_secs)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.leeway_secs",
+            note: "baked into the jsonwebtoken Validation at OAuthValidator construction \
+                   (oauth.rs).",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.require_at_jwt",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.require_at_jwt)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.require_at_jwt",
+            note: "held by the OAuthValidator built at startup (oauth.rs) — \
+                   security-critical, deliberately not made live.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.accept_static_bearer",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.accept_static_bearer)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.accept_static_bearer",
+            note: "decides whether AuthState holds the static bearer token at all \
+                   (server.rs run_server) — security-critical, deliberately not made \
+                   live, same posture as mcp.bearer_token_env.",
         }],
     },
     DiffField {
