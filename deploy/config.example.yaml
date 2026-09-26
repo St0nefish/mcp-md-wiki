@@ -334,26 +334,125 @@ webhook:
 # ----------------------------------------------------------------------------
 # mcp — Model Context Protocol server (Streamable HTTP)
 # ----------------------------------------------------------------------------
-# Exposes a `search` tool over MCP at /mcp. Clients authenticate with a
-# Bearer token. The search tool accepts: query (required), domain, type,
-# tags, and limit (default 10, max 50) parameters.
+# Exposes the MCP tools at /mcp. Clients authenticate with an OAuth access
+# token from your identity provider (recommended — see `oauth` below and
+# docs/oauth.md) and/or a static Bearer token (`bearer_token_env`).
 #
 # The listen port used to live here (`port:`). It is a bootstrap binding —
 # the process cannot change which port it listens on without a restart —
 # so it moved to MCP_PORT. See "ENV-only settings" below.
 mcp:
 
-  # Name of the environment variable containing the Bearer token for MCP
-  # authentication.
+  # OAuth 2.1 resource-server mode (RFC 9728 + the MCP authorization spec) —
+  # the RECOMMENDED way to authenticate. Clients get a per-user, expiring JWT
+  # access token from your authorization server (Authentik, Authelia, Kanidm,
+  # ...) and this server verifies it locally against that server's published
+  # keys. Required for Claude's hosted surfaces (claude.ai / Desktop / iOS),
+  # which can only connect through an authorization-code flow. Provider
+  # recipes and a checklist for any other provider: docs/oauth.md.
+  #
+  # Disabled by default; omit the whole block and nothing changes. With OAuth
+  # enabled, the static bearer token below keeps working alongside it (either
+  # credential is accepted) unless accept_static_bearer is false, and
+  # bearer_token_env may be left unset for OAuth-only. Running with ONLY a
+  # static token logs a startup warning recommending OAuth.
+  #
+  # When enabled, two unauthenticated discovery routes appear:
+  #   /.well-known/oauth-protected-resource/mcp
+  #   /.well-known/oauth-protected-resource
+  # Both must stay publicly reachable — they are how a client with no token
+  # finds out where to get one.
+  #
+  # NOTE: per-tool write-scope enforcement is NOT implemented — the auth
+  # middleware cannot see which MCP tool a request invokes. Any token that
+  # passes required_scope currently has full access, writes included.
+  #
+  # RESTART REQUIRED for every key below: the validator, its JWKS cache and the
+  # metadata document are all built once at startup, the same posture as
+  # bearer_token_env. A misconfigured block fails startup naming every bad key.
+  #
+  # oauth:
+  #   enabled: true
+  #
+  #   # REQUIRED. The authorization server's issuer, compared BYTE-EXACTLY
+  #   # against each token's `iss`. Copy it from the AS's discovery document
+  #   # including any trailing slash — Authentik's per-application issuer has
+  #   # one, Authelia's does not, and getting it wrong rejects every token.
+  #   issuer: "https://auth.example.com/application/o/wiki/"
+  #
+  #   # REQUIRED. This server's public MCP URL. Published as `resource` in the
+  #   # metadata document and used to derive the resource_metadata URL
+  #   # advertised in WWW-Authenticate. Absolute http(s) URL, no fragment.
+  #   resource: "https://kb.example.com/mcp"
+  #
+  #   # REQUIRED (this or `audiences`). A value each token's `aud` must contain;
+  #   # there is deliberately no default. Decode a real access token and look:
+  #   #  - servers that stamp the RESOURCE URL (RFC 8707, or a configurable
+  #   #    access-token audience, e.g. Authelia) -> the same value as `resource`
+  #   #  - servers that stamp the OAuth CLIENT ID and ignore `resource`
+  #   #    (Authentik, Kanidm) -> the client_id
+  #   audience: "example-client-id"
+  #
+  #   # Additional accepted audiences; a token matching ANY configured value
+  #   # passes. Useful while migrating from a client_id to a resource-URL
+  #   # audience. Default [].
+  #   audiences: []
+  #
+  #   # Where the signing keys (JWKS) live. Default "" = discover it from the
+  #   # issuer's metadata (OpenID Connect Discovery, then RFC 8414), refusing a
+  #   # document whose `issuer` does not match byte-for-byte. Keys load at
+  #   # startup, refresh hourly, and an unknown `kid` triggers at most one
+  #   # refetch per minute.
+  #   jwks_uri: ""
+  #
+  #   # Scope a token must carry to get past the auth middleware (a single
+  #   # scope, exact match). A valid token without it gets 403
+  #   # insufficient_scope rather than 401.
+  #   required_scope: "mcp:read"
+  #
+  #   # Advertised to clients in the metadata document and the 401 challenge.
+  #   # Declarative only.
+  #   scopes_supported: ["mcp:read", "mcp:write"]
+  #
+  #   # Claims the token's scopes are read from; each may be a space-delimited
+  #   # string or an array, and all are unioned. The default covers RFC 9068's
+  #   # `scope` (Authentik, Kanidm) and the `scp` Authelia emits instead.
+  #   scope_claims: ["scope", "scp"]
+  #
+  #   # Claims tried in order to name the caller in logs (logging only). Many
+  #   # servers put no username in access tokens, hence the `sub` fallback.
+  #   # Add "email" if you want addresses in your logs.
+  #   principal_claims: ["preferred_username", "sub"]
+  #
+  #   # Accepted signing algorithms. Each key is further limited to what its
+  #   # own type can produce. HS256/384/512 and "none" are refused at startup.
+  #   algorithms: ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA"]
+  #
+  #   # Clock-skew allowance on exp/nbf, in seconds. Max 300.
+  #   leeway_secs: 60
+  #
+  #   # Require the JWT header typ to be at+jwt (RFC 9068). Off by default
+  #   # because Authentik emits "JWT"; turn it ON if your server emits at+jwt
+  #   # (Authelia, Kanidm) — it stops an ID token being replayed as an
+  #   # access token.
+  #   require_at_jwt: false
+  #
+  #   # Keep accepting the static bearer token (bearer_token_env) while OAuth
+  #   # is on. Set false for OAuth-only even when MCP_BEARER_TOKEN is set.
+  #   accept_static_bearer: true
+
+  # Name of the environment variable containing the static Bearer token for
+  # MCP authentication. Still supported; OAuth (above) is recommended.
   # RESTART REQUIRED: the token is resolved from the named env var once at
   # startup — POST /admin/reload cannot change which var it reads, or
   # re-check the var's value, on a running server. Security-critical by
   # design: auth must not change underneath an in-flight deployment silently.
   bearer_token_env: "MCP_BEARER_TOKEN"
 
-  # When false (the default), the server refuses to start if the bearer token
-  # env var is unset or empty. Set to true only in trusted environments where
-  # authentication is handled by an upstream proxy or is genuinely not needed.
+  # When false (the default), the server refuses to start with no
+  # authentication at all — neither OAuth enabled nor the bearer token env
+  # var set. Set to true only in trusted environments where authentication is
+  # handled by an upstream proxy or is genuinely not needed.
   # RESTART REQUIRED — same reasoning as bearer_token_env above.
   allow_unauthenticated: false
 
@@ -370,64 +469,6 @@ mcp:
   # startup — POST /admin/reload cannot change this on a running server.
   # allowed_hosts:
   #   - "kb.example.com"
-
-  # OAuth 2.1 resource-server mode (RFC 9728 + the MCP authorization spec).
-  # Disabled by default; omit the whole block and nothing changes.
-  #
-  # This is ADDITIVE to bearer_token_env above, never a replacement: with both
-  # configured a request authenticates if EITHER the static token matches OR a
-  # valid access token is presented. Claude Code uses the static token; the
-  # OAuth path exists so Claude's hosted surfaces (claude.ai / Desktop / iOS)
-  # can connect as a custom connector, which requires an authorization-code
-  # flow. Enabling OAuth also satisfies the "must have some authentication"
-  # startup check, so bearer_token_env may be left unset if you only want OAuth.
-  #
-  # When enabled, two unauthenticated discovery routes appear:
-  #   /.well-known/oauth-protected-resource/mcp
-  #   /.well-known/oauth-protected-resource
-  # Both must stay publicly reachable — they are how a client with no token
-  # finds out where to get one.
-  #
-  # RESTART REQUIRED for every key below: the validator, its JWKS cache and the
-  # metadata document are all built once at startup, the same posture as
-  # bearer_token_env.
-  #
-  # oauth:
-  #   enabled: true
-  #
-  #   # The authorization server's issuer, compared BYTE-EXACTLY against each
-  #   # token's `iss`. Copy it from the AS's discovery document including any
-  #   # trailing slash — Authentik's has one, and dropping it rejects every
-  #   # token.
-  #   issuer: "https://authentik.example.com/application/o/mcp-kb-rag/"
-  #
-  #   # Where the signing keys live. Fetched lazily on first token and cached;
-  #   # an unknown `kid` triggers at most one refetch per minute.
-  #   jwks_uri: "https://authentik.example.com/application/o/mcp-kb-rag/jwks/"
-  #
-  #   # The value each token's `aud` claim must contain. This is the OAuth
-  #   # CLIENT ID, not the resource URL below, and that is deliberate:
-  #   # Authentik does not implement RFC 8707 resource indicators — it ignores
-  #   # the `resource` request parameter and hardcodes the audience to the
-  #   # provider's client_id. Setting this to the resource URL will reject
-  #   # every real token.
-  #   audience: "your-oauth-client-id"
-  #
-  #   # This server's public MCP URL. Published as `resource` in the metadata
-  #   # document and used to derive the resource_metadata URL advertised in
-  #   # WWW-Authenticate. Not compared against `aud` — see above.
-  #   resource: "https://kb.example.com/mcp"
-  #
-  #   # Scope a token must carry to get past the auth middleware. A valid token
-  #   # without it gets 403 insufficient_scope rather than 401.
-  #   #
-  #   # NOTE: per-tool write-scope enforcement is NOT implemented — the auth
-  #   # middleware cannot see which MCP tool a request invokes. Any token that
-  #   # passes this check currently has full access, writes included.
-  #   required_scope: "mcp:read"
-  #
-  #   # Advertised to clients in the metadata document. Declarative only.
-  #   scopes_supported: ["mcp:read", "mcp:write"]
 
   # DEPRECATED: custom narrative for MCP server instructions. Replaced by a
   # server.md file under mcp.extensions_path in the served knowledge base,

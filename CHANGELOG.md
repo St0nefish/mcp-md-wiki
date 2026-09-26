@@ -16,6 +16,47 @@ sample rather than an exhaustive list.
 
 ## [Unreleased]
 
+### Authentication
+
+- **OAuth is now provider-agnostic, and the recommended way to authenticate.**
+  Before this, the resource server read scopes only from the `scope` claim, so a
+  perfectly valid Authelia access token (scopes in `scp`, a JSON array) got
+  `403 insufficient_scope` with `present=[]`. Scopes are now read from every claim
+  in `mcp.oauth.scope_claims` (default `["scope", "scp"]`), as either a
+  space-delimited string or an array, and combined. Other additions, all under
+  `mcp.oauth`:
+  - `audiences`: extra accepted `aud` values, combined with `audience`. One of the
+    two is required.
+  - `jwks_uri` is now optional. When omitted it is discovered from the issuer
+    (OIDC, then RFC 8414), and a document whose `issuer` differs is refused.
+  - `algorithms`: an asymmetric allowlist, adding ES256/ES384/PS*/EdDSA (Kanidm
+    signs ES256). Each key is limited to what its own type can produce, and
+    `HS*`/`none` are refused at startup.
+  - `leeway_secs` (default 60, max 300). `nbf` is now checked too.
+  - `require_at_jwt` (default off): enforce RFC 9068's `typ`. Other explicit JWT
+    types such as `dpop+jwt` are now always refused.
+  - `principal_claims` (default `["preferred_username", "sub"]`) names the caller
+    in logs.
+  - `accept_static_bearer` (default true) runs OAuth-only when set to `false`,
+    even with `MCP_BEARER_TOKEN` set.
+
+  Signing keys load at startup and refresh hourly in the background, so an
+  unreachable issuer shows up as one startup warning and a withdrawn key stops
+  being trusted. Refreshes no longer hold the key lock across the network, so a
+  slow IdP cannot stall requests whose key is cached. Metadata/JWKS bodies are
+  capped, and https→http redirects are refused. The `Bearer` scheme is now matched
+  case-insensitively. Running with only a static bearer token logs a startup
+  warning recommending OAuth. The docs lead with OAuth; the new
+  [`docs/oauth.md`](docs/oauth.md) has recipes for Authentik, Authelia and Kanidm,
+  each marked with what was actually tested, plus a checklist for any other
+  provider.
+
+  **Upgrade:** no action needed. Existing `mcp.oauth` blocks and
+  `MCP_BEARER_TOKEN` keep working unchanged; a regression test pins the
+  production Authentik config and token shape. Config load is stricter only for
+  values that could never have worked: `issuer`/`resource`/`jwks_uri` must be
+  absolute http(s) URLs, and `required_scope` must be a single scope. No reindex.
+
 ### Retrieval
 
 - **`start_line: 1` is valid against an empty document** (fix #298), a
