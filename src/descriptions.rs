@@ -19,6 +19,13 @@
 //! KB at once. Per-KB policy belongs in the extension files, never here.
 //! Extensions are APPEND-ONLY: they can never suppress or contradict a
 //! compiled or config-derived sentence, only add to it.
+//!
+//! Length: layers 1 and 2 are held to [`COMPILED_DESCRIPTION_BUDGET`] by
+//! tests, leaving the rest of [`CLIENT_DESCRIPTION_CAP`] (Claude Code's
+//! truncation point) for layer 3. A description is what a tool does, when to
+//! use it, and what a model would get wrong without being told up front;
+//! per-parameter rules go on the parameter's schema description, which is
+//! not truncated.
 
 use crate::config::Granularity;
 use std::collections::HashMap;
@@ -38,10 +45,25 @@ pub const TOOL_NAMES: [&str; 6] = [
     "update_schema",
 ];
 
+/// Whether `tool` is enabled — i.e. not named in the live `mcp.disabled_tools`.
+/// Shared by every server-instructions sentence that names a specific tool
+/// (`top_level_areas_sentence` below, and `server.rs`'s scoped-schema-
+/// directories sentence naming `get_schema`), so instructions never point a
+/// caller at a tool `tools/list`/`tools/call` will refuse.
+pub fn tool_enabled(tool: &str, disabled_tools: &[String]) -> bool {
+    !disabled_tools.iter().any(|t| t == tool)
+}
+
 /// Compiled-in server narrative — mechanics true of every KB this binary
 /// could ever serve. See this module's doc comment for the hard rule that
 /// keeps per-KB policy out of this file.
 const SERVER_BASE: &str = include_str!("../assets/mcp/server.md");
+
+/// Compiled-in server narrative about how `search` matches text and paths —
+/// kept apart from [`SERVER_BASE`] because it describes `search`'s
+/// parameters, so it is dropped when `search` is disabled
+/// (`mcp.disabled_tools` / `mcp.enabled_tools`).
+const SERVER_SEARCH: &str = include_str!("../assets/mcp/server_search.md");
 
 /// Compiled-in per-tool base description, indexed by tool name. `None` for
 /// any name outside [`TOOL_NAMES`].
@@ -62,6 +84,58 @@ fn compiled_tool_base(tool: &str) -> Option<&'static str> {
 /// paid on every `tools/list` response. Truncated on a char boundary; a
 /// truncation is logged via [`cap_extension_body`].
 const MAX_EXTENSION_BODY_BYTES: usize = 8 * 1024;
+
+/// Length, in characters, past which Claude Code truncates a tool
+/// `description` or the server `instructions` (appending "… [truncated]").
+/// This is that client's observed behavior, not an MCP specification limit;
+/// input-schema property descriptions are not truncated, which is why
+/// detailed per-parameter rules live on the properties.
+pub const CLIENT_DESCRIPTION_CAP: usize = 2048;
+
+/// Ceiling, in characters, on every compiled + config-derived tool
+/// description and on the server instructions (with a realistic corpus),
+/// under the configuration that makes each longest. The gap up to
+/// [`CLIENT_DESCRIPTION_CAP`] is left for the knowledge base's own extension
+/// files. Enforced by tests, not at runtime.
+pub const COMPILED_DESCRIPTION_BUDGET: usize = 1500;
+
+/// Last over-cap length warned about, per surface (`"server instructions"` or
+/// a tool name), so [`warn_if_over_client_cap`] logs once per distinct length
+/// instead of on every metadata-refresh tick.
+static OVER_CAP_WARNED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Warn when a fully composed description (extension included) is longer
+/// than [`CLIENT_DESCRIPTION_CAP`] — Claude Code will cut it off. The
+/// compiled + config-derived part is held under
+/// [`COMPILED_DESCRIPTION_BUDGET`] by tests, so the extension file is the
+/// likely culprit. Logged once per surface per distinct length; dropping back
+/// under the cap re-arms it.
+pub fn warn_if_over_client_cap(surface: &str, composed: &str) {
+    // UTF-16 code units, not chars: Claude Code is a JavaScript client, and
+    // counting the larger of the two can only make this fire earlier.
+    let len = composed.encode_utf16().count();
+    let mut warned = OVER_CAP_WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if len <= CLIENT_DESCRIPTION_CAP {
+        warned.remove(surface);
+        return;
+    }
+    if warned.get(surface) == Some(&len) {
+        return;
+    }
+    warned.insert(surface.to_string(), len);
+    warn!(
+        surface,
+        chars = len,
+        cap = CLIENT_DESCRIPTION_CAP,
+        "MCP {surface} is {len} characters, over the {CLIENT_DESCRIPTION_CAP}-character \
+         length Claude Code truncates at; its knowledge-base extension file is the likely \
+         culprit — keep extensions under ~{} characters",
+        CLIENT_DESCRIPTION_CAP - COMPILED_DESCRIPTION_BUDGET
+    );
+}
 
 /// The sentence appended to `search`'s description when quoted-phrase
 /// matching is both configured (`search.phrase`) and actually available at
@@ -99,9 +173,11 @@ pub fn retrieval_mode_sentence(hybrid: bool, phrase: bool) -> &'static str {
 /// tool's schema `enum`. `effective` is
 /// `ResolvedConfig::effective_granularities`'s output.
 ///
-/// Used verbatim in two places so they cannot diverge: as the `granularity`
-/// property's description in the tool's input schema (`overlay_input_schema`)
-/// and, via [`granularity_sentence`], in the composed tool description.
+/// Served as the `granularity` property's description in the tool's input
+/// schema (`overlay_input_schema`) — property descriptions are not subject to
+/// the client's description cap (see [`CLIENT_DESCRIPTION_CAP`]), so the full
+/// per-value detail lives here. The tool description carries only
+/// [`granularity_summary`], a one-sentence pointer naming the same values.
 ///
 /// Each default clause must match `mcp::resolve_search_granularity`: with a
 /// query, the first enabled of chunk → document → section; without one,
@@ -166,17 +242,33 @@ pub fn granularity_description(effective: &[Granularity]) -> String {
     }
 }
 
+/// The one-sentence `granularity` pointer in `search`'s composed tool
+/// description: names only the enabled values (never a disabled one — the
+/// same rule [`granularity_description`] follows), leaving what each value
+/// returns and the default rules to the `granularity` property's description.
+/// The empty set is unreachable from a validated config and falls back to
+/// [`granularity_description`]'s configuration-problem wording.
+pub fn granularity_summary(effective: &[Granularity]) -> String {
+    let names: Vec<String> = effective
+        .iter()
+        .map(|g| format!("`{}`", g.as_str()))
+        .collect();
+    match names.as_slice() {
+        [] => granularity_description(effective),
+        [only] => format!("`granularity` is fixed to {only} on this server."),
+        [init @ .., last] => format!(
+            "`granularity` chooses what each result is: {} or {last}.",
+            init.join(", ")
+        ),
+    }
+}
+
 /// The `heading_prefix` sentence appended to `search`'s description when
-/// `chunking.heading_metadata` is on. Kept in step with the
-/// `SearchParams::heading_prefix` doc comment (the schema property
-/// description) and `mcp::heading_prefix_condition`'s behavior.
+/// `chunking.heading_metadata` is on. The matching rules and examples live on
+/// the `heading_prefix` property itself (`SearchParams::heading_prefix`'s doc
+/// comment), kept in step with `mcp::heading_prefix_condition`'s behavior.
 pub const HEADING_PREFIX_SENTENCE: &str = "`heading_prefix` restricts query results to \
-     everything under a run of consecutive headings, which can start at any level. Each \
-     segment is a complete heading name, not a prefix of one: `[\"Conditions\"]`, \
-     `[\"Chapter 10: Game Mastering\", \"Conditions\"]` and `[\"Conditions\", \"Blinded\"]` all \
-     match text under `Chapter 10: Game Mastering > Conditions > Blinded`, but \
-     `[\"Chapter 10\", \"Conditions\"]` matches nothing there (matched ignoring case, \
-     whitespace and invisible characters). It requires a `query`.";
+     everything under a run of consecutive headings, which can start at any level.";
 
 /// Whether any enabled granularity can serve a `search` without a query
 /// (enumeration). When none can, every sentence and schema property that
@@ -191,8 +283,7 @@ pub fn enumeration_available(effective: &[Granularity]) -> bool {
 /// reason.
 pub const ENUMERATION_SENTENCE: &str = "Without a `query`, every match is returned in a stable \
      order with an exact total — use that when you need a *complete* set rather than the best \
-     few. That listing is exhaustive: `offset` pages it as deep as you like, and `path_prefix` \
-     is the same substring match there.";
+     few. That listing is exhaustive: `offset` pages it as deep as you like.";
 
 /// Effective-set-aware descriptions for `search`'s schema properties whose
 /// static doc comments assume every granularity and mode is available
@@ -270,22 +361,32 @@ pub fn search_property_descriptions(
 
 /// The server-instructions sentence naming the knowledge base's top-level
 /// areas, pointing at `search` + `path_prefix` to explore one — as an
-/// exhaustive listing only when [`enumeration_available`].
-pub fn top_level_areas_sentence(areas: &[String], effective: &[Granularity]) -> String {
+/// exhaustive listing only when [`enumeration_available`]. `None` when
+/// `search` itself is disabled (`mcp.disabled_tools`): the sentence's entire
+/// point is pointing at a tool that, in that case, does not exist, so it is
+/// dropped rather than left naming an unreachable tool.
+pub fn top_level_areas_sentence(
+    areas: &[String],
+    effective: &[Granularity],
+    search_enabled: bool,
+) -> Option<String> {
+    if !search_enabled {
+        return None;
+    }
     let how = if enumeration_available(effective) {
         "Use search with path_prefix (and no query, for an exhaustive listing) to enumerate one."
     } else {
         "Use search with a query and path_prefix to explore one."
     };
-    format!(
+    Some(format!(
         "Top-level areas of this knowledge base: {}. {how}",
         areas.join(", ")
-    )
+    ))
 }
 
 /// The config-derived sentence(s) for `search`'s tool description:
 /// [`ENUMERATION_SENTENCE`] when [`enumeration_available`], then
-/// [`granularity_description`], plus, when `heading_metadata` is on,
+/// [`granularity_summary`], plus, when `heading_metadata` is on,
 /// [`HEADING_PREFIX_SENTENCE`] — gated independently of which granularities
 /// are enabled, since the filter applies to every query granularity, not
 /// just `section`.
@@ -298,9 +399,9 @@ pub fn granularity_sentence(effective: &[Granularity], heading_metadata: bool) -
         sentence.push_str(ENUMERATION_SENTENCE);
         sentence.push_str("\n\n");
     }
-    sentence.push_str(&granularity_description(effective));
+    sentence.push_str(&granularity_summary(effective));
     if heading_metadata {
-        sentence.push_str("\n\n");
+        sentence.push(' ');
         sentence.push_str(HEADING_PREFIX_SENTENCE);
     }
     sentence
@@ -325,9 +426,18 @@ fn join_sections<'a>(sections: impl IntoIterator<Item = &'a str>) -> String {
 /// the corpus-dependent parts of category 2 (facet vocabularies, schema
 /// scopes, authoring rules); the KB extension (category 3) is appended after
 /// THAT, via [`append_extension`] — see this module's doc comment for the
-/// full composition order.
-pub fn compose_server_mechanics(hybrid: bool, phrase: bool) -> String {
-    join_sections([SERVER_BASE, retrieval_mode_sentence(hybrid, phrase)])
+/// full composition order. With `search` disabled, only [`SERVER_BASE`] is
+/// returned: the text-matching narrative and the retrieval-mode sentence
+/// both describe `search`.
+pub fn compose_server_mechanics(hybrid: bool, phrase: bool, search_enabled: bool) -> String {
+    if !search_enabled {
+        return join_sections([SERVER_BASE]);
+    }
+    join_sections([
+        SERVER_BASE,
+        SERVER_SEARCH,
+        retrieval_mode_sentence(hybrid, phrase),
+    ])
 }
 
 /// Compose one tool's final description: its compiled base, the
@@ -365,7 +475,8 @@ pub fn append_extension(base: &str, extension: Option<&str>) -> String {
 /// installed into `KbSearchServer`'s description overlay. `extensions_dir`
 /// should already be resolved (see [`resolve_extensions_dir`]) so a caller
 /// that also needs the server's `server.md` extension resolves the
-/// directory only once per call.
+/// directory only once per call. Each composed description goes through
+/// [`warn_if_over_client_cap`].
 pub fn compose_tool_descriptions(
     extensions_dir: Option<&Path>,
     phrase_effective: bool,
@@ -383,7 +494,10 @@ pub fn compose_tool_descriptions(
                 heading_metadata,
                 extension.as_deref(),
             )
-            .map(|desc| (tool.to_string(), desc))
+            .map(|desc| {
+                warn_if_over_client_cap(&format!("{tool} tool description"), &desc);
+                (tool.to_string(), desc)
+            })
         })
         .collect()
 }
@@ -688,7 +802,7 @@ mod tests {
 
     #[test]
     fn compose_server_mechanics_includes_the_retrieval_mode_sentence() {
-        let mechanics = compose_server_mechanics(false, false);
+        let mechanics = compose_server_mechanics(false, false, true);
         assert!(mechanics.contains(retrieval_mode_sentence(false, false)));
         assert!(mechanics.starts_with(SERVER_BASE.trim()));
     }
@@ -922,7 +1036,9 @@ mod tests {
         assert!(s.contains("`chunk`"));
         assert!(s.contains("`document`"));
         assert!(s.contains("`section`"));
-        assert!(s.contains("Defaults to `chunk` with a query"));
+        // The default rule lives on the `granularity` property, not the
+        // tool description.
+        assert!(granularity_description(&ALL).contains("Defaults to `chunk` with a query"));
         assert!(
             !s.contains("heading_prefix"),
             "heading_prefix must be gated on heading_metadata alone: {s}"
@@ -965,8 +1081,7 @@ mod tests {
         let off = granularity_sentence(&ALL, false);
         let on = granularity_sentence(&ALL, true);
         assert!(!off.contains("heading_prefix"));
-        assert!(on.contains("`heading_prefix`"));
-        assert!(on.contains("`[\"Conditions\"]`"));
+        assert!(on.contains(HEADING_PREFIX_SENTENCE));
     }
 
     #[test]
@@ -976,6 +1091,37 @@ mod tests {
         // `section` itself is disabled, as long as heading_metadata is on.
         let s = granularity_sentence(&[Granularity::Chunk, Granularity::Document], true);
         assert!(s.contains("`heading_prefix`"));
+    }
+
+    // --- tool_enabled / top_level_areas_sentence (mcp.disabled_tools) ------
+
+    #[test]
+    fn tool_enabled_is_true_when_not_named_in_disabled_tools() {
+        assert!(tool_enabled("search", &[]));
+        assert!(tool_enabled(
+            "search",
+            &["get_schema".to_string(), "update_schema".to_string()]
+        ));
+    }
+
+    #[test]
+    fn tool_enabled_is_false_when_named_in_disabled_tools() {
+        assert!(!tool_enabled("search", &["search".to_string()]));
+    }
+
+    #[test]
+    fn top_level_areas_sentence_names_search_when_enabled() {
+        let areas = vec!["dev".to_string(), "food".to_string()];
+        let sentence = top_level_areas_sentence(&areas, &ALL, true)
+            .expect("must produce a sentence when search is enabled");
+        assert!(sentence.contains("dev, food"));
+        assert!(sentence.contains("search"));
+    }
+
+    #[test]
+    fn top_level_areas_sentence_is_none_when_search_is_disabled() {
+        let areas = vec!["dev".to_string(), "food".to_string()];
+        assert_eq!(top_level_areas_sentence(&areas, &ALL, false), None);
     }
 
     // --- composed `search` description mentions only enabled values ------
@@ -1007,5 +1153,97 @@ mod tests {
         let desc = compose_tool_description("get_document", false, &ALL, true, None).unwrap();
         assert!(!desc.contains("`granularity`"));
         assert!(!desc.contains("heading_prefix"));
+    }
+
+    // --- description length budget ----------------------------------------
+
+    /// Every non-empty granularity subset, so the budget is checked against
+    /// whichever combination of config-derived sentences is longest rather
+    /// than one assumed to be.
+    const GRANULARITY_SUBSETS: [&[Granularity]; 7] = [
+        &ALL,
+        &[Granularity::Chunk, Granularity::Document],
+        &[Granularity::Chunk, Granularity::Section],
+        &[Granularity::Document, Granularity::Section],
+        &[Granularity::Chunk],
+        &[Granularity::Document],
+        &[Granularity::Section],
+    ];
+
+    #[test]
+    fn every_compiled_tool_description_fits_the_budget_under_every_config() {
+        for tool in TOOL_NAMES {
+            for phrase in [false, true] {
+                for heading_metadata in [false, true] {
+                    for effective in GRANULARITY_SUBSETS {
+                        let desc = compose_tool_description(
+                            tool,
+                            phrase,
+                            effective,
+                            heading_metadata,
+                            None,
+                        )
+                        .unwrap();
+                        let len = desc.chars().count();
+                        assert!(
+                            len <= COMPILED_DESCRIPTION_BUDGET,
+                            "`{tool}` description is {len} chars (phrase={phrase}, \
+                             heading_metadata={heading_metadata}, granularities={effective:?}), \
+                             over the {COMPILED_DESCRIPTION_BUDGET}-char budget that leaves \
+                             room for KB extensions under Claude Code's \
+                             {CLIENT_DESCRIPTION_CAP}-char cap. Move detail onto the \
+                             parameter it governs:\n{desc}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_server_mechanics_fit_the_budget() {
+        // The corpus-dependent remainder is budgeted together with this in
+        // `server.rs`'s realistic-corpus test; this pins the static part.
+        for hybrid in [false, true] {
+            for phrase in [false, true] {
+                let len = compose_server_mechanics(hybrid, phrase, true)
+                    .chars()
+                    .count();
+                assert!(
+                    len <= COMPILED_DESCRIPTION_BUDGET,
+                    "server mechanics are {len} chars (hybrid={hybrid}, phrase={phrase})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn warn_if_over_client_cap_remembers_the_last_warned_length_per_surface() {
+        let surface = "test-only surface";
+        let over = "x".repeat(CLIENT_DESCRIPTION_CAP + 1);
+        warn_if_over_client_cap(surface, &over);
+        assert_eq!(
+            OVER_CAP_WARNED.lock().unwrap().get(surface),
+            Some(&(CLIENT_DESCRIPTION_CAP + 1))
+        );
+        // Back under the cap re-arms the warning for this surface.
+        warn_if_over_client_cap(surface, "short");
+        assert!(OVER_CAP_WARNED.lock().unwrap().get(surface).is_none());
+    }
+
+    #[test]
+    fn granularity_summary_names_only_enabled_values() {
+        assert_eq!(
+            granularity_summary(&ALL),
+            "`granularity` chooses what each result is: `chunk`, `document` or `section`."
+        );
+        assert_eq!(
+            granularity_summary(&[Granularity::Chunk, Granularity::Document]),
+            "`granularity` chooses what each result is: `chunk` or `document`."
+        );
+        assert_eq!(
+            granularity_summary(&[Granularity::Section]),
+            "`granularity` is fixed to `section` on this server."
+        );
     }
 }

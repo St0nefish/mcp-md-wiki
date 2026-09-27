@@ -16,6 +16,73 @@ sample rather than an exhaustive list.
 
 ## [Unreleased]
 
+### MCP tools
+
+- **`mcp.disabled_tools`**: a new config key (default `[]`) disables MCP tools
+  at the server level. A disabled tool disappears from `tools/list`,
+  `tools/get` returns nothing for it, and `tools/call` refuses it with the
+  same `invalid_params("tool not found")` error an unknown tool name gets —
+  `KbSearchServer::enabled_tool_router` builds a fresh `ToolRouter` per
+  request with every configured name disabled (rmcp 1.8's
+  `ToolRouter::disable_route`), so all three code paths agree. Every entry
+  must be one of the six MCP tool names, with no duplicates, and the list may
+  not disable all six — config load fails naming the problem otherwise.
+  Server-instructions sentences that reference a disabled tool by name are
+  dropped: the top-level-areas listing (which points at `search`) disappears
+  when `search` is disabled, and the "call `get_schema` before writing there"
+  prompt disappears when `get_schema` is disabled (the surrounding directory
+  listing itself survives, since it isn't tool-specific). Live-reloadable:
+  read fresh from the live config on every `tools/list`/`tools/get`/
+  `tools/call`, so a `POST /admin/reload` change takes effect starting with
+  the very next request — no restart, no metadata-refresh-tick wait — though
+  an already-connected client that cached an earlier `tools/list` is not
+  proactively notified, since this server does not advertise the
+  `listChanged` tool capability. The web UI's `/api/doc/*` write routes call
+  `write::write_document`/`write::delete_document` directly, not through MCP
+  dispatch, so they are unaffected by this setting. No reindex.
+  **`mcp.enabled_tools`**: an allowlist alternative — `Option<Vec<String>>`,
+  absent by default — that resolves to the complement of `disabled_tools`:
+  every tool NOT named is disabled, computed once at config-resolve time
+  against the same six tool names. Setting both `enabled_tools` and a
+  non-empty `disabled_tools` fails config load, as does an unknown name, a
+  duplicate, or an empty `enabled_tools: []` (which would disable every
+  tool). The resolved effective set is what every downstream reader
+  (`enabled_tool_router`, server instructions, reload reporting) already
+  reads, so an allowlist gets the exact same live-reload and instructions
+  behavior described above with no separate code path. Unlike
+  `disabled_tools`, a tool added to this binary in a future release stays
+  disabled under an existing allowlist until the allowlist itself is updated
+  to name it.
+- **Tool descriptions and server instructions trimmed to fit Claude Code's
+  2048-character cap.** Claude Code truncates each tool description and the
+  server instructions at 2048 characters; `search` (3189), `get_document`
+  (5726) and `write_document` (4977) were all being cut, and the server
+  instructions went over once a KB's `server.md` extension was appended.
+  Descriptions now carry what a tool does, when to use it, and the behavior a
+  model would otherwise get wrong; the detailed rules moved onto the parameter
+  they govern, whose schema descriptions are not truncated: `search`'s
+  granularity details (now only on `granularity`), `path_prefix`'s
+  substring/truncation rules and `filters`' shapes; `get_document`'s
+  `heading_path` resolution tiers, ambiguity/suggestion errors and
+  oversized-section behavior (on `heading_path`/`line`) and outline capping
+  (on `outline`); `write_document`'s per-mode rules (on `content`,
+  `old_string`, `frontmatter_patch`, `append`, `new_path`, `expected_hash`)
+  and the whole batch contract (on `documents`). Tool-to-tool references that
+  would dangle when a tool is disabled via `mcp.disabled_tools` were dropped,
+  and with `search` disabled the server instructions also omit their
+  text-matching/`path_prefix` narrative and retrieval-mode sentence.
+  When every top-level area has its own `.kb-schema.yaml`, the server
+  instructions' scoped-directory line now reads "Every top-level area has its
+  own stricter frontmatter rules, as do: …" and lists only the deeper scopes,
+  instead of repeating the whole areas list.
+  Parameter descriptions no longer leak internal Rust paths or issue numbers.
+  Every compiled + config-derived description, and the server instructions
+  for a realistic corpus, is now held to 1500 characters by tests, leaving
+  ~500 for each per-KB extension; **an extension that pushes a description
+  past 2048 characters is still truncated by Claude Code**, and the server now
+  logs a warning naming the tool (or the server instructions) and its length
+  when that happens. No config change, no reindex.
+
 ### Authentication
 
 - **OAuth is now provider-agnostic, and the recommended way to authenticate.**

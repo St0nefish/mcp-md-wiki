@@ -8,8 +8,12 @@ use chrono::{DateTime, NaiveDate};
 use anyhow::Context as _;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler, handler::server::wrapper::Parameters,
-    model::*, schemars, service::RequestContext, tool, tool_handler, tool_router,
+    ErrorData as McpError, RoleServer, ServerHandler,
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    model::*,
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
 };
 use tracing::{debug, error, warn};
 
@@ -1220,26 +1224,57 @@ pub struct GetDocumentParams {
     /// Relative path, unique basename, or absolute path.
     pub path: String,
     /// First line to return (1-based, inclusive). A range you name yourself is
-    /// served in full, however large. Not combinable with
-    /// `line`/`heading_path`/`outline`.
+    /// served in full, however large — the size limit only applies to reads
+    /// you did not bound. Not combinable with `line`/`heading_path`/`outline`.
     #[serde(default)]
     pub start_line: Option<usize>,
     /// Last line to return (1-based, inclusive). A range you name yourself is
-    /// served in full, however large. Not combinable with
-    /// `line`/`heading_path`/`outline`.
+    /// served in full, however large — the size limit only applies to reads
+    /// you did not bound. Not combinable with `line`/`heading_path`/`outline`.
     #[serde(default)]
     pub end_line: Option<usize>,
-    /// Select a section by any 1-based line in it: the deepest heading whose
-    /// range contains the line (its heading line and intro text belong to
-    /// the section itself). Not combinable with `heading_path`.
+    /// Select a section by any 1-based line in it (must be 1 or greater): the
+    /// deepest heading whose range contains the line. A line on a heading, or
+    /// in the text before its first sub-heading, selects that heading's
+    /// section; a line inside a sub-heading's range selects the sub-heading.
+    /// Names the same section `heading_path` would — never a different read —
+    /// and an oversized section is handled as described there. Not combinable
+    /// with `heading_path` or `start_line`/`end_line`.
     #[serde(default)]
     pub line: Option<usize>,
-    /// Select a section by heading path, e.g. `["Spells", "Fireball"]` — a
-    /// trailing suffix of the full path is enough; each segment is a complete
-    /// heading name, matched ignoring case, whitespace differences and
-    /// invisible characters (but not Unicode normalization form — a
-    /// precomposed accented character does not match a decomposed spelling of
-    /// the same text). Not combinable with `line`.
+    /// Select a section by heading path, e.g. `["Spells", "Fireball"]`. Each
+    /// segment is a complete heading name, in order; none may be empty or
+    /// blank. Resolves in tiers, each only when it names exactly one section:
+    /// the full path; then a trailing suffix (`["Fireball"]` alone is
+    /// enough); then an ordered match that may also skip a middle segment
+    /// (`["Feats", "Dual Wielding"]` matches `Feats > Combat > Dual
+    /// Wielding`). Order still matters: `["Dual Wielding", "Feats"]` does not
+    /// match that section. Matching ignores case, whitespace differences and
+    /// invisible characters such as soft hyphens, but not Unicode
+    /// normalization form — a precomposed `é` does not match `e` + a
+    /// combining accent. Heading text over 200 characters is cut to its first
+    /// 200 in outlines and paths (zero-width joiners, direction marks and
+    /// variation selectors don't count toward that); passing the full text
+    /// still matches.
+    ///
+    /// If it names more than one section (a duplicated exact path, common in
+    /// rulebook conversions, or segments matching several sections in order)
+    /// the error lists every candidate's line range: pick one with `line` when
+    /// their full paths are identical, or a longer or reordered
+    /// `heading_path` otherwise. If nothing resolves, the error may suggest
+    /// sections whose path the segments match in order by a looser
+    /// per-segment substring comparison (`["Dual Wield"]` surfaces `Dual
+    /// Wielding`) — suggestions only, never a resolved read.
+    ///
+    /// A selected section over the size limit that has sub-headings comes
+    /// back as `outline_only: true` — no text, just its sub-heading outline
+    /// (what `outline: true` with this selector returns) — plus, if it has
+    /// text of its own before its first sub-heading, that range as `intro`
+    /// (read it with `start_line`/`end_line`). One with no sub-headings comes
+    /// back flagged `oversized: true`, cut on a line boundary when it exceeds
+    /// the limit — then `truncated: true` and `end_line` (the last line you
+    /// got) say so; read on from `end_line + 1`. Not combinable with `line`
+    /// or `start_line`/`end_line`.
     #[serde(default)]
     pub heading_path: Option<Vec<String>>,
     /// Climb this many parent headings above the selected section (a heading's
@@ -1250,7 +1285,11 @@ pub struct GetDocumentParams {
     pub levels_up: Option<usize>,
     /// Return a heading outline (with line ranges) instead of content: of the
     /// whole document, or — with `line`/`heading_path` — of that section's
-    /// sub-headings.
+    /// sub-headings. Outlines are capped to roughly the size limit's worth of
+    /// headings, keeping the shallowest levels first; a capped outline has
+    /// `truncated: true`, `total_entries` (the uncapped count) and a `hint`
+    /// saying how to reach the rest — usually by outlining one of the listed
+    /// sections. Not combinable with `start_line`/`end_line`.
     #[serde(default)]
     pub outline: Option<bool>,
 }
@@ -1468,15 +1507,24 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
 
-    /// Frontmatter criteria by field (dot-paths).
+    /// Frontmatter criteria keyed by field (dot-paths for nested fields): a
+    /// scalar means equals (`{"type": "guide"}`), an array means any-of, an
+    /// object means all-of or a numeric range
+    /// (`{"planning.prep_minutes": {"lt": 30}}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<SearchFiltersInput>,
 
-    /// Restrict by location: a case-insensitive substring of the document's
-    /// path. Matches anywhere in the path, so it also finds a
-    /// document from a fragment of its name — `stir_fr` finds
-    /// `kitchen/recipes/stir_fry.md`. A short needle is correspondingly broad.
-    /// A trailing slash is optional.
+    /// Restrict by location: a case-insensitive **substring** of the
+    /// document's path, not a prefix. It matches anywhere in the path, so it
+    /// also finds a document from a fragment of its name — `stir_fr` finds
+    /// `kitchen/recipes/stir_fry.md`, and `recipes/` finds everything under
+    /// any `recipes` folder. A trailing slash is optional: `sysadmin/` and
+    /// `sysadmin` behave identically. A short needle is correspondingly
+    /// broad — `sys` matches `sysadmin/` and `archive/old-sys/` alike — so
+    /// prefer the longest fragment you are sure of. A needle matching more
+    /// documents than the server will filter on at once sets
+    /// `path_prefix_truncated: true` on the response, rather than silently
+    /// returning fewer matches than exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
 
@@ -1554,78 +1602,117 @@ pub struct WriteDocumentParams {
     /// `documents` is set for a batch write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Whole file content, including frontmatter.
+    /// The whole file, including YAML frontmatter. Creates `path` if it is
+    /// new, replaces it if it exists. Not combinable with any other edit mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Surgical edit: exact text to replace.
+    /// Exact text to replace with `new_string`, instead of resending the
+    /// whole file. Must occur exactly once in the document. Not combinable
+    /// with `content`, `frontmatter_patch` or `append`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_string: Option<String>,
-    /// Surgical edit: its replacement.
+    /// Replacement for `old_string`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_string: Option<String>,
-    /// Structured frontmatter edits; combines with `append`, not with `content`
-    /// or `old_string`/`new_string`. See `write::FrontmatterEdit`.
+    /// Structured edits to just the frontmatter, leaving the body untouched —
+    /// the usual small edit (flipping `status: draft` to `active`, adding a
+    /// tag) needs no `content` at all. Applied in order, each
+    /// `{operation, field, value}` or `{operation, field, values}` with
+    /// `field` a dot-path: `set_field` sets or replaces a value (`value`);
+    /// `remove_field` deletes a field (errors if it is not set);
+    /// `add_values` appends to a list field, creating it if absent,
+    /// de-duplicated (`values`); `remove_values` removes from a list field
+    /// (errors if it is absent). Combines with `append` (the patch applies
+    /// first), not with `content` or `old_string`/`new_string`.
+    /// `expected_hash` still guards the whole file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontmatter_patch: Option<Vec<FrontmatterPatchOp>>,
-    /// Append this text to the end of the document body; combines with
-    /// `frontmatter_patch`, not with `content` or `old_string`/`new_string`.
+    /// Text to add to the end of the document body, with no need to read or
+    /// resend existing content. Exactly one newline separates it from what
+    /// was already there; include your own blank line in `append` for one.
+    /// Never lands inside the frontmatter block, even for a document with no
+    /// body yet. Combines with `frontmatter_patch` (applied after it), not
+    /// with `content` or `old_string`/`new_string`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append: Option<String>,
-    /// Relocate here; combines with an edit, or stands alone.
+    /// Relocate to this path. Combines with any edit mode, or stands alone
+    /// for a pure move (the server reads the current body itself). Links
+    /// pointing at the document are rewritten for you. If `path` is a
+    /// directory, its whole subtree moves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_path: Option<String>,
     /// Commit message; a default is generated if omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// Stale-read guard: content_hash from a prior get_document.
+    /// Stale-read guard: the `content_hash` from a prior `get_document` read.
+    /// The edit is rejected if the file has changed since. It covers the
+    /// whole file, even for a `frontmatter_patch` that touches only a few
+    /// fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_hash: Option<String>,
     /// Skip the near-duplicate check when creating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_new: Option<bool>,
-    /// Batch write (#180): a list of documents to write together as ONE git
-    /// commit instead of one commit per document. Mutually exclusive with
-    /// `path` and every other field above — a batch call supplies ONLY this
-    /// field (plus, optionally, `message` for the whole batch's commit
-    /// subject). Each entry supports the same content-edit modes as a
-    /// single-document call (`content` / `old_string`+`new_string` /
-    /// `frontmatter_patch` / `append`) but NOT `new_path` — a batch entry
-    /// can create or fully replace a document, not move one; see
-    /// `write::BatchWriteRequest`'s doc comment for why moves are excluded.
-    /// Capped at `write::MAX_BATCH_DOCUMENTS` documents per call.
+    // The cap below is `write::MAX_BATCH_DOCUMENTS`; doc comments cannot
+    // interpolate it, so `batch_documents_description_states_the_real_cap`
+    // pins the number. Moves are excluded per `write::BatchWriteRequest`.
+    /// Batch write: several documents written as ONE commit instead of one
+    /// commit per document — for restructuring related pages, or the same
+    /// kind of change (e.g. a status flip) across a set. A batch call passes
+    /// ONLY this (plus, optionally, `message` as the batch's commit subject);
+    /// `path` and every other top-level field are rejected alongside it.
+    /// Each entry takes the single-document edit modes (`content`,
+    /// `old_string`+`new_string`, `frontmatter_patch`, `append`) with the
+    /// same exclusivity rules, but not `new_path`: a batch can create or
+    /// replace documents, not move them. Every `path` must be unique; at most
+    /// 25 documents per call.
+    ///
+    /// Atomic: every document lands in the one commit, or (if git fails
+    /// before committing) none do and everything this call wrote is rolled
+    /// back — there is no partial success. Frontmatter validation, and the
+    /// near-duplicate check for creates, run for every entry before anything
+    /// is written; a failure lists every offending document in
+    /// `data.failures`. A successful batch's `structured_content` has one
+    /// `outcome`, `sha`, `rebased_paths` and `sync_failure_cause` (one
+    /// commit), plus `documents`: one `{path, is_create, diff,
+    /// diff_truncated, diff_total_bytes}` per document. The text summary has
+    /// every diff in full.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub documents: Option<Vec<BatchDocumentInput>>,
 }
 
-/// One document within a `write_document` batch call (`WriteDocumentParams::documents`).
-/// Field-for-field the same content-edit vocabulary as a single-document
-/// `write_document` call, minus `new_path` (no per-entry moves — see
-/// `WriteDocumentParams::documents`'s doc comment) and minus `message` (the
-/// batch has ONE commit message, supplied once at the top level, not one per
-/// entry).
+// One document within a `write_document` batch call
+// (`WriteDocumentParams::documents`): the single-document content-edit
+// vocabulary minus `new_path` (no per-entry moves) and `message` (the batch
+// has one commit message, supplied once at the top level). A `//` comment,
+// not `///`, so none of this reaches the served schema.
+/// One document in a batch write.
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct BatchDocumentInput {
     /// Document path, relative to the KB root. Must be unique within the batch.
     pub path: String,
-    /// Whole file content, including frontmatter.
+    /// The whole file, including YAML frontmatter. Creates `path` if it is
+    /// new, replaces it if it exists. Not combinable with any other edit mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Surgical edit: exact text to replace.
+    /// Exact text to replace with `new_string`; must occur exactly once.
+    /// Not combinable with `content`, `frontmatter_patch` or `append`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_string: Option<String>,
-    /// Surgical edit: its replacement.
+    /// Replacement for `old_string`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_string: Option<String>,
-    /// Structured frontmatter edits; combines with `append`, not with
-    /// `content` or `old_string`/`new_string`. See `write::FrontmatterEdit`.
+    /// Structured frontmatter edits, same operations as the top-level
+    /// `frontmatter_patch`; combines with `append`, not with `content` or
+    /// `old_string`/`new_string`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontmatter_patch: Option<Vec<FrontmatterPatchOp>>,
     /// Append this text to the end of the document body; combines with
     /// `frontmatter_patch`, not with `content` or `old_string`/`new_string`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append: Option<String>,
-    /// Stale-read guard: content_hash from a prior get_document, checked
-    /// against this document specifically.
+    /// Stale-read guard: the `content_hash` from a prior `get_document` read,
+    /// checked against this document specifically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_hash: Option<String>,
     /// Skip the near-duplicate check when creating this document.
@@ -1633,11 +1720,11 @@ pub struct BatchDocumentInput {
     pub force_new: Option<bool>,
 }
 
-/// One structured frontmatter edit, mirroring `update_schema`'s
-/// `operation`/`field`/`values`/`definition` shape — this codebase's
-/// established idiom for "a structured edit instead of a free-text patch"
-/// (see `UpdateSchemaParams`, `build_schema_edit`) — applied here to a
-/// document's own frontmatter values. See `write::FrontmatterEdit`.
+// Mirrors `update_schema`'s `operation`/`field`/`values`/`definition` shape
+// (`UpdateSchemaParams`, `build_schema_edit`), applied to a document's own
+// frontmatter values; parsed into `write::FrontmatterEdit`. A `//` comment,
+// not `///`, so none of this reaches the served schema.
+/// One structured frontmatter edit.
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct FrontmatterPatchOp {
     /// "set_field" | "remove_field" | "add_values" | "remove_values".
@@ -3075,6 +3162,24 @@ impl KbSearchServer {
         crate::config::load_shared_config(&self.config)
     }
 
+    /// A fresh `tool_router()` with every name in the live `mcp.disabled_tools`
+    /// disabled (`ToolRouter::disable_route`) — the one place `list_tools`,
+    /// `get_tool`, and `call_tool` all build their router from, so the three
+    /// can never disagree about which tools are currently enabled. Reads
+    /// `self.config()` fresh on every call, same live-reload contract as every
+    /// other config consumer here: a `POST /admin/reload` that changes
+    /// `mcp.disabled_tools` is observed starting with the very next request,
+    /// no restart or metadata-refresh-tick wait required (`config::validate`
+    /// has already rejected an unknown or all-disabling set, so every name
+    /// reaching `disable_route` here is one of `descriptions::TOOL_NAMES`).
+    fn enabled_tool_router(&self) -> ToolRouter<Self> {
+        let mut router = Self::tool_router();
+        for name in &self.config().mcp.disabled_tools {
+            router.disable_route(name.clone());
+        }
+        router
+    }
+
     /// Apply the live description overlay to one router-provided `Tool`,
     /// recovering from a poisoned lock the same way `get_info` does for
     /// `instructions`. A tool name absent from the overlay (should not
@@ -3099,8 +3204,9 @@ impl KbSearchServer {
     /// `heading_prefix` disappears from what a caller/model can even see,
     /// not just from prose it might skip: the `granularity` property's
     /// `enum` becomes the effective set and its `description` becomes
-    /// `descriptions::granularity_description` for that set (the same text
-    /// the tool description carries), and `heading_prefix` is removed while
+    /// `descriptions::granularity_description` for that set (the full
+    /// per-value text; the tool description carries only
+    /// `descriptions::granularity_summary`), and `heading_prefix` is removed while
     /// `chunking.heading_metadata` is off. Reads `self.config()` live, same
     /// fresh-snapshot-per-call contract as every other config consumer
     /// here. A no-op for every tool but `search`.
@@ -5924,19 +6030,24 @@ impl ServerHandler for KbSearchServer {
     // macro regenerates the tool list from `Self::tool_router()` (and its
     // compile-time `#[tool(...)]` attributes) on every call, so a description
     // that needs to change at runtime — per `descriptions.rs`'s whole point —
-    // cannot be baked into that attribute. These two methods apply this
-    // server's live `description_overlay`, then the live per-instance schema
-    // restrictions (`overlay_input_schema`, #286), then the stateless
-    // `tool_schema::self_contained` rewrite that strips `$ref`/`$defs` and
-    // boolean subschemas for llama.cpp-backed clients (#288), on top of the
-    // router's own `Tool` entries; `call_tool` is left for the macro to
-    // generate unchanged, since dispatch itself does not depend on either.
+    // cannot be baked into that attribute. All three methods below build their
+    // router from `self.enabled_tool_router()` rather than the bare
+    // `Self::tool_router()`, so a name in the live `mcp.disabled_tools` is
+    // hidden from `list_tools`, absent from `get_tool`, and refused by
+    // `call_tool` — see that method's doc comment for why `#[tool_handler]`
+    // does not generate a conflicting one. `list_tools`/`get_tool` additionally
+    // apply this server's live `description_overlay`, then the live
+    // per-instance schema restrictions (`overlay_input_schema`, #286), then the
+    // stateless `tool_schema::self_contained` rewrite that strips `$ref`/
+    // `$defs` and boolean subschemas for llama.cpp-backed clients (#288), on
+    // top of the router's own `Tool` entries.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let tools = Self::tool_router()
+        let tools = self
+            .enabled_tool_router()
             .list_all()
             .into_iter()
             .map(|tool| self.overlay_description(tool))
@@ -5947,12 +6058,31 @@ impl ServerHandler for KbSearchServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        Self::tool_router()
+        self.enabled_tool_router()
             .get(name)
             .cloned()
             .map(|tool| self.overlay_description(tool))
             .map(|tool| self.overlay_input_schema(tool))
             .map(tool_schema::self_contained)
+    }
+
+    /// Hand-written, rather than left for `#[tool_handler]` to generate
+    /// (`rmcp_macros::tool_handler` only fills in a `call_tool` when the impl
+    /// block does not already define one, so this is not a duplicate): the
+    /// generated version dispatches through the bare `Self::tool_router()`,
+    /// which knows nothing about `mcp.disabled_tools`. This does exactly what
+    /// the macro would — `ToolCallContext::new` plus `.call(tcc).await` — but
+    /// through `self.enabled_tool_router()`, so a disabled tool's `call`
+    /// reaches `ToolRouter::call`'s own disabled-route check and comes back as
+    /// `invalid_params("tool not found")`, identical to an unknown tool name.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let router = self.enabled_tool_router();
+        let tcc = ToolCallContext::new(self, request, context);
+        router.call(tcc).await
     }
 }
 
@@ -9405,6 +9535,64 @@ mod tests {
         assert!(server.get_tool("not_a_real_tool").is_none());
     }
 
+    /// A server whose live config disables a tool: `mcp.disabled_tools`.
+    fn make_test_server_with_disabled_tools(disabled_tools: Vec<String>) -> KbSearchServer {
+        let mut config = make_test_resolved_config(&std::env::temp_dir());
+        Arc::make_mut(&mut config).mcp.disabled_tools = disabled_tools;
+        make_overlay_test_server_with_config(HashMap::new(), config)
+    }
+
+    #[test]
+    fn get_tool_returns_none_for_a_disabled_tool() {
+        // Same contract as an unknown name (`get_tool_returns_none_for_an_unknown_name`
+        // above) — `enabled_tool_router` hides a disabled name from `ToolRouter::get`
+        // exactly the way a genuinely nonexistent one is hidden.
+        let server = make_test_server_with_disabled_tools(vec!["write_document".to_string()]);
+        assert!(
+            server.get_tool("write_document").is_none(),
+            "a disabled tool must not be returned by get_tool"
+        );
+        assert!(
+            server.get_tool("search").is_some(),
+            "an unrelated, still-enabled tool must be unaffected"
+        );
+    }
+
+    #[test]
+    fn enabled_tool_router_omits_every_disabled_name_from_list_all() {
+        let server = make_test_server_with_disabled_tools(vec![
+            "write_document".to_string(),
+            "delete_document".to_string(),
+        ]);
+        let names: Vec<String> = server
+            .enabled_tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+
+        assert!(!names.contains(&"write_document".to_string()));
+        assert!(!names.contains(&"delete_document".to_string()));
+        assert_eq!(names.len(), crate::descriptions::TOOL_NAMES.len() - 2);
+    }
+
+    #[test]
+    fn enabled_tool_router_with_no_disabled_tools_matches_the_bare_tool_router() {
+        let server = make_test_server_with_disabled_tools(Vec::new());
+        let bare: Vec<String> = KbSearchServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let enabled: Vec<String> = server
+            .enabled_tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(bare, enabled);
+    }
+
     // --- input-schema overlay: granularity enum / heading_prefix (#286) ---
 
     fn overlay_test_config(
@@ -9445,9 +9633,8 @@ mod tests {
         );
         // `type` is untouched — still nullable, exactly what schemars produced.
         assert_eq!(granularity["type"], serde_json::json!(["string", "null"]));
-        // The property description is the effective-set text, identical to
-        // what the tool description carries — never the static doc comment,
-        // and never mentioning the disabled `section`.
+        // The property description is the effective-set text — never the
+        // static doc comment, and never mentioning the disabled `section`.
         let description = granularity["description"].as_str().unwrap();
         assert_eq!(
             description,
@@ -15708,5 +15895,63 @@ mod tests {
             text.contains("Lower limit"),
             "must point at limit instead: {text}"
         );
+    }
+
+    /// `WriteDocumentParams::documents`'s doc comment states the batch cap as a
+    /// literal (doc comments cannot interpolate a const); this keeps that
+    /// served number in step with `write::MAX_BATCH_DOCUMENTS`.
+    #[test]
+    fn batch_documents_description_states_the_real_cap() {
+        let schema = schemars::schema_for!(WriteDocumentParams);
+        let description = schema.as_value()["properties"]["documents"]["description"]
+            .as_str()
+            .expect("documents must carry a description");
+        let expected = format!("at most\n{} documents per call", write::MAX_BATCH_DOCUMENTS);
+        assert!(
+            description
+                .replace('\n', " ")
+                .contains(&expected.replace('\n', " ")),
+            "documents description must state the real cap ({}): {description}",
+            write::MAX_BATCH_DOCUMENTS
+        );
+    }
+
+    /// Doc comments on schemars-derived parameter types become the served
+    /// input schema; none may leak Rust paths, issue numbers or notes aimed at
+    /// this codebase's maintainers.
+    #[test]
+    fn served_tool_schemas_carry_no_internal_references() {
+        let server = make_overlay_test_server_with_config(
+            HashMap::new(),
+            overlay_test_config(&Granularity::ALL, true),
+        );
+        let leaks = |d: &str| {
+            ["::", "doc comment", "codebase"]
+                .iter()
+                .any(|n| d.contains(n))
+                || d.as_bytes()
+                    .windows(2)
+                    .any(|w| w[0] == b'#' && w[1].is_ascii_digit())
+        };
+        for name in crate::descriptions::TOOL_NAMES {
+            let tool = server.get_tool(name).unwrap();
+            let schema = serde_json::Value::Object((*tool.input_schema).clone());
+            let mut stack = vec![&schema];
+            while let Some(value) = stack.pop() {
+                match value {
+                    serde_json::Value::Object(map) => {
+                        if let Some(serde_json::Value::String(d)) = map.get("description") {
+                            assert!(
+                                !leaks(d),
+                                "`{name}` schema description leaks an internal reference: {d}"
+                            );
+                        }
+                        stack.extend(map.values());
+                    }
+                    serde_json::Value::Array(items) => stack.extend(items),
+                    _ => {}
+                }
+            }
+        }
     }
 }
