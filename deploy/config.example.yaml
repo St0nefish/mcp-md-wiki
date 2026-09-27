@@ -496,10 +496,45 @@ mcp:
   # since this default is relative to source.data_path.
   # An absolute value is accepted but is NOT reachable through write_document
   # (logged once at startup). Empty ("") disables extension loading entirely.
+  # Length: Claude Code truncates each tool description and the server
+  # instructions at 2048 characters. The compiled + config-derived text stays
+  # under 1500, so keep each extension body under ~500 characters; a composed
+  # description over 2048 is logged as a warning naming the tool.
   # Live-reloadable: re-resolved by the periodic metadata-refresh timer below,
   # so a change takes effect within metadata_refresh_secs of a POST
   # /admin/reload.
   # extensions_path: "meta/mcp"
+
+  # MCP tool names to disable at the server level: hidden from tools/list,
+  # tools/get returns nothing for them, and tools/call refuses them with the
+  # same error as an unknown tool name. Valid names are search, get_document,
+  # write_document, delete_document, get_schema, update_schema — every entry
+  # must be one of these, with no duplicates, and the list may not name every
+  # tool (config load fails otherwise). The web UI's own /api/doc/* write
+  # routes call write::write_document/delete_document directly rather than
+  # going through MCP dispatch, so they are unaffected by this setting.
+  # Live-reloadable: KbSearchServer::enabled_tool_router reads this fresh on
+  # every tools/list, tools/get, and tools/call, so a change takes effect
+  # starting with the very next request — no metadata_refresh_secs wait, no
+  # restart. An already-connected client that cached an earlier tools/list is
+  # not notified (this server does not advertise the listChanged capability).
+  # Mutually exclusive with enabled_tools below — set one or the other, never
+  # both (config load fails if both are set).
+  # disabled_tools: []
+
+  # Allowlist alternative to disabled_tools above: when set, every tool NOT
+  # named here is disabled, exactly as if it had been listed in
+  # disabled_tools. Unset (the default) means no allowlist is in effect and
+  # disabled_tools applies as-is. Same name/duplicate rules as
+  # disabled_tools, plus: an empty list (enabled_tools: []) is rejected, since
+  # it would disable every tool. Mutually exclusive with disabled_tools —
+  # config load fails if both are set.
+  # A tool added to this binary in a later release is NOT automatically
+  # enabled under an allowlist — it stays disabled until this list is updated
+  # to name it, unlike disabled_tools, where a new tool starts enabled unless
+  # named there.
+  # Live-reloadable, same as disabled_tools above.
+  # enabled_tools: [search, get_document, get_schema]
 
 
 # ----------------------------------------------------------------------------

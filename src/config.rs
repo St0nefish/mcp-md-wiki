@@ -551,6 +551,35 @@ pub struct McpConfig {
     /// of OAuth keeps parsing and keeps behaving exactly as it did.
     #[serde(default)]
     pub oauth: OAuthConfig,
+    /// MCP tool names to disable at the server level — hidden from `tools/list`,
+    /// `tools/get` returns `None`, and `tools/call` refuses them the same way it
+    /// refuses an unknown tool name. Empty (the default) disables nothing.
+    ///
+    /// Every entry must be one of `descriptions::TOOL_NAMES` (a cross-module edge
+    /// from config validation into `descriptions.rs`'s tool-name list — the one
+    /// place both this check and `mcp.rs`'s dispatch agree on which names are
+    /// real), duplicate-free, and must not name every tool at once. Mutually
+    /// exclusive with `enabled_tools` below — see [`Config::resolve`]'s
+    /// validation.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+    /// Allowlist alternative to `disabled_tools` above: when set, every tool NOT
+    /// named here is disabled, exactly as if it had been listed in
+    /// `disabled_tools`. `None` (the default, and distinct from `Some(vec![])`)
+    /// means no allowlist is in effect and `disabled_tools` applies as-is.
+    ///
+    /// Because the effective set is computed once at resolve time from whichever
+    /// list is currently a fixed set of `descriptions::TOOL_NAMES`, a tool added
+    /// to this binary in a later release is NOT automatically enabled for a
+    /// deployment using this allowlist — it stays disabled until the allowlist
+    /// is updated to name it. `disabled_tools`-style configuration does not have
+    /// this trap: a newly added tool starts enabled unless named there.
+    ///
+    /// Setting both this and a non-empty `disabled_tools` is rejected at
+    /// validation, as is naming an unknown tool, a duplicate, or an empty list
+    /// (which would disable every tool) — see [`Config::resolve`].
+    #[serde(default)]
+    pub enabled_tools: Option<Vec<String>>,
 }
 
 impl Default for McpConfig {
@@ -563,6 +592,8 @@ impl Default for McpConfig {
             allowed_hosts: Vec::new(),
             extensions_path: default_extensions_path(),
             oauth: OAuthConfig::default(),
+            disabled_tools: Vec::new(),
+            enabled_tools: None,
         }
     }
 }
@@ -950,6 +981,15 @@ pub struct ResolvedMcpConfig {
     pub extensions_path: String,
     /// `Some` exactly when `mcp.oauth.enabled` was true and validation passed.
     pub oauth: Option<ResolvedOAuthConfig>,
+    /// The EFFECTIVE disabled-tool set — not necessarily `McpConfig::disabled_tools`
+    /// verbatim. When `McpConfig::enabled_tools` is `Some(list)`, this is
+    /// `descriptions::TOOL_NAMES` minus `list` (in `TOOL_NAMES` order); otherwise
+    /// it is the configured `disabled_tools` unchanged. Every downstream reader
+    /// (`KbSearchServer::enabled_tool_router`, `descriptions::tool_enabled`,
+    /// `server::build_instructions`) reads this field and needs no knowledge of
+    /// `enabled_tools` at all. Validated in [`Config::resolve`], so a live
+    /// `ResolvedConfig` never carries an unknown, duplicate, or all-disabling set.
+    pub disabled_tools: Vec<String>,
 }
 
 impl Default for ResolvedMcpConfig {
@@ -963,6 +1003,7 @@ impl Default for ResolvedMcpConfig {
             allowed_hosts: Vec::new(),
             extensions_path: default_extensions_path(),
             oauth: None,
+            disabled_tools: Vec::new(),
         }
     }
 }
@@ -1516,6 +1557,8 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("mcp.metadata_refresh_secs", "mcp"),
     ("mcp.allowed_hosts", "mcp"),
     ("mcp.extensions_path", "mcp"),
+    ("mcp.disabled_tools", "mcp"),
+    ("mcp.enabled_tools", "mcp"),
     ("mcp.oauth.enabled", "mcp"),
     ("mcp.oauth.issuer", "mcp"),
     ("mcp.oauth.jwks_uri", "mcp"),
@@ -1648,6 +1691,53 @@ fn yaml_top_level_sections(content: &str) -> HashSet<&'static str> {
         .copied()
         .filter(|section| mapping.contains_key(serde_yaml_ng::Value::String((*section).into())))
         .collect()
+}
+
+/// Validates a tool-name list — `mcp.disabled_tools` or `mcp.enabled_tools` — against
+/// `descriptions::TOOL_NAMES`: bails naming every unknown name at once, then bails on
+/// the first duplicate. Shared by both settings' validation in
+/// [`Config::resolve_inner`] since this much of the check is identical between a
+/// blocklist and an allowlist; each setting's own axis (a blocklist must not disable
+/// every tool, an allowlist must not be empty) is checked separately by the caller,
+/// since the two mean opposite things for the same edge case.
+///
+/// Cross-module edge: `descriptions::TOOL_NAMES` is the one place both this check and
+/// `mcp.rs`'s dispatch (`KbSearchServer::enabled_tool_router`) agree on which tool
+/// names are real, so a typo here is caught at startup rather than silently doing
+/// nothing (an unknown name in `ToolRouter::disable_route` is a no-op) or crashing a
+/// live `tools/call`.
+fn validate_tool_name_list(names: &[String], setting: &str) -> anyhow::Result<()> {
+    let valid: std::collections::HashSet<&str> =
+        crate::descriptions::TOOL_NAMES.iter().copied().collect();
+    let mut unknown: Vec<&str> = names
+        .iter()
+        .map(|t| t.as_str())
+        .filter(|t| !valid.contains(t))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        unknown.dedup();
+        anyhow::bail!(
+            "{setting} names unknown tool(s): {} — valid names are {}",
+            unknown.join(", "),
+            crate::descriptions::TOOL_NAMES.join(", ")
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicates: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !seen.insert(*t))
+        .collect();
+    if !duplicates.is_empty() {
+        duplicates.sort_unstable();
+        duplicates.dedup();
+        anyhow::bail!(
+            "{setting} contains duplicate value(s): {}",
+            duplicates.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Fully resolved configuration — all required fields validated and present.
@@ -2020,6 +2110,35 @@ impl Config {
         if self.mcp.metadata_refresh_secs < 10 {
             anyhow::bail!("mcp.metadata_refresh_secs must be >= 10");
         }
+        {
+            // `enabled_tools` (an allowlist) and a non-empty `disabled_tools` (a
+            // blocklist) are two ways of saying the same thing from opposite
+            // directions — allowing both at once would leave it ambiguous which
+            // one the resolved effective set should follow, so exactly one may be
+            // set. `enabled_tools: Some([])` is deliberately not "no allowlist";
+            // it is checked below.
+            if self.mcp.enabled_tools.is_some() && !self.mcp.disabled_tools.is_empty() {
+                anyhow::bail!("set one of mcp.enabled_tools / mcp.disabled_tools, not both");
+            }
+            validate_tool_name_list(&self.mcp.disabled_tools, "mcp.disabled_tools")?;
+            if self.mcp.disabled_tools.len() == crate::descriptions::TOOL_NAMES.len() {
+                anyhow::bail!(
+                    "mcp.disabled_tools disables every tool ({}) — the server would have no \
+                     usable MCP surface at all",
+                    crate::descriptions::TOOL_NAMES.join(", ")
+                );
+            }
+            if let Some(enabled) = &self.mcp.enabled_tools {
+                validate_tool_name_list(enabled, "mcp.enabled_tools")?;
+                if enabled.is_empty() {
+                    anyhow::bail!(
+                        "mcp.enabled_tools is empty — that would disable every tool ({}); name \
+                         at least one, or omit mcp.enabled_tools entirely",
+                        crate::descriptions::TOOL_NAMES.join(", ")
+                    );
+                }
+            }
+        }
         if self.indexing.reconcile_interval_secs == 0 {
             anyhow::bail!("indexing.reconcile_interval_secs must be >= 1");
         }
@@ -2121,15 +2240,41 @@ impl Config {
             },
             validation: self.validation,
             webhook: self.webhook,
-            mcp: ResolvedMcpConfig {
-                port: mcp_port,
-                bearer_token_env: self.mcp.bearer_token_env,
-                allow_unauthenticated: self.mcp.allow_unauthenticated,
-                instructions: self.mcp.instructions,
-                metadata_refresh_secs: self.mcp.metadata_refresh_secs,
-                allowed_hosts: self.mcp.allowed_hosts,
-                extensions_path: self.mcp.extensions_path,
-                oauth,
+            mcp: {
+                // `enabled_tools` (an allowlist) resolves to its complement against
+                // `descriptions::TOOL_NAMES` — everything not named is what ends up
+                // disabled. `Config::resolve_inner`'s validation above has already
+                // rejected an unknown/duplicate/empty allowlist and the both-set
+                // case, so this is a plain set difference. Absent, the configured
+                // `disabled_tools` passes through unchanged — the pre-allowlist
+                // behavior. Every downstream reader of `ResolvedMcpConfig::
+                // disabled_tools` (`KbSearchServer::enabled_tool_router`,
+                // `descriptions::tool_enabled`, `server::build_instructions`) reads
+                // this one effective field and needs no knowledge of `enabled_tools`
+                // at all.
+                let effective_disabled_tools = match &self.mcp.enabled_tools {
+                    Some(enabled) => {
+                        let enabled_set: std::collections::HashSet<&str> =
+                            enabled.iter().map(String::as_str).collect();
+                        crate::descriptions::TOOL_NAMES
+                            .iter()
+                            .filter(|t| !enabled_set.contains(*t))
+                            .map(|t| t.to_string())
+                            .collect()
+                    }
+                    None => self.mcp.disabled_tools,
+                };
+                ResolvedMcpConfig {
+                    port: mcp_port,
+                    bearer_token_env: self.mcp.bearer_token_env,
+                    allow_unauthenticated: self.mcp.allow_unauthenticated,
+                    instructions: self.mcp.instructions,
+                    metadata_refresh_secs: self.mcp.metadata_refresh_secs,
+                    allowed_hosts: self.mcp.allowed_hosts,
+                    extensions_path: self.mcp.extensions_path,
+                    oauth,
+                    disabled_tools: effective_disabled_tools,
+                }
             },
             rate_limit: self.rate_limit,
             write: self.write,
@@ -3198,6 +3343,163 @@ mcp:
     fn search_granularities_custom_subset_round_trips() {
         let cfg = Config::from_str_raw("search:\n  granularities: [document]\n").unwrap();
         assert_eq!(cfg.search.granularities, vec![Granularity::Document]);
+    }
+
+    #[test]
+    fn mcp_disabled_tools_unknown_names_are_all_named_at_once() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("mcp:\n  disabled_tools: [bogus_tool, search, another_bogus]\n")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bogus_tool"), "{msg}");
+        assert!(msg.contains("another_bogus"), "{msg}");
+        assert!(
+            msg.contains("mcp.disabled_tools names unknown tool(s)"),
+            "{msg}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_disabled_tools_duplicate_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("mcp:\n  disabled_tools: [search, search]\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mcp.disabled_tools contains duplicate value(s): search"),
+            "got: {err}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_disabled_tools_disabling_every_tool_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let all = crate::descriptions::TOOL_NAMES.join(", ");
+        let err = Config::from_str(&format!("mcp:\n  disabled_tools: [{all}]\n")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mcp.disabled_tools disables every tool"),
+            "got: {err}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_disabled_tools_valid_subset_is_accepted() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let cfg = Config::from_str("mcp:\n  disabled_tools: [write_document, delete_document]\n")
+            .expect("a valid, non-exhaustive subset must be accepted");
+        assert_eq!(
+            cfg.mcp.disabled_tools,
+            vec!["write_document".to_string(), "delete_document".to_string()]
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_disabled_tools_absent_enabled_tools_falls_back_to_disabled_tools() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let cfg = Config::from_str("mcp:\n  disabled_tools: [search]\n")
+            .expect("disabled_tools alone, with no enabled_tools, must resolve unchanged");
+        assert_eq!(cfg.mcp.disabled_tools, vec!["search".to_string()]);
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_enabled_tools_resolves_to_the_complement() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let cfg = Config::from_str("mcp:\n  enabled_tools: [search, get_document]\n")
+            .expect("a valid allowlist must be accepted");
+        // Complement of {search, get_document} within TOOL_NAMES, in TOOL_NAMES order.
+        assert_eq!(
+            cfg.mcp.disabled_tools,
+            vec![
+                "write_document".to_string(),
+                "delete_document".to_string(),
+                "get_schema".to_string(),
+                "update_schema".to_string(),
+            ]
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_enabled_tools_naming_every_tool_disables_nothing() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let all = crate::descriptions::TOOL_NAMES.join(", ");
+        let cfg = Config::from_str(&format!("mcp:\n  enabled_tools: [{all}]\n"))
+            .expect("naming every tool in the allowlist must be accepted");
+        assert!(
+            cfg.mcp.disabled_tools.is_empty(),
+            "got: {:?}",
+            cfg.mcp.disabled_tools
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_enabled_tools_and_disabled_tools_both_set_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str(
+            "mcp:\n  enabled_tools: [search]\n  disabled_tools: [write_document]\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("set one of mcp.enabled_tools / mcp.disabled_tools, not both"),
+            "got: {err}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_enabled_tools_unknown_names_are_all_named_at_once() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("mcp:\n  enabled_tools: [bogus_tool, search, another_bogus]\n")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bogus_tool"), "{msg}");
+        assert!(msg.contains("another_bogus"), "{msg}");
+        assert!(
+            msg.contains("mcp.enabled_tools names unknown tool(s)"),
+            "{msg}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_enabled_tools_duplicate_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("mcp:\n  enabled_tools: [search, search]\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mcp.enabled_tools contains duplicate value(s): search"),
+            "got: {err}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_enabled_tools_empty_list_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("mcp:\n  enabled_tools: []\n").unwrap_err();
+        assert!(
+            err.to_string().contains("mcp.enabled_tools is empty"),
+            "got: {err}"
+        );
+        clear_required_env();
     }
 
     /// A minimal but fully-populated `ResolvedConfig` for tests that need to

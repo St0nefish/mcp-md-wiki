@@ -616,6 +616,36 @@ const DIFF_TABLE: &[DiffField] = &[
                    on the next tick, within mcp.metadata_refresh_secs seconds.",
         }],
     },
+    DiffField {
+        // `get` reads `ResolvedConfig::mcp.disabled_tools`, which is the EFFECTIVE
+        // disabled set (`config::Config::resolve_inner`): either the configured
+        // blocklist verbatim, or — when `mcp.enabled_tools` (an allowlist) is set
+        // instead — its complement against `descriptions::TOOL_NAMES`. A reload that
+        // changes either YAML key changes this one resolved value, so one `DiffField`
+        // reading it correctly reports both; `mcp.enabled_tools` itself is in
+        // `RELOAD_DIFF_EXCLUDED` below rather than a second `DiffField`, since
+        // `DiffField::get` returns one value per `ResolvedConfig` snapshot and this is
+        // it.
+        path: "mcp.disabled_tools",
+        get: |c| Some(d(&c.mcp.disabled_tools)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "mcp.enabled_tools / mcp.disabled_tools",
+            note: "`KbSearchServer::enabled_tool_router` (mcp.rs) reads the resolved effective \
+                   disabled set fresh from the live config on every tools/list, tools/get, and \
+                   tools/call — a changed set (from either key) takes effect starting with the \
+                   very next request, no metadata-refresh-tick or restart wait. An \
+                   already-connected client is not notified: this server does not advertise the \
+                   `listChanged` tool capability, so no notifications/tools/list_changed is \
+                   sent — a client that cached an earlier tools/list keeps offering a \
+                   now-disabled tool until it calls tools/list again, though the call itself is \
+                   still refused. The cross-reference sentences naming search/get_schema in \
+                   server instructions (descriptions.rs top_level_areas_sentence, server.rs's \
+                   scoped-schema-directories sentence) DO follow this on the same \
+                   metadata-refresh-tick cadence as every other instructions input, since they \
+                   are computed by compose_server_instructions.",
+        }],
+    },
     // ── mcp.oauth ────────────────────────────────────────────────────────────
     // The whole block is restart-required for the same reason `mcp.bearer_token_env`
     // is: `AuthState` — including the `OAuthValidator` and its JWKS cache — is built
@@ -1444,6 +1474,59 @@ mod tests {
     }
 
     #[test]
+    fn mcp_disabled_tools_is_reported_as_applied() {
+        // `KbSearchServer::enabled_tool_router` (mcp.rs) reads `mcp.disabled_tools`
+        // fresh from the live config on every tools/list, tools/get, and
+        // tools/call — no restart or metadata-refresh-tick wait, unlike the
+        // instructions cross-reference sentences that also depend on it.
+        let mut old = base_config();
+        let mut new = base_config();
+        old.mcp.disabled_tools = vec![];
+        new.mcp.disabled_tools = vec!["write_document".to_string()];
+
+        let report = diff(&old, &new);
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(
+            report.applied[0].setting,
+            "mcp.enabled_tools / mcp.disabled_tools"
+        );
+        assert!(report.restart_required.is_empty());
+        assert!(report.reindex_required.is_empty());
+        assert!(report.reindex_scheduled.is_empty());
+    }
+
+    #[test]
+    fn mcp_enabled_tools_change_is_reported_under_the_same_applied_entry() {
+        // `mcp.enabled_tools` (an allowlist) has no `ResolvedConfig` field of its
+        // own — `Config::resolve_inner` folds it into `ResolvedConfig::mcp.
+        // disabled_tools` (the effective set) before this module ever sees it, so a
+        // reload that changes ONLY `mcp.enabled_tools` in YAML is, at this level,
+        // indistinguishable from a `disabled_tools` change: this pins that it still
+        // surfaces, under the shared "mcp.enabled_tools / mcp.disabled_tools"
+        // applied entry, exactly the way `mcp_disabled_tools_is_reported_as_applied`
+        // above pins the blocklist side.
+        let mut old = base_config();
+        let mut new = base_config();
+        old.mcp.disabled_tools = vec![]; // no allowlist, no blocklist configured
+        // `enabled_tools: [search]` resolves to this complement against
+        // `descriptions::TOOL_NAMES`.
+        new.mcp.disabled_tools = vec![
+            "get_document".to_string(),
+            "write_document".to_string(),
+            "delete_document".to_string(),
+            "get_schema".to_string(),
+            "update_schema".to_string(),
+        ];
+
+        let report = diff(&old, &new);
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(
+            report.applied[0].setting,
+            "mcp.enabled_tools / mcp.disabled_tools"
+        );
+    }
+
+    #[test]
     fn validation_lint_timeout_secs_is_reported_as_applied() {
         // Same story as `search_phrase_is_reported_as_applied` above.
         let mut old = base_config();
@@ -1457,9 +1540,18 @@ mod tests {
     }
 
     /// Dotted [`Config`] leaf paths with no `ResolvedConfig` field to diff — see
-    /// [`DIFF_TABLE`]'s doc comment for why these two, specifically, are excluded
-    /// rather than covered by a `DiffField`.
-    const RELOAD_DIFF_EXCLUDED: &[&str] = &["embedding.api_key_env", "reranking.api_key_env"];
+    /// [`DIFF_TABLE`]'s doc comment for why `embedding.api_key_env`/
+    /// `reranking.api_key_env` are excluded. `mcp.enabled_tools` is excluded for a
+    /// different reason: it has no `ResolvedConfig` field of its own (by design —
+    /// see `ResolvedMcpConfig::disabled_tools`'s doc comment in config.rs) because
+    /// `Config::resolve_inner` folds it into `ResolvedConfig::mcp.disabled_tools`
+    /// before this module ever sees it, and the `mcp.disabled_tools` `DiffField`
+    /// above already reports a change to either key.
+    const RELOAD_DIFF_EXCLUDED: &[&str] = &[
+        "embedding.api_key_env",
+        "reranking.api_key_env",
+        "mcp.enabled_tools",
+    ];
 
     #[test]
     fn reload_diff_settings_matches_every_yaml_reloadable_config_field() {

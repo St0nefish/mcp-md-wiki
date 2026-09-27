@@ -1543,9 +1543,9 @@ pub fn build_authoring_section(frontmatter: &FrontmatterConfig) -> String {
     // frontmatter lint, so an MCP-authored document plants a pre-commit failure that
     // surfaces later in an unrelated commit.
     lines.push(
-        "Do NOT write a `domain` field. It is derived from the document's top-level \
-         folder — putting the file in the right directory is what sets it. It remains a \
-         search filter, but authoring it is an error."
+        "Do NOT write a `domain` field: it is derived from the document's top-level \
+         folder, so the directory you write to sets it. It remains a search filter, but \
+         authoring it is an error."
             .to_string(),
     );
 
@@ -1583,6 +1583,7 @@ fn top_level_areas(data_path: &Path) -> Vec<String> {
 /// has them, and facets are consulted only for fields with no declared set to fall back
 /// to (issue #77 — a permitted-but-unused value like `archived` must still be
 /// advertised, not silently hidden until something adopts it).
+#[allow(clippy::too_many_arguments)]
 async fn build_instructions(
     base: &str,
     qdrant: &QdrantStore,
@@ -1591,6 +1592,7 @@ async fn build_instructions(
     schemas: &SchemaCache,
     frontmatter: &FrontmatterConfig,
     effective_granularities: &[config::Granularity],
+    disabled_tools: &[String],
 ) -> String {
     const MAX_VALUES_PER_FIELD: usize = 50;
     /// Cap on scoped-schema directories listed, so instruction size stays bounded
@@ -1600,14 +1602,20 @@ async fn build_instructions(
     let mut instructions = base.to_string();
 
     let areas = top_level_areas(data_path);
+    let mut areas_listed = false;
     if !areas.is_empty() {
         // Only offers an exhaustive no-query listing when an enabled
-        // granularity can serve one (#286).
-        instructions.push('\n');
-        instructions.push_str(&descriptions::top_level_areas_sentence(
+        // granularity can serve one (#286); dropped entirely when `search`
+        // itself is disabled (`mcp.disabled_tools`).
+        if let Some(sentence) = descriptions::top_level_areas_sentence(
             &areas,
             effective_granularities,
-        ));
+            descriptions::tool_enabled("search", disabled_tools),
+        ) {
+            instructions.push('\n');
+            instructions.push_str(&sentence);
+            areas_listed = true;
+        }
     }
 
     // Only root-level vocabularies are enumerated here. Listing every scope's values
@@ -1681,15 +1689,53 @@ async fn build_instructions(
         .scope_paths()
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| sanitize_facet_value(&format!("{}/", p.display())))
-        .take(MAX_SCOPES_LISTED)
         .collect();
+    // When every top-level area already listed above has its own schema,
+    // naming them all again would repeat the areas line verbatim — the
+    // instructions share Claude Code's 2048-char cap with the KB's `server.md`
+    // extension, so the line says "every top-level area" and lists only the
+    // deeper scopes.
+    let every_area_scoped = areas_listed
+        && areas
+            .iter()
+            .all(|area| scoped.iter().any(|s| *s == format!("{area}/")));
     if !scoped.is_empty() {
-        instructions.push_str(&format!(
-            "\nDirectories with their own stricter frontmatter rules: {}. \
-             Call get_schema with a path before writing there — the rules above are \
-             root-level only and may not be complete for a given location.",
-            scoped.join(", ")
-        ));
+        if every_area_scoped {
+            let deeper: Vec<&str> = scoped
+                .iter()
+                .filter(|s| !areas.iter().any(|area| **s == format!("{area}/")))
+                .map(String::as_str)
+                .take(MAX_SCOPES_LISTED)
+                .collect();
+            if deeper.is_empty() {
+                instructions
+                    .push_str("\nEvery top-level area has its own stricter frontmatter rules.");
+            } else {
+                instructions.push_str(&format!(
+                    "\nEvery top-level area has its own stricter frontmatter rules, as do: {}.",
+                    deeper.join(", ")
+                ));
+            }
+        } else {
+            let listed: Vec<&str> = scoped
+                .iter()
+                .map(String::as_str)
+                .take(MAX_SCOPES_LISTED)
+                .collect();
+            instructions.push_str(&format!(
+                "\nDirectories with their own stricter frontmatter rules: {}.",
+                listed.join(", ")
+            ));
+        }
+        // The call-to-action names `get_schema` specifically, so it is dropped
+        // when that tool is disabled (`mcp.disabled_tools`) rather than
+        // pointing a caller at a tool `tools/call` would refuse.
+        if descriptions::tool_enabled("get_schema", disabled_tools) {
+            instructions.push_str(
+                " Call get_schema with a path before writing there — the rules above are \
+                 root-level only.",
+            );
+        }
     }
 
     instructions.push_str(&build_authoring_section(frontmatter));
@@ -1703,7 +1749,8 @@ async fn build_instructions(
 /// authoring rules), then the KB's `server.md` extension — or, failing that,
 /// the deprecated `mcp.instructions` — appended last via
 /// `descriptions::append_extension`. See `descriptions.rs`'s module doc for
-/// why the KB extension must come after everything else.
+/// why the KB extension must come after everything else. The result goes
+/// through `descriptions::warn_if_over_client_cap`.
 ///
 /// Called once at startup and again on every metadata-refresh tick, so every
 /// input here must be read fresh from `config`/`schemas` rather than captured
@@ -1722,7 +1769,11 @@ pub(crate) async fn compose_server_instructions(
     // (e.g. an older Qdrant that rejected the phrase-matching text index).
     let phrase_effective =
         config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available();
-    let mechanics = descriptions::compose_server_mechanics(config.search.hybrid, phrase_effective);
+    let mechanics = descriptions::compose_server_mechanics(
+        config.search.hybrid,
+        phrase_effective,
+        descriptions::tool_enabled("search", &config.mcp.disabled_tools),
+    );
     let full = build_instructions(
         &mechanics,
         qdrant,
@@ -1731,6 +1782,7 @@ pub(crate) async fn compose_server_instructions(
         schemas,
         &config.frontmatter,
         &config.effective_granularities(),
+        &config.mcp.disabled_tools,
     )
     .await;
 
@@ -1755,7 +1807,9 @@ pub(crate) async fn compose_server_instructions(
         warn!("extension-loading blocking task panicked: {e}");
         None
     });
-    descriptions::append_extension(&full, effective_extension.as_deref())
+    let composed = descriptions::append_extension(&full, effective_extension.as_deref());
+    descriptions::warn_if_over_client_cap("server instructions", &composed);
+    composed
 }
 
 /// Compose the current per-tool description overlay — every tool's compiled
@@ -4041,6 +4095,7 @@ mod tests {
             &schemas,
             &frontmatter,
             &config::Granularity::ALL,
+            &[],
         )
         .await;
 
@@ -4052,6 +4107,204 @@ mod tests {
             !instructions.contains("Available tags"),
             "an undeclared field falls back to facets, which are unreachable here: {instructions}"
         );
+    }
+
+    // --- build_instructions cross-references omit a disabled tool ---------
+
+    /// Both the top-level-areas sentence (names `search`) and the scoped-schema
+    /// call-to-action (names `get_schema`) must stop naming their tool once
+    /// `mcp.disabled_tools` disables it, so instructions never point a caller
+    /// at a tool `tools/call` would refuse.
+    async fn build_instructions_for_disabled_tools_test(disabled_tools: &[String]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("dev")).unwrap();
+        std::fs::create_dir_all(dir.path().join("food")).unwrap();
+        std::fs::write(
+            dir.path().join("food/.kb-schema.yaml"),
+            "fields:\n  prep:\n    type: integer\n    indexed: true\n",
+        )
+        .unwrap();
+        let frontmatter = FrontmatterConfig::default();
+        let schemas = SchemaCache::build(dir.path(), &frontmatter);
+
+        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
+            url: "http://127.0.0.1:1".into(),
+            collection: "unused".into(),
+        })
+        .expect("client construction is lazy and must not require a live server");
+
+        build_instructions(
+            "base",
+            &qdrant,
+            "unused",
+            dir.path(),
+            &schemas,
+            &frontmatter,
+            &config::Granularity::ALL,
+            disabled_tools,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn build_instructions_drops_the_top_level_areas_sentence_when_search_is_disabled() {
+        let enabled = build_instructions_for_disabled_tools_test(&[]).await;
+        assert!(
+            enabled.contains("Top-level areas of this knowledge base"),
+            "{enabled}"
+        );
+
+        let disabled = build_instructions_for_disabled_tools_test(&["search".to_string()]).await;
+        assert!(
+            !disabled.contains("Top-level areas of this knowledge base"),
+            "search is disabled, so the sentence pointing at it must be dropped: {disabled}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_instructions_drops_the_get_schema_call_to_action_when_get_schema_is_disabled() {
+        let enabled = build_instructions_for_disabled_tools_test(&[]).await;
+        assert!(
+            enabled.contains("Directories with their own stricter frontmatter rules"),
+            "{enabled}"
+        );
+        assert!(enabled.contains("Call get_schema with a path"), "{enabled}");
+
+        let disabled =
+            build_instructions_for_disabled_tools_test(&["get_schema".to_string()]).await;
+        assert!(
+            disabled.contains("Directories with their own stricter frontmatter rules"),
+            "the directory listing itself is not tool-specific and must survive: {disabled}"
+        );
+        assert!(
+            !disabled.contains("get_schema"),
+            "get_schema is disabled, so the call-to-action naming it must be dropped: {disabled}"
+        );
+    }
+
+    // --- server instructions length budget --------------------------------
+
+    /// The compiled + config-derived + corpus-dependent server instructions,
+    /// for a corpus shaped like a real personal knowledge base (15 top-level
+    /// areas, each with its own schema, plus two nested schema scopes and
+    /// three root vocabularies), must stay within
+    /// `descriptions::COMPILED_DESCRIPTION_BUDGET` under the configuration
+    /// that makes them longest — leaving room for the KB's `server.md`
+    /// extension under Claude Code's truncation cap.
+    #[tokio::test]
+    async fn server_instructions_for_a_realistic_corpus_fit_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let areas = [
+            "3d-printing",
+            "dev",
+            "firearms",
+            "food",
+            "gaming",
+            "home-theater",
+            "lifestyle",
+            "media",
+            "meta",
+            "pets",
+            "recreation",
+            "sysadmin",
+            "test",
+            "vehicles",
+            "woodworking",
+        ];
+        let scoped = "fields:\n  status:\n    type: enum\n    values: [active]\n";
+        for area in areas {
+            std::fs::create_dir_all(dir.path().join(area)).unwrap();
+            std::fs::write(dir.path().join(area).join(".kb-schema.yaml"), scoped).unwrap();
+        }
+        for nested in ["food/plans", "food/recipes"] {
+            std::fs::create_dir_all(dir.path().join(nested)).unwrap();
+            std::fs::write(dir.path().join(nested).join(".kb-schema.yaml"), scoped).unwrap();
+        }
+        std::fs::write(
+            dir.path().join(".kb-schema.yaml"),
+            "fields:\n\
+             \x20 status:\n    type: enum\n    indexed: true\n    values: [active, archived, draft]\n\
+             \x20 tags:\n    type: list\n    indexed: true\n    values: [claude-code, docker, \
+             node:apollo, node:ares, node:argos, node:atlas, node:hermes, node:pfsense]\n\
+             \x20 type:\n    type: enum\n    indexed: true\n    values: [architecture, config, \
+             decision-record, guide, migration, project, reference, research, troubleshooting]\n",
+        )
+        .unwrap();
+
+        let frontmatter = FrontmatterConfig::default();
+        let schemas = SchemaCache::build(dir.path(), &frontmatter);
+        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
+            url: "http://127.0.0.1:1".into(),
+            collection: "unused".into(),
+        })
+        .expect("client construction is lazy and must not require a live server");
+
+        let instructions = build_instructions(
+            &descriptions::compose_server_mechanics(true, true, true),
+            &qdrant,
+            "unused",
+            dir.path(),
+            &schemas,
+            &frontmatter,
+            &config::Granularity::ALL,
+            &[],
+        )
+        .await;
+
+        // Guard against a fixture that silently stopped exercising the
+        // corpus-dependent lines this budget exists for.
+        for line in [
+            "Top-level areas of this knowledge base: 3d-printing,",
+            "Available status: active, archived, draft",
+            "Available tags: claude-code,",
+            "Available type: architecture,",
+            "Every top-level area has its own stricter frontmatter rules, as do: \
+             food/plans/, food/recipes/.",
+            "Call get_schema",
+        ] {
+            assert!(
+                instructions.contains(line),
+                "missing {line:?}: {instructions}"
+            );
+        }
+        let len = instructions.chars().count();
+        assert!(
+            len <= descriptions::COMPILED_DESCRIPTION_BUDGET,
+            "server instructions are {len} chars for a realistic corpus, over the {}-char \
+             budget that leaves room for the KB's server.md extension:\n{instructions}",
+            descriptions::COMPILED_DESCRIPTION_BUDGET
+        );
+
+        // With `search` disabled the areas line is not emitted, so "every
+        // top-level area" would have nothing to refer to: the scoped
+        // directories are listed by name instead.
+        let without_search = build_instructions(
+            &descriptions::compose_server_mechanics(true, true, false),
+            &qdrant,
+            "unused",
+            dir.path(),
+            &schemas,
+            &frontmatter,
+            &config::Granularity::ALL,
+            &["search".to_string()],
+        )
+        .await;
+        assert!(
+            without_search
+                .contains("Directories with their own stricter frontmatter rules: 3d-printing/,"),
+            "{without_search}"
+        );
+        assert!(
+            !without_search.contains("Every top-level area"),
+            "{without_search}"
+        );
+        // Nothing describing `search`'s matching or parameters survives.
+        for search_only in ["path_prefix", "Search fuses", "Document *text*"] {
+            assert!(
+                !without_search.contains(search_only),
+                "{search_only:?} describes the disabled search tool: {without_search}"
+            );
+        }
     }
 
     // --- compose_server_instructions phrase-flag gating (effective, not raw) ---
@@ -5307,6 +5560,192 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Same as [`test_mcp_router_with_hosts`], but with a caller-supplied config
+    /// rather than `make_test_resolved_config`'s defaults — needed by the
+    /// `mcp.disabled_tools` end-to-end tests below, which exercise real
+    /// `tools/list`/`tools/call` JSON-RPC dispatch through `KbSearchServer`'s
+    /// hand-written `ServerHandler` methods (`enabled_tool_router`, mcp.rs),
+    /// not the lower-level router calls `mcp.rs`'s own unit tests use.
+    fn test_mcp_router_with_config(config: Arc<ResolvedConfig>) -> Router {
+        let tmp = tempfile::tempdir().unwrap();
+        let instructions = Arc::new(RwLock::new("test instructions".to_string()));
+
+        let qdrant_config = crate::config::ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test".into(),
+        };
+        let qdrant = Arc::new(QdrantStore::new(&qdrant_config).unwrap());
+        let embed_config = crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "test".into(),
+            api_key: None,
+            vector_size: 768,
+            batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
+        };
+        let embed = Arc::new(EmbedClient::new(&embed_config));
+
+        let effective_granularities = config.effective_granularities();
+
+        let handler = KbSearchServer::new(
+            embed,
+            qdrant,
+            "test".into(),
+            tmp.path().to_path_buf(),
+            &["**/*.md".to_string()],
+            instructions,
+            config::shared_config(Arc::clone(&config)),
+            crate::mcp::empty_test_schema_cache(),
+            None,
+            Arc::new(crate::reindex::ReindexQueue::new()),
+            Arc::new(RwLock::new(descriptions::compose_tool_descriptions(
+                None,
+                false,
+                &effective_granularities,
+                config.chunking.heading_metadata,
+            ))),
+        )
+        .unwrap();
+
+        let mcp_service = StreamableHttpService::new(
+            move || Ok(handler.clone()),
+            LocalSessionManager::default().into(),
+            mcp_transport_config(CancellationToken::new(), &[]),
+        );
+
+        Router::new().nest_service("/mcp", mcp_service)
+    }
+
+    fn tools_call_request_body(name: &str, arguments: serde_json::Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments,
+            }
+        })
+        .to_string()
+    }
+
+    async fn post_mcp(app: Router, body: String) -> serde_json::Value {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "kb.example.com")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tools_list_omits_a_disabled_tool() {
+        let mut config = crate::mcp::make_test_resolved_config(&std::env::temp_dir());
+        Arc::make_mut(&mut config).mcp.disabled_tools = vec!["write_document".to_string()];
+
+        let json = post_mcp(
+            test_mcp_router_with_config(config),
+            tools_list_request_body(),
+        )
+        .await;
+        let tools = json["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should contain a tools array");
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+
+        assert!(
+            !names.contains(&"write_document"),
+            "a disabled tool must not appear in tools/list: {names:?}"
+        );
+        assert_eq!(
+            names.len(),
+            crate::descriptions::TOOL_NAMES.len() - 1,
+            "exactly the other five tools should remain: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_call_on_a_disabled_tool_returns_the_same_error_as_an_unknown_tool() {
+        let mut config = crate::mcp::make_test_resolved_config(&std::env::temp_dir());
+        Arc::make_mut(&mut config).mcp.disabled_tools = vec!["write_document".to_string()];
+
+        let disabled_json = post_mcp(
+            test_mcp_router_with_config(Arc::clone(&config)),
+            tools_call_request_body(
+                "write_document",
+                serde_json::json!({"path": "x.md", "content": "x"}),
+            ),
+        )
+        .await;
+        let unknown_json = post_mcp(
+            test_mcp_router_with_config(config),
+            tools_call_request_body("not_a_real_tool", serde_json::json!({})),
+        )
+        .await;
+
+        // Both must be a top-level JSON-RPC error, not a `CallToolResult` with
+        // `isError: true` — `ToolRouter::call` refuses a disabled name before
+        // ever reaching a tool's own argument parsing (rmcp 1.8.0
+        // `handler/server/router/tool.rs`).
+        assert!(
+            disabled_json.get("result").is_none(),
+            "a disabled tool must not produce a tool result: {disabled_json}"
+        );
+        assert_eq!(
+            disabled_json["error"]["code"], unknown_json["error"]["code"],
+            "disabled: {disabled_json}, unknown: {unknown_json}"
+        );
+        assert_eq!(
+            disabled_json["error"]["message"], unknown_json["error"]["message"],
+            "disabled: {disabled_json}, unknown: {unknown_json}"
+        );
+        assert_eq!(disabled_json["error"]["message"], "tool not found");
+    }
+
+    #[tokio::test]
+    async fn tools_list_hides_non_allowlisted_tools_when_enabled_tools_is_configured() {
+        // `mcp.enabled_tools` (an allowlist) has no field of its own on
+        // `ResolvedConfig` — `Config::resolve_inner` folds it into
+        // `ResolvedConfig::mcp.disabled_tools` (the effective set) before a
+        // `KbSearchServer` ever exists; config.rs's
+        // `mcp_enabled_tools_resolves_to_the_complement` pins that resolution
+        // step. This test picks up from the already-resolved side, the same way
+        // `tools_list_omits_a_disabled_tool` above does for a blocklist: an
+        // allowlist naming only `search` resolves to every other tool disabled,
+        // and that is what must disappear from a real tools/list call.
+        let mut config = crate::mcp::make_test_resolved_config(&std::env::temp_dir());
+        Arc::make_mut(&mut config).mcp.disabled_tools = crate::descriptions::TOOL_NAMES
+            .iter()
+            .filter(|t| **t != "search")
+            .map(|t| t.to_string())
+            .collect();
+
+        let json = post_mcp(
+            test_mcp_router_with_config(config),
+            tools_list_request_body(),
+        )
+        .await;
+        let tools = json["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should contain a tools array");
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+
+        assert_eq!(
+            names,
+            vec!["search"],
+            "only the allowlisted tool should remain: {names:?}"
+        );
     }
 
     #[tokio::test]
