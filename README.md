@@ -8,7 +8,7 @@ Built as a single Rust binary for type safety, small Docker images, and simple d
 
 - [`deploy/USAGE.md`](deploy/USAGE.md) — Setup guide, configuration, frontmatter, chunking
 - [`deploy/TROUBLESHOOTING.md`](deploy/TROUBLESHOOTING.md) — Common issues and fixes
-- [`docs/oauth.md`](docs/oauth.md) — OAuth setup (recommended auth): how it works, provider recipes marked by what was actually tested, a checklist for any other provider
+- [`docs/oauth.md`](docs/oauth.md) — OAuth setup (recommended auth): the `mcp.oauth` keys and defaults, and this server's setup; provider recipes marked by what was actually tested live in the [`oauth-resource-server`](https://github.com/St0nefish/oauth-resource-server) crate's `docs/providers.md`
 - [`deploy/config.example.yaml`](deploy/config.example.yaml) — Full annotated config reference
 - [`deploy/ci-examples/`](deploy/ci-examples/) — Sample CI workflows for webhook-triggered reindex
 
@@ -53,9 +53,10 @@ claude mcp add --transport http --client-id <client-id> --callback-port <port> \
   kb-search https://your-host:8001/mcp
 ```
 
-[docs/oauth.md](docs/oauth.md) covers how it works, recipes for the providers it has
-been tested against (Authentik and Authelia end to end, and Kanidm's token shape),
-and a checklist for any other. The
+[docs/oauth.md](docs/oauth.md) covers the `mcp.oauth` keys and this server's setup;
+the validator, JWKS handling and provider recipes themselves live in the
+[`oauth-resource-server`](https://github.com/St0nefish/oauth-resource-server)
+crate this server's OAuth support is built on (mcp-md-wiki#308). The
 static bearer token keeps working alongside OAuth unless you turn it off
 (`mcp.oauth.accept_static_bearer: false`).
 

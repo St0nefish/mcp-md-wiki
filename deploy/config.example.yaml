@@ -343,8 +343,10 @@ mcp:
   # access token from your authorization server (Authentik, Authelia, Kanidm,
   # ...) and this server verifies it locally against that server's published
   # keys. Required for Claude's hosted surfaces (claude.ai / Desktop / iOS),
-  # which can only connect through an authorization-code flow. Provider
-  # recipes and a checklist for any other provider: docs/oauth.md.
+  # which can only connect through an authorization-code flow. Keys and this
+  # server's setup: docs/oauth.md. Provider recipes and a checklist for any
+  # other provider: the oauth-resource-server crate's docs/providers.md
+  # (https://github.com/St0nefish/oauth-resource-server/blob/master/docs/providers.md).
   #
   # Disabled by default; omit the whole block and nothing changes. With OAuth
   # enabled, the static bearer token below keeps working alongside it (either
@@ -353,14 +355,17 @@ mcp:
   # static token logs a startup warning recommending OAuth.
   #
   # When enabled, two unauthenticated discovery routes appear:
-  #   /.well-known/oauth-protected-resource/mcp
+  #   /.well-known/oauth-protected-resource/mcp   (derived from `resource`'s
+  #       path, RFC 9728 §3.1: /mcp for https://kb.example.com/mcp, /kb/mcp
+  #       for https://host/kb/mcp)
   #   /.well-known/oauth-protected-resource
   # Both must stay publicly reachable — they are how a client with no token
   # finds out where to get one.
   #
   # NOTE: per-tool write-scope enforcement is NOT implemented — the auth
   # middleware cannot see which MCP tool a request invokes. Any token that
-  # passes required_scope currently has full access, writes included.
+  # passes required_scope/required_scopes currently has full access, writes
+  # included.
   #
   # RESTART REQUIRED for every key below: the validator, its JWKS cache and the
   # metadata document are all built once at startup, the same posture as
@@ -373,11 +378,13 @@ mcp:
   #   # against each token's `iss`. Copy it from the AS's discovery document
   #   # including any trailing slash — Authentik's per-application issuer has
   #   # one, Authelia's does not, and getting it wrong rejects every token.
+  #   # https, unless the host is loopback or allow_insecure_http is set.
   #   issuer: "https://auth.example.com/application/o/wiki/"
   #
   #   # REQUIRED. This server's public MCP URL. Published as `resource` in the
   #   # metadata document and used to derive the resource_metadata URL
-  #   # advertised in WWW-Authenticate. Absolute http(s) URL, no fragment.
+  #   # advertised in WWW-Authenticate. Absolute URL, no query or fragment;
+  #   # https, unless the host is loopback or allow_insecure_http is set.
   #   resource: "https://kb.example.com/mcp"
   #
   #   # REQUIRED (this or `audiences`). A value each token's `aud` must contain;
@@ -385,7 +392,9 @@ mcp:
   #   #  - servers that stamp the RESOURCE URL (RFC 8707, or a configurable
   #   #    access-token audience, e.g. Authelia) -> the same value as `resource`
   #   #  - servers that stamp the OAuth CLIENT ID and ignore `resource`
-  #   #    (Authentik, Kanidm) -> the client_id
+  #   #    (Authentik, Kanidm) -> the client_id. Only sound when that OAuth
+  #   #    client is used for this server alone: every token it obtains, for
+  #   #    any resource, carries the same aud (see docs/oauth.md).
   #   audience: "example-client-id"
   #
   #   # Additional accepted audiences; a token matching ANY configured value
@@ -393,20 +402,35 @@ mcp:
   #   # audience. Default [].
   #   audiences: []
   #
-  #   # Where the signing keys (JWKS) live. Default "" = discover it from the
-  #   # issuer's metadata (OpenID Connect Discovery, then RFC 8414), refusing a
-  #   # document whose `issuer` does not match byte-for-byte. Keys load at
-  #   # startup, refresh hourly, and an unknown `kid` triggers at most one
-  #   # refetch per minute.
+  #   # Where the signing keys (JWKS) live. Default unset (as are ~ and "") =
+  #   # discover it from the issuer's metadata (OpenID Connect Discovery, then
+  #   # RFC 8414), refusing a document whose `issuer` does not match
+  #   # byte-for-byte. Keys load at startup, refresh hourly, and an unknown
+  #   # `kid` triggers at most one refetch per minute. A plain http:// URL on a
+  #   # non-loopback host fails startup unless allow_insecure_http is set.
   #   jwks_uri: ""
   #
   #   # Scope a token must carry to get past the auth middleware (a single
   #   # scope, exact match). A valid token without it gets 403
-  #   # insufficient_scope rather than 401.
+  #   # insufficient_scope rather than 401. Defaults to "mcp:read" only when
+  #   # this is unset AND required_scopes below is unset or empty; if
+  #   # required_scopes is non-empty, this stays unset unless you set it
+  #   # explicitly (an unset required_scope adds no implicit scope).
   #   required_scope: "mcp:read"
   #
+  #   # Further required scopes, unioned with required_scope above — a token
+  #   # must carry ALL of them. Default []. Setting this without
+  #   # required_scope replaces the implicit "mcp:read" default with exactly
+  #   # this list, not "mcp:read" plus this list.
+  #   required_scopes: []
+  #
   #   # Advertised to clients in the metadata document and the 401 challenge.
-  #   # Declarative only.
+  #   # Not enforced (that is required_scope/required_scopes), but clients
+  #   # request exactly what this lists, so it must include every required
+  #   # scope — change it together with required_scope (e.g. to
+  #   # ["mcp_read", "mcp_write"] for an IdP that refuses ":" in scope names).
+  #   # An explicit [] advertises nothing: the metadata document omits the key
+  #   # and the 401 challenge names the required scopes instead.
   #   scopes_supported: ["mcp:read", "mcp:write"]
   #
   #   # Claims the token's scopes are read from; each may be a space-delimited
@@ -431,6 +455,19 @@ mcp:
   #   # (Authelia, Kanidm) — it stops an ID token being replayed as an
   #   # access token.
   #   require_at_jwt: false
+  #
+  #   # Accept a plain http:// issuer, jwks_uri or resource on a non-loopback
+  #   # host (an in-cluster address on a network you trust). Default false:
+  #   # keys fetched over cleartext can be substituted, and tokens sent to a
+  #   # cleartext resource read. Each such URL still logs a startup warning.
+  #   # Also required for a discovered jwks_uri or a key-fetch redirect that
+  #   # lands on plain http on a non-loopback host.
+  #   allow_insecure_http: false
+  #
+  #   # Accept a block with no required scope and require_at_jwt off (which
+  #   # would let OIDC ID tokens in). No effect here: this server always
+  #   # requires a scope ("mcp:read" unless you name another).
+  #   allow_unscoped_tokens: false
   #
   #   # Keep accepting the static bearer token (bearer_token_env) while OAuth
   #   # is on. Set false for OAuth-only even when MCP_BEARER_TOKEN is set.

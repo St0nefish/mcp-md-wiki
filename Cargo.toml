@@ -110,20 +110,23 @@ futures = "0.3"
 
 # Date/time parsing for mtime range filters and CLI date flags
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-# JWT verification for the OAuth 2.1 resource-server path (src/oauth.rs): RS256
-# signature checking plus issuer/audience/expiry validation against a fetched JWKS.
+# OAuth 2.1 resource server (mcp-md-wiki#308): JWT access-token validation against a
+# JWKS, RFC 9728 metadata, the `WWW-Authenticate` challenges, the static-token policy,
+# and the axum middleware + well-known routes `server.rs` mounts. Published to
+# crates.io: https://crates.io/crates/oauth-resource-server.
 #
-# Pinned to 9.x, NOT the current 11.x, on purpose. 11.x dropped `ring` and requires
-# picking one of two crypto backends: `rust_crypto`, which pulls in the `rsa` crate
-# and with it RUSTSEC-2023-0071 (Marvin timing sidechannel, no fixed version) —
-# `cargo audit` runs in CI and there is no version of that we could upgrade to — or
-# `aws_lc_rs`, which needs cmake and a C toolchain in the Docker builder. 9.x uses
-# `ring`, which is already compiled into this tree via rustls/reqwest, so this adds
-# no new crypto implementation at all. Revisit when jsonwebtoken offers a backend
-# that is neither unpatched nor a new build-tooling requirement.
-jsonwebtoken = "9"
+# `native-tls`, not the crate's default `rustls-tls`: this binary's own `reqwest`
+# (above) enables `default-tls`, so reqwest's default backend — the one the JWKS
+# client uses — stays native-tls, as before the extraction, and this dependency
+# adds no TLS stack of its own. That is not "rustls is absent": async-openai
+# (`rustls` default feature), qdrant-client (`reqwest/rustls-tls`) and tonic
+# (tokio-rustls) already pull rustls 0.23 into the tree.
+oauth-resource-server = { version = "0.1", default-features = false, features = ["native-tls", "serde", "axum"] }
 
 [dev-dependencies]
+# Throwaway keys, token minting and a fake JWKS server for `server.rs`'s auth tests.
+# Test-only by construction: the private keys it ships are public knowledge.
+oauth-resource-server = { version = "0.1", default-features = false, features = ["native-tls", "serde", "axum", "testing"] }
 tempfile = "3"
 tower = "0.5"
 # Only for tests: `#[tokio::test(start_paused = true)]` lets reindex.rs's retry/backoff

@@ -133,7 +133,10 @@ The error lists every problem at once, one per line. The common ones:
 - an empty `issuer`/`resource`/`audience`;
 - an `issuer`/`resource`/`jwks_uri` that is not an absolute http(s) URL;
 - `HS256` or `none` in `algorithms` (never allowed);
-- a `required_scope` containing a space;
+- a blank `required_scope` (`required_scope: ""`) or one containing a space;
+- a `required_scopes` entry that is blank (`mcp.oauth.required_scopes contains
+  an empty entry`) or contains a space (`mcp.oauth.required_scopes entry "a b"
+  must be a single scope`) — list each scope as its own entry;
 - `leeway_secs` above 300.
 
 **Fix:** Correct the named keys. [docs/oauth.md](../docs/oauth.md#configuration) has the full table.
@@ -495,7 +498,7 @@ Passing a bearer token doesn't change the outcome. This was confirmed against th
 **Two ways out, neither requiring an interactive SSO session from a script:**
 
 1. **Reach the container directly, bypassing the proxy.** From inside the Docker network: `docker compose exec mcp-md-wiki curl http://localhost:8001/health`. From the host, if the port happens to be published: `curl http://localhost:8001/health` against the mapped port. Either way skips the proxy hop entirely, so nothing intercepts the request or has a chance to redirect it.
-2. **Use the bearer token against a route the proxy doesn't intercept.** `/status` is gated inside the binary itself (the same `bearer_auth` layer that protects `/mcp`), which is a different mechanism from the proxy's SSO layer that's producing the 302:
+2. **Use the bearer token against a route the proxy doesn't intercept.** `/status` is gated inside the binary itself (the same [`oauth-resource-server`](https://github.com/St0nefish/oauth-resource-server) crate's `require_auth` layer that protects `/mcp`, mcp-md-wiki#308), which is a different mechanism from the proxy's SSO layer that's producing the 302:
 
    ```bash
    curl -H "Authorization: Bearer $MCP_BEARER_TOKEN" https://your-host/status
@@ -525,8 +528,11 @@ reason. To see what the token actually carries, decode its middle segment
 | `token rejected: ExpiredSignature` / `ImmatureSignature` | The token has expired, or it is not valid yet (`nbf`). Check clock sync on both hosts. `leeway_secs` absorbs small drift. |
 | `token algorithm … is not in mcp.oauth.algorithms` | The provider signs with an algorithm you excluded, or with HS256. HS256 cannot be verified by a resource server; give the provider an asymmetric signing key. |
 | `token typ … is not accepted` | The header `typ` is `JWT` or missing while `require_at_jwt` is on, or it is a different kind of JWT altogether. |
+| `token header lists critical extensions (crit)…` | The provider marked the token with a JWS extension this server cannot process. Configure it not to. |
+| `token nbf is not a NumericDate…` | The provider emitted a malformed `nbf` (a string, or an out-of-range number). |
+| `token is sender-constrained (cnf)…` | The token is DPoP- or mTLS-bound, which this server cannot verify; it accepts plain bearer tokens only. Configure the client to request unbound tokens. |
 | `no … key for kid …` | No key in the JWKS matches. Either the provider rotated its keys (the next refetch, at most a minute later, picks the new one up), or the token comes from a different issuer or client. Kanidm, for example, has a separate issuer and JWKS per client. |
-| `InsufficientScope` (403) | The token is valid but lacks `required_scope`. The info line `OAuth token is valid but lacks the required scope` lists the scopes it has (`present=[…]`). Grant the scope to the user or client at the provider. If the scopes are in a claim other than `scope`/`scp`, add that claim to `scope_claims`. |
+| `InsufficientScope` (403) | The token is valid but lacks at least one required scope — every scope in `required_scope` ∪ `required_scopes` (by default just `mcp:read`) must be present. The info line `OAuth token is valid but lacks the required scope` lists the scopes it has (`present=[…]`) next to the ones required (`required=…`). Grant the missing scope(s) to the user or client at the provider, and make sure `scopes_supported` lists every required scope — clients request exactly what it advertises. If the scopes are in a claim other than `scope`/`scp`, add that claim to `scope_claims`. |
 
 ## Model / Vector Issues
 
@@ -547,13 +553,16 @@ Set `RUST_LOG` in your `.env` file or compose environment. The server warns on s
 | `info` | Default — startup events, webhook accepts, indexing summaries |
 | `mcp_md_wiki=debug` | Verbose app logging: per-file decisions, search timing, per-batch embed progress |
 | `info,mcp_md_wiki::webhook=debug` | Info everywhere + detailed webhook trace |
+| `info,mcp_md_wiki=debug,oauth_resource_server=debug` | App debug logging plus auth debug lines (see below) — the `mcp_md_wiki=debug` preset alone does NOT show them, since auth now logs under a different target |
 | `debug` | Very verbose — includes library internals (noisy) |
 
 ### Key log events and how to find them
 
+Authentication events (mcp-md-wiki#308) are logged under the `oauth_resource_server` target, not `mcp_md_wiki` — a `RUST_LOG` that names only `mcp_md_wiki` (e.g. `mcp_md_wiki=debug`) will not show them; add `oauth_resource_server=debug` as in the preset above.
+
 `Bearer auth rejected` (WARN) — every request rejected by MCP bearer-token auth when OAuth is off. A flood of these means a client is using the wrong token.
 
-`OAuth bearer auth rejected` (WARN) — a request refused with OAuth on, with the reason (`reason=Invalid("…")` or `InsufficientScope`). See [OAuth](#oauth) for what each reason means. A request with no credential at all is logged only at DEBUG (`No bearer credential presented`), because every OAuth client's first request looks like that.
+`OAuth bearer auth rejected` (WARN) — a request refused with OAuth on, with the reason (`reason=Invalid("…")` or `InsufficientScope`). See [OAuth](#oauth) for what each reason means. A request with no credential at all is logged only at DEBUG (`No bearer credential presented`) under the `oauth_resource_server` target, because every OAuth client's first request looks like that.
 
 `Webhook signature verification failed` (WARN) — HMAC mismatch between the forge secret and `WEBHOOK_SECRET`, logged with the provider name.
 

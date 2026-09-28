@@ -8,7 +8,6 @@ mod git;
 mod heading;
 mod ingest;
 mod mcp;
-mod oauth;
 mod qdrant;
 mod reindex;
 mod reload;
@@ -37,6 +36,15 @@ use tracing::info;
 /// terminated, serve finished — which on an actively used server buries the indexing
 /// pipeline's own output entirely. Its warnings and errors (including tool-call
 /// failures) still come through at `warn`.
+///
+/// Authentication events are not logged under `mcp_md_wiki`: the auth middleware
+/// and the JWT/JWKS validator live in the `oauth_resource_server` crate
+/// (mcp-md-wiki#308), so `Bearer auth rejected`, `OAuth bearer auth rejected`,
+/// `No bearer credential presented`, `OAuth bearer auth accepted` and every JWKS
+/// load/refresh line carry an `oauth_resource_server::*` target. This default
+/// shows the INFO+ ones; a `RUST_LOG` that names only `mcp_md_wiki` (e.g.
+/// `mcp_md_wiki=debug`) hides all of them, so auth debugging needs
+/// `oauth_resource_server=debug` alongside it.
 const DEFAULT_LOG_FILTER: &str = "info,rmcp=warn";
 
 fn print_component(name: &str, c: &server::ComponentHealth) {

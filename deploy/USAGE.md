@@ -485,7 +485,7 @@ Without `GIT_URL`, you'll need an external process to update the bind-mounted di
 
 ## Deployment Posture: Network Exposure and Access Control
 
-mcp-md-wiki serves everything — the MCP endpoint, diagnostics, and the web UI — off one port (8001, by default), but not everything on that port carries the same protection. `server.rs`'s `assemble_router` wraps `/mcp`, `/status`, `/metrics`, and `POST /admin/reload` in a `bearer_auth` middleware layer; `/health` and every route `web.rs`'s `ui_router` registers (`/`, the static UI assets, and the whole `/api/*` family) are merged into the app with no such layer at all, by design. Which of those two groups a given route falls in is fixed in the binary — it doesn't change based on how you deploy it. What *does* change based on deployment is who can reach the unguarded group in the first place, and that's the actual decision this section covers: two supported ways to answer "who can reach `/health` and `/api/*`," each with a different trade-off.
+mcp-md-wiki serves everything — the MCP endpoint, diagnostics, and the web UI — off one port (8001, by default), but not everything on that port carries the same protection. `server.rs`'s `assemble_router` wraps `/mcp`, `/status`, `/metrics`, and `POST /admin/reload` in the [`oauth-resource-server`](https://github.com/St0nefish/oauth-resource-server) crate's `require_auth` middleware layer (mcp-md-wiki#308); `/health` and every route `web.rs`'s `ui_router` registers (`/`, the static UI assets, and the whole `/api/*` family) are merged into the app with no such layer at all, by design. Which of those two groups a given route falls in is fixed in the binary — it doesn't change based on how you deploy it. What *does* change based on deployment is who can reach the unguarded group in the first place, and that's the actual decision this section covers: two supported ways to answer "who can reach `/health` and `/api/*`," each with a different trade-off.
 
 ### Posture A: reverse proxy with SSO (the default)
 
@@ -527,16 +527,16 @@ and set `MCP_BIND_ADDR` in `.env` alongside the variables from [Set up environme
 
 #### Exactly what publishing the port grants access to
 
-Publishing the port doesn't change which routes are gated — it only changes who can reach the port at all. These four stay behind the bearer token no matter which posture you run, because `assemble_router` wraps them in `bearer_auth` regardless (`src/server.rs`):
+Publishing the port doesn't change which routes are gated — it only changes who can reach the port at all. These four stay behind the bearer token no matter which posture you run, because `assemble_router` wraps them in the crate's `require_auth` middleware regardless (`src/server.rs`):
 
 | Route | Method | Gate |
 |---|---|---|
-| `/mcp` | Streamable HTTP | `bearer_auth`, applied via `.route_layer` on `mcp_router` |
-| `/status` | GET | `bearer_auth`, applied via `.route_layer` on `status_router` |
-| `/metrics` | GET | `bearer_auth`, applied via `.route_layer` on `status_router` |
-| `/admin/reload` | POST | `bearer_auth`, applied via `.route_layer` on `admin_router` |
+| `/mcp` | Streamable HTTP | `require_auth`, applied via `.route_layer` on `mcp_router` |
+| `/status` | GET | `require_auth`, applied via `.route_layer` on `status_router` |
+| `/metrics` | GET | `require_auth`, applied via `.route_layer` on `status_router` |
+| `/admin/reload` | POST | `require_auth`, applied via `.route_layer` on `admin_router` |
 
-Everything below carries no in-process gate at all in either posture — `assemble_router` merges `/health` in directly with no `bearer_auth` layer, and merges `web.rs`'s entire `ui_router` in the same unguarded way (`src/server.rs`; the individual routes are registered in `src/web.rs`'s `ui_router` function). On the LAN-only posture, this is the exact list of what "reachable by anyone who can reach the port" means:
+Everything below carries no in-process gate at all in either posture — `assemble_router` merges `/health` in directly with no `require_auth` layer, and merges `web.rs`'s entire `ui_router` in the same unguarded way (`src/server.rs`; the individual routes are registered in `src/web.rs`'s `ui_router` function). On the LAN-only posture, this is the exact list of what "reachable by anyone who can reach the port" means:
 
 | Route | Method(s) |
 |---|---|
