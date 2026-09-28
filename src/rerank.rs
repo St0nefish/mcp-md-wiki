@@ -25,7 +25,7 @@ pub struct RerankClient {
     base_url: String,
     model: String,
     api_key: Option<String>,
-    /// Per-document byte budget, derived from `chunking.max_chunk_size` — see
+    /// Per-document byte budget, from `reranking.max_document_bytes` — see
     /// [`ResolvedRerankingConfig::max_document_bytes`].
     max_document_bytes: usize,
 }
@@ -87,10 +87,10 @@ impl Reranker for RerankClient {
                 // Once per request, not once per document: visible without being
                 // noisy, since a single oversized chunk used to fail silently.
                 tracing::warn!(
-                    "Truncated {shortened} of {} rerank documents to the {budget}-byte budget \
-                     (longest was {longest} bytes). The budget follows chunking.max_chunk_size; \
-                     documents exceed it when a description is prepended or a section cannot be \
-                     split. Only the reranker's view is truncated — returned content is unaffected.",
+                    "Truncated {shortened} of {} rerank documents to the {budget}-byte \
+                     reranking.max_document_bytes budget (longest was {longest} bytes). Raise \
+                     it when the reranker's --ubatch-size/context allows a larger document. \
+                     Only the reranker's view is truncated — returned content is unaffected.",
                     truncated.len()
                 );
             }

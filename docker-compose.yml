@@ -124,11 +124,12 @@ services:
       - HOME=/tmp
       - RUST_LOG=${RUST_LOG:-info}
       # --- Optional cross-encoder reranking (uncomment to enable) ---
-      # - RERANKING_ENABLED=true
-      # - RERANKING_BASE_URL=http://reranker:8081/v1
-      # - RERANKING_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+      # reranking.enabled: true also has to be set in config.yaml (mount it via
+      # the volumes entry above) — RERANKING_ENABLED is recognized-but-unhonored,
+      # see config.example.yaml.
+      # - RERANKING_BASE_URL=http://reranker:8081
+      # - RERANKING_MODEL=Alibaba-NLP/gte-reranker-modernbert-base
       # - RERANKING_API_KEY=${RERANKING_API_KEY:-}
-      # - RERANKING_CANDIDATE_LIMIT=50
     ports:
       - "${MCP_PORT:-8001}:8001"
     healthcheck:
@@ -146,10 +147,23 @@ services:
       #   condition: service_healthy
 
   # --- Optional cross-encoder reranker service (uncomment to enable) ---
+  # CPU image, like the embeddings service above. GGUF converted from
+  # Alibaba-NLP/gte-reranker-modernbert-base via llama.cpp's convert_hf_to_gguf.py.
+  # --ubatch-size equal to --ctx-size is what keeps reranking.max_document_bytes'
+  # default (6144 bytes, config.example.yaml) safe — for a different reranker, size
+  # that config key to whatever --ubatch-size you set here instead.
   # reranker:
-  #   image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+  #   image: ghcr.io/ggml-org/llama.cpp:server
   #   restart: unless-stopped
-  #   command: --model-id cross-encoder/ms-marco-MiniLM-L-6-v2 --port 8081
+  #   volumes:
+  #     - ${MODEL_PATH:-./data/models}:/models:ro
+  #   command: >
+  #     --model /models/${RERANK_MODEL_FILE:-reranker.gguf}
+  #     --host 0.0.0.0 --port 8081
+  #     --reranking
+  #     --ctx-size 8192
+  #     --batch-size 8192
+  #     --ubatch-size 8192
   #   ports:
   #     - "127.0.0.1:8081:8081"
   #   healthcheck:

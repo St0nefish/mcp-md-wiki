@@ -177,11 +177,6 @@ chunking:
 
   # Hard upper limit. Sections larger than this are force-split by a
   # secondary markdown-aware splitter. Must be >= target_chunk_size.
-  #
-  # This value does double duty: it is also the per-document budget for
-  # rerank requests (see the reranking section below), since the reranker
-  # is sent chunk text. Raising it therefore has a reranker-side cost —
-  # the reranker must be able to accept documents this large.
   max_chunk_size: 1500
 
   # Prepend the document's `description` frontmatter field (if present) to
@@ -724,10 +719,11 @@ search:
 # ----------------------------------------------------------------------------
 # base_url and model are connection wiring / model identity — ENV-only
 # (RERANKING_BASE_URL / RERANKING_MODEL), required only when enabled is
-# true. See "ENV-only settings" below. `enabled` and `candidate_limit` are
-# pure tuning knobs and stay YAML-only — RERANKING_ENABLED and
-# RERANKING_CANDIDATE_LIMIT env vars are NOT honored (a deployment that
-# still sets one logs a startup warning and the var is otherwise ignored).
+# true. See "ENV-only settings" below. `enabled`, `candidate_limit` and
+# `max_document_bytes` are pure tuning knobs and stay YAML-only —
+# RERANKING_ENABLED and RERANKING_CANDIDATE_LIMIT env vars are NOT honored
+# (a deployment that still sets one logs a startup warning and the var is
+# otherwise ignored).
 reranking:
 
   # Master switch. When true, RERANKING_BASE_URL and RERANKING_MODEL become
@@ -746,14 +742,22 @@ reranking:
   # Higher values improve rerank quality at the cost of latency.
   candidate_limit: 50
 
-  # NOTE — per-document size has no knob here. Each document sent to the
-  # reranker is truncated to chunking.max_chunk_size bytes, because the
-  # reranker is sent chunk text and so the largest document it can be asked
-  # to score is exactly what the chunker is configured to emit. Without this
-  # bound, one over-long chunk makes the server reject the WHOLE request and
-  # every candidate loses its reranking. Truncation is logged once per
-  # request and affects only the reranker's view — returned content is
-  # unchanged. See deploy/TROUBLESHOOTING.md for the bytes-vs-tokens caveat.
+  # Per-document byte budget for rerank requests. Each document sent to the
+  # reranker is truncated to this many bytes before it goes on the wire —
+  # without a bound, one over-long document makes the server reject the
+  # WHOLE request and every candidate loses its reranking (#128). Truncation
+  # is logged once per request and affects only the reranker's view —
+  # returned document content is unchanged.
+  # RESTART REQUIRED: RerankClient bakes this in at construction, like
+  # reranking.enabled — a reload cannot hand a running client a new budget.
+  #
+  # The default (6144) fits an 8192-token reranker served with --ubatch-size
+  # equal to --ctx-size (the documented gte-reranker-modernbert-base setup —
+  # see docker-compose.yml's reranker service). A reranker at llama.cpp's
+  # default --ubatch-size 512 needs roughly 1500 instead; a larger window can
+  # raise it. This is a byte budget, not a token count — see
+  # deploy/TROUBLESHOOTING.md for the bytes-vs-tokens caveat.
+  max_document_bytes: 6144
 
 
 # ----------------------------------------------------------------------------
