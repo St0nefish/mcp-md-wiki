@@ -126,6 +126,21 @@ sample rather than an exhaustive list.
 
 ### Retrieval
 
+- **`reranking.max_document_bytes` decouples the reranker's per-document byte
+  budget from `chunking.max_chunk_size`** (fix #307). Chunks get a description
+  and heading breadcrumb prepended *after* chunking, so enriched chunk text
+  routinely exceeded the old derived budget and was truncated before the
+  cross-encoder ever saw it. The budget is now its own YAML-only key, default
+  `6144` — sized to an 8192-token reranker (the documented
+  `gte-reranker-modernbert-base` setup) served with `--ubatch-size` equal to
+  `--ctx-size`, minus 2048 tokens reserved for the query and special tokens, at
+  one token per byte worst case. It still guards #128 (the reranker rejects
+  the *whole request* when one document exceeds its physical batch size), and
+  is restart-required, same as before. **Upgrade note:** a reranker running a
+  small `--ubatch-size` (such as llama.cpp's 512 default) previously got an
+  implicit ~1500-byte budget from the default `max_chunk_size`; it must now
+  set `reranking.max_document_bytes: 1500` explicitly, or it will hit #128's
+  whole-request 500s. No reindex is needed.
 - **`start_line: 1` is valid against an empty document** (fix #298), a
   regression from #290: `get_document`/`/api/doc` now serve `start_line: 1`
   against a 0-byte document as `content: ""`, `end_line: 0`, `partial: false`

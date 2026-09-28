@@ -362,8 +362,8 @@ fn default_batch_concurrency() -> usize {
     4
 }
 
-/// `reranking` — YAML side. `enabled` and `candidate_limit` are pure tuning knobs
-/// and stay YAML-only with NO env override — `RERANKING_ENABLED` /
+/// `reranking` — YAML side. `enabled`, `candidate_limit` and `max_document_bytes`
+/// are pure tuning knobs and stay YAML-only with NO env override — `RERANKING_ENABLED` /
 /// `RERANKING_CANDIDATE_LIMIT` used to silently override these (the incident this
 /// migration fixes: a deployed `RERANKING_CANDIDATE_LIMIT` env var made a YAML
 /// change a no-op), so both env vars are now recognized-but-unhonored (see
@@ -382,6 +382,10 @@ pub struct RerankingConfig {
     pub api_key_env: String,
     #[serde(default = "default_reranking_candidate_limit")]
     pub candidate_limit: usize,
+    /// Per-document byte budget for the rerank request — see
+    /// [`ResolvedRerankingConfig::max_document_bytes`] for what it guards.
+    #[serde(default = "default_reranking_max_document_bytes")]
+    pub max_document_bytes: usize,
 }
 
 impl Default for RerankingConfig {
@@ -390,6 +394,7 @@ impl Default for RerankingConfig {
             enabled: false,
             api_key_env: default_reranking_api_key_env(),
             candidate_limit: default_reranking_candidate_limit(),
+            max_document_bytes: default_reranking_max_document_bytes(),
         }
     }
 }
@@ -402,6 +407,15 @@ fn default_reranking_candidate_limit() -> usize {
     50
 }
 
+/// 8192-token window (the documented setup: `gte-reranker-modernbert-base` served
+/// by llama.cpp with `--ubatch-size` equal to `--ctx-size`, #307) minus 2048 tokens
+/// reserved for the query and special tokens, at the worst case of one token per
+/// byte — a byte-level BPE tokenizer cannot emit more tokens than bytes, so this
+/// bound holds for any text, not just English prose.
+fn default_reranking_max_document_bytes() -> usize {
+    6144
+}
+
 /// Resolved reranking config — only present when reranking is enabled and all required fields are set.
 #[derive(Debug, Clone)]
 pub struct ResolvedRerankingConfig {
@@ -409,11 +423,11 @@ pub struct ResolvedRerankingConfig {
     pub model: String,
     pub api_key: Option<String>,
     pub candidate_limit: usize,
-    /// Per-document byte budget for the rerank request, **derived** from
-    /// `chunking.max_chunk_size` — deliberately not a knob of its own. The
-    /// reranker is sent chunk text, so the largest document it can be asked to
-    /// score is exactly what the chunker is configured to emit; one number
-    /// governs both ends and they cannot drift apart.
+    /// Per-document byte budget for the rerank request — its own key,
+    /// `reranking.max_document_bytes` (default `6144`, #307), sized to the
+    /// reranker's context window rather than derived from `chunking.max_chunk_size`.
+    /// Chunks get a description and heading breadcrumb prepended *after*
+    /// chunking, so enriched chunk text routinely exceeds `max_chunk_size`.
     ///
     /// This exists because the reranker rejects the *whole request* when any
     /// single document exceeds its physical batch size (llama.cpp's
@@ -1591,6 +1605,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("search.granularities", "search"),
     ("reranking.enabled", "reranking"),
     ("reranking.candidate_limit", "reranking"),
+    ("reranking.max_document_bytes", "reranking"),
     ("reranking.api_key_env", "reranking"),
     ("ui.semantic_edges.enabled", "ui"),
     ("ui.semantic_edges.k", "ui"),
@@ -2185,6 +2200,12 @@ impl Config {
         if self.reranking.enabled && self.reranking.candidate_limit == 0 {
             anyhow::bail!("reranking.candidate_limit must be >= 1");
         }
+        // Same reasoning as candidate_limit above: a 0 budget loaded successfully
+        // and only surfaced at query time as `truncate_for_rerank` handing the
+        // reranker an empty string for every candidate (#307).
+        if self.reranking.enabled && self.reranking.max_document_bytes == 0 {
+            anyhow::bail!("reranking.max_document_bytes must be >= 1");
+        }
         if !missing.is_empty() {
             anyhow::bail!(
                 "Missing required environment variable(s):\n  - {}",
@@ -2209,11 +2230,6 @@ impl Config {
         let qdrant_url = qdrant_url.ok_or_else(|| {
             anyhow::anyhow!("QDRANT_URL must be set (internal error: missing after validation)")
         })?;
-
-        // Read before the struct literal below moves `self.chunking` into it.
-        // The reranker's per-document budget is derived from this, not configured
-        // separately — see `ResolvedRerankingConfig::max_document_bytes`.
-        let max_chunk_size = self.chunking.max_chunk_size;
 
         Ok(ResolvedConfig {
             source: ResolvedSourceConfig {
@@ -2285,7 +2301,7 @@ impl Config {
                     model: reranking_model.unwrap(),
                     api_key: reranking_api_key,
                     candidate_limit: self.reranking.candidate_limit,
-                    max_document_bytes: max_chunk_size,
+                    max_document_bytes: self.reranking.max_document_bytes,
                 })
             } else {
                 None
@@ -2690,6 +2706,39 @@ mcp:
         let yaml =
             format!("{MINIMAL_CONFIG}\nreranking:\n  enabled: false\n  candidate_limit: 0\n");
         Config::from_str(&yaml).expect("disabled reranking must ignore candidate_limit");
+
+        unsafe {
+            std::env::remove_var("RERANKING_BASE_URL");
+            std::env::remove_var("RERANKING_MODEL");
+        }
+        clear_required_env();
+    }
+
+    #[test]
+    fn reranking_zero_max_document_bytes_is_rejected_when_enabled() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::set_var("RERANKING_BASE_URL", "http://reranker:8081/v1");
+            std::env::set_var("RERANKING_MODEL", "reranker");
+        }
+
+        // Enabled with max_document_bytes: 0 must fail loudly at load, mirroring
+        // reranking.candidate_limit's own zero check (#307).
+        let yaml =
+            format!("{MINIMAL_CONFIG}\nreranking:\n  enabled: true\n  max_document_bytes: 0\n");
+        let err = Config::from_str(&yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reranking.max_document_bytes must be >= 1"),
+            "expected the max_document_bytes validation message, got: {err}"
+        );
+
+        // Disabled with the same zero value must NOT fail — the check only
+        // applies while reranking is actually in use.
+        let yaml =
+            format!("{MINIMAL_CONFIG}\nreranking:\n  enabled: false\n  max_document_bytes: 0\n");
+        Config::from_str(&yaml).expect("disabled reranking must ignore max_document_bytes");
 
         unsafe {
             std::env::remove_var("RERANKING_BASE_URL");
@@ -3110,6 +3159,9 @@ mcp:
         assert_eq!(cfg.search.rrf_candidates, 50);
         assert!(cfg.search.phrase);
         assert_eq!(cfg.search.diversity_max_per_document, Some(3));
+        // The example's reranking.max_document_bytes must stay in sync with the
+        // compiled default (#307).
+        assert_eq!(cfg.reranking.max_document_bytes, 6144);
     }
 
     #[test]
@@ -3996,6 +4048,7 @@ mcp:
         assert!(!cfg.reranking.enabled);
         assert_eq!(cfg.reranking.candidate_limit, 50);
         assert_eq!(cfg.reranking.api_key_env, "RERANKING_API_KEY");
+        assert_eq!(cfg.reranking.max_document_bytes, 6144);
     }
 
     #[test]
@@ -4008,10 +4061,16 @@ mcp:
             std::env::set_var("RERANKING_API_KEY", "sk-rerank");
         }
 
+        // chunking.max_chunk_size is deliberately different from
+        // reranking.max_document_bytes here, pinning that the two no longer derive
+        // from one another (#307).
         let yaml = r#"
+chunking:
+  max_chunk_size: 1000
 reranking:
   enabled: true
   candidate_limit: 100
+  max_document_bytes: 20000
 "#;
         let cfg = Config::from_str(yaml).unwrap();
         let reranking = cfg.reranking.expect("reranking should be resolved");
@@ -4019,6 +4078,7 @@ reranking:
         assert_eq!(reranking.model, "reranker");
         assert_eq!(reranking.api_key.as_deref(), Some("sk-rerank"));
         assert_eq!(reranking.candidate_limit, 100);
+        assert_eq!(reranking.max_document_bytes, 20000);
 
         unsafe {
             std::env::remove_var("RERANKING_BASE_URL");

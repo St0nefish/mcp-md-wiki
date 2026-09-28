@@ -214,13 +214,6 @@ struct ConsumerEntry {
 /// means there is nothing on `ResolvedConfig` for a `get` fn here to read. See
 /// `RELOAD_DIFF_EXCLUDED` in the test module for how these two stay accounted for
 /// without a `DiffField` entry.
-///
-/// `ResolvedRerankingConfig::max_document_bytes` is likewise absent, and is not a
-/// YAML setting at all: it is derived from `chunking.max_chunk_size` in
-/// `Config::resolve_inner` and baked into `RerankClient` at construction. It rides
-/// on `chunking.max_chunk_size`'s entry, but unlike the indexer's use of that number
-/// (re-chunked automatically), a change reaches the reranker only on restart — the
-/// same lifetime as every other `RerankClient` field.
 const DIFF_TABLE: &[DiffField] = &[
     // ── source ───────────────────────────────────────────────────────────────
     // `source.git_token_env` names the env var used to authenticate git operations.
@@ -393,8 +386,7 @@ const DIFF_TABLE: &[DiffField] = &[
             setting: "chunking.max_chunk_size",
             note: "read fresh by the chunker; every document chunked under the old value is \
                    re-chunked and re-embedded automatically by the full reconcile this reload \
-                   queued (chunking fingerprint mismatch). The reranker's derived \
-                   max_document_bytes still only changes on restart.",
+                   queued (chunking fingerprint mismatch).",
         }],
     },
     DiffField {
@@ -1013,6 +1005,19 @@ const DIFF_TABLE: &[DiffField] = &[
                    to regardless.",
         }],
     },
+    DiffField {
+        path: "reranking.max_document_bytes",
+        // `None` on either side (reranking disabled in that snapshot) skips the
+        // comparison entirely — same guard as `reranking.candidate_limit` above.
+        get: |c| c.reranking.as_ref().map(|r| d(&r.max_document_bytes)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "reranking.max_document_bytes",
+            note: "RerankClient bakes this in at construction (rerank.rs RerankClient::new), \
+                   like reranking.enabled — a reload cannot hand an already-running client a \
+                   new budget.",
+        }],
+    },
     // ── ui.semantic_edges ────────────────────────────────────────────────────
     // #226: previously missing from this table entirely — every change below it
     // reported nothing on reload, which reads as "did not take effect" even
@@ -1358,6 +1363,33 @@ mod tests {
         let report = diff(&old, &new);
         assert_eq!(report.applied.len(), 1);
         assert_eq!(report.applied[0].setting, "reranking.candidate_limit");
+    }
+
+    #[test]
+    fn reranking_max_document_bytes_change_is_restart_required() {
+        let mut old = base_config();
+        let mut new = base_config();
+        // Disabled on both sides: nothing to compare, nothing reported.
+        let report = diff(&old, &new);
+        assert!(report.is_empty());
+
+        let rr = |max_document_bytes: usize| {
+            Some(ResolvedRerankingConfig {
+                base_url: "http://localhost:9000".into(),
+                model: "test".into(),
+                api_key: None,
+                candidate_limit: 50,
+                max_document_bytes,
+            })
+        };
+        old.reranking = rr(6144);
+        new.reranking = rr(20000);
+        let report = diff(&old, &new);
+        assert_eq!(report.restart_required.len(), 1);
+        assert_eq!(
+            report.restart_required[0].setting,
+            "reranking.max_document_bytes"
+        );
     }
 
     #[test]

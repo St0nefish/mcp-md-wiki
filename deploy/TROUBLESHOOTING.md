@@ -286,35 +286,44 @@ reranker directly returns:
 {"error":{"code":500,"message":"input (518 tokens) is too large to process. increase the physical batch size (current batch size: 512)"}}
 ```
 
-**Cause.** A single candidate chunk exceeds the reranker's physical batch size, and
+**Cause.** A single candidate document exceeds the reranker's physical batch size, and
 the server rejects the whole request rather than that one document. llama.cpp
-defaults `--ubatch-size` to 512 tokens; chunks at the default `max_chunk_size` of
-1500 characters can exceed that.
+defaults `--ubatch-size` to 512 tokens; documents at the default
+`reranking.max_document_bytes` of 6144 bytes (sized for an 8192-token reranker served
+with `--ubatch-size` equal to `--ctx-size`) can exceed that on a smaller-context
+server.
 
-**Fix.** mcp-md-wiki now truncates each document to `chunking.max_chunk_size` bytes
-before sending it, so an over-long chunk degrades *that document's* score instead of
-costing the whole query its reranking. When this happens you get one warning per
+**Fix.** mcp-md-wiki truncates each document to `reranking.max_document_bytes` bytes
+before sending it, so an over-long document degrades *that document's* score instead
+of costing the whole query its reranking. When this happens you get one warning per
 request rather than a silent fallback:
 
 ```text
-Truncated 1 of 50 rerank documents to the 1500-byte budget (longest was 2199 bytes).
+Truncated 1 of 50 rerank documents to the 6144-byte reranking.max_document_bytes budget (longest was 7200 bytes).
 ```
 
-The budget deliberately has no knob of its own — it follows `chunking.max_chunk_size`,
-so the reranker accepts exactly what the chunker is configured to emit. It is applied
-only to the reranker's view of the text; returned document content is unaffected.
+Lower `reranking.max_document_bytes` to fit your reranker's actual `--ubatch-size`, or
+raise `--ubatch-size`/`--ctx-size` to fit the configured budget — whichever is cheaper
+for your deployment. Unlike `chunking.max_chunk_size`, this key has no automatic
+reindex tie-in and no other consumer, so changing it never re-chunks or re-embeds
+anything; it only changes what the reranker is sent (restart required, since
+`RerankClient` bakes it in at construction). It is applied only to the reranker's view
+of the text; returned document content is unaffected.
 
 That bound is in **bytes**, not tokens, and the two are not the same thing. Roughly
-four bytes per token holds for English prose (1500 bytes ≈ 375 tokens, comfortably
-inside llama.cpp's 512 default), but CJK text, base64 blobs and long unbroken
-identifiers tokenize far worse per byte. So if you raise `max_chunk_size` much past
-~2000, or your corpus is not mostly English prose, also raise the reranker's batch and
-context sizing so a query-plus-document pair still fits:
+four bytes per token holds for English prose (6144 bytes ≈ 1500 tokens), but CJK
+text, base64 blobs and long unbroken identifiers tokenize far worse per byte. The
+default is sized for the worst case — a byte-level BPE tokenizer never emits more
+than one token per byte, so 6144 bytes plus 2048 tokens of query headroom always
+fits an 8192-token `--ubatch-size`. When you size the key down for a smaller
+`--ubatch-size`, the English-prose estimate is optimistic: `1500` suits a
+512-token ubatch for mostly-English prose, but a corpus that isn't needs a lower
+budget, or the reranker's batch sizing raised to match its context:
 
 ```yaml
-      --ctx-size 16384
-      --batch-size 2048
-      --ubatch-size 2048
+      --ctx-size 8192
+      --batch-size 8192
+      --ubatch-size 8192
 ```
 
 Size `--ctx-size` for the number of parallel slots as well — llama.cpp divides it
