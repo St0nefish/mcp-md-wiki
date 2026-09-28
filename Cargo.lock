@@ -1645,7 +1645,7 @@ dependencies = [
  "gray_matter",
  "hex",
  "hmac",
- "jsonwebtoken",
+ "oauth-resource-server",
  "pulldown-cmark",
  "qdrant-client",
  "reqwest",
@@ -1801,6 +1801,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "oauth-resource-server"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9f11f62272a2d43c220c8101ecf05d1420442dabd05de0de51d8274fe50934d"
+dependencies = [
+ "axum 0.8.8",
+ "base64",
+ "http",
+ "jsonwebtoken",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]

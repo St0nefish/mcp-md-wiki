@@ -4,7 +4,20 @@ mcp-md-wiki can act as an **OAuth 2.1 resource server**: MCP clients get an acce
 token from your identity provider (the *authorization server*, AS) and present it on
 every request, and the server verifies it locally against the provider's published
 signing keys. This is the recommended way to protect `/mcp`, `/status`, `/metrics`
-and `POST /admin/reload`:
+and `POST /admin/reload`.
+
+The validator, JWKS handling, RFC 9728 metadata, `WWW-Authenticate` challenges and
+the auth middleware itself live in a separate, general-purpose crate,
+[`oauth-resource-server`](https://github.com/St0nefish/oauth-resource-server)
+(mcp-md-wiki#308) — extracted so the same tested implementation can protect other
+services, not only this one. This page covers what's specific to mcp-md-wiki: the
+`mcp.oauth` YAML keys and their defaults here, and how to set up this server with a
+given client. For how the validator works internally, its security properties and
+design rationale, and provider setup recipes, see the crate's
+[README](https://github.com/St0nefish/oauth-resource-server#readme) and
+[`docs/providers.md`](https://github.com/St0nefish/oauth-resource-server/blob/master/docs/providers.md).
+
+Why use it:
 
 - **Per user.** Every token names who it belongs to, so the logs do too.
 - **Expiring and revocable.** A leaked token dies on its own, usually within an hour
@@ -17,11 +30,15 @@ keeps working alongside OAuth. If you run with only the static token, the server
 logs a startup warning recommending OAuth. Nothing about an existing deployment
 changes until you edit its config.
 
-> **Scope enforcement is coarse.** A token must carry `mcp.oauth.required_scope`
-> (default `mcp:read`) to get in at all. There is no per-tool check yet, so any
-> accepted token can also call the write tools (`write_document`,
-> `delete_document`, `update_schema`). Only grant the scope to people you would let
-> edit the knowledge base.
+> **Scope enforcement is coarse.** A token must carry every scope in
+> `mcp.oauth.required_scope`/`required_scopes` (default: just `mcp:read`) to get in
+> at all. There is no per-tool check yet, so any accepted token can also call the
+> write tools (`write_document`, `delete_document`, `update_schema`). Only grant the
+> scope to people you would let edit the knowledge base. The match is exact, with
+> no scope hierarchy: a token carrying only `mcp:write` does not satisfy
+> `mcp:read`, so grant `mcp:read` to everyone who should get in, writers
+> included. (The MCP spec asks servers to account for a broader scope implying
+> narrower ones; this server does not yet.)
 
 ## How it works
 
@@ -29,28 +46,24 @@ changes until you edit its config.
    `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…", scope="…"`.
 2. It fetches the protected-resource metadata (RFC 9728) from
    `/.well-known/oauth-protected-resource/mcp` (also served at
-   `/.well-known/oauth-protected-resource`). Both routes are unauthenticated. The
+   `/.well-known/oauth-protected-resource`). The suffixed route is derived from
+   `resource`'s path (RFC 9728 §3.1) — `/mcp` for the usual
+   `https://kb.example.com/mcp`, `/kb/mcp` for a server published at
+   `https://host/kb/mcp`. Both routes are unauthenticated. The
    document names your `issuer` as the authorization server, plus
    `scopes_supported`.
 3. The client runs the authorization-code flow with PKCE against your AS and comes
    back with an access token.
-4. For each request, mcp-md-wiki checks the token:
-   1. It must be a JWT. Opaque tokens are refused.
-   2. The `alg` must be on the allowlist, and `typ` must be an access-token type.
-   3. The signature must verify against the AS's JWKS.
-   4. `iss` must equal `issuer` byte for byte.
-   5. `aud` must contain one of your configured audiences.
-   6. `exp` and `nbf` must hold, give or take `leeway_secs`.
-   7. The required scope must be present, or the request gets `403
-      insufficient_scope`.
+4. mcp-md-wiki checks the token against `mcp.oauth` below, on every request.
 
-The JWKS URI comes from `jwks_uri` when you set it. If you leave it empty, the
-server discovers it from the issuer's own metadata (OpenID Connect Discovery first,
-then RFC 8414). A discovered document whose `issuer` does not match yours byte for
-byte is refused. Keys are loaded at startup and re-read every hour, so a key the AS
-withdraws stops being trusted. A token signed with an unknown `kid` triggers at
-most one refetch per minute. If the AS is unreachable, the server rejects tokens
-(fails closed) but keeps the keys it already has.
+Steps 1, 2 and 4 are all `oauth-resource-server`'s: this server just supplies the
+config. For exactly what step 4 checks and in what order (JWT shape, `alg`
+allowlist, signature against the JWKS, `iss`/`aud`/`exp`/`nbf`, `typ`, scope), how
+the JWKS is fetched or discovered and kept fresh, and what happens when the AS is
+unreachable, see the crate's
+[What is checked, in order](https://github.com/St0nefish/oauth-resource-server#what-is-checked-in-order),
+[Security model](https://github.com/St0nefish/oauth-resource-server#security-model) and
+[Design rationale](https://github.com/St0nefish/oauth-resource-server#design-rationale).
 
 ## Configuration
 
@@ -61,18 +74,21 @@ in [`deploy/config.example.yaml`](../deploy/config.example.yaml).
 | Key | Default | Notes |
 |---|---|---|
 | `enabled` | `false` | Master switch. |
-| `issuer` | (required) | Copy it exactly from the AS's discovery document, including any trailing slash. |
-| `resource` | (required) | The public URL of this server's MCP endpoint, e.g. `https://kb.example.com/mcp`. |
+| `issuer` | (required) | Copy it exactly from the AS's discovery document, including any trailing slash. Must be `https` unless its host is loopback or `allow_insecure_http` is set. |
+| `resource` | (required) | The public URL of this server's MCP endpoint, e.g. `https://kb.example.com/mcp`. Same `https` rule as `issuer`. A trailing slash is part of the path: `https://kb.example.com/mcp/` is described at `/.well-known/oauth-protected-resource/mcp/`. |
 | `audience` | (required, unless `audiences` is set) | A value the token's `aud` must contain. See [Choosing the audience](#choosing-the-audience). |
 | `audiences` | `[]` | More accepted audiences. Combined with `audience`; a match on any one is enough. |
-| `jwks_uri` | `""` (discover) | Set it to skip discovery. |
-| `required_scope` | `mcp:read` | A single scope. Matching is exact and case-sensitive. |
-| `scopes_supported` | `[mcp:read, mcp:write]` | Advertised to clients. |
+| `jwks_uri` | unset (discover) | Set it to skip discovery. Unset, `~` and `""` all mean discover. A plain `http://` URL on a non-loopback host (anyone on that path could substitute the signing keys) fails startup unless `allow_insecure_http` is set. |
+| `required_scope` | `mcp:read` | A single scope (printable ASCII, no spaces, `"` or `\`), matched exactly and case-sensitively. mcp-md-wiki defaults this to `mcp:read` when neither it nor `required_scopes` is set — the crate itself has no default scope. An explicit `required_scope: ""` is still an error, never "no scope". |
+| `required_scopes` | `[]` | Further required scopes — a token must carry ALL of them, unioned with `required_scope`. Setting this alone (with `required_scope` unset) replaces the implicit `mcp:read` default with exactly this list. |
+| `scopes_supported` | `[mcp:read, mcp:write]` | Advertised to clients, in the metadata document and in every 401's `scope=`. Enforcement is `required_scope`/`required_scopes`, but clients request exactly what this lists, so it must include every required scope — change both together. An explicit `[]` advertises nothing: the metadata document omits `scopes_supported`, and every 401's `scope=` names the required scopes instead. |
 | `scope_claims` | `[scope, scp]` | The claims scopes are read from. Each can be a space-delimited string or an array, and their contents are combined. |
 | `principal_claims` | `[preferred_username, sub]` | Log attribution only: the first claim present names the caller. |
 | `algorithms` | RS/PS 256/384/512, ES256, ES384, EdDSA | Accepted signing algorithms. `HS*` and `none` are refused when the config loads. |
 | `leeway_secs` | `60` | Clock-skew allowance on `exp`/`nbf`. Maximum 300. |
-| `require_at_jwt` | `false` | Require header `typ: at+jwt` (RFC 9068). Turn it on if your AS emits it. |
+| `require_at_jwt` | `false` | Require header `typ: at+jwt` (RFC 9068 §4 requires it; off is a deliberate leniency for servers that emit `JWT`). Turn it on if your AS emits it. |
+| `allow_insecure_http` | `false` | Accept a plain `http://` `issuer`, `jwks_uri` or `resource` on a non-loopback host — for an in-cluster address such as `http://authentik-server:9000/...` on a network you trust. Each such URL is still logged as a startup warning. It also governs URLs reached at run time: a `jwks_uri` discovered from a loopback `http://` issuer, and any redirect followed while fetching keys, may land on plain `http` on a non-loopback host only with it set (each use is logged as a warning). Loopback hosts never need it. |
+| `allow_unscoped_tokens` | `false` | Accept a block with no required scope and `require_at_jwt` off. Has no effect here: this server always requires a scope (`mcp:read` unless you name another). |
 | `accept_static_bearer` | `true` | Set `false` to run OAuth-only even when `MCP_BEARER_TOKEN` is set. |
 
 A misconfigured block stops the server at startup, and the error lists every
@@ -89,218 +105,117 @@ default, so you must set it:
   an access-token audience per client): set `audience` to the same value as
   `resource`. This is what the MCP authorization spec intends.
 - **Your AS stamps the OAuth client_id** and ignores the `resource` parameter: set
-  `audience` to the client_id.
+  `audience` to the client_id. This departs from the MCP authorization spec
+  ("Token Handling" and "Access Token Privilege Restriction": an MCP server MUST
+  accept only tokens issued for it as the audience, per RFC 8707 §2) and from
+  RFC 9068 §4 (`aud` must identify this resource server). Every token that
+  client obtains from your AS, for any resource, carries the same `aud` and is
+  accepted here, so it is sound only when that OAuth client is **dedicated to
+  this one server** — never shared with another MCP server or API. Use a
+  resource-URL audience wherever your AS supports one. The crate's
+  [Audience](https://github.com/St0nefish/oauth-resource-server#audience-which-value-to-configure) section has the detail.
 
 To find out which yours does, decode one real access token (the middle segment is
 base64url JSON) and look at `aud`. To switch from one to the other without
 downtime, list both in `audiences` while you migrate.
 
-## Provider recipes
+## Setting up a provider and an MCP client
 
-Only providers that have actually been tested are listed here. Each line is
-marked:
+Provider recipes (Authentik, Authelia, Kanidm) and a checklist for any other
+provider — issuing JWT access tokens, signing asymmetrically, choosing the
+audience, finding the scope claim, and registering a client — now live in the
+crate's [`docs/providers.md`](https://github.com/St0nefish/oauth-resource-server/blob/master/docs/providers.md),
+each recipe labeled by exactly how much it's been verified.
 
-- **[verified]**: observed in a real deployment or a sandbox test.
-- **[docs]**: taken from the provider's documentation and not independently tested.
+**Using a crate recipe here:** the crate's recipes are written as a top-level
+YAML block for a generic resource server, and don't paste into mcp-md-wiki's
+config unchanged:
 
-Placeholders: `auth.example.com` / `idm.example.com` for the AS,
-`kb.example.com` for this server, `example-client` for the client id.
+- Nest every key under `mcp.oauth` in `config.yaml` (i.e. `mcp:` with an
+  `oauth:` block under it — see the example block below) — `resource =
+  "https://api.example.com"` in the recipe becomes `mcp.oauth.resource:
+  https://api.example.com` here.
+- Always set `resource` to **this server's own `/mcp` URL**, e.g.
+  `https://kb.example.com/mcp`, not the generic `https://api.example.com` the
+  recipe shows.
+- Set `audience` per [Choosing the audience](#choosing-the-audience) above,
+  **not** by copying the recipe's `audience` line unchanged: Authentik and
+  Kanidm stamp the OAuth client id, so `audience` there is that client's id
+  (not a URL), while Authelia stamps the resource, so `audience` there must
+  equal `resource` — on both the Authelia server config and the Authelia
+  client itself.
+- Drop the recipe's `required_scope` and `scopes_supported` lines, or set
+  them to `mcp:read` and `[mcp:read, mcp:write]` explicitly — mcp-md-wiki
+  already defaults them to exactly that (see the table above), and pasting the
+  recipe's own scopes (e.g. `api:read`) verbatim means tokens need a scope
+  your IdP likely isn't issuing, and every caller gets
+  `403 insufficient_scope`. If your IdP can't issue `mcp:read` itself
+  (Kanidm's recipe warns it may refuse a `:` in a scope name), use a name it
+  does accept (e.g. `mcp_read`) in all three places, and keep them matched:
+  `mcp.oauth.required_scope` and `mcp.oauth.scopes_supported` here (e.g.
+  `mcp_read` and `[mcp_read, mcp_write]`), and the IdP's scope map.
+  `scopes_supported` is this server's own setting, not the IdP's: it is what
+  the metadata document and every 401 challenge tell clients to request, so
+  leaving it at the `mcp:read`/`mcp:write` default while requiring `mcp_read`
+  gets every call a 403.
+- Replace the recipes' own example scope names — `api:read`/`api:write` —
+  with `mcp:read`/`mcp:write` (or your chosen scope from the bullet above)
+  everywhere they appear on the IdP side, not just in the `required_scope`
+  line: Authelia's client `scopes:` list, Authentik's scope mappings, and
+  Kanidm's scope map. If you drop the recipe's `required_scope` line and rely
+  on the `mcp:read` default here but leave the IdP client registered with
+  `api:read`/`api:write` as shown in the recipe, the issued token never
+  carries `mcp:read` and every caller gets `403 insufficient_scope`.
 
-### Authentik
-
-Status: **verified in production**, the deployment this feature was first built
-for, running OAuth alongside the static bearer token.
-
-- [verified] Use an OAuth2/OpenID provider. The per-application issuer has a trailing
-  slash: `https://auth.example.com/application/o/<slug>/`.
-- [verified] The JWKS is at `<issuer>jwks/`. Discovery also finds it.
-- [verified] `aud` is the provider's **client_id** as a string. The `resource`
-  parameter is ignored.
-- [verified] `scope` is a space-delimited string, signed RS256, with header `typ:
-  JWT` (so leave `require_at_jwt` off).
-- [docs] The provider needs a **signing key**. Without one, Authentik signs with
-  HS256 using the client secret, which no resource server can verify (and
-  mcp-md-wiki refuses HS256 outright).
-- [docs] Only scopes backed by a scope mapping on the provider end up in `scope`.
-  Create mappings for `mcp:read` / `mcp:write`, or change `required_scope` to a
-  scope the provider does issue.
-
-```yaml
-mcp:
-  oauth:
-    enabled: true
-    issuer: "https://auth.example.com/application/o/wiki/"
-    jwks_uri: "https://auth.example.com/application/o/wiki/jwks/"   # optional
-    audience: "example-client-id"
-    resource: "https://kb.example.com/mcp"
-```
-
-### Authelia (4.39)
-
-Status: **verified in a sandbox**, end to end. Real Authelia 4.39.4 tokens were
-accepted and rejected as expected by this server, including discovery, the `scp`
-claim, a resource-URL audience, `require_at_jwt`, a 403 for a token missing
-`mcp:read`, and a 401 when the audience is configured as the client_id instead.
-
-- [verified] Access tokens are **opaque by default**. Set
-  `access_token_signed_response_alg: 'RS256'` on the client to get JWTs. The header
-  is then `{"alg":"RS256","typ":"at+jwt"}`.
-- [verified] Scopes arrive as `scp` (a JSON array), with no `scope` claim. Authelia
-  refuses to add one through a claims policy. The default `scope_claims` reads
-  `scp`.
-- [verified] `aud` never contains the client_id. It holds only the client's
-  configured `audience` values, and the `resource` parameter is ignored. Configure
-  the client with `audience: ['https://kb.example.com/mcp']` and
-  `requested_audience_mode: 'implicit'`, and set the server's `audience` to the same
-  URL.
-- [verified] `iss` has no trailing slash. `sub` is an opaque UUID, and the access
-  token carries no username, so logs show the `sub`.
-- [verified] There is no dynamic client registration, so pre-register a client. A
-  public client (`public: true`, `token_endpoint_auth_method: 'none'`, PKCE S256)
-  works. The custom scopes `mcp:read`/`mcp:write` cause only a validation warning.
-- [verified] For redirect URIs, `http://127.0.0.1/callback` matches 127.0.0.1 on
-  any port. `localhost` matches only exactly registered ports.
-
-Authelia client (excerpt):
-
-```yaml
-identity_providers:
-  oidc:
-    clients:
-      - client_id: 'example-client'
-        public: true
-        token_endpoint_auth_method: 'none'
-        authorization_policy: 'one_factor'      # or two_factor
-        consent_mode: 'implicit'
-        require_pkce: true
-        pkce_challenge_method: 'S256'
-        redirect_uris:
-          - 'http://127.0.0.1/callback'         # matches 127.0.0.1 on any port
-          - 'http://localhost:38765/callback'   # exact port, e.g. claude --callback-port 38765
-        scopes: ['openid', 'offline_access', 'mcp:read', 'mcp:write']
-        response_types: ['code']
-        grant_types: ['authorization_code', 'refresh_token']
-        access_token_signed_response_alg: 'RS256'   # without this, tokens are opaque
-        audience: ['https://kb.example.com/mcp']
-        requested_audience_mode: 'implicit'
-```
-
-mcp-md-wiki:
+For reference, the production-verified `mcp.oauth` block for Authentik looks
+like:
 
 ```yaml
 mcp:
   oauth:
     enabled: true
-    issuer: "https://auth.example.com"          # no trailing slash
-    audience: "https://kb.example.com/mcp"      # the resource URL, not the client id
+    issuer: "https://auth.example.com/application/o/mcp-md-wiki/"
+    jwks_uri: "https://auth.example.com/application/o/mcp-md-wiki/jwks/"
     resource: "https://kb.example.com/mcp"
-    require_at_jwt: true
+    audience: "mcp-md-wiki-client-id"   # Authentik's OAuth client id, not a URL
+    required_scope: "mcp:read"
 ```
 
-### Kanidm
+Everything else about setting up a provider — creating the application,
+signing asymmetrically, registering the client — is not mcp-md-wiki-specific
+and is covered in full in the crate's `docs/providers.md`.
 
-Status: **token shape verified in a sandbox; not tested end to end with this
-server.** A real Kanidm access token was verified with an independent JWT tool. A
-unit test replays that exact shape through mcp-md-wiki's validator
-(`observed_shape_kanidm_…` in `src/oauth.rs`), but no live Kanidm token has been
-sent to a running mcp-md-wiki.
+What's specific to this server:
 
-- [verified] Each client has its own issuer: `https://idm.example.com/oauth2/openid/<client>`.
-  The trailing-slash variant does not match. Discovery works at
-  `<issuer>/.well-known/openid-configuration`, and the JWKS is per client.
-- [verified] Tokens are signed **ES256** with header `typ: at+jwt`. `aud` is the
-  **client name** (a string). `scope` is a space-delimited string. `sub` is a UUID,
-  with no username or groups in the access token. Tokens live 900 s.
-- [verified] The `resource` parameter is accepted and ignored. There is no dynamic
-  client registration. Public clients require PKCE S256.
-- [docs] Grant scopes to users with a scope map on the client, for a group. Whether
-  Kanidm accepts a scope name containing `:` was not tested. If it refuses
-  `mcp:read`, use e.g. `mcp_read` and set `required_scope` and `scopes_supported`
-  to match.
+- **Grant the required scope** (`mcp:read` by default) to the users who should get
+  in. Remember that write access currently comes with it.
+- **Register the MCP client.** Most self-hosted authorization servers have no
+  dynamic client registration, so create a public client with PKCE and give its
+  client id to the MCP client. For Claude Code, that is `claude mcp add --transport
+  http --client-id <id> --callback-port <port> <name> <url>`. The redirect URI must
+  be registered exactly.
+- **Hosted clients** (claude.ai, Claude Desktop, the mobile apps) can only connect
+  to a remote MCP server through the OAuth authorization-code flow — the static
+  bearer token does not work for them. See [README.md](../README.md#authentication-oauth-recommended).
+- **Check the startup log.** It should say `authorization server signing keys
+  loaded`. Then decode a failing request's reason from the `OAuth bearer auth
+  rejected` warning, logged under the `oauth_resource_server` target. That
+  line (and the JWKS load/refresh failure warnings) is WARN, so it's already
+  visible under the default `RUST_LOG=info` — no extra directive needed,
+  *unless* your `RUST_LOG` names only `mcp_md_wiki` with no global level
+  (e.g. bare `mcp_md_wiki=debug`), which hides every other target including
+  this one. Only the DEBUG-level accept/reject detail lines (`OAuth bearer
+  auth accepted`, `No bearer credential presented`) need you to add
+  `oauth_resource_server=debug` to `RUST_LOG` to see them, e.g.
+  `RUST_LOG=info,mcp_md_wiki=debug,oauth_resource_server=debug` (see
+  `main.rs`'s `DEFAULT_LOG_FILTER` doc comment for the full reasoning). See
+  [TROUBLESHOOTING](../deploy/TROUBLESHOOTING.md#oauth).
 
-```yaml
-mcp:
-  oauth:
-    enabled: true
-    issuer: "https://idm.example.com/oauth2/openid/example-client"
-    audience: "example-client"
-    resource: "https://kb.example.com/mcp"
-    require_at_jwt: true
-```
+## Security properties and design rationale
 
-### Any other provider: checklist
-
-1. **Issue JWT access tokens.** mcp-md-wiki cannot verify opaque tokens: there is no
-   RFC 7662 introspection. Many servers issue opaque tokens by default and have a
-   per-client or global switch for JWTs. A token without two `.` characters is
-   opaque, and the server logs `credential is not a JWT`.
-2. **Sign asymmetrically.** Use RS256, PS256, ES256, ES384 or EdDSA. HS256 cannot
-   be verified by a resource server.
-3. **Copy the issuer exactly** from `<issuer>/.well-known/openid-configuration`,
-   trailing slash included.
-4. **Decode a real token** and read three claims:
-   - `aud`: put it in `audience`. See [Choosing the audience](#choosing-the-audience).
-   - Where the scopes are: `scope` or `scp`, as a string or an array, all work by
-     default. Anything else goes in `scope_claims`.
-   - `typ` in the header: if it is `at+jwt`, turn on `require_at_jwt`.
-5. **Grant the required scope** (`mcp:read` by default) to the users who should get
-   in. Remember that write access currently comes with it.
-6. **Register the MCP client.** Most self-hosted servers have no dynamic client
-   registration, so create a public client with PKCE and give its client id to the
-   MCP client. For Claude Code, that is `claude mcp add --transport http
-   --client-id <id> --callback-port <port> <name> <url>`. The redirect URI must be
-   registered exactly.
-7. **Check the startup log.** It should say `authorization server signing keys
-   loaded`. Then decode a failing request's reason from the `OAuth bearer auth
-   rejected` warning. See [TROUBLESHOOTING](../deploy/TROUBLESHOOTING.md#oauth).
-
-## Security notes
-
-- **Use `require_at_jwt` when your AS supports it.** With `aud` set to the
-  client_id (Authentik, Kanidm), an **ID token** for the same client also has a
-  matching `iss` and `aud`. It is normally stopped by the scope check, because ID
-  tokens carry no `scope`. The `typ` check stops it explicitly, but only for servers
-  that emit `at+jwt`.
-- **Algorithms and keys.** Each key is limited to the algorithms its own type (and
-  its `alg`, if it declares one) can produce. A token cannot steer an RSA key into
-  ECDSA verification, or any key into HMAC. Symmetric (`oct`) keys and `use: enc`
-  keys in a JWKS are ignored.
-- **Network.** The server fetches only URLs derived from your configured `issuer`,
-  or your `jwks_uri`. Response bodies are capped. Redirects are limited, and a
-  redirect from https to http is refused. A plain-http issuer on a non-loopback
-  host produces a startup warning.
-- **Logs.** Tokens are never logged. Accepted requests are attributed at DEBUG
-  level, and refused ones are logged at WARN with the reason (for example
-  `InvalidAudience`). The HTTP response carries no reason, so a client cannot probe
-  which check failed.
-
-## Design notes
-
-Decisions made while making OAuth provider-agnostic, with the main alternatives
-that were rejected:
-
-- **Scopes: read `scope` and `scp` by default, in every shape, and combine them.**
-  A per-provider "scope format" switch was rejected because the default already
-  covers every shape seen in practice, and a claim a token does not carry adds
-  nothing.
-- **Audience: explicit config with no default, accepting any of several values.**
-  Defaulting to `resource` was rejected: it would silently reject every Authentik
-  and Kanidm token, and the choice is too consequential to guess.
-- **Algorithms: a wide asymmetric allowlist, with each key bound to its own type.**
-  Staying RS256-only was rejected because Kanidm signs ES256 by default. HMAC is
-  refused outright rather than made configurable.
-- **Discovery: used only when `jwks_uri` is empty, with an exact issuer match, run
-  in the background at startup.** Making startup wait for discovery was rejected,
-  because an outage at the AS would then also take this server down.
-- **`typ`: accept `at+jwt`, `JWT` or no `typ` by default, with an opt-in strict
-  mode.** Making strict the default was rejected because Authentik, Keycloak and
-  Entra ID emit `JWT`.
-- **Opaque tokens: not supported.** RFC 7662 introspection would need a client
-  secret, an AS round trip per request (or an introspection cache with its own
-  revocation semantics), and a second validation path. It is a possible follow-up,
-  not part of this change. Every server this project has tested can issue JWT
-  access tokens.
-- **401 on a request with no credential keeps `error="invalid_token"`.** RFC 6750
-  §3.1 says to omit the error code there. That change was deferred because clients
-  already in use start their flow from the current challenge. The
-  `resource_metadata` parameter they depend on is present either way.
+The algorithm allowlist, key-type binding, JWKS discovery/refresh, network limits,
+scope-claim handling, and the design decisions behind each of those (why there's no
+audience default, why HMAC is refused outright, why discovery doesn't block
+startup, and so on) are all `oauth-resource-server`'s and documented once, for every
+consumer of the crate, in its [Security model](https://github.com/St0nefish/oauth-resource-server#security-model) and
+[Design rationale](https://github.com/St0nefish/oauth-resource-server#design-rationale) sections.

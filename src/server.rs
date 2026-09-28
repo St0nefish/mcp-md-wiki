@@ -8,15 +8,14 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
-    middleware::{self, Next},
+    http::StatusCode,
+    middleware,
     response::Response,
 };
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use std::sync::RwLock;
-use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 use tower_governor::{
     GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
@@ -30,11 +29,14 @@ use crate::embed::EmbedClient;
 use crate::git;
 use crate::ingest;
 use crate::mcp::KbSearchServer;
-use crate::oauth::{OAuthValidator, PROTECTED_RESOURCE_METADATA_PREFIX, TokenRejection};
 use crate::qdrant::QdrantStore;
 use crate::rerank::RerankClient;
 use crate::schema::{self, SchemaCache};
 use crate::webhook::{self, WebhookState};
+use oauth_resource_server::axum::{AuthLayer, metadata_router, require_auth};
+use oauth_resource_server::{
+    OAuthValidator, PROTECTED_RESOURCE_METADATA_PREFIX, StaticTokenDecision, static_token_policy,
+};
 
 #[derive(Clone)]
 struct HealthState {
@@ -1117,238 +1119,118 @@ pub fn render_prometheus(
     s
 }
 
-/// The credentials this server accepts, resolved once at startup.
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+/// The auth middleware's state: the credentials this server accepts, resolved once
+/// at startup, as `oauth_resource_server`'s [`AuthLayer`] (mcp-md-wiki#308).
 ///
-/// Both fields are independently optional and the middleware below accepts EITHER,
-/// which is the whole design: adding OAuth must not disturb the static token, since
-/// Claude Code authenticates with it and is not being migrated. `bearer_token` is
-/// `None` only under `mcp.allow_unauthenticated`; `oauth` is `None` unless
-/// `mcp.oauth.enabled` (see `config::OAuthConfig`).
-#[derive(Clone)]
-struct AuthState {
-    bearer_token: Option<String>,
+/// Dual-mode: a request is let through if its `Authorization: Bearer` credential
+/// matches the static token (compared in constant time, tried first — it needs no
+/// network, so the common Claude Code request never touches the JWT machinery or
+/// depends on the authorization server being up) OR validates as an OAuth access
+/// token carrying every required scope. Adding OAuth must not disturb the static
+/// token. `bearer_token` is what [`static_bearer_token`] decided; `oauth` is `Some`
+/// only when `mcp.oauth.enabled`.
+///
+/// Refusals are 401 (missing or invalid credential) or 403 (valid token, missing
+/// scope) with an empty body. Once OAuth is configured EVERY refusal carries the
+/// validator's `WWW-Authenticate` challenge — including a failed static-token
+/// request, since the server cannot tell which credential the caller meant to
+/// present. With only the static token, a 401 carries no challenge: this server
+/// has never sent one to static-token clients, so the layer opts out of the
+/// crate's default static challenge (`static_challenge(None)`) to keep those
+/// responses unchanged. That header is load-bearing: claude.ai does not start the
+/// authorization flow at all without its `resource_metadata` parameter (Claude
+/// Code tolerates its absence, which is why a missing header is easy to ship and
+/// hard to notice). A request with no credential gets the same `invalid_token`
+/// challenge as a bad one; the difference lives in the log level only.
+///
+/// On an OAuth success the middleware inserts the `oauth_resource_server::
+/// AuthorizedToken` (and a `Credential`) into request extensions. NOTHING READS IT
+/// YET: write-scope enforcement (`mcp:write` for write_document / delete_document /
+/// update_schema) is not implemented, because the middleware cannot see which MCP
+/// tool a request invokes — that is in the JSON-RPC body, which only rmcp parses.
+/// Any valid token therefore grants full access today, writes included.
+///
+/// The layer is built from [`static_bearer_token`]'s decision, never from a raw
+/// token, so the crate's `AuthLayerBuilder::build_with_decision` owns the mapping:
+/// the explicit pass-through (`AuthLayer::allow_unauthenticated`) only for a
+/// `StaticTokenDecision::Unauthenticated` — which the policy returns only with
+/// `mcp.allow_unauthenticated` and neither credential configured — and a check
+/// that the decision and `oauth` agree (a decision made with OAuth on needs a
+/// validator, and vice versa). No configuration mistake can produce an open
+/// server here.
+fn auth_layer(
+    decision: StaticTokenDecision,
     oauth: Option<Arc<OAuthValidator>>,
+) -> Result<AuthLayer> {
+    AuthLayer::builder()
+        .optional_oauth(oauth)
+        .static_challenge(None)
+        .build_with_decision(decision)
+        .context("Failed to build the bearer-auth layer")
 }
 
-impl AuthState {
-    /// Build the `WWW-Authenticate` challenge for a refusal, when there is one to
-    /// build. `None` for a deployment with no OAuth configured — RFC 6750 would let
-    /// us emit a bare `Bearer` realm challenge there, but nothing consumes it and
-    /// the existing static-token clients have never seen one.
-    fn challenge(&self, rejection: &TokenRejection) -> Option<String> {
-        let oauth = self.oauth.as_ref()?;
-        Some(match rejection {
-            TokenRejection::InsufficientScope => oauth.insufficient_scope_challenge(),
-            // A request with NO credential gets the same `invalid_token` challenge
-            // as a bad one. RFC 6750 §3.1 says a server SHOULD NOT send an error
-            // code then, but this is the challenge claude.ai and Claude Code have
-            // been starting the flow from since #273, and the part they depend on
-            // — `resource_metadata` — is present either way. Deliberately left
-            // as-is; the distinction lives in the log level only.
-            TokenRejection::Invalid(_) | TokenRejection::Missing => oauth.invalid_token_challenge(),
-        })
-    }
-}
-
-/// Turn a refusal into a response, attaching the challenge header when OAuth is
-/// configured.
+/// Decide the static bearer token the auth layer holds — as the crate's
+/// `StaticTokenDecision`, which [`auth_layer`] builds the layer from — from the
+/// env var's value (`env_value`, read by the caller so this stays a pure,
+/// testable function) and the RESOLVED OAuth config. Errors when the result
+/// would leave the protected routes with no authentication and
+/// `mcp.allow_unauthenticated` was not set.
 ///
-/// The header is load-bearing rather than decorative: claude.ai has been observed
-/// not starting the authorization flow at all when a 401 arrives without
-/// `resource_metadata`, because that parameter is how it discovers the
-/// authorization server. Claude Code tolerates its absence — which is precisely why
-/// a missing header is easy to ship and hard to notice. It therefore goes on EVERY
-/// refusal once OAuth is configured, including a failed static-token request: the
-/// server cannot tell which credential the caller meant to present, and a static
-/// token is exactly what a hosted client that has not yet run the flow does not
-/// have.
-fn auth_rejection(auth: &AuthState, rejection: TokenRejection) -> Response {
-    let status = match rejection {
-        TokenRejection::InsufficientScope => StatusCode::FORBIDDEN,
-        TokenRejection::Invalid(_) | TokenRejection::Missing => StatusCode::UNAUTHORIZED,
-    };
-    let mut response = Response::builder().status(status);
-    if let Some(challenge) = auth.challenge(&rejection)
-        && let Ok(value) = axum::http::HeaderValue::from_str(&challenge)
-    {
-        response = response.header(axum::http::header::WWW_AUTHENTICATE, value);
-    }
-    response
-        .body(axum::body::Body::empty())
-        .expect("a status-and-header-only response is always constructible")
-}
-
-/// Dual-mode bearer auth: a request is authenticated if the presented credential
-/// matches the static token OR validates as an OAuth access token.
-///
-/// The static path is unchanged and is tried first — it is a constant-time
-/// comparison against an in-memory string, so it costs nothing, and putting it
-/// first means the overwhelmingly common Claude Code request never touches the JWT
-/// machinery. Only if that fails (or is not configured) does the OAuth validator
-/// get a look.
-///
-/// Note what happens with NEITHER configured: the request is let through, exactly
-/// as before, which is `mcp.allow_unauthenticated`. Configuring either credential
-/// closes that door.
-async fn bearer_auth(
-    State(auth): State<AuthState>,
-    headers: HeaderMap,
-    request: axum::extract::Request,
-    next: Next,
-) -> Response {
-    if auth.bearer_token.is_none() && auth.oauth.is_none() {
-        return next.run(request).await;
-    }
-
-    let path = request.uri().path().to_string();
-
-    let auth_header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let token = bearer_credential(auth_header);
-
-    if let Some(ref expected_token) = auth.bearer_token
-        && !token.is_empty()
-        && token.as_bytes().ct_eq(expected_token.as_bytes()).into()
-    {
-        return next.run(request).await;
-    }
-
-    let Some(ref oauth) = auth.oauth else {
-        warn!(path = %path, "Bearer auth rejected");
-        return auth_rejection(
-            &auth,
-            TokenRejection::Invalid("static token mismatch".into()),
-        );
-    };
-
-    match oauth.validate(token).await {
-        Ok(claims) => {
-            debug!(
-                path = %path,
-                principal = ?claims.principal,
-                subject = ?claims.subject,
-                scopes = ?claims.scopes,
-                "OAuth bearer auth accepted"
-            );
-            // Stashed for a future per-tool scope check. NOTHING READS IT YET:
-            // write-scope enforcement (`mcp:write` for write_document /
-            // delete_document / update_schema) is not implemented, because this
-            // middleware cannot see which MCP tool a request invokes — that is in
-            // the JSON-RPC body, which only rmcp parses. Any valid token therefore
-            // grants full access today, writes included. See `oauth.rs`'s module
-            // doc.
-            let mut request = request;
-            request.extensions_mut().insert(claims);
-            next.run(request).await
-        }
-        // A request with no credential at all is how every OAuth client starts
-        // (401 → read `resource_metadata` → authorize), so it is not worth a warning.
-        Err(TokenRejection::Missing) => {
-            debug!(path = %path, "No bearer credential presented");
-            auth_rejection(&auth, TokenRejection::Missing)
-        }
-        Err(rejection) => {
-            warn!(path = %path, reason = ?rejection, "OAuth bearer auth rejected");
-            auth_rejection(&auth, rejection)
-        }
-    }
-}
-
-/// The credential from an `Authorization: Bearer <token>` header, or `""`.
-///
-/// The auth-scheme is matched case-insensitively (RFC 9110 §11.1, RFC 6750 §2.1
-/// examples notwithstanding) — `bearer x` is the same credential as `Bearer x`,
-/// and refusing it would be a spurious 401 for a client that lower-cases scheme
-/// names. The token itself is taken verbatim, minus surrounding spaces.
-fn bearer_credential(header: &str) -> &str {
-    match header.split_once(' ') {
-        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
-        _ => "",
-    }
-}
-
-/// Decide the static bearer token `AuthState` holds, from the env var's value
-/// (`env_value`, read by the caller so this stays a pure, testable function) and
-/// the RESOLVED OAuth config. Errors when the result would leave the protected
-/// routes with no authentication and `mcp.allow_unauthenticated` was not set.
-///
-/// `oauth` is the resolved config — `Some` only when OAuth is genuinely on —
-/// never the mere presence of the YAML block, so neither `accept_static_bearer:
-/// false` nor an OAuth block with `enabled: false` can be the thing that leaves a
-/// server open.
+/// The decision is `oauth_resource_server::static_token_policy`'s; what is added
+/// here is this server's startup log lines and its refusal text, which name its own
+/// settings. `oauth` is the resolved config — `Some` only when OAuth is genuinely
+/// on — never the mere presence of the YAML block, so neither
+/// `accept_static_bearer: false` nor an OAuth block with `enabled: false` can be
+/// the thing that leaves a server open.
 fn static_bearer_token(
     env_name: &str,
     env_value: Option<String>,
     oauth: Option<&crate::config::ResolvedOAuthConfig>,
     allow_unauthenticated: bool,
-) -> Result<Option<String>> {
-    let env_value = env_value.filter(|v| !v.is_empty());
-    match (env_value, oauth) {
-        // `mcp.oauth.accept_static_bearer: false`: OAuth-only even with the env
-        // var set.
-        (Some(_), Some(o)) if !o.accept_static_bearer => {
-            info!(
-                "'{env_name}' is set but mcp.oauth.accept_static_bearer is false — the \
-                 static bearer token is IGNORED; only OAuth access tokens are accepted"
-            );
-            Ok(None)
-        }
-        (Some(token), Some(_)) => Ok(Some(token)),
-        (Some(token), None) => {
-            // OAuth-first: a shared static secret is still supported, but it
-            // is one leaked string away from full access (writes included) and
-            // cannot be scoped, expired or attributed to a person. Said once at
-            // startup, never per request. The listener always binds 0.0.0.0 (see
-            // `run_server`), so there is no loopback-only case to exempt.
-            warn!(
-                "Only a static bearer token ('{env_name}') protects /mcp. It works, but \
-                 OAuth (mcp.oauth) is the recommended setup: per-user, expiring, \
-                 revocable tokens from your identity provider. See docs/oauth.md."
-            );
-            Ok(Some(token))
-        }
-        (None, Some(_)) => {
-            info!(
-                "No static bearer token configured ('{env_name}' unset) — OAuth access \
-                 tokens are the only accepted credential"
-            );
-            Ok(None)
-        }
-        (None, None) if allow_unauthenticated => {
-            warn!("{}", unauthenticated_mcp_warning(env_name));
-            Ok(None)
-        }
-        (None, None) => anyhow::bail!(
+) -> Result<StaticTokenDecision> {
+    let Ok(decision) = static_token_policy(env_value, oauth, allow_unauthenticated) else {
+        anyhow::bail!(
             "Environment variable '{env_name}' is not set or empty. Enable mcp.oauth \
              (recommended — see docs/oauth.md), set it to a bearer token, or set \
              mcp.allow_unauthenticated: true in config.yaml to explicitly opt out of \
              authentication."
+        );
+    };
+    match &decision {
+        // `mcp.oauth.accept_static_bearer: false`: OAuth-only even with the env
+        // var set.
+        StaticTokenDecision::StaticIgnored => info!(
+            "'{env_name}' is set but mcp.oauth.accept_static_bearer is false — the \
+             static bearer token is IGNORED; only OAuth access tokens are accepted"
         ),
+        StaticTokenDecision::StaticAndOAuth(_) => {}
+        // OAuth-first: a shared static secret is still supported, but it is one
+        // leaked string away from full access (writes included) and cannot be
+        // scoped, expired or attributed to a person. Said once at startup, never per
+        // request. The listener always binds 0.0.0.0 (see `run_server`), so there is
+        // no loopback-only case to exempt.
+        StaticTokenDecision::StaticOnly(_) => warn!(
+            "Only a static bearer token ('{env_name}') protects /mcp. It works, but \
+             OAuth (mcp.oauth) is the recommended setup: per-user, expiring, \
+             revocable tokens from your identity provider. See docs/oauth.md."
+        ),
+        StaticTokenDecision::OAuthOnly => info!(
+            "No static bearer token configured ('{env_name}' unset) — OAuth access \
+             tokens are the only accepted credential"
+        ),
+        StaticTokenDecision::Unauthenticated => {
+            warn!("{}", unauthenticated_mcp_warning(env_name));
+        }
+        // `StaticTokenDecision` is `#[non_exhaustive]`. A future variant still
+        // builds exactly the layer the policy chose; it just has no startup line
+        // of its own until one is written.
+        _ => {}
     }
-}
-
-/// `GET /.well-known/oauth-protected-resource[/mcp]` — RFC 9728 protected-resource
-/// metadata.
-///
-/// Deliberately registered OUTSIDE `bearer_auth`: this document is how an
-/// unauthenticated client discovers *where to authenticate*, so gating it behind
-/// authentication would make the OAuth flow unstartable. It contains nothing
-/// secret — an issuer URL, an audience-free scope list, and this server's own
-/// public URL, all of which the client already needs before it has any credential.
-///
-/// 404s when OAuth is not configured, rather than serving an empty document: a
-/// client that finds metadata will act on it, and metadata pointing at no
-/// authorization server is worse than no metadata at all.
-async fn oauth_metadata_handler(
-    State(oauth): State<Option<Arc<OAuthValidator>>>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    match oauth {
-        Some(v) => Ok(Json(v.metadata())),
-        None => Err(StatusCode::NOT_FOUND),
-    }
+    Ok(decision)
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,7 +1256,7 @@ struct AdminState {
 /// with (`--config` / the `config` CLI default), never a caller-supplied path — an
 /// admin endpoint that reads an arbitrary path named in the request would let an
 /// authenticated-but-untrusted caller read any file the process can see. Behind the
-/// same bearer-token auth as `/status`/`/metrics` (see `bearer_auth`); this action
+/// same bearer-token auth as `/status`/`/metrics` (see `require_auth`); this action
 /// can change how the write tools authenticate content or which webhook provider is
 /// trusted, so it gets no weaker a gate than those.
 ///
@@ -1981,13 +1863,16 @@ const METRICS_PATH: &str = "/metrics";
 const ADMIN_RELOAD_PATH: &str = "/admin/reload";
 const MCP_PATH: &str = "/mcp";
 /// Open by design, unlike the four paths above — see `web.rs`'s module doc for why
-/// `/health` and the UI routes carry no `bearer_auth` layer.
+/// `/health` and the UI routes carry no `require_auth` layer.
 const HEALTH_PATH: &str = "/health";
 
-/// RFC 9728 protected-resource metadata, served at BOTH the path-suffixed and the
-/// bare form. Two routes, not one, because clients probe the suffixed form first
-/// and fall back to the root — Anthropic's own sample resource server registers
-/// both, and a client that finds neither never starts the authorization flow.
+/// RFC 9728 protected-resource metadata, served by `oauth_resource_server::axum::
+/// metadata_router` at BOTH the path-suffixed and the bare form. Two routes, not
+/// one, because clients probe the suffixed form first and fall back to the root —
+/// Anthropic's own sample resource server registers both, and a client that finds
+/// neither never starts the authorization flow. The suffixed route is derived from
+/// `mcp.oauth.resource` (RFC 9728 §3.1), so for this server's documented resource,
+/// `https://<host>/mcp`, it is `OAUTH_METADATA_MCP_PATH` (see the tests).
 ///
 /// Open by design, like `HEALTH_PATH` above and for a sharper reason: this document
 /// is how a caller with no credential discovers where to GET one. Gating discovery
@@ -1996,13 +1881,14 @@ const HEALTH_PATH: &str = "/health";
 /// `router_assembly_rejects_unauthenticated_requests_on_every_protected_route`
 /// walks; `oauth_metadata_routes_are_reachable_without_credentials` asserts the
 /// opposite property for them.
-///
-/// This one must stay `{OAUTH_METADATA_ROOT_PATH}{MCP_PATH}`. It is spelled out
-/// rather than composed because `concat!` takes literals only, and the relationship
-/// is asserted by `oauth_metadata_paths_agree_with_the_rfc_prefix`.
-const OAUTH_METADATA_MCP_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
-/// The bare form of [`OAUTH_METADATA_MCP_PATH`] — same handler, same openness.
 const OAUTH_METADATA_ROOT_PATH: &str = PROTECTED_RESOURCE_METADATA_PREFIX;
+/// The path-suffixed form of [`OAUTH_METADATA_ROOT_PATH`] for a resource at
+/// [`MCP_PATH`]. Must stay `{OAUTH_METADATA_ROOT_PATH}{MCP_PATH}`; it is spelled
+/// out rather than composed because `concat!` takes literals only, and the
+/// relationship is asserted by `oauth_metadata_paths_agree_with_the_rfc_prefix`.
+/// Only the tests name it: the route itself comes from the configured resource.
+#[cfg(test)]
+const OAUTH_METADATA_MCP_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
 
 /// The startup warning `run_server` logs when `mcp.allow_unauthenticated: true` and
 /// no bearer token is configured — i.e. every route in the `STATUS_PATH`/
@@ -2012,7 +1898,7 @@ const OAUTH_METADATA_ROOT_PATH: &str = PROTECTED_RESOURCE_METADATA_PREFIX;
 /// two reasons: it lets `mod tests` assert on the message's actual content instead of
 /// only on the fact that some `warn!` fired, and — the point of #154 — it forces the
 /// endpoint list to be built from the same path constants `assemble_router` uses to
-/// wire up `bearer_auth`, rather than retyped as string literals that can silently
+/// wire up `require_auth`, rather than retyped as string literals that can silently
 /// drift from the route group they describe. That drift is exactly what happened
 /// before this fix: the message named only `/mcp`, `/status` and `/metrics`, omitting
 /// `/admin/reload` even though `reload_handler`'s own doc comment says it "gets no
@@ -2038,7 +1924,7 @@ fn unauthenticated_mcp_warning(bearer_token_env: &str) -> String {
 /// added or moved (see #177).
 struct RouterAssemblyDeps {
     mcp_service: StreamableHttpService<KbSearchServer, LocalSessionManager>,
-    auth_state: AuthState,
+    auth: AuthLayer,
     health_state: HealthState,
     status_state: StatusState,
     admin_state: AdminState,
@@ -2060,7 +1946,7 @@ struct RouterAssemblyDeps {
 /// merge order, the real `route_layer` placement per sub-router, the real body
 /// limits — rather than a hand-rolled Router built fresh in the test module. See
 /// #177: a test that never calls this function cannot notice a new route left
-/// outside the `bearer_auth` layer, no matter how many assertions it makes about
+/// outside the `require_auth` layer, no matter how many assertions it makes about
 /// routes it already knows the names of.
 fn assemble_router(deps: RouterAssemblyDeps) -> Router {
     let mcp_router = Router::new()
@@ -2075,8 +1961,8 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
         // inner service reads it.
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)) // 10 MB
         .route_layer(middleware::from_fn_with_state(
-            deps.auth_state.clone(),
-            bearer_auth,
+            deps.auth.clone(),
+            require_auth,
         ));
 
     // `/status` and `/metrics` sit behind the same bearer token as `/mcp`, not open like
@@ -2088,8 +1974,8 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
         .route(METRICS_PATH, axum::routing::get(metrics_handler))
         .with_state(deps.status_state)
         .route_layer(middleware::from_fn_with_state(
-            deps.auth_state.clone(),
-            bearer_auth,
+            deps.auth.clone(),
+            require_auth,
         ));
 
     // `/admin/reload` sits behind the same bearer token as `/status`/`/metrics` —
@@ -2102,24 +1988,18 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
         .route(ADMIN_RELOAD_PATH, axum::routing::post(reload_handler))
         .with_state(deps.admin_state)
         .route_layer(middleware::from_fn_with_state(
-            deps.auth_state.clone(),
-            bearer_auth,
+            deps.auth.clone(),
+            require_auth,
         ));
 
     // Both well-known routes, merged here rather than into any of the
-    // `route_layer(bearer_auth)` routers above — see the path constants' doc
+    // `route_layer(require_auth)` routers above — see the path constants' doc
     // comment: discovery has to work for a caller who does not yet have a
-    // credential, which is the entire point of it.
-    let oauth_metadata_router = Router::new()
-        .route(
-            OAUTH_METADATA_MCP_PATH,
-            axum::routing::get(oauth_metadata_handler),
-        )
-        .route(
-            OAUTH_METADATA_ROOT_PATH,
-            axum::routing::get(oauth_metadata_handler),
-        )
-        .with_state(deps.auth_state.oauth.clone());
+    // credential, which is the entire point of it. With OAuth off every path under
+    // the well-known prefix 404s rather than serving an empty document: a client
+    // that finds metadata will act on it, and metadata pointing at no authorization
+    // server is worse than none.
+    let oauth_metadata_router = metadata_router(deps.auth.oauth().cloned());
 
     let mut app = Router::new()
         .route(
@@ -2508,12 +2388,11 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
                 issuer = %oauth_config.issuer,
                 resource = %oauth_config.resource,
                 audiences = ?oauth_config.accepted_audiences(),
-                jwks_uri = %if oauth_config.jwks_uri.is_empty() {
-                    "(discovered from the issuer)"
-                } else {
-                    oauth_config.jwks_uri.as_str()
-                },
-                required_scope = %oauth_config.required_scope,
+                jwks_uri = %oauth_config
+                    .jwks_uri
+                    .as_deref()
+                    .unwrap_or("(discovered from the issuer)"),
+                required_scopes = ?oauth_config.required_scopes,
                 scope_claims = ?oauth_config.scope_claims,
                 static_bearer_accepted = oauth_config.accept_static_bearer,
                 "OAuth resource-server validation enabled"
@@ -2531,16 +2410,13 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     };
 
     // Bearer token for MCP auth
-    let bearer_token = static_bearer_token(
+    let decision = static_bearer_token(
         &config.mcp.bearer_token_env,
         std::env::var(&config.mcp.bearer_token_env).ok(),
         config.mcp.oauth.as_ref(),
         config.mcp.allow_unauthenticated,
     )?;
-    let auth_state = AuthState {
-        bearer_token,
-        oauth,
-    };
+    let auth = auth_layer(decision, oauth)?;
 
     // Webhook state — optional, skip if secret is unset/empty
     let webhook_secret = std::env::var(&config.webhook.secret_env)
@@ -2579,7 +2455,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     let webhook_enabled = webhook_secret.is_some();
     let app = assemble_router(RouterAssemblyDeps {
         mcp_service,
-        auth_state: auth_state.clone(),
+        auth: auth.clone(),
         health_state: HealthState {
             qdrant: Arc::clone(&qdrant),
             embed: Arc::clone(&embed_client),
@@ -2627,11 +2503,16 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     info!("  Status endpoints: /status (JSON), /metrics (Prometheus)");
     info!("  Admin endpoint: POST /admin/reload (re-reads config.yaml without a restart)");
     info!("  Web UI: / (unauthenticated — see web.rs's module doc)");
-    if auth_state.oauth.is_some() {
+    if let Some(oauth) = auth.oauth() {
+        let suffixed = oauth.metadata_path();
+        let paths = if suffixed == OAUTH_METADATA_ROOT_PATH {
+            suffixed.to_string()
+        } else {
+            format!("{suffixed} and {OAUTH_METADATA_ROOT_PATH}")
+        };
         info!(
-            "  OAuth discovery: {OAUTH_METADATA_MCP_PATH} and {OAUTH_METADATA_ROOT_PATH} \
-             (unauthenticated by design — this is how a client finds the authorization \
-             server before it has a token)"
+            "  OAuth discovery: {paths} (unauthenticated by design — this is how a client \
+             finds the authorization server before it has a token)"
         );
     }
 
@@ -2701,6 +2582,37 @@ mod tests {
     use axum::{body::Body, http::Request, routing::get};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use tower::ServiceExt;
+
+    /// The auth layer for a test router: `bearer_token` and/or `oauth` accepted;
+    /// with neither, the explicit `mcp.allow_unauthenticated` pass-through — the
+    /// same three shapes `run_server` can build, through the same decision.
+    fn test_auth_layer(
+        bearer_token: Option<String>,
+        oauth: Option<Arc<OAuthValidator>>,
+    ) -> AuthLayer {
+        let decision = static_bearer_token(
+            "T",
+            bearer_token,
+            oauth.as_deref().map(|v| v.config()),
+            true,
+        )
+        .unwrap();
+        auth_layer(decision, oauth).unwrap()
+    }
+
+    #[test]
+    fn auth_layer_is_a_pass_through_only_when_explicitly_allowed() {
+        // Neither credential, no opt-out: refused rather than silently open.
+        assert!(static_bearer_token("T", None, None, false).is_err());
+        assert!(static_bearer_token("T", Some(String::new()), None, false).is_err());
+        let open = static_bearer_token("T", None, None, true).unwrap();
+        assert!(auth_layer(open, None).unwrap().allows_unauthenticated());
+        // A configured credential is never weakened by the opt-out.
+        let closed = static_bearer_token("T", Some("secret".into()), None, true).unwrap();
+        assert!(!auth_layer(closed, None).unwrap().allows_unauthenticated());
+        // A decision that disagrees with the validator is refused, not guessed at.
+        assert!(auth_layer(StaticTokenDecision::OAuthOnly, None).is_err());
+    }
 
     // --- status & metrics ---
 
@@ -3401,16 +3313,13 @@ mod tests {
     async fn status_and_metrics_require_the_bearer_token() {
         // Mirrors the production topology: status routes carry the same auth layer as
         // /mcp, while /health stays open.
-        let auth_state = AuthState {
-            bearer_token: Some("secret".into()),
-            oauth: None,
-        };
+        let auth_state = test_auth_layer(Some("secret".into()), None);
         let protected = Router::new()
             .route("/status", get(|| async { "status" }))
             .route("/metrics", get(|| async { "metrics" }))
             .route_layer(middleware::from_fn_with_state(
                 auth_state.clone(),
-                bearer_auth,
+                require_auth,
             ));
         let app = Router::new()
             .route("/health", get(|| async { "health" }))
@@ -3492,10 +3401,7 @@ mod tests {
         config_path: std::path::PathBuf,
         shared_config: SharedConfig,
     ) -> Router {
-        let auth_state = AuthState {
-            bearer_token,
-            oauth: None,
-        };
+        let auth_state = test_auth_layer(bearer_token, None);
         let admin_state = AdminState {
             shared_config,
             config_path: Arc::new(config_path),
@@ -3504,7 +3410,7 @@ mod tests {
         Router::new()
             .route("/admin/reload", axum::routing::post(reload_handler))
             .with_state(admin_state)
-            .route_layer(middleware::from_fn_with_state(auth_state, bearer_auth))
+            .route_layer(middleware::from_fn_with_state(auth_state, require_auth))
     }
 
     // `reload_handler` calls `Config::load`, which reads the same process-global env
@@ -4415,13 +4321,10 @@ mod tests {
     }
 
     fn test_app(token: Option<String>) -> Router {
-        let auth_state = AuthState {
-            bearer_token: token,
-            oauth: None,
-        };
+        let auth_state = test_auth_layer(token, None);
         Router::new()
             .route("/test", get(|| async { "ok" }))
-            .route_layer(middleware::from_fn_with_state(auth_state, bearer_auth))
+            .route_layer(middleware::from_fn_with_state(auth_state, require_auth))
     }
 
     #[tokio::test]
@@ -4693,7 +4596,7 @@ mod tests {
     // its own purpose-built `Router` literal, so each only proves that hand-rolled
     // shape behaves correctly — not that `assemble_router` (what `run_server` actually
     // serves) wires the same routes the same way. A new protected route added to
-    // `assemble_router` and left outside its `bearer_auth` `route_layer` sails through
+    // `assemble_router` and left outside its `require_auth` `route_layer` sails through
     // every test above unnoticed. The test below calls `assemble_router` itself
     // against fake-but-real dependencies, and walks the same `STATUS_PATH`/
     // `METRICS_PATH`/`ADMIN_RELOAD_PATH`/`MCP_PATH` constants `assemble_router` used to
@@ -4702,9 +4605,9 @@ mod tests {
 
     /// Builds a `RouterAssemblyDeps` wired to closed/unreachable backends (port 1
     /// refuses instantly, same trick `status_config`/`health_handler_reports_component_errors`
-    /// use above) so the test can exercise real routing and real `bearer_auth`
+    /// use above) so the test can exercise real routing and real `require_auth`
     /// without a live Qdrant/embeddings/git remote. `bearer_token` controls what
-    /// `auth_state` inside the assembled router will accept.
+    /// the auth layer inside the assembled router will accept.
     fn test_router_assembly_deps(
         data_path: &std::path::Path,
         bearer_token: Option<String>,
@@ -4712,7 +4615,7 @@ mod tests {
         test_router_assembly_deps_with_oauth(data_path, bearer_token, None)
     }
 
-    /// As above, plus the OAuth half of `AuthState`. Separate entry point rather
+    /// As above, plus the OAuth half of the auth layer. Separate entry point rather
     /// than a fourth argument on every existing call site, so the pre-OAuth tests
     /// keep reading as they did.
     fn test_router_assembly_deps_with_oauth(
@@ -4773,10 +4676,7 @@ mod tests {
 
         RouterAssemblyDeps {
             mcp_service,
-            auth_state: AuthState {
-                bearer_token,
-                oauth,
-            },
+            auth: test_auth_layer(bearer_token, oauth),
             health_state: HealthState {
                 qdrant: Arc::clone(&qdrant),
                 embed: Arc::clone(&embed),
@@ -4806,7 +4706,7 @@ mod tests {
     // --- #154 ---
 
     /// Regression: this warning used to name only `/mcp`, `/status` and `/metrics`,
-    /// omitting `/admin/reload` even though it shares `AuthState` with the other
+    /// omitting `/admin/reload` even though it shares the auth layer with the other
     /// three and is documented (`reload_handler`'s own doc comment) as equally
     /// sensitive. Assert on the actual message content, not just "a warning fires" —
     /// a content-blind test would have kept passing against the old, incomplete
@@ -4838,7 +4738,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = assemble_router(test_router_assembly_deps(dir.path(), Some("secret".into())));
 
-        // Every path `assemble_router` nests under `bearer_auth`. See the constants'
+        // Every path `assemble_router` nests under `require_auth`. See the constants'
         // doc comment above `run_server` — this is the exact list `assemble_router`
         // used to register these routes, not a retyped copy of it.
         for (method, path) in [
@@ -4878,12 +4778,12 @@ mod tests {
                 resp.status(),
                 StatusCode::UNAUTHORIZED,
                 "{method} {path} with a valid bearer token must be let past \
-                 bearer_auth (whatever the handler itself then does with an empty \
+                 require_auth (whatever the handler itself then does with an empty \
                  body is not this test's concern)"
             );
         }
 
-        // `/health` and the web UI's `/` stay open by design — no `bearer_auth` layer
+        // `/health` and the web UI's `/` stay open by design — no `require_auth` layer
         // covers either (see `web.rs`'s module doc). A request with no token at all
         // must still be served.
         for path in [HEALTH_PATH, "/"] {
@@ -4929,23 +4829,25 @@ mod tests {
     // a sibling asserting the static path still behaves identically, because Claude
     // Code authenticates with the static token and is not being migrated.
 
-    use crate::oauth::testing as oauth_testing;
+    use oauth_resource_server::testing as oauth_testing;
 
+    /// A validator over the crate's fixture config, which matches what
+    /// `config::resolve_mcp_oauth` produces for the fixture's issuer/audience/
+    /// resource except for the metadata `resource_name` this application adds.
     fn test_oauth_validator(jwks_uri: &str) -> Arc<OAuthValidator> {
-        Arc::new(OAuthValidator::new(&oauth_testing::resolved_config(jwks_uri)).unwrap())
+        let mut config = oauth_testing::resolved_config(jwks_uri);
+        config.resource_name = Some(config::OAUTH_RESOURCE_NAME.to_string());
+        Arc::new(OAuthValidator::new(&config).unwrap())
     }
 
-    /// A bare `/test` route behind the real `bearer_auth`, for asserting on status
+    /// A bare `/test` route behind the real `require_auth`, for asserting on status
     /// codes and headers without dragging the whole assembled router in. Mirrors
     /// `test_app` above, which predates OAuth.
     fn oauth_test_app(bearer_token: Option<String>, oauth: Option<Arc<OAuthValidator>>) -> Router {
-        let auth_state = AuthState {
-            bearer_token,
-            oauth,
-        };
+        let auth_state = test_auth_layer(bearer_token, oauth);
         Router::new()
             .route("/test", get(|| async { "ok" }))
-            .route_layer(middleware::from_fn_with_state(auth_state, bearer_auth))
+            .route_layer(middleware::from_fn_with_state(auth_state, require_auth))
     }
 
     async fn get_with_auth(app: &Router, header: Option<&str>) -> Response {
@@ -5071,6 +4973,66 @@ mod tests {
         }
     }
 
+    /// The exact `invalid_token` challenge, through WIKI's own resolve path, for
+    /// the default `scopes_supported` and for an explicit `scopes_supported: []`.
+    ///
+    /// The second changed in mcp-md-wiki#308: before the extraction the header
+    /// ended in `scope=""` (RFC 6749 §3.3 requires at least one scope-token
+    /// there) and the metadata published `"scopes_supported": []` (RFC 9728 §3.2
+    /// says to omit a parameter with zero values). Now the challenge names the
+    /// required scope instead, so a client still learns what to ask for, and
+    /// the metadata leaves `scopes_supported` out. Only an explicit `[]` is
+    /// affected; an omitted key still advertises `mcp:read mcp:write`.
+    #[tokio::test]
+    async fn the_invalid_token_challenge_for_default_and_empty_scopes_supported() {
+        let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
+        let metadata_url = "https://kb.example.test/.well-known/oauth-protected-resource/mcp";
+        for (scopes_supported, expected) in [
+            (
+                None,
+                format!(
+                    "Bearer error=\"invalid_token\", resource_metadata=\"{metadata_url}\", \
+                     scope=\"mcp:read mcp:write\""
+                ),
+            ),
+            (
+                Some(Vec::new()),
+                format!(
+                    "Bearer error=\"invalid_token\", resource_metadata=\"{metadata_url}\", \
+                     scope=\"mcp:read\""
+                ),
+            ),
+        ] {
+            let resolved = config::resolve_mcp_oauth(config::OAuthConfig {
+                enabled: true,
+                issuer: oauth_testing::ISSUER.to_string(),
+                jwks_uri: Some(jwks.url.clone()),
+                audience: oauth_testing::AUDIENCE.to_string(),
+                resource: oauth_testing::RESOURCE.to_string(),
+                scopes_supported: scopes_supported.clone(),
+                ..config::OAuthConfig::default()
+            })
+            .unwrap()
+            .expect("enabled");
+            let validator = Arc::new(OAuthValidator::new(&resolved).unwrap());
+            assert_eq!(
+                validator.metadata().get("scopes_supported").is_some(),
+                scopes_supported.is_none(),
+                "scopes_supported: {scopes_supported:?}"
+            );
+            let app = oauth_test_app(Some("secret".into()), Some(validator));
+            for header in [None, Some("Bearer not-the-secret")] {
+                let resp = get_with_auth(&app, header).await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+                assert_eq!(
+                    www_authenticate(&resp),
+                    expected,
+                    "scopes_supported: {scopes_supported:?}, header: {header:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn an_invalid_token_gets_401_and_an_insufficient_scope_token_gets_403() {
         let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
@@ -5079,7 +5041,7 @@ mod tests {
         let expired = oauth_testing::mint(
             oauth_testing::KEY_A_PEM,
             oauth_testing::KID_A,
-            serde_json::json!({
+            &serde_json::json!({
                 "iss": oauth_testing::ISSUER, "aud": oauth_testing::AUDIENCE,
                 "exp": oauth_testing::now() - 3600, "scope": "mcp:read",
             }),
@@ -5091,7 +5053,7 @@ mod tests {
         let unscoped = oauth_testing::mint(
             oauth_testing::KEY_A_PEM,
             oauth_testing::KID_A,
-            serde_json::json!({
+            &serde_json::json!({
                 "iss": oauth_testing::ISSUER, "aud": oauth_testing::AUDIENCE,
                 "exp": oauth_testing::now() + 3600, "scope": "openid profile",
             }),
@@ -5119,10 +5081,10 @@ mod tests {
         let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
         let app = oauth_test_app(None, Some(test_oauth_validator(&jwks.url)));
         let token = oauth_testing::mint_with(
-            jsonwebtoken::Algorithm::RS256,
+            oauth_resource_server::Algorithm::RS256,
             Some(oauth_testing::KID_A),
             Some("at+jwt"),
-            serde_json::json!({
+            &serde_json::json!({
                 "iss": oauth_testing::ISSUER, "aud": [oauth_testing::AUDIENCE],
                 "exp": oauth_testing::now() + 3600, "nbf": oauth_testing::now(),
                 "sub": "44726d41-0000-4000-8000-000000000000",
@@ -5165,27 +5127,43 @@ mod tests {
 
         // Original behaviour, unchanged: dual mode, static-only, OAuth-only.
         assert_eq!(
-            static_bearer_token("T", tok(), Some(&oauth), false).unwrap(),
+            static_bearer_token("T", tok(), Some(&oauth), false)
+                .unwrap()
+                .into_static_token(),
             tok()
         );
-        assert_eq!(static_bearer_token("T", tok(), None, false).unwrap(), tok());
         assert_eq!(
-            static_bearer_token("T", None, Some(&oauth), false).unwrap(),
+            static_bearer_token("T", tok(), None, false)
+                .unwrap()
+                .into_static_token(),
+            tok()
+        );
+        assert_eq!(
+            static_bearer_token("T", None, Some(&oauth), false)
+                .unwrap()
+                .into_static_token(),
             None
         );
         assert_eq!(
-            static_bearer_token("T", Some(String::new()), Some(&oauth), false).unwrap(),
+            static_bearer_token("T", Some(String::new()), Some(&oauth), false)
+                .unwrap()
+                .into_static_token(),
             None
         );
         // No credential of either kind: refuse to start unless explicitly opted out.
         let err = static_bearer_token("T", None, None, false).unwrap_err();
         assert!(err.to_string().contains("mcp.oauth"), "{err}");
-        assert_eq!(static_bearer_token("T", None, None, true).unwrap(), None);
+        assert_eq!(
+            static_bearer_token("T", None, None, true).unwrap(),
+            StaticTokenDecision::Unauthenticated
+        );
 
         // `accept_static_bearer: false` drops a set token when OAuth is on.
         oauth.accept_static_bearer = false;
         assert_eq!(
-            static_bearer_token("T", tok(), Some(&oauth), false).unwrap(),
+            static_bearer_token("T", tok(), Some(&oauth), false)
+                .unwrap()
+                .into_static_token(),
             None
         );
     }

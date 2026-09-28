@@ -85,6 +85,98 @@ sample rather than an exhaustive list.
 
 ### Authentication
 
+- **OAuth support moved into a separate, general-purpose crate,
+  [`oauth-resource-server`](https://github.com/St0nefish/oauth-resource-server)
+  (mcp-md-wiki#308).** The validator, JWKS handling, RFC 9728 metadata,
+  `WWW-Authenticate` challenges, and the axum auth middleware are now published
+  code rather than living only in this binary, so the same reviewed
+  implementation can protect other services. It is an internal move: every
+  `mcp.oauth` key, default and validation message stays the same, and for a
+  config that parsed before, the 401/403 statuses, headers and bodies a client
+  sees are the same, except for the edge cases listed below. Three new keys:
+  **`mcp.oauth.required_scopes`** (default `[]`) lists
+  further required scopes, unioned with `required_scope` — a token must carry
+  all of them. `required_scope` still defaults to `mcp:read` when neither key
+  is set; setting `required_scopes` alone replaces that default with exactly
+  the list given. **`mcp.oauth.allow_insecure_http`** (default `false`) is
+  the opt-in for a plain-`http` URL described below.
+  **`mcp.oauth.allow_unscoped_tokens`** (default `false`) exists because the
+  crate has it and has no effect here, since this server always requires a
+  scope. Auth log lines now carry the `oauth_resource_server` target
+  rather than `mcp_md_wiki`. The WARN-level lines (rejection reasons, JWKS
+  load/refresh failures) are visible under the default `RUST_LOG=info` as
+  before; only the DEBUG-level accept/reject detail needs
+  `oauth_resource_server=debug` added to `RUST_LOG`, e.g.
+  `RUST_LOG=info,mcp_md_wiki=debug,oauth_resource_server=debug` — see
+  `main.rs`'s `DEFAULT_LOG_FILTER` doc comment for the full reasoning.
+  `oauth-resource-server` is an ordinary
+  [crates.io](https://crates.io/crates/oauth-resource-server) dependency (docs at
+  [docs.rs](https://docs.rs/oauth-resource-server)).
+  **Upgrade action, only for a plain-`http` URL:** an `mcp.oauth.issuer`,
+  `jwks_uri` or `resource` that is plain `http://` on a non-loopback host (an
+  in-cluster `http://authentik-server:9000/...` `jwks_uri`, say) now fails
+  startup — keys fetched over cleartext can be substituted by anyone on the
+  path (RFC 8414 §2, RFC 9728 §1.2). Switch it to `https`, or set
+  `mcp.oauth.allow_insecure_http: true` if that network is trusted; each such
+  URL then logs a startup warning, as a plain-http `issuer` or `jwks_uri` did
+  before.
+  Tokens this server now refuses that it accepted before (none issued by a
+  standard deployment of the tested providers):
+  - a token whose header lists critical extensions (`crit`, RFC 7515
+    §4.1.11 — none is supported);
+  - a token whose `nbf` is present but not a non-negative number (it used to
+    skip the not-before check entirely);
+  - a sender-constrained token (a `cnf` claim: DPoP or mTLS-bound), which is
+    no longer accepted as a plain bearer token (RFC 9449 §7.2, RFC 8705 §3);
+  - a token signed by a JWKS key whose `key_ops` omits `verify`.
+  Config values now refused at startup: a required or advertised scope that
+  is not an RFC 6749 scope-token (a space, `"`, `\`, or a non-printable
+  character), and an `issuer`, `resource` or `jwks_uri` containing a space,
+  control or non-ASCII character (either could make every 401 go out without
+  `WWW-Authenticate`).
+  Other edge-case behavior changes, none affecting a default deployment:
+  - With an explicit `mcp.oauth.scopes_supported: []`, the metadata document
+    omits `scopes_supported` (it published `[]`; RFC 9728 §3.2 says to omit
+    a parameter with no values), and the `invalid_token` challenge names the
+    required scope (`scope="mcp:read"`) instead of sending `scope=""`. The
+    startup warning that a required scope is missing from
+    `scopes_supported` is no longer logged for that case, since clients are
+    now told the required scope.
+  - A `jwks_uri` discovered from a loopback `http://` issuer, or a redirect
+    followed while fetching the metadata or keys, that lands on plain `http`
+    on a non-loopback host is refused (a JWKS refresh failure) unless
+    `mcp.oauth.allow_insecure_http` is set, which then logs each use as a
+    warning. It used to be followed silently.
+  - A `mcp.oauth.resource` whose path ends in a slash keeps it in the
+    metadata URL (RFC 9728 §3.1): `https://host/mcp/` is described at
+    `/.well-known/oauth-protected-resource/mcp/`, not `…/mcp`.
+  - A JWKS refetch runs to completion even if the request that started it is
+    dropped (a client disconnect used to spend the one-per-minute unknown-`kid`
+    refetch without loading keys), and the background key refresh retries a
+    failed pass after a minute, backing off to an hour, rather than waiting
+    the full hour.
+  - A JWKS key that declares no `alg` and could verify several algorithms is
+    still used, and now logged at WARN (naming its `kid`) when it first
+    appears.
+  - The path-suffixed metadata route is derived from `mcp.oauth.resource`'s
+    path (RFC 9728 §3.1) instead of being fixed at `/mcp`: a resource at
+    `https://host/kb/mcp` is now described at
+    `/.well-known/oauth-protected-resource/kb/mcp`, the URL its challenge
+    already advertised, and no longer at `…/oauth-protected-resource/mcp`. The
+    startup warning "mcp.oauth.resource derives a protected-resource metadata
+    URL this server does not serve" is gone, since that can no longer happen.
+    For the usual `https://…/mcp` resource nothing changes.
+  - An explicit YAML null (`required_scope: ~`, `jwks_uri: ~`,
+    `scopes_supported: ~`) now means unset, taking the default, instead of
+    failing to parse.
+  - With OAuth off, a non-GET request to `/.well-known/oauth-protected-resource/mcp`
+    is answered 404 (it was 405); every method there is 404 when there is no
+    document to serve.
+  - `/admin/reload` reports a scope change under the setting
+    `mcp.oauth.required_scope / mcp.oauth.required_scopes`, with the resolved
+    scope list as its old/new value (e.g. `["mcp:read"]`), and renders
+    `jwks_uri` values as `Some("…")`/`None` instead of a bare string.
+  No reindex.
 - **OAuth is now provider-agnostic, and the recommended way to authenticate.**
   Before this, the resource server read scopes only from the `scope` claim, so a
   perfectly valid Authelia access token (scopes in `scp`, a JSON array) got
@@ -114,9 +206,11 @@ sample rather than an exhaustive list.
   capped, and https→http redirects are refused. The `Bearer` scheme is now matched
   case-insensitively. Running with only a static bearer token logs a startup
   warning recommending OAuth. The docs lead with OAuth; the new
-  [`docs/oauth.md`](docs/oauth.md) has recipes for Authentik, Authelia and Kanidm,
-  each marked with what was actually tested, plus a checklist for any other
-  provider.
+  [`docs/oauth.md`](docs/oauth.md) covers the `mcp.oauth` keys and this
+  server's setup — recipes for Authentik, Authelia and Kanidm, each marked
+  with what was actually tested, plus a checklist for any other provider,
+  now live in the [`oauth-resource-server`](https://github.com/St0nefish/oauth-resource-server)
+  crate's `docs/providers.md` (mcp-md-wiki#308).
 
   **Upgrade:** no action needed. Existing `mcp.oauth` blocks and
   `MCP_BEARER_TOKEN` keep working unchanged; a regression test pins the

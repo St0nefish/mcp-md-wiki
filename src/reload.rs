@@ -551,7 +551,7 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.bearer_token_env",
             note: "the bearer token is resolved once at server startup and stored by \
-                   value on AuthState (server.rs run_server) — security-critical, \
+                   value on the AuthLayer (server.rs run_server) — security-critical, \
                    deliberately not made live.",
         }],
     },
@@ -561,7 +561,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.allow_unauthenticated",
-            note: "gates how AuthState is built at startup (server.rs run_server) — \
+            note: "gates how the AuthLayer is built at startup (server.rs run_server) — \
                    security-critical, deliberately not made live.",
         }],
     },
@@ -640,11 +640,11 @@ const DIFF_TABLE: &[DiffField] = &[
     },
     // ── mcp.oauth ────────────────────────────────────────────────────────────
     // The whole block is restart-required for the same reason `mcp.bearer_token_env`
-    // is: `AuthState` — including the `OAuthValidator` and its JWKS cache — is built
-    // once in `server.rs run_server` and stored by value on the middleware. Making
-    // any of it live would mean an authorization server, audience or required scope
-    // could change under an in-flight request, which is not a property worth having
-    // on the credential-checking path.
+    // is: the auth middleware's state (`oauth_resource_server::axum::AuthLayer`) —
+    // including the `OAuthValidator` and its JWKS cache — is built once in `server.rs
+    // run_server` and never rebuilt. Making any of it live would mean an authorization
+    // server, audience or required scope could change under an in-flight request,
+    // which is not a property worth having on the credential-checking path.
     DiffField {
         path: "mcp.oauth.enabled",
         // Mirrors `reranking.enabled`: the resolved side collapses the flag into an
@@ -655,7 +655,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.enabled",
-            note: "gates whether AuthState holds an OAuthValidator at all, and whether the \
+            note: "gates whether the AuthLayer holds an OAuthValidator at all, and whether the \
                    /.well-known/oauth-protected-resource routes serve metadata (server.rs \
                    run_server / assemble_router) — decided once at startup.",
         }],
@@ -667,8 +667,8 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.issuer",
             note: "baked into the jsonwebtoken Validation the OAuthValidator builds at \
-                   construction (oauth.rs OAuthValidator::new), and into the metadata \
-                   document's authorization_servers.",
+                   construction (oauth_resource_server OAuthValidator::new), and into the \
+                   metadata document's authorization_servers.",
         }],
     },
     DiffField {
@@ -678,9 +678,9 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.jwks_uri",
             note: "stored on the OAuthValidator alongside its in-memory key cache \
-                   (oauth.rs), or discovered once from the issuer when empty — a new URL \
-                   would also have to invalidate that cache, so it is deliberately \
-                   restart-only.",
+                   (oauth_resource_server), or discovered once from the issuer when empty — \
+                   a new URL would also have to invalidate that cache, so it is \
+                   deliberately restart-only.",
         }],
     },
     DiffField {
@@ -690,9 +690,9 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.audience",
             note: "baked into the jsonwebtoken Validation at OAuthValidator construction \
-                   (oauth.rs), together with mcp.oauth.audiences; see config.rs \
-                   OAuthConfig::audience for which value a given authorization server \
-                   needs.",
+                   (oauth_resource_server), together with mcp.oauth.audiences; see \
+                   oauth_resource_server's OAuthConfig::audience for which value a given \
+                   authorization server needs.",
         }],
     },
     DiffField {
@@ -702,7 +702,7 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.audiences",
             note: "unioned with mcp.oauth.audience into the jsonwebtoken Validation at \
-                   OAuthValidator construction (oauth.rs) — security-critical, \
+                   OAuthValidator construction (oauth_resource_server) — security-critical, \
                    deliberately not made live.",
         }],
     },
@@ -712,9 +712,9 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.scope_claims",
-            note: "held by the OAuthValidator built at startup (oauth.rs) — which claims \
-                   are read decides whether the required scope is found, so it follows \
-                   mcp.oauth.required_scope's restart-only posture.",
+            note: "held by the OAuthValidator built at startup (oauth_resource_server) — \
+                   which claims are read decides whether the required scope is found, so it \
+                   follows mcp.oauth.required_scope's restart-only posture.",
         }],
     },
     DiffField {
@@ -723,9 +723,9 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.principal_claims",
-            note: "held by the OAuthValidator built at startup (oauth.rs); logging only, \
-                   but it lives on the same startup-built value as every other \
-                   mcp.oauth key.",
+            note: "held by the OAuthValidator built at startup (oauth_resource_server); \
+                   logging only, but it lives on the same startup-built value as every \
+                   other mcp.oauth key.",
         }],
     },
     DiffField {
@@ -735,7 +735,7 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.algorithms",
             note: "the allowlist, and every cached key's permitted algorithms, are fixed \
-                   when the OAuthValidator and its JWKS cache are built (oauth.rs).",
+                   when the OAuthValidator and its JWKS cache are built (oauth_resource_server).",
         }],
     },
     DiffField {
@@ -745,7 +745,7 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.leeway_secs",
             note: "baked into the jsonwebtoken Validation at OAuthValidator construction \
-                   (oauth.rs).",
+                   (oauth_resource_server).",
         }],
     },
     DiffField {
@@ -754,8 +754,32 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.require_at_jwt",
-            note: "held by the OAuthValidator built at startup (oauth.rs) — \
+            note: "held by the OAuthValidator built at startup (oauth_resource_server) — \
                    security-critical, deliberately not made live.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.allow_unscoped_tokens",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.allow_unscoped_tokens)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.allow_unscoped_tokens",
+            note: "applied when mcp.oauth is resolved at startup (oauth_resource_server \
+                   OAuthConfig::resolve), which is what the OAuthValidator is built from — \
+                   security-critical, deliberately not made live. This server always \
+                   requires a scope (mcp:read by default), so it has no effect here.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.allow_insecure_http",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.allow_insecure_http)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.allow_insecure_http",
+            note: "applied when mcp.oauth is resolved at startup (oauth_resource_server \
+                   OAuthConfig::resolve), and it only admits URLs held by the \
+                   startup-built OAuthValidator — security-critical, deliberately not made \
+                   live.",
         }],
     },
     DiffField {
@@ -764,7 +788,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.oauth.accept_static_bearer",
-            note: "decides whether AuthState holds the static bearer token at all \
+            note: "decides whether the AuthLayer holds the static bearer token at all \
                    (server.rs run_server) — security-critical, deliberately not made \
                    live, same posture as mcp.bearer_token_env.",
         }],
@@ -777,16 +801,23 @@ const DIFF_TABLE: &[DiffField] = &[
             setting: "mcp.oauth.resource",
             note: "the protected-resource metadata document and the resource_metadata URL \
                    in every WWW-Authenticate challenge are derived from it once at \
-                   OAuthValidator construction (oauth.rs).",
+                   OAuthValidator construction (oauth_resource_server).",
         }],
     },
     DiffField {
+        // Both scope keys feed ONE resolved value, `ResolvedOAuthConfig::required_scopes`
+        // (`required_scope` ∪ `required_scopes`, after the `mcp:read` default
+        // `config::apply_mcp_oauth_defaults` fills in when neither is set), so one
+        // `DiffField` reading it reports a change to either — the same shape as
+        // `mcp.disabled_tools`/`mcp.enabled_tools` above. `mcp.oauth.required_scopes`
+        // is in `RELOAD_DIFF_EXCLUDED` below rather than a second `DiffField`, which
+        // would report the same change twice.
         path: "mcp.oauth.required_scope",
-        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.required_scope)),
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.required_scopes)),
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::RestartRequired,
-            setting: "mcp.oauth.required_scope",
-            note: "held by the OAuthValidator built at startup (oauth.rs) — \
+            setting: "mcp.oauth.required_scope / mcp.oauth.required_scopes",
+            note: "held by the OAuthValidator built at startup (oauth_resource_server) — \
                    security-critical, deliberately not made live, same posture as \
                    mcp.bearer_token_env.",
         }],
@@ -799,7 +830,7 @@ const DIFF_TABLE: &[DiffField] = &[
             setting: "mcp.oauth.scopes_supported",
             note: "advertised in the protected-resource metadata document and the \
                    WWW-Authenticate scope parameter, both rendered once at \
-                   OAuthValidator construction (oauth.rs).",
+                   OAuthValidator construction (oauth_resource_server).",
         }],
     },
     // ── rate_limit ───────────────────────────────────────────────────────────
@@ -1578,12 +1609,49 @@ mod tests {
     /// see `ResolvedMcpConfig::disabled_tools`'s doc comment in config.rs) because
     /// `Config::resolve_inner` folds it into `ResolvedConfig::mcp.disabled_tools`
     /// before this module ever sees it, and the `mcp.disabled_tools` `DiffField`
-    /// above already reports a change to either key.
+    /// above already reports a change to either key. `mcp.oauth.required_scopes` is
+    /// the same case: both scope keys resolve into one
+    /// `ResolvedOAuthConfig::required_scopes`, which the `mcp.oauth.required_scope`
+    /// `DiffField` reports under both names.
     const RELOAD_DIFF_EXCLUDED: &[&str] = &[
         "embedding.api_key_env",
         "reranking.api_key_env",
         "mcp.enabled_tools",
+        "mcp.oauth.required_scopes",
     ];
+
+    /// A config with OAuth enabled, resolved from `scope_keys` (YAML lines under
+    /// `mcp.oauth`) through the same `Config::resolve` a reload runs.
+    fn oauth_config(scope_keys: &str) -> ResolvedConfig {
+        let yaml = format!(
+            "mcp:\n  oauth:\n    enabled: true\n    issuer: \"https://idp.example.test/\"\n    \
+             resource: \"https://kb.example.test/mcp\"\n    audience: \"c\"\n{scope_keys}"
+        );
+        let raw: Config = serde_yaml_ng::from_str(&yaml).unwrap();
+        let mut resolved = base_config();
+        resolved.mcp.oauth = crate::config::resolve_mcp_oauth(raw.mcp.oauth).unwrap();
+        resolved
+    }
+
+    #[test]
+    fn mcp_oauth_required_scopes_change_is_restart_required() {
+        let unset = oauth_config("");
+        let write_only = oauth_config("    required_scopes: [\"mcp:write\"]\n");
+        let both = oauth_config("    required_scopes: [\"mcp:read\", \"mcp:write\"]\n");
+        let same_as_default = oauth_config("    required_scope: \"mcp:read\"\n");
+
+        for (old, new) in [(&unset, &write_only), (&write_only, &both)] {
+            let report = diff(old, new);
+            assert!(report.applied.is_empty(), "{report:?}");
+            assert_eq!(report.restart_required.len(), 1, "{report:?}");
+            assert_eq!(
+                report.restart_required[0].setting,
+                "mcp.oauth.required_scope / mcp.oauth.required_scopes"
+            );
+        }
+        // Spelling the `mcp:read` default out changes nothing that was enforced.
+        assert!(diff(&unset, &same_as_default).is_empty());
+    }
 
     #[test]
     fn reload_diff_settings_matches_every_yaml_reloadable_config_field() {
