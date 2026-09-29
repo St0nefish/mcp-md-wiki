@@ -3,18 +3,19 @@
 Releases are cut by publishing a GitHub release (`.github/workflows/release.yml`).
 The container image `ghcr.io/st0nefish/mcp-md-wiki` has three kinds of tag: `:latest`
 is the most recent release, `:vX.Y.Z` pins one release, and `:dev` follows `master`.
-No release has been tagged yet; the first will be 0.1.0. Until then this file tracks
-notable, operator-relevant changes under a running `[Unreleased]` heading, in roughly
-chronological order (most recent first); a release moves them under its own version
-heading. `fix #N` references are GitHub issues; see the repo's closed-issues list for the
-complete history — recent activity included an automated multi-agent documentation
-and correctness audit that closed roughly forty issues across security hardening,
-indexing correctness, and doc drift, of which the entries below are a representative
-sample rather than an exhaustive list.
+This file tracks notable, operator-relevant changes: unreleased ones under
+`[Unreleased]`, which a release moves under its own version heading. `fix #N`
+references are GitHub issues; see the repo's closed-issues list for the complete
+history. 0.1.0 is the first tagged release and collects everything before it; its
+entries are a representative sample rather than an exhaustive list — that period
+included an automated multi-agent documentation and correctness audit that closed
+roughly forty issues across security hardening, indexing correctness, and doc drift.
 
 <!-- verify-merge-a: inert marker for concurrent-PR auto-merge test, safe to delete -->
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-09-29
 
 ### Deployment
 
@@ -515,3 +516,6 @@ operator upgrading an old deployment needs to know happened at some point:
   folder rather than trusted from frontmatter. See [Backward compatibility and
   upgrade note](deploy/USAGE.md#backward-compatibility-and-upgrade-note) in
   `deploy/USAGE.md` for the full detail.
+
+[Unreleased]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/St0nefish/mcp-md-wiki/releases/tag/v0.1.0
