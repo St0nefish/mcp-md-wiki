@@ -1,0 +1,355 @@
+name: Checks
+
+# The one definition of what "this commit passes" means. Three callers run it:
+#   - ci.yml, on every PR (behind `ci-pass`, the only required check),
+#   - post-merge.yml, on every push to master (the combined tree non-strict merging
+#     can produce, and the job that saves the cargo caches PRs restore),
+#   - release.yml, on the exact commit a release tags, before anything is promoted.
+# Keeping the steps here means the PR gate, the post-merge safety net and release
+# verification cannot drift apart.
+#
+# The three jobs are independent and run in parallel, each on its own self-hosted
+# runner container, so the PR wall clock is the slowest job rather than the sum.
+#
+# A called workflow sees the CALLER's `github` context (github.event, github.ref,
+# github.sha are the caller's), so the PR number and head sha could be read from
+# github.event.pull_request here. They are passed as inputs instead: a caller that is
+# not a pull_request run (post-merge, release) then cannot reach the rebase step with
+# an event payload that lacks those fields, and the step fails loudly if they are
+# missing rather than rebasing an empty ref. No `concurrency` here on purpose: each
+# caller owns its own group, and a group declared in a called workflow would be
+# evaluated against the caller's context and could collide with the caller's.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit to check out (default: the caller's own ref)"
+        type: string
+        required: false
+        default: ""
+      pr-rebase:
+        description: "Force the workspace to pr-head-sha and rebase it onto current master first"
+        type: boolean
+        required: false
+        default: false
+      pr-number:
+        description: "PR number, for fetching refs/pull/<n>/head (required with pr-rebase)"
+        type: string
+        required: false
+        default: ""
+      pr-head-sha:
+        description: "PR head commit (required with pr-rebase)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# CARGO_INCREMENTAL=0: incremental artifacts are useless in CI (every build starts from
+# a restored cache, never from a previous edit) and roughly double target/, which is
+# what the cache stores and restores. line-tables-only keeps backtraces usable while
+# dropping most of the debug info, shrinking target/ and link time again.
+# rust-cache hashes CARGO_* / RUST* env into its key, so these are set once, here, for
+# every job and every caller, or a PR's restore would miss master's save.
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Rebase onto master
+        if: inputs.pr-rebase
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          PR_HEAD_SHA: ${{ inputs.pr-head-sha }}
+        run: |
+          if [[ -z "$PR_NUMBER" || -z "$PR_HEAD_SHA" ]]; then
+            echo "::error::pr-rebase needs both pr-number and pr-head-sha"
+            exit 1
+          fi
+          git config user.email "ci@stonefish.tech"
+          git config user.name "CI"
+          # Persistent self-hosted runner hygiene. Two failure modes to defend against:
+          #  1. A prior run whose rebase hit conflicts leaves a stale
+          #     .git/rebase-merge, making every later `git rebase` abort with
+          #     "already a rebase-merge directory".
+          #  2. actions/checkout may land on a stale cached refs/pull/N/merge,
+          #     so the workspace HEAD is an old (force-pushed-away) head and the
+          #     rebase replays obsolete commits that conflict.
+          # Clear any in-progress rebase, then force the workspace to the exact
+          # PR head SHA from the event before rebasing onto current master.
+          git rebase --abort 2>/dev/null || true
+          rm -rf .git/rebase-merge .git/rebase-apply
+          git fetch --force origin master "refs/pull/${PR_NUMBER}/head"
+          git checkout --force --detach "${PR_HEAD_SHA}"
+          git rebase origin/master
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: .github/scripts/rust-version.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+          components: clippy, rustfmt
+
+      # Keyed per job: clippy's check-metadata artifacts share nothing useful with the
+      # test profile's, so lint and the test jobs keep separate caches instead of
+      # overwriting each other. Saved only from master: GitHub scopes a cache to the
+      # ref that saved it, and a PR can restore caches saved on its base branch but
+      # never another PR's, so a PR-saved cache is quota spent on something no other
+      # run can read, and it evicts master's. post-merge.yml runs these jobs on every
+      # master push, which keeps master's caches current for PRs to restore.
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        # --all-targets lints test code too, matching .githooks/pre-commit. Without
+        # it, lint failures confined to #[cfg(test)] code sail past both the
+        # (opt-in) hook and CI (fix #196).
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Audit dependencies
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall cargo-audit --no-confirm
+          cargo audit
+
+  test:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Rebase onto master
+        if: inputs.pr-rebase
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          PR_HEAD_SHA: ${{ inputs.pr-head-sha }}
+        run: |
+          if [[ -z "$PR_NUMBER" || -z "$PR_HEAD_SHA" ]]; then
+            echo "::error::pr-rebase needs both pr-number and pr-head-sha"
+            exit 1
+          fi
+          git config user.email "ci@stonefish.tech"
+          git config user.name "CI"
+          # Same self-hosted-runner hygiene as the lint job above — see its
+          # comment for the two failure modes this guards against.
+          git rebase --abort 2>/dev/null || true
+          rm -rf .git/rebase-merge .git/rebase-apply
+          git fetch --force origin master "refs/pull/${PR_NUMBER}/head"
+          git checkout --force --detach "${PR_HEAD_SHA}"
+          git rebase origin/master
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: .github/scripts/rust-version.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+
+      # `cargo test` here and `cargo test -- --ignored` in qdrant-integration compile
+      # exactly the same test-profile artifacts, so they share one cache key. This job
+      # is the one that saves it (master only — see the lint job's cache step);
+      # qdrant-integration only restores, so the two never race to save one key.
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Run tests
+        run: cargo test
+
+  # The mocked VectorStore suite proves nothing about real Qdrant wire
+  # semantics — filters, phrase matching, RRF, recommend. The eight tests that
+  # do exercise a live server (src/qdrant.rs) are #[ignore]d, and plain
+  # `cargo test` (above) never passes --ignored, so none of them ran in CI
+  # before this job was added (#186, and its narrower instance #133). Start a
+  # qdrant container (image pin single-sourced from docker-compose.yml, but
+  # NOT the compose service itself — see `Start Qdrant` for why) and run just
+  # those.
+  qdrant-integration:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    # Blocking as of #133. Three separate things had to be true first, and all
+    # three now are:
+    #  1. Two pre-existing bugs in the tests themselves — an invalid literal
+    #     point-ID UUID in phrase_index_enables_exact_phrase_matching's fixture
+    #     (fixed by #212) and a genuine assertion mismatch in
+    #     recommend_by_point_id_finds_nearest_neighbor (fixed by #231, which
+    #     also made the suite safe under cargo's default multi-threaded
+    #     harness rather than --test-threads=1). Both closed.
+    #  2. The job could never reach qdrant at all: it published ports onto the
+    #     host's loopback from a runner that is itself a container. Fixed in
+    #     `Start Qdrant` below — see that step's comment.
+    #  3. An actual green run. This job had 0 successes in 52 attempts before
+    #     that fix; run 33342483836 is the first, with `Run live-Qdrant tests`
+    #     reporting "7 passed; 0 failed". It is required from that point on,
+    #     not on the strength of local runs.
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Rebase onto master
+        if: inputs.pr-rebase
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          PR_HEAD_SHA: ${{ inputs.pr-head-sha }}
+        run: |
+          if [[ -z "$PR_NUMBER" || -z "$PR_HEAD_SHA" ]]; then
+            echo "::error::pr-rebase needs both pr-number and pr-head-sha"
+            exit 1
+          fi
+          git config user.email "ci@stonefish.tech"
+          git config user.name "CI"
+          # Same self-hosted-runner hygiene as the lint job above — see its
+          # comment for the two failure modes this guards against.
+          git rebase --abort 2>/dev/null || true
+          rm -rf .git/rebase-merge .git/rebase-apply
+          git fetch --force origin master "refs/pull/${PR_NUMBER}/head"
+          git checkout --force --detach "${PR_HEAD_SHA}"
+          git rebase origin/master
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read pinned Rust toolchain version
+        # Same pin as the other two jobs (#235), so this job's `cargo test`
+        # can't end up on a different toolchain than the one `test` compiled
+        # and `lint` linted against.
+        id: rust_version
+        run: .github/scripts/rust-version.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+
+      # Restores the `test` job's cache (same artifacts); never saves — see there.
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: false
+
+      - name: Start Qdrant
+        run: |
+          # The self-hosted runner is itself a container driving the host's
+          # Docker daemon through a mounted /var/run/docker.sock, so
+          # `docker compose up` creates a SIBLING container on the host and
+          # docker-compose.yml's `127.0.0.1:6334:6334` publishes onto the
+          # HOST's loopback -- which is not this container's loopback. Every
+          # run of this job since it was added failed for that reason, first
+          # in the wait step and then in `cargo test` itself, which hardcodes
+          # http://localhost:6334 (src/qdrant.rs).
+          #
+          # Put qdrant in THIS container's network namespace instead: then
+          # `localhost:6334` is literally correct, nothing is published on the
+          # host (so two PRs' jobs can't collide on 6333/6334), and the tests
+          # need no environment plumbing. `hostname` is NOT the container ID
+          # on this runner -- derive the real one from /proc/self/mountinfo,
+          # which is data-root/storage-driver agnostic because it keys off the
+          # second-to-last path component, not a fixed prefix.
+          #
+          # `exit` after the print so an over-mounted /etc/hostname (two
+          # matching mountinfo lines) yields ONE id rather than a multi-line
+          # value that sails past the emptiness check and then fails opaquely
+          # inside `docker run --network container:<two ids>`.
+          #
+          # By design this hard-fails on a non-containerized (bare-metal)
+          # runner: there is no /etc/hostname bind mount to derive an id from,
+          # so the check below trips and this now-REQUIRED job goes red. That
+          # is deliberate -- a bare-metal runner needs the published-ports
+          # approach instead, and silently falling back to it would reintroduce
+          # the cross-PR port collision this netns trick exists to avoid.
+          # Whoever migrates runners: rework this step, don't just delete it.
+          cid=$(awk '$5=="/etc/hostname"{n=split($4,p,"/"); print p[n-1]; exit}' /proc/self/mountinfo)
+          if [[ -z "$cid" ]]; then
+            echo "::error::could not determine this runner's own container id"
+            exit 1
+          fi
+          # The container name must be unique per runner, not a fixed string:
+          # several self-hosted runner containers share one Docker daemon, so a
+          # hardcoded `ci-qdrant` means PR-B's startup `docker rm -f` destroys
+          # the server PR-A is mid-`cargo test` against -- failing PR-A's
+          # required check for a fault it did not cause. `cid` is already unique
+          # per runner, so key the name off it, and export it so the `Stop
+          # Qdrant` step (a separate step, with its own shell) removes the same
+          # container this one created.
+          name="ci-qdrant-${cid}"
+          echo "CI_QDRANT_NAME=${name}" >> "$GITHUB_ENV"
+          docker rm -f "$name" 2>/dev/null || true
+          # Image stays single-sourced from docker-compose.yml so the pin
+          # can't drift from what the deployment runs.
+          image=$(docker compose -f docker-compose.yml config --images qdrant)
+          docker run -d --name "$name" --network "container:${cid}" "$image"
+
+      - name: Wait for Qdrant to be ready
+        run: |
+          # Now genuinely this container's loopback, so a direct probe is
+          # correct (poll, not sleep -- see deploy.sh's fix, #198).
+          timeout=60
+          elapsed=0
+          while true; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:6333/readyz || echo "000")
+            [[ "$code" == "200" ]] && break
+            if (( elapsed >= timeout )); then
+              echo "::error::qdrant did not become ready within ${timeout}s (last HTTP status: ${code})"
+              docker logs "$CI_QDRANT_NAME"
+              exit 1
+            fi
+            sleep 2
+            elapsed=$((elapsed + 2))
+          done
+
+      - name: Run live-Qdrant tests
+        run: cargo test -- --ignored
+
+      - name: Stop Qdrant
+        if: always()
+        # Only ever removes THIS runner's own container (see `Start Qdrant`),
+        # never another concurrent PR's. `if: always()` means this can run when
+        # `Start Qdrant` failed before exporting the name, so guard on it being
+        # set — an unguarded `docker rm -f ""` would just be noise.
+        run: |
+          if [[ -n "${CI_QDRANT_NAME:-}" ]]; then
+            docker rm -f "$CI_QDRANT_NAME" 2>/dev/null || true
+          fi

@@ -75,16 +75,20 @@ Check each claim against the code rather than the plan that preceded it. Code co
 
 ## Workflow
 
-**Pattern A (CI-gated)**, per the knowledge base:
+**Pattern C (CI-gated, tag-released)**, per the knowledge base:
 `dev/tools/repo-workflow-patterns.md`. `master` takes no direct pushes and is
 protected by a repo **ruleset** (not classic branch protection) — direct push
 disabled, status checks required, exactly as before, but the mechanism is a
 ruleset and the details below are what changed:
 
-- Work on a branch, open a PR against `master`. `ci.yml` runs `test` and
-  `qdrant-integration`, fanning into a single `ci-pass` job — that is the
-  **only** required status check the ruleset enforces (never list individual
-  job names as required checks).
+- Work on a branch, open a PR against `master`. `ci.yml` runs a `changes` path
+  filter, then the reusable `checks.yml` (`lint` = fmt/clippy/audit, `test`,
+  `qdrant-integration`, in parallel on self-hosted runners), fanning into a
+  single `ci-pass` job — that is the **only** required status check the ruleset
+  enforces (never list individual job names as required checks). A PR builds no
+  image. `checks.yml` is shared with `post-merge.yml` and `release.yml`; its
+  `pr-rebase` input (used only by `ci.yml`) makes the jobs check the PR head
+  rebased onto current `master` rather than the possibly-stale merge ref.
 - Merges are **squash only** (`allow_merge_commit: false`,
   `allow_rebase_merge: false`) via `auto-merge.yml` (`gh pr merge --auto
   --squash`), titled `<PR title> (#<number>)`. Auto-merge fires as soon as
@@ -111,32 +115,70 @@ ruleset and the details below are what changed:
   only to resolve a real conflict, or because the workflow file itself
   changed (rare here, since GitHub reads workflow files from the PR's base
   ref, not this Gitea gotcha).
-- `post-merge.yml` re-runs the cheap lint/test checks on `master` after every
-  push, to catch the rare semantic conflict that non-strict merging permits
-  (two PRs each green against an older base, broken once combined). It is
-  **not** a required check — it runs after the merge, not before.
-- **Watching a PR means watching it through release.** "Merged" is not the
-  finish line. A watch covers the whole chain and is not done until the last
-  link reports a terminal state: `ci-pass` → auto-merge → `post-merge.yml` on
-  the combined tree → `release.yml` (retag `:latest` + trigger Watchtower).
-  Report each one's outcome, not just the final merge. A green `release` run
-  is not by itself a deploy: a merge touching nothing in `ci.yml`'s
-  `CODE_PATHS` builds no image and the retag and Watchtower steps skip, so
-  check that the retag actually ran and that Watchtower reported `failed: 0`
-  before calling anything deployed.
+- On every push to `master`, two workflows run on the merge commit.
+  `post-merge.yml` re-runs `checks.yml` on the combined tree, to catch the
+  rare semantic conflict that non-strict merging permits (two PRs each green
+  against an older base, broken once combined), and saves the cargo caches
+  PRs restore. `dev.yml` builds one multi-arch image (amd64 on the
+  self-hosted runner, arm64 natively on GitHub-hosted `ubuntu-24.04-arm`),
+  smoke-tests it, and tags it (see the table below). Neither is a required
+  check — they run after the merge, not before. **A merge deploys nothing:**
+  it never touches `:latest` or Watchtower.
+- **Watching a PR** covers `ci-pass` → auto-merge → `post-merge.yml` and
+  `dev.yml` on the merge commit, each reported by its own outcome, not just
+  "merged". A green `dev.yml` run is the signal the commit is releasable
+  (it has its `:sha-<commit>` image). **Watching a release** is a separate
+  watch: `release.yml`'s `check` → `verify-ci` / `verify-image` → `release`
+  → `release-notes`, and it is not done until Watchtower reports `failed: 0`
+  and `:latest` actually moved to the new digest.
 - `fix #N` in the merge commit auto-closes GitHub issues.
 - Branches auto-delete after merge.
 - Pre-commit hook enforces `cargo fmt` + `cargo clippy` (activate with
   `./scripts/setup-dev.sh` after cloning).
-- **Batch related changes into one PR.** Every merge to `master` runs
-  `release.yml`, which builds a new image and pokes Watchtower to restart the
-  live service — so N small PRs cost N builds and N restarts, and they
-  serialize on the single self-hosted runner. Splitting a fix from the doc
-  correction that belongs with it, or opening a second PR for something that
-  could have been another commit on a branch already in flight, is pure
-  churn. If several must land separately anyway, set the `DEPLOY_HOLD` repo
-  variable to `true`, let them accumulate, then ship the batch with one
-  `workflow_dispatch` run (`force=true`).
+- **No need to batch PRs to save builds or restarts.** Merging does not
+  deploy, so several small PRs cost only their CI and one `dev.yml` build
+  each; only a release restarts the live service.
+
+### Releasing
+
+Two owner-only steps; nothing else moves `:latest` (`release.yml` has no
+`push` or `workflow_dispatch` trigger).
+
+1. Merge a bump PR: `version` in `Cargo.toml` (and `Cargo.lock`), the
+   `[Unreleased]` entries in `CHANGELOG.md` moved under `## [X.Y.Z] - <date>`,
+   and its link reference at the bottom. Merging publishes nothing.
+2. Once `dev.yml` has built that commit, publish the release:
+   `gh release create vX.Y.Z --target <sha of the bump commit> --title vX.Y.Z --notes "..."`.
+   Use the SHA, not `master`: with `--target master`, anything merged after the
+   bump rides into the release with no CHANGELOG entry.
+
+`release.yml` (trigger: `release: published` only) then runs `check` (sender is
+the owner, tag is `vX.Y.Z` and equals `Cargo.toml`'s version at that commit,
+commit is on `master`, CHANGELOG section non-empty), `verify-ci` (`checks.yml`
+on the tagged commit) and `verify-image` (resolves `:sha-<commit>`, smoke-tests
+it), then `release` (environment `release`; refuses unless this is the highest
+stable tag; retags the same digest as `:latest` and `:vX.Y.Z` — no rebuild —
+and triggers Watchtower on atlas), then `release-notes` (replaces the notes
+with the CHANGELOG section). No `:sha-<commit>` image means no release.
+
+Recovery: a transient failure is `gh run rerun <id> --failed` (every stage is
+safe to repeat). If the tagged commit is genuinely broken, re-running cannot
+help — merge the fix and release a higher version, or delete with
+`gh release delete vX.Y.Z --cleanup-tag` and release again at the new commit.
+
+Image tags (`ghcr.io/st0nefish/mcp-md-wiki`, all multi-arch, all one digest per
+commit):
+
+| Tag | Set by | Meaning |
+|---|---|---|
+| `:dev` | `dev.yml` | Newest master commit whose build passed (only master's tip moves it) |
+| `:<x.y.z>-dev.<n>` | `dev.yml` | Immutable; x.y.z = latest release's patch + 1 (`Cargo.toml` version before the first release), n = commits since |
+| `:sha-<full commit sha>` | `dev.yml` | Immutable, after the smoke test; what `release.yml` resolves |
+| `:latest` | `release.yml` | Most recent release; the only tag Watchtower deploys |
+| `:vX.Y.Z` | `release.yml` | Pins one release |
+
+`:build-<sha>` (staging) and `:buildcache-<arch>` (cargo-chef layer cache) also
+exist but are not images to run.
 
 ## Issue tracking
 

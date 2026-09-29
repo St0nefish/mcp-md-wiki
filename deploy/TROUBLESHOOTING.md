@@ -166,6 +166,8 @@ docker run --rm -v <volume_name>:/data --user root --entrypoint chown \
 
 If you're running the container with a custom compose `user:` override instead of the image default, replace `65532:65532` with that uid:gid. This only needs to be done once per pre-existing volume.
 
+`:latest` is the most recent release; use `:dev` (newest `master` build) or `:vX.Y.Z` if that is the tag your stack runs.
+
 ### `docker compose up` hangs; `mcp-md-wiki` never starts; `qdrant` shows `starting` then `unhealthy`
 
 **Symptom.** `docker compose ps` shows `qdrant` stuck in `(health: starting)` and then
@@ -174,7 +176,7 @@ starting a container — `depends_on: qdrant: condition: service_healthy` means 
 won't start it until qdrant reports healthy, which here it never will. This hits a
 clean `docker compose up` on any host: a first-time deployment, a disaster-recovery
 rebuild, or a reboot. If the stack looks fine on your existing host, that's because
-Watchtower restarts the `qdrant` container directly on image updates, bypassing
+Watchtower restarts the `qdrant` container directly when it pulls a new image, bypassing
 compose and its `depends_on` gate entirely — it doesn't mean the healthcheck works.
 
 **Cause.** Fixed as of #256: the qdrant healthcheck used to run `curl -f

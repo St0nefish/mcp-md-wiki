@@ -469,6 +469,8 @@ docker run --rm -v kb_data:/data --user root --entrypoint chown \
 
 Replace `1000:1000` with the UID:GID from your compose `user:` setting.
 
+Image tags: `:latest` is the most recent GitHub release (it moves only when a release is published, not on every merge), `:vX.Y.Z` pins one release, and `:dev` follows `master` for the newest build. Use the same tag here as in your compose file.
+
 ### Bind-mount (alternative)
 
 Mount a pre-cloned repo from the host. Useful when you need direct host access to the files or can't use `GIT_URL` (e.g. local-only repos).
