@@ -13,27 +13,43 @@
 # pin here compiled clean through every cargo step CI ran and failed only in
 # this Docker build, at the end of a long job.
 ARG RUST_VERSION=1.89
-FROM rust:${RUST_VERSION}-alpine AS builder
-
+# Dependency compilation goes through cargo-chef so it is an ordinary image layer
+# (keyed on Cargo.toml/Cargo.lock only, via recipe.json) that a buildx registry
+# cache can store and reuse. A `RUN --mount=type=cache` target dir cannot be
+# exported to a registry cache, so on a fresh builder (CI) it starts empty and
+# every dependency would recompile on every build.
+#
+# Pinned so the layer is reproducible; `--locked` uses cargo-chef's own lockfile.
+# Installed with `cargo install` rather than the lukemathwalker/cargo-chef image so
+# it works for whatever RUST_VERSION is passed, not only versions that image tags.
+FROM rust:${RUST_VERSION}-alpine AS chef
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static perl
-
+RUN cargo install cargo-chef --locked --version 0.1.78
 WORKDIR /build
 
-# Cache dependencies
+# Reduce the manifests + sources to recipe.json. Only its content flows into the
+# cook stage, so editing a source file leaves the cook layer's cache key unchanged
+# unless dependencies changed.
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=md-rag-target,target=/build/target \
-    cargo build --release && \
-    rm -rf src
+COPY src/ src/
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Build real binary
+# Compile dependencies only. Must not depend on the registry cache mount for
+# correctness; the mount just saves re-downloads on local rebuilds.
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo chef cook --release --recipe-path recipe.json
+
+# Build the real binary. src/, assets/ (include_str!) and migrations/ are the
+# compile-time inputs; deploy/ is only read by a #[cfg(test)] include_str!.
+COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY migrations/ migrations/
 COPY assets/ assets/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=md-rag-target,target=/build/target \
-    touch src/main.rs && cargo build --release && \
+    cargo build --release && \
     cp target/release/mcp-md-wiki /usr/local/bin/mcp-md-wiki
 
 # Runtime image
@@ -42,10 +58,9 @@ FROM alpine:3.21
 # Populated by CI (`docker buildx build --build-arg VERSION=... --build-arg
 # REVISION=...`); default to "unknown" so a plain local `docker build .` with no
 # build args still produces a valid, if uninformative, label instead of an empty
-# one. REVISION matters beyond documentation: the arm64 nightly (fix #194) reads
-# org.opencontainers.image.revision back out of a previously-built image's config
-# to decide whether anything has changed since its last build, so CI actually
-# setting this is what makes that skip-if-unchanged check work at all.
+# one. REVISION records the exact commit the image was built from
+# (org.opencontainers.image.revision), which is useful metadata for tracing a
+# running image back to its source.
 ARG VERSION=unknown
 ARG REVISION=unknown
 

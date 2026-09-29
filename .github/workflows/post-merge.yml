@@ -1,6 +1,6 @@
 name: Post-Merge
 
-# The ruleset's required_status_checks no longer requires PR branches to stay
+# The ruleset's required_status_checks does not require PR branches to stay
 # up to date with master (strict_required_status_checks_policy: false), so
 # two PRs that were each green against an older master can still combine into
 # a broken master (a semantic conflict no textual merge conflict catches).
@@ -9,72 +9,31 @@ name: Post-Merge
 #
 # Deliberately NOT a required status check -- it runs after the merge, not
 # before, so it cannot gate anything. See dev/tools/repo-workflow-patterns.md
-# in the knowledge base for the full rationale (Pattern A).
+# in the knowledge base for the full rationale (Pattern C: a merge runs CI and
+# builds a dev image; only a published release ships).
 #
-# Re-runs only the cheap, secret-free correctness checks from ci.yml's `test`
-# job (fmt, clippy, unit tests). Deliberately excludes:
-#   - the docker build/push step -- needs registry credentials and re-proves
-#     something the PR gate already proved builds
-#   - `qdrant-integration` -- needs a live Qdrant container wired through the
-#     self-hosted runner's network namespace; too heavy to duplicate on every
-#     push to master for what is meant to be a lightweight safety net
-# A semantic break that slips past the PR gate is far more likely to surface
-# in fmt/clippy/unit tests than in the Qdrant wire-protocol suite, so this
-# narrower set still catches what actually matters here.
+# Runs the full checks.yml -- the same lint, unit-test and live-Qdrant jobs the
+# PR gate runs -- on the combined tree. They run on the self-hosted runners in
+# parallel, so the Qdrant suite costs no extra wall clock here. This is also the
+# only caller that runs on master, so it is what saves the cargo caches every
+# PR restores (see checks.yml's cache steps). A red run here also means the
+# commit is not releasable: release.yml re-runs checks.yml on the tagged commit.
 
 on:
   push:
     branches: [master]
 
+# One run at a time, never cancelled. A pending run is superseded by a newer
+# push's pending run (GitHub keeps one pending run per group), which still
+# checks the newest combined tree; an in-progress run always finishes so its
+# cache save is not cut off halfway.
 concurrency:
-  group: ${{ github.workflow }}
+  group: post-merge
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
-  verify:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev
-
-      - name: Read pinned Rust toolchain version
-        # Single source of truth is rust-toolchain.toml's `channel`, same as
-        # ci.yml -- see that file's identically-named step for why.
-        id: rust_version
-        run: |
-          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
-          if [[ -z "$version" ]]; then
-            echo "::error::could not parse channel from rust-toolchain.toml"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust_version.outputs.version }}
-          components: clippy, rustfmt
-
-      - name: Cache cargo registry and build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-
-
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-      - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Run tests
-        run: cargo test
+  checks:
+    uses: ./.github/workflows/checks.yml

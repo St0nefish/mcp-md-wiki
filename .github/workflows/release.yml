@@ -1,331 +1,346 @@
 name: Release
 
-on:
-  push:
-    branches: [master]
-  # Manual deploy, for shipping a batch of merges as one restart. With
-  # DEPLOY_HOLD set, merges accumulate on master without deploying; a single
-  # dispatch with force=true then promotes whatever master currently is.
-  workflow_dispatch:
-    inputs:
-      force:
-        description: "Deploy even if the DEPLOY_HOLD repo variable is set"
-        type: boolean
-        default: false
-
-# One deploy at a time, repo-wide. Two release runs overlapping on separate
-# runners race on a shared mutable target: both read :latest's digest, both
-# `imagetools create` it, and the last writer wins — so the *older* commit can
-# end up as :latest, and both pokes reach Watchtower, restarting the live
-# service twice for one intended deploy. The group is a constant, not keyed by
-# ref or sha, because the thing being serialized is the deployment, of which
-# there is exactly one regardless of what triggered the run.
+# Deploys only when the owner publishes a GitHub release — and only then. A merge to
+# master runs CI and builds a dev image (dev.yml); it ships nothing. A release is a
+# promotion, never a build: dev.yml built every master commit once as `:sha-<commit>`
+# (multi-arch); this re-verifies the tagged commit, adds `:latest` and `:<tag>` to that
+# same image-index digest, pulls it onto the atlas host and triggers Watchtower. No
+# `sha-<commit>` image for the tagged commit means no release.
 #
-# `cancel-in-progress: false` — superseded runs queue, they do not get killed:
-#   - every master commit must still publish its `:<merge_sha>` tag, which is
-#     what makes a rollback target findable from master's history (see the
-#     "Tag as latest" step); cancelling a superseded run would leave that
-#     commit with no image anybody can name.
-#   - a deliberate `workflow_dispatch` batch deploy must not be cancelled by an
-#     incidental push that lands while it runs.
-# Deploy churn is DEPLOY_HOLD's job (see the gate below), not this knob's.
+# Cutting a release:
+#   1. Merge a PR that bumps `version` in Cargo.toml (and Cargo.lock) and moves
+#      CHANGELOG.md's `[Unreleased]` entries under a matching `## [X.Y.Z] - <date>`
+#      heading, with its link reference at the bottom. Merging it publishes nothing.
+#   2. Once dev.yml has built that commit, the owner creates the release for it, naming
+#      the bump commit's SHA rather than `master`:
+#        gh release create vX.Y.Z --target <sha of the bump commit> \
+#          --title vX.Y.Z --notes "..."
+#      With `--target master`, anything merged after the bump would ride along into the
+#      release without a CHANGELOG entry. Publishing the release creates the `vX.Y.Z` tag
+#      and starts this workflow. The notes given there are replaced by the CHANGELOG
+#      section once the image has shipped.
+#
+# No `push` and no `workflow_dispatch` trigger, deliberately: the only way to move
+# `:latest` is an owner-published release of a commit on master, so what is deployed is
+# always a named, CHANGELOG-described version. Only the owner can cause a deploy, and they
+# have to do two things: create the `v*` tag (a tag ruleset lets only repository admins
+# create, move or delete `v*` tags, so neither GITHUB_TOKEN nor the auto-merge App can)
+# and publish the release, which `check` enforces by failing unless the event's sender is
+# the owner. (A release published with a GitHub App installation token does start
+# workflow runs, and the auto-merge App has `contents: write`, so without the sender check
+# it could publish a release on an existing, unpublished `v*` tag.) Nothing in this
+# workflow ever creates or moves a git tag.
+#
+#   check          GitHub-hosted, read-only. Fails closed unless: the owner published
+#                  the release; the tag is `vX.Y.Z` and names this run's commit; it
+#                  matches Cargo.toml's [package] version at that commit; the commit is
+#                  on master; CHANGELOG.md has a non-empty `## [X.Y.Z]` section.
+#   verify-ci      checks.yml (lint, tests, live-Qdrant suite) on the tagged commit.
+#   verify-image   Finds dev.yml's `sha-<commit>` image (waiting a bounded time for a
+#                  build still running, then failing closed) and smoke-tests that digest.
+#   release        In the `release` environment (deployment policy: `v*` tags only; it
+#                  holds WATCHTOWER_ATLAS_TOKEN). Refuses unless the tag is the highest
+#                  stable release, retags the verified digest as `:latest` and `:<tag>`,
+#                  then triggers Watchtower.
+#   release-notes  Replaces the release's notes with the CHANGELOG section, after the
+#                  image has shipped.
+#
+# If the tagged commit is genuinely broken, "re-run failed jobs" cannot help — it re-runs
+# the same commit. Merge the fix and release it as a new, higher version (or, as the
+# owner, delete the release and its tag with `gh release delete vX.Y.Z --cleanup-tag` and
+# create it again at the new commit). A transient failure is re-run with
+# `gh run rerun <id> --failed`; every stage is safe to repeat.
+
+on:
+  release:
+    types: [published]
+
+# One run per tag, never cancelled. GitHub keeps at most one *pending* run per concurrency
+# group and cancels the older pending one when a newer run queues, so a single shared
+# group could silently drop a release. Per tag, nothing is dropped; runs for different
+# tags may overlap, and `:latest` is protected instead by the release job's guard: it
+# fails closed, before moving any tag, unless this release is the highest stable
+# v<x.y.z> tag, so an older release (published late, or re-run) can never move `:latest`
+# backwards.
 concurrency:
-  group: release
+  group: release-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
-  release:
-    runs-on: self-hosted
-
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
-      # Deploy hold. Every merge to master otherwise retags :latest and pokes
-      # Watchtower, which restarts the running container — so a run of N merged
-      # PRs costs N restarts of a live service for no benefit, since only the
-      # last one's image is the one anybody keeps.
-      #
-      # Set the DEPLOY_HOLD repo variable to "true" to accumulate merges without
-      # deploying. Nothing is lost while held: CI still builds and pushes the
-      # per-PR sha image, and the steps below still run far enough to name the
-      # image this push would have shipped, so the log says exactly what is
-      # pending. Ship the batch with a workflow_dispatch run (force=true), which
-      # promotes the newest built image in a single restart — normally HEAD's,
-      # or the newest one behind it when HEAD is a non-code merge (fix #262).
-      #
-      # Deliberately a gate inside the job rather than disabling the workflow:
-      # a disabled workflow leaves no run history, so there is no record that a
-      # merge went out un-deployed. A held run shows up as a green run whose log
-      # says it was held.
-      - name: Resolve deploy hold
-        id: gate
+      - name: Require the release to be published by the owner
+        # The tag ruleset means only the owner can create a `v*` tag, but publishing a
+        # release on an existing tag is a separate act: a GitHub App installation token
+        # with `contents: write` can do it, and unlike GITHUB_TOKEN it does start
+        # workflow runs. Only the owner may.
         env:
-          DEPLOY_HOLD: ${{ vars.DEPLOY_HOLD }}
-          FORCED: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+          SENDER: ${{ github.event.sender.login }}
         run: |
-          if [ "${DEPLOY_HOLD}" = "true" ] && [ "${FORCED}" != "true" ]; then
-            echo "::notice::DEPLOY_HOLD is set — this push will not be deployed. Run this workflow manually with force=true to ship the accumulated batch."
-            echo "held=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "held=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: actions/checkout@v5
-        with:
-          # Deep enough to walk back over a held batch. A forced dispatch may
-          # need to look past several non-code merges to find the newest built
-          # image — see the walk in "Resolve the image tag to ship".
-          fetch-depth: 50
-
-      - name: Set image name
-        id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-
-      # Must precede the version step: that step inspects the registry to find
-      # which candidate images actually exist, which needs an authenticated
-      # daemon.
-      - name: Login to container registry
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Resolve the image tag to ship
-        id: version
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IMAGE_NAME: ${{ steps.image.outputs.name }}
-          FORCED: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
-        run: |
-          # Resolve the PR that contains this commit via the API rather than
-          # parsing the commit subject for a "(#123)" suffix. That suffix is
-          # only GitHub's *default* squash-merge subject — a merge that
-          # supplies an explicit commit_title (the correct way to keep a
-          # stale or misleading branch commit message out of master's
-          # history) produces a subject with no "(#N)" at all, which broke
-          # this step when it grep'd the log under `set -e` (fix #260,
-          # observed in run 33344570055 on commit 4e90661).
-          #
-          # Command substitution runs in a subshell that does NOT inherit
-          # errexit unless this is set. Without it, a function whose last
-          # statement is `echo` returns 0 even when the command before it
-          # failed, so `TAG=$(tag_for_pr ...)` would swallow a `gh` outage and
-          # hand back a garbage "sha-" tag. That silently turns an API blip
-          # into "deployed nothing" (or, mid-walk, into skipping a commit that
-          # did have an image and shipping older code).
-          shopt -s inherit_errexit
-
-          resolve_pr() {
-            gh api "repos/${GITHUB_REPOSITORY}/commits/$1/pulls" --jq '.[0].number // empty'
-          }
-          tag_for_pr() {
-            local head_sha
-            head_sha=$(gh pr view "$1" --json headRefOid --jq '.headRefOid') || return 1
-            [ -n "$head_sha" ] || return 1
-            echo "sha-${head_sha:0:7}"
-          }
-
-          # ci.yml's paths filter, as an anchored regex. A commit touching any
-          # of these produced an image; one touching none legitimately did not.
-          CODE_PATHS='^(src/|assets/|migrations/|Cargo\.(toml|lock)$|Dockerfile$|docker-compose\.yml$|rust-toolchain\.toml$|\.dockerignore$|\.github/workflows/ci\.yml$)'
-
-          PR_NUM=$(resolve_pr "${GITHUB_SHA}")
-          if [ -n "$PR_NUM" ]; then
-            TAG=$(tag_for_pr "$PR_NUM")
-
-            # A forced dispatch ships an accumulated batch, and the batch's
-            # final merge is not necessarily the one that built an image: CI
-            # only builds when code changed (ci.yml's paths filter), so a
-            # docs- or workflow-only merge lands on master with no image of
-            # its own. Retagging nothing in that case strands every code
-            # change queued behind it — which is exactly what happened to
-            # #254/#258/#255 sitting behind the workflow-only #261.
-            #
-            # So when HEAD has no image, walk back to the most recent commit
-            # that does. What makes that safe is not just that `ci-pass` is
-            # required, but that master's ruleset sets
-            # `strict_required_status_checks_policy: true` (branch must be up
-            # to date before merging) with `bypass_actors: []` — so the head
-            # CI built already contained every earlier master commit, and no
-            # admin can merge around it. The image found by walking back
-            # therefore carries the same code as HEAD.
-            #
-            # That argument is about what CI *did*, while a registry probe
-            # only reports what a tag resolves to *now* — a deleted or pruned
-            # image looks identical to one that was never built, and walking
-            # past it would silently ship older code. So before skipping any
-            # commit, prove from its diff that it legitimately had no build.
-            # A commit with no PR at all is never walked past either — that is
-            # the direct-push case below, and it stays fatal.
-            #
-            # Only on a forced dispatch. A plain docs-only push keeps the old
-            # behavior (skip the retag, deploy nothing) rather than poking
-            # Watchtower to redeploy an image it already runs.
-            if [ "${FORCED}" = "true" ] && ! docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}" >/dev/null 2>&1; then
-              echo "::notice::HEAD (${GITHUB_SHA}) has no image of its own — walking back for the newest built one."
-              FOUND=""
-              # Start at HEAD's parent: the `if` above already proved HEAD's
-              # own tag does not resolve.
-              for sha in $(git rev-list -n 50 "${GITHUB_SHA}^"); do
-                if ! pr=$(resolve_pr "$sha"); then
-                  echo "::error::Could not resolve the PR for ${sha} — the GitHub API call failed. Re-run this dispatch; no deploy was performed."
-                  exit 1
-                fi
-                if [ -z "$pr" ]; then
-                  echo "::error::${sha} has no associated PR, so the walk cannot prove the commits above it were non-code. Refusing to guess an image."
-                  exit 1
-                fi
-                candidate=$(tag_for_pr "$pr")
-                if docker buildx imagetools inspect "${IMAGE_NAME}:${candidate}" >/dev/null 2>&1; then
-                  FOUND="$candidate"
-                  echo "::notice::Shipping ${candidate}, built for PR #${pr} at ${sha}."
-                  break
-                fi
-                # No image here. Only keep walking if this commit genuinely
-                # changed nothing CI builds from; otherwise its image went
-                # missing and anything older is stale code.
-                if git diff --name-only "${sha}^" "${sha}" | grep -qE "${CODE_PATHS}"; then
-                  echo "::error::${sha} (PR #${pr}) changed code but has no image ${candidate} — it may have been deleted or pruned. Refusing to ship an older image in its place."
-                  exit 1
-                fi
-              done
-              if [ -z "$FOUND" ]; then
-                echo "::error::No built image found in the last 50 commits of master. Nothing can be deployed — check that CI built and pushed an image for at least one merged code change."
-                exit 1
-              fi
-              TAG="$FOUND"
-            fi
-          else
-            # No PR is associated with this commit — a direct push to master.
-            # CI only builds and tags images on PR branches (sha-<PR head
-            # SHA>), so there is no prebuilt image for a bare master commit
-            # to fall back to. Fail loudly rather than silently computing a
-            # sha-<master SHA> tag that would 404 on pull.
-            echo "::error::No pull request found for commit ${GITHUB_SHA} — this looks like a direct push to master. No image was built for this commit (CI only builds on PR branches), so there is nothing to release. Open a PR so CI builds and pushes an image."
+          if [[ "$SENDER" != "St0nefish" ]]; then
+            echo "::error::this release was published by '${SENDER}'; only the repository owner may publish a release."
             exit 1
           fi
-          echo "short_sha=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Using image tag: ${TAG}"
 
-          # Whether this tag actually resolves. The held report below reads it:
-          # when a batch is held, the walk above has not run (it is scoped to
-          # forced dispatches), so HEAD's tag may name no image at all — and
-          # saying "already built and pushed" there would be the very
-          # falsehood that hid #262.
-          if docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}" >/dev/null 2>&1; then
-            echo "image_exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "image_exists=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::${IMAGE_NAME}:${TAG} does not exist — this commit changed nothing CI builds from."
-          fi
+      - name: Checkout the tagged commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          # Full history, so the ancestry check below has the commits it needs.
+          fetch-depth: 0
+          persist-credentials: false
 
-          # Also expose a tag keyed to THIS commit on master. The tag above is the
-          # PR head SHA, because CI builds the image on the PR branch and this job
-          # only retags it — but that SHA does not appear anywhere in master's
-          # history, so `git log` gives you no way to find the image for a given
-          # master commit. That matters when a deploy needs rolling back: you know
-          # the master commit you want to return to, not the PR head it came from.
-          echo "merge_sha=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Report held deploy
-        if: steps.gate.outputs.held == 'true'
+      - name: Match the release tag to the tagged commit's Cargo.toml version
+        id: version
         env:
-          IMAGE: ${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}
-          MERGE_TAG: ${{ steps.version.outputs.merge_sha }}
-          EXISTS: ${{ steps.version.outputs.image_exists }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          echo "Deploy held."
-          if [ "${EXISTS}" = "true" ]; then
-            echo "This push would have shipped:"
-            echo "  ${IMAGE}"
-            echo "  (as :latest and :${MERGE_TAG})"
-            echo ""
-            echo "The sha-tagged image is already built and pushed by CI, so nothing"
-            echo "needs rebuilding when the batch ships — the release job only retags."
-            PENDING="Pending image: \`${IMAGE}\`"
-          else
-            echo "This commit changed nothing CI builds from, so it has no image of"
-            echo "its own (${IMAGE} does not exist). A forced dispatch will walk back"
-            echo "to the newest built image and ship that, so the code merges queued"
-            echo "behind this one are not stranded (fix #262)."
-            PENDING="No image for this commit; a forced dispatch ships the newest built one."
+          # Stable versions only. A release moves `:latest`, and the release job's
+          # highest-stable-tag guard would refuse a pre-release anyway; failing here
+          # says why before anything else runs.
+          semver='[0-9]+\.[0-9]+\.[0-9]+'
+          if [[ ! "$TAG" =~ ^v${semver}$ ]]; then
+            echo "::error::release tag '${TAG}' is not of the form vX.Y.Z (pre-releases are not supported: a release moves :latest)"
+            exit 1
           fi
-          {
-            echo "### Deploy held :pause_button:"
-            echo ""
-            echo "\`DEPLOY_HOLD\` is set, so this merge did not restart the service."
-            echo ""
-            echo "${PENDING}"
-            echo ""
-            echo "Ship the accumulated batch by running this workflow manually with \`force=true\`."
-          } >> "$GITHUB_STEP_SUMMARY"
+
+          # For a release event GITHUB_SHA is the commit the tag named when the
+          # release was published. Confirm the tag still names it and that this
+          # checkout is that commit, rather than trust either.
+          if [[ "$GITHUB_REF" != "refs/tags/${TAG}" ]]; then
+            echo "::error::GITHUB_REF is ${GITHUB_REF}, expected refs/tags/${TAG}"
+            exit 1
+          fi
+          git fetch --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          tag_commit=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          head_commit=$(git rev-parse HEAD)
+          if [[ "$tag_commit" != "$GITHUB_SHA" || "$head_commit" != "$GITHUB_SHA" ]]; then
+            echo "::error::tag ${TAG} is at ${tag_commit} and the checkout at ${head_commit}, but the release event names ${GITHUB_SHA}"
+            exit 1
+          fi
+
+          # The `version` key of the `[package]` table, without needing a Rust
+          # toolchain on this runner.
+          version=$(awk '
+            /^\[/ { in_package = ($0 == "[package]") }
+            in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }
+          ' Cargo.toml)
+          if [[ ! "$version" =~ ^${semver}$ ]]; then
+            echo "::error::could not read a valid version from Cargo.toml at ${GITHUB_SHA} (got '${version}')"
+            exit 1
+          fi
+          if [[ "$TAG" != "v${version}" ]]; then
+            echo "::error::release tag ${TAG} does not match Cargo.toml's version ${version} at ${GITHUB_SHA}. Bump the version in a merged PR first, then release that commit."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Require the tagged commit to be on master
+        run: |
+          # Fetch master explicitly and fail closed: a failed fetch or a commit
+          # master does not contain both stop the release.
+          #
+          # This catches mistakes; it is not a security boundary. The run uses the
+          # workflow file as it exists at the tagged commit, so a tag on an unmerged
+          # commit could carry a copy of this file without the check. The boundary is
+          # the owner-only `v*` tag ruleset, the `release` environment's `v*`-only
+          # deployment policy, and the owner sender check at the top of this job.
+          git fetch --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
+          status=0
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/master || status=$?
+          case "$status" in
+            0)
+              echo "${GITHUB_SHA} is on master"
+              ;;
+            1)
+              echo "::error::${GITHUB_SHA} is not an ancestor of master. Release only a commit that has merged to master."
+              exit 1
+              ;;
+            *)
+              echo "::error::git merge-base failed (exit ${status}); cannot tell whether ${GITHUB_SHA} is on master."
+              exit 1
+              ;;
+          esac
+
+      - name: Require a non-empty CHANGELOG section for the version
+        # The same extraction `release-notes` uses, so a missing or empty section
+        # fails here, before anything is promoted.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          awk -v heading="## [${VERSION}]" '
+            index($0, heading) == 1 { in_section = 1; next }
+            in_section && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            in_section { print }
+          ' CHANGELOG.md > "${RUNNER_TEMP}/release-notes.md"
+          if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/release-notes.md"; then
+            echo "::error::CHANGELOG.md's '## [${VERSION}]' section is missing or empty; the release notes are taken from it."
+            exit 1
+          fi
+
+  # The same checks.yml the PR gate and post-merge run, on the exact commit about to be
+  # promoted. It restores master's cargo caches but never saves (checks.yml saves only
+  # when github.ref is master, and here it is the tag).
+  verify-ci:
+    needs: [check]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: ${{ github.sha }}
+
+  # Self-hosted: the smoke test runs the image on an amd64 Docker host, the same place
+  # dev.yml smoke-tested it. Read-only on the registry; it names the digest `release`
+  # promotes, so what ships is exactly what was tested here.
+  verify-image:
+    needs: [check]
+    runs-on: self-hosted
+    timeout-minutes: 30
+    # actions: the resolve script reads dev.yml's runs, to stop waiting when the build failed.
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+      digest: ${{ steps.resolve.outputs.digest }}
+      sha_tag: ${{ steps.resolve.outputs.sha_tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the dev build of the tagged commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: .github/scripts/resolve-release-image.sh
+
+      - name: Smoke test the image
+        run: .github/scripts/smoke-test-image.sh "${{ steps.resolve.outputs.image_ref }}"
+
+  release:
+    needs: [check, verify-ci, verify-image]
+    runs-on: self-hosted
+    timeout-minutes: 15
+    environment: release
+    # packages: the retag pushes :latest and :<tag> to ghcr.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Immediately before the retag, so a release published meanwhile is seen. See the
+      # concurrency comment above for why. A run this guard stops stays failed; to ship a
+      # fix on top of a newer release, release it as a new, higher version.
+      - name: Refuse to move :latest backwards
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          refs=$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v")
+          highest=$(printf '%s' "${refs}" |
+            jq -r '.[].ref | sub("^refs/tags/"; "") | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' |
+            sort -V | tail -n 1)
+          if [ -z "${highest}" ] || [ "${TAG}" != "${highest}" ]; then
+            echo "::error::${TAG} is not the highest release tag (${highest:-none found}); not moving :latest or any other tag."
+            exit 1
+          fi
+          echo "${TAG} is the highest release tag."
 
       - name: Tag as latest
         id: retag
-        if: steps.gate.outputs.held != 'true'
+        env:
+          IMAGE: ${{ needs.verify-image.outputs.image }}
+          DIGEST: ${{ needs.verify-image.outputs.digest }}
+          SHA_TAG: ${{ needs.verify-image.outputs.sha_tag }}
+          TAG: ${{ needs.check.outputs.tag }}
         run: |
-          IMAGE="${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}"
-          # CI only builds/pushes the sha image when code changed (see ci.yml path filter).
-          # Docs-only merges (e.g. .gitignore) produce no image, so there is nothing to retag.
-          # On a forced dispatch this branch is unreachable: the version step's
-          # walk either found an image that exists or failed the job.
-          if ! docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1; then
-            echo "No image $IMAGE for this push (docs-only change?) — skipping latest retag."
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          digest_of() {
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null |
+              jq -r '.digest // empty' || true
+          }
+
+          # The digest verify-image smoke-tested must still be what the commit's sha-
+          # tag names.
+          current=$(digest_of "${IMAGE}:${SHA_TAG}")
+          if [ -z "${DIGEST}" ] || [ "${current}" != "${DIGEST}" ]; then
+            echo "::error::${IMAGE}:${SHA_TAG} is '${current}', not the verified ${DIGEST}."
+            exit 1
           fi
 
-          # What :latest points at now. A forced dispatch that walks back can
-          # legitimately re-ship the image :latest already carries (a batch of
-          # nothing but non-code merges), and then Watchtower correctly reports
-          # updated=0 — which its step below otherwise treats as a failure and
-          # blames on a missing opt-in label.
-          PREV_DIGEST=$(docker buildx imagetools inspect "${{ steps.image.outputs.name }}:latest" \
-            --format '{{.Manifest.Digest}}' 2>/dev/null || echo "none")
-          # imagetools create builds :latest from exactly the source refs given
-          # to it — it does not merge with whatever :latest already pointed at.
-          # $IMAGE is amd64-only (ci.yml builds a single platform), so passing
-          # it alone would silently drop the arm64 platform that arm64-nightly.yml
-          # publishes to :latest-arm64, every time a PR merges (fix #193) — arm64
-          # would only reappear in :latest for the ~24h window after the next
-          # nightly run. Fold :latest-arm64 back in whenever it exists so a
-          # normal merge-triggered retag stays multi-arch too, not just the
-          # nightly job's own manifest update.
-          ARM64_TAG="${{ steps.image.outputs.name }}:latest-arm64"
-          ARM64_REFS=()
-          if docker buildx imagetools inspect "$ARM64_TAG" >/dev/null 2>&1; then
-            ARM64_REFS=("$ARM64_TAG")
-          else
-            echo "No $ARM64_TAG yet (no arm64-nightly run has published one) — retagging amd64-only."
-          fi
+          # What :latest points at now. A re-run of a release that already shipped
+          # re-applies the digest :latest already carries, and then Watchtower correctly
+          # reports updated=0 — which the step below otherwise treats as a failure.
+          PREV_DIGEST=$(digest_of "${IMAGE}:latest")
 
-          # Both tags point at the same manifest — no rebuild, no extra push of
-          # layers. The merge-sha tag is what makes a rollback target findable
-          # from master's history (see the version step for why the primary tag
-          # cannot serve that purpose).
+          # No rebuild, no layer push. The source is dev.yml's multi-arch image index,
+          # and a single index source with no annotations is copied verbatim, so the new
+          # tags carry the same digest as :sha-<commit> (--prefer-index=false only
+          # matters for a single-manifest source). Verified below rather than trusted.
           docker buildx imagetools create \
-            --tag ${{ steps.image.outputs.name }}:latest \
-            --tag ${{ steps.image.outputs.name }}:${{ steps.version.outputs.merge_sha }} \
-            "$IMAGE" \
-            "${ARM64_REFS[@]}"
-          echo "skipped=false" >> "$GITHUB_OUTPUT"
+            --tag "${IMAGE}:latest" \
+            --tag "${IMAGE}:${TAG}" \
+            "${IMAGE}@${DIGEST}"
 
-          NEW_DIGEST=$(docker buildx imagetools inspect "${{ steps.image.outputs.name }}:latest" \
-            --format '{{.Manifest.Digest}}' 2>/dev/null || echo "none")
-          if [ "$PREV_DIGEST" = "$NEW_DIGEST" ]; then
-            echo "::notice:::latest already pointed at this manifest (${NEW_DIGEST}) — nothing for Watchtower to update."
+          for tag in latest "${TAG}" "${SHA_TAG}"; do
+            got=$(digest_of "${IMAGE}:${tag}")
+            if [ "${got}" != "${DIGEST}" ]; then
+              echo "::error::${IMAGE}:${tag} is '${got}' after the retag, expected ${DIGEST}."
+              exit 1
+            fi
+            echo "${IMAGE}:${tag} -> ${DIGEST}"
+          done
+
+          if [ "$PREV_DIGEST" = "$DIGEST" ]; then
+            echo "::notice:::latest already pointed at this manifest (${DIGEST}) — nothing for Watchtower to update."
             echo "digest_changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "digest_changed=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Trigger Watchtower
-        if: steps.gate.outputs.held != 'true' && steps.retag.outputs.skipped != 'true'
+        env:
+          IMAGE: ${{ needs.verify-image.outputs.image }}
+          WATCHTOWER_URL: ${{ vars.WATCHTOWER_ATLAS_URL }}
+          WATCHTOWER_TOKEN: ${{ secrets.WATCHTOWER_ATLAS_TOKEN }}
+          DIGEST_CHANGED: ${{ steps.retag.outputs.digest_changed }}
         run: |
           # Pull the retagged image onto the host daemon first so Watchtower's
           # local digest comparison sees the new :latest immediately, rather
-          # than racing registry propagation. Mirrors the devbox deploy job.
-          docker pull "${{ steps.image.outputs.name }}:latest"
+          # than racing registry propagation.
+          docker pull "${IMAGE}:latest"
           # Do not swallow transport errors — a failed trigger must fail the job.
           response=$(curl -fsSL -X POST \
-            -H "Authorization: Bearer ${{ secrets.WATCHTOWER_ATLAS_TOKEN }}" \
-            "${{ vars.WATCHTOWER_ATLAS_URL }}?image=${{ steps.image.outputs.name }}:latest")
+            -H "Authorization: Bearer ${WATCHTOWER_TOKEN}" \
+            "${WATCHTOWER_URL}?image=${IMAGE}:latest")
           echo "${response}"
           updated=$(printf '%s' "${response}" | jq -r '.summary.updated // 0')
           if [ "${updated}" -gt 0 ]; then
@@ -333,10 +348,10 @@ jobs:
             exit 0
           fi
           # updated=0 is expected and fine when :latest did not actually move —
-          # a forced dispatch whose batch contained no code changes re-ships the
-          # manifest already deployed. Only treat it as a failure when the
-          # digest really did change.
-          if [ "${{ steps.retag.outputs.digest_changed }}" = "false" ]; then
+          # a re-run of a release that already shipped re-applies the manifest
+          # already deployed. Only treat it as a failure when the digest really
+          # did change.
+          if [ "${DIGEST_CHANGED}" = "false" ]; then
             echo "Watchtower reported updated=0, and :latest did not move — already running this image."
             exit 0
           fi
@@ -348,5 +363,49 @@ jobs:
           echo "::error::Watchtower reported updated=0 after retagging :latest."
           echo "Check that the target container carries the opt-in label:"
           echo "  com.centurylinklabs.watchtower.enable=true"
-          echo "and that Watchtower can pull ${{ steps.image.outputs.name }}:latest."
+          echo "and that Watchtower can pull ${IMAGE}:latest."
           exit 1
+
+  # Sets the release's notes to the CHANGELOG section once the image has shipped, so a
+  # release whose deploy failed keeps the notes it was published with — a visible sign
+  # it never went out. Edits the existing release only — never creates a release or a
+  # tag (the tag ruleset would refuse GITHUB_TOKEN anyway). Re-running it writes the
+  # same notes again.
+  release-notes:
+    needs: [check, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the tagged commit
+        # Only CHANGELOG.md is read; the release is edited through the API, so the
+        # checkout needs no stored credentials.
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Replace the release notes with the CHANGELOG section
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # The `## [X.Y.Z]` section, up to the next version heading or the
+          # link-reference block at the end of the file. `check` already ran this
+          # same extraction and required it to be non-empty.
+          awk -v heading="## [${VERSION}]" '
+            index($0, heading) == 1 { in_section = 1; next }
+            in_section && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            in_section { print }
+          ' CHANGELOG.md > "${RUNNER_TEMP}/release-notes.md"
+          if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/release-notes.md"; then
+            echo "::error::CHANGELOG.md's '## [${VERSION}]' section is empty or missing."
+            exit 1
+          fi
+
+          gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --notes-file "${RUNNER_TEMP}/release-notes.md"
+          echo "### Set the ${TAG} release notes from CHANGELOG.md" >> "$GITHUB_STEP_SUMMARY"

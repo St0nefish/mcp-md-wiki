@@ -1,12 +1,12 @@
 # Changelog
 
-This project has not yet cut a tagged release. Every merge to `master` builds and
-pushes a new container image tagged by commit sha (`.github/workflows/release.yml`),
-with `:latest` following `master` directly — there is no version number to pin to
-yet, and no historical version list to reconstruct here. Until a tagging scheme
-exists, this file tracks notable, operator-relevant changes on `master` under a
-running `[Unreleased]` heading, in roughly chronological order (most recent first).
-`fix #N` references are GitHub issues; see the repo's closed-issues list for the
+Releases are cut by publishing a GitHub release (`.github/workflows/release.yml`).
+The container image `ghcr.io/st0nefish/mcp-md-wiki` has three kinds of tag: `:latest`
+is the most recent release, `:vX.Y.Z` pins one release, and `:dev` follows `master`.
+No release has been tagged yet; the first will be 0.1.0. Until then this file tracks
+notable, operator-relevant changes under a running `[Unreleased]` heading, in roughly
+chronological order (most recent first); a release moves them under its own version
+heading. `fix #N` references are GitHub issues; see the repo's closed-issues list for the
 complete history — recent activity included an automated multi-agent documentation
 and correctness audit that closed roughly forty issues across security hardening,
 indexing correctness, and doc drift, of which the entries below are a representative
@@ -15,6 +15,18 @@ sample rather than an exhaustive list.
 <!-- verify-merge-a: inert marker for concurrent-PR auto-merge test, safe to delete -->
 
 ## [Unreleased]
+
+### Deployment
+
+- **`:latest` now moves only on a GitHub release, not on every merge to `master`.**
+  A merge builds one multi-arch image (`linux/amd64` + `linux/arm64`) and tags it
+  `:sha-<commit>`, `:<x.y.z>-dev.<n>` and, if it is still master's tip, `:dev`. A
+  release retags that same image as `:latest` and `:vX.Y.Z` (no rebuild) and
+  triggers Watchtower. The arm64 image is now built natively per master commit
+  into the same multi-arch tag; the separate nightly build and its single-platform
+  `:latest-arm64` tag are gone. Upgrade: compose files that pull `:latest` keep
+  working but now track releases, so they will not update until the first release
+  is published; pull `:dev` instead to keep tracking `master`.
 
 ### MCP tools
 
