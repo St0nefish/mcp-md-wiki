@@ -1,6 +1,6 @@
 [package]
 name = "mcp-md-wiki"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # Keep in lockstep with `channel` in rust-toolchain.toml and `RUST_VERSION`
 # in Dockerfile (#235) -- this makes cargo itself refuse a too-old local
