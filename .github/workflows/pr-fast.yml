@@ -51,7 +51,7 @@ jobs:
       integration: false
       runner: ubuntu-latest
 
-  # The one context to look at, like ci.yml's `ci-pass`: success when `changes` ran and
+  # The one context to look at: success when `changes` ran and
   # `checks` passed or had nothing to check. Skipped (with everything else) on the
   # owner's and bots' PRs.
   pr-fast:

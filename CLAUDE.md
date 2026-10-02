@@ -112,13 +112,10 @@ protection): direct push disabled, status checks required.
   moves this crate's own version in `Cargo.toml`/`Cargo.lock` does not count)
   still queues, so it lands in order, but the train posts both statuses green
   without running anything.
-- **Required checks (cutover pending).** Until the ruleset is switched to
-  require `ci-fast` + `ci-slow`, the only required check is still `ci.yml`'s
-  `ci-pass` (`changes` path filter, then `checks.yml` on the PR head rebased
-  onto `master` through its `pr-rebase` input), so during that window a PR
-  merges on `ci-pass` and the train's statuses are informational. The cutover
-  PR deletes `ci.yml` and `checks.yml`'s `pr-rebase` inputs. Never list
-  individual job names as required checks.
+- **Required checks.** The ruleset requires exactly `ci-fast` + `ci-slow`,
+  statuses only `train.yml` posts. There is no per-PR gate workflow: a PR is
+  tested once, by the train, on its squash onto `master`. Never list individual
+  job names as required checks.
 - `pr-fast.yml` gives PRs the owner did not open (and that no bot opened) the
   fast tier on GitHub-hosted runners, as the non-required `pr-fast` check — an
   unreviewed PR's code never runs on the self-hosted runners, and it cannot
