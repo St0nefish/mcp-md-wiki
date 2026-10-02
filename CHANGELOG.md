@@ -12,8 +12,6 @@ entries are a representative sample rather than an exhaustive list — that peri
 included an automated multi-agent documentation and correctness audit that closed
 roughly forty issues across security hardening, indexing correctness, and doc drift.
 
-<!-- verify-merge-a: inert marker for concurrent-PR auto-merge test, safe to delete -->
-
 ## [Unreleased]
 
 ### Deployment
