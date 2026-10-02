@@ -1,0 +1,72 @@
+name: PR fast checks
+
+# Compile/lint/unit-test feedback for PRs the owner did not open, reported as `pr-fast`.
+# Informational, never a required check: what gates a merge is the merge train
+# (train.yml), which runs once the owner arms auto-merge on the PR — that arming is the
+# approval. Until then a contributor gets the fast tier and nothing else: the slow tier
+# (image build, live-Qdrant suite) runs on the owner's self-hosted runners, and an
+# unreviewed PR must not be able to start it.
+#
+# GitHub-hosted runners only (checks.yml's `runner` input; the integration job, the one
+# that has to be self-hosted, is off): an unreviewed PR's code must not run on the
+# self-hosted runners. The owner's own PRs and bots' skip this entirely — the owner's are
+# armed on open and the train runs the same tier on the squash.
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-fast-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    if: github.event.pull_request.user.login != 'St0nefish' && github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      # The default checkout is the PR's merge commit: first parent master, so
+      # HEAD^1..HEAD is exactly the PR's change.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - name: Did the PR change a code path?
+        id: filter
+        run: echo "code=$(.github/scripts/code-paths.sh HEAD^1 HEAD)" | tee -a "$GITHUB_OUTPUT"
+
+  checks:
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/checks.yml
+    with:
+      fast: true
+      integration: false
+      runner: ubuntu-latest
+
+  # The one context to look at, like ci.yml's `ci-pass`: success when `changes` ran and
+  # `checks` passed or had nothing to check. Skipped (with everything else) on the
+  # owner's and bots' PRs.
+  pr-fast:
+    if: always() && needs.changes.result != 'skipped'
+    needs: [changes, checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check result
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          CHECKS: ${{ needs.checks.result }}
+        run: |
+          if [[ "$CHANGES" != success || ! "$CHECKS" =~ ^(success|skipped)$ ]]; then
+            echo "changes: ${CHANGES}, checks: ${CHECKS}"
+            exit 1
+          fi
+          echo "fast checks passed (checks: ${CHECKS})"

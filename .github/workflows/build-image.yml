@@ -1,0 +1,330 @@
+name: Build image
+
+# Builds, smoke-tests and tags one multi-arch image (linux/amd64 + linux/arm64). Callers:
+#   - train.yml, on the squash of a PR onto master, tagged `:tree-<tree hash>` — the
+#     train cannot name a build after the merge commit, which does not exist until after
+#     the build, so it names it after what it tested: the tree, which the squash merge
+#     reproduces exactly. master.yml later finds the build by the merge commit's tree.
+#   - master.yml's fallback, on a merge commit whose tree the train did not build,
+#     tagged `:sha-<commit>`.
+#
+# The build is pushed under a staging tag (`:build-<tag>`, nothing reads it) and gets
+# `<tag>` only after the smoke test passes, so a build that fails, or fails its smoke test,
+# never carries the tag anything resolves. When `<tag>` already exists — the train
+# re-testing a tree it already built (a re-dispatch after a flaky failure, or a PR
+# re-pushed with the same content) — nothing is rebuilt and the existing digest is the
+# output: tags are immutable here, and an image that carries `<tag>` was smoke-tested.
+#
+# Labels: org.opencontainers.image.revision = `revision` (the tree hash, for both callers —
+# release.yml maps it back to a master commit), org.opencontainers.image.version =
+# `version`. Nothing here touches :dev, :latest or Watchtower.
+#
+# Squash mode / ref mode as in checks.yml: with base-sha + head-sha + expected-tree every
+# job rebuilds the train's squash (.github/scripts/train-squash.sh) and refuses a
+# different tree; with `ref` it is a plain checkout.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Ref mode: commit to build"
+        type: string
+        required: false
+        default: ""
+      base-sha:
+        description: "Squash mode: the master commit the train pinned"
+        type: string
+        required: false
+        default: ""
+      head-sha:
+        description: "Squash mode: the PR head commit the train pinned"
+        type: string
+        required: false
+        default: ""
+      expected-tree:
+        description: "Squash mode: the tree of the squash; a job whose squash differs fails"
+        type: string
+        required: false
+        default: ""
+      tag:
+        description: "Tag the smoke-tested image gets, e.g. tree-<tree> or sha-<commit>"
+        type: string
+        required: true
+      revision:
+        description: "org.opencontainers.image.revision label (the tree hash)"
+        type: string
+        required: true
+      version:
+        description: "org.opencontainers.image.version label"
+        type: string
+        required: true
+    outputs:
+      image:
+        description: "ghcr.io/<owner>/<repo>, lowercased"
+        value: ${{ jobs.prepare.outputs.image }}
+      digest:
+        description: "Image-index digest that carries `tag`"
+        value: ${{ jobs.merge.outputs.digest || jobs.prepare.outputs.existing_digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Decides whether to build at all, before any runner spends time on a compile.
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      rust_version: ${{ steps.rust_version.outputs.version }}
+      exists: ${{ steps.existing.outputs.exists }}
+      existing_digest: ${{ steps.existing.outputs.digest }}
+    steps:
+      - name: Require exactly one of squash mode and ref mode
+        env:
+          REF: ${{ inputs.ref }}
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: |
+          if [[ -n "$EXPECTED_TREE" && -n "$BASE_SHA" && -n "$HEAD_SHA" && -z "$REF" ]]; then
+            echo "squash mode: ${HEAD_SHA} onto ${BASE_SHA}, tree ${EXPECTED_TREE}"
+          elif [[ -n "$REF" && -z "$EXPECTED_TREE$BASE_SHA$HEAD_SHA" ]]; then
+            echo "ref mode: ${REF}"
+          else
+            echo "::error::pass either base-sha + head-sha + expected-tree, or ref"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.base-sha || inputs.ref }}
+          fetch-depth: 0
+
+      # The toolchain pin comes from the tree being built: a PR may move it.
+      - name: Squash the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/train-squash.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: .github/scripts/rust-version.sh
+
+      - name: Set image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A registry error is not "not found" — fail rather than rebuild over a tag that
+      # might exist.
+      - name: Skip a build that already exists
+        id: existing
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if out=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest}}' 2>&1); then
+            digest=$(jq -r '.digest' <<<"${out}")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::${IMAGE}:${TAG} resolved to no usable digest: ${out}"
+              exit 1
+            fi
+            echo "${IMAGE}:${TAG} already exists (${digest}); not rebuilding."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          elif grep -qiE 'not found|manifest unknown' <<<"${out}"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Cannot inspect ${IMAGE}:${TAG}: ${out}"
+            exit 1
+          fi
+
+  # One native build per architecture: amd64 on the self-hosted runners, arm64 on
+  # GitHub's hosted arm64 runner (free for a public repo; atlas has no arm64 host), so
+  # neither needs QEMU. Each pushes its image by digest only — no tag — and hands the
+  # digest to `merge`, which is the only job that names anything.
+  build:
+    needs: [prepare]
+    if: needs.prepare.outputs.exists == 'false'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # One architecture failing means no index can be made, so stop the other early.
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: self-hosted
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.base-sha || inputs.ref }}
+          fetch-depth: 0
+
+      - name: Squash the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/train-squash.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+
+      # A docker-container builder: the default docker driver can neither push by
+      # digest nor export a registry cache.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # VERSION/REVISION feed the Dockerfile's OCI labels. provenance: false keeps each
+      # per-arch push a single image manifest, so the index `merge` builds holds exactly
+      # the two platform images and no unknown/unknown attestation entries. The layer
+      # cache is per architecture: the two builds share no layers, and one ref would have
+      # them overwrite each other's cache on every run. `context: .` builds the checked
+      # out working tree — the squash, in squash mode — not a fresh git fetch.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            RUST_VERSION=${{ needs.prepare.outputs.rust_version }}
+            VERSION=${{ inputs.version }}
+            REVISION=${{ inputs.revision }}
+          provenance: false
+          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::build produced no usable digest: '${DIGEST}'"
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Joins the per-arch digests into one image index, smoke-tests it, and only then gives
+  # it `tag`. Self-hosted, because that is an amd64 host with Docker where the smoke test
+  # can run the image (it pulls the amd64 entry of the index).
+  merge:
+    needs: [prepare, build]
+    runs-on: self-hosted
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    steps:
+      # The smoke test and the Qdrant pin it reads (docker-compose.yml) come from the
+      # tree under test.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.base-sha || inputs.ref }}
+          fetch-depth: 0
+
+      - name: Squash the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/train-squash.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushed under the staging tag only; nothing reads build- tags.
+      - name: Create the multi-arch index
+        id: index
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          refs=()
+          for f in "${RUNNER_TEMP}"/digests/*; do
+            refs+=("${IMAGE}@sha256:$(basename "$f")")
+          done
+          if [ "${#refs[@]}" -ne 2 ]; then
+            echo "::error::expected 2 per-arch digests (amd64, arm64), got ${#refs[@]}: ${refs[*]}"
+            exit 1
+          fi
+          docker buildx imagetools create --tag "${IMAGE}:build-${TAG}" "${refs[@]}"
+          digest=$(docker buildx imagetools inspect "${IMAGE}:build-${TAG}" --format '{{json .Manifest}}' | jq -r '.digest')
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::${IMAGE}:build-${TAG} resolved to no usable digest: '${digest}'"
+            exit 1
+          fi
+          echo "${IMAGE}:build-${TAG} -> ${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test the build
+        run: .github/scripts/smoke-test-image.sh "${{ needs.prepare.outputs.image }}@${{ steps.index.outputs.digest }}"
+
+      # Only now does the build get the tag anything reads. The source is a single image
+      # index with no annotations, which `imagetools create` copies verbatim, so the tag
+      # names the smoke-tested index digest rather than a new index. (--prefer-index=false
+      # is for a single-MANIFEST source, where the default would wrap it in a new index;
+      # an index source is copied either way.) The digest check proves it rather than
+      # trusting it.
+      - name: Tag the tested build
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          docker buildx imagetools create --tag "${IMAGE}:${TAG}" "${IMAGE}@${DIGEST}"
+          got=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest}}' | jq -r '.digest')
+          if [ "${got}" != "${DIGEST}" ]; then
+            echo "::error::${IMAGE}:${TAG} is ${got} after the retag, expected ${DIGEST}."
+            exit 1
+          fi
+          echo "${IMAGE}:${TAG} -> ${DIGEST}"

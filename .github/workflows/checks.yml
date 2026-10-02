@@ -1,45 +1,87 @@
 name: Checks
 
-# The one definition of what "this commit passes" means. Three callers run it:
-#   - ci.yml, on every PR (behind `ci-pass`, the only required check),
-#   - post-merge.yml, on every push to master (the combined tree non-strict merging
-#     can produce, and the job that saves the cargo caches PRs restore),
-#   - release.yml, on the exact commit a release tags, before anything is promoted.
-# Keeping the steps here means the PR gate, the post-merge safety net and release
-# verification cannot drift apart.
+# The one definition of what "this commit passes" means. Callers:
+#   - train.yml, the merge train: `fast` (lint + test) on the squash of a PR onto master,
+#     then `integration` (live-Qdrant) on the same squash once the fast tier passed. The
+#     train posts the required `ci-fast`/`ci-slow` statuses from these results.
+#   - master.yml's fallback, on a merge commit whose tree the train did not build.
+#   - release.yml, on the commit a release promotes, when started with full_tests.
+#   - pr-fast.yml, the fast tier for contributors' PRs, on a GitHub-hosted runner.
+#   - ci.yml, on every PR, behind `ci-pass` (the required check until the ruleset moves
+#     to `ci-fast` + `ci-slow`; ci.yml and the pr-rebase inputs below go then).
+# Keeping the steps here means the gate, the fallback and release verification cannot
+# drift apart.
 #
-# The three jobs are independent and run in parallel, each on its own self-hosted
-# runner container, so the PR wall clock is the slowest job rather than the sum.
+# Two ways to say what to check:
+#   - squash mode (base-sha + head-sha + expected-tree): every job rebuilds the train's
+#     squash with .github/scripts/train-squash.sh and refuses to run unless its tree is
+#     the one the train pinned, so jobs on different runners test the same tree without
+#     passing it around as an artifact;
+#   - ref mode (ref, or nothing for the caller's own ref): a plain checkout.
+#
+# The jobs are independent and run in parallel, each on its own runner container, so
+# the wall clock is the slowest job rather than the sum.
 #
 # A called workflow sees the CALLER's `github` context (github.event, github.ref,
-# github.sha are the caller's), so the PR number and head sha could be read from
-# github.event.pull_request here. They are passed as inputs instead: a caller that is
-# not a pull_request run (post-merge, release) then cannot reach the rebase step with
-# an event payload that lacks those fields, and the step fails loudly if they are
-# missing rather than rebasing an empty ref. No `concurrency` here on purpose: each
-# caller owns its own group, and a group declared in a called workflow would be
-# evaluated against the caller's context and could collide with the caller's.
+# github.sha are the caller's), so it could read a PR's details from the event. They are
+# passed as inputs instead: callers that are not pull_request runs (the train, master,
+# release) then cannot reach a step with an event payload that lacks them, and a missing
+# input fails loudly rather than checking out an empty ref. No `concurrency` here on
+# purpose: each caller owns its own group, and a group declared in a called workflow
+# would be evaluated against the caller's context and could collide with the caller's.
 
 on:
   workflow_call:
     inputs:
       ref:
-        description: "Commit to check out (default: the caller's own ref)"
+        description: "Ref mode: commit to check out (default: the caller's own ref)"
         type: string
         required: false
         default: ""
+      base-sha:
+        description: "Squash mode: the master commit the train pinned"
+        type: string
+        required: false
+        default: ""
+      head-sha:
+        description: "Squash mode: the PR head commit the train pinned"
+        type: string
+        required: false
+        default: ""
+      expected-tree:
+        description: "Squash mode: the tree of the squash; a job whose squash differs fails"
+        type: string
+        required: false
+        default: ""
+      fast:
+        description: "Run the fast tier: lint (fmt, clippy, audit) and unit tests"
+        type: boolean
+        required: false
+        default: true
+      integration:
+        description: "Run the live-Qdrant integration suite"
+        type: boolean
+        required: false
+        default: true
+      runner:
+        description: "Runner for lint and test (qdrant-integration is always self-hosted)"
+        type: string
+        required: false
+        default: self-hosted
+      # ci.yml's interface, kept only so ci.yml keeps working until the ruleset requires
+      # the train's statuses instead of its `ci-pass`; removed together with ci.yml.
       pr-rebase:
-        description: "Force the workspace to pr-head-sha and rebase it onto current master first"
+        description: "ci.yml only: force the workspace to pr-head-sha and rebase it onto current master first"
         type: boolean
         required: false
         default: false
       pr-number:
-        description: "PR number, for fetching refs/pull/<n>/head (required with pr-rebase)"
+        description: "ci.yml only: PR number, for fetching refs/pull/<n>/head (required with pr-rebase)"
         type: string
         required: false
         default: ""
       pr-head-sha:
-        description: "PR head commit (required with pr-rebase)"
+        description: "ci.yml only: PR head commit (required with pr-rebase)"
         type: string
         required: false
         default: ""
@@ -60,13 +102,24 @@ env:
 
 jobs:
   lint:
-    runs-on: self-hosted
+    if: inputs.fast
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     steps:
+      # Squash mode checks out the pinned master commit, so the squash script that runs
+      # next is master's copy, not one the PR could have edited.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
+
+      - name: Squash the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/train-squash.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
 
       - name: Rebase onto master
         if: inputs.pr-rebase
@@ -115,8 +168,9 @@ jobs:
       # overwriting each other. Saved only from master: GitHub scopes a cache to the
       # ref that saved it, and a PR can restore caches saved on its base branch but
       # never another PR's, so a PR-saved cache is quota spent on something no other
-      # run can read, and it evicts master's. post-merge.yml runs these jobs on every
-      # master push, which keeps master's caches current for PRs to restore.
+      # run can read, and it evicts master's. The train is dispatched on master
+      # (github.ref is refs/heads/master even though it checks a squash), so every
+      # train run keeps master's caches current; pr-fast and ci.yml only restore.
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -139,13 +193,23 @@ jobs:
           cargo audit
 
   test:
-    runs-on: self-hosted
+    if: inputs.fast
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
+
+      # See the lint job.
+      - name: Squash the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/train-squash.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
 
       - name: Rebase onto master
         if: inputs.pr-rebase
@@ -203,6 +267,9 @@ jobs:
   # NOT the compose service itself — see `Start Qdrant` for why) and run just
   # those.
   qdrant-integration:
+    if: inputs.integration
+    # Always self-hosted, whatever `runner` says: `Start Qdrant` below depends on this
+    # runner being a container on the host's Docker daemon.
     runs-on: self-hosted
     timeout-minutes: 30
     # Blocking as of #133. Three separate things had to be true first, and all
@@ -223,8 +290,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
+
+      # See the lint job.
+      - name: Squash the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/train-squash.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
 
       - name: Rebase onto master
         if: inputs.pr-rebase
