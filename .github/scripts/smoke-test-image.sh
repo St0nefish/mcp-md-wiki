@@ -41,7 +41,7 @@ token=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 body=$(mktemp)
 code=000
 
-# Qdrant image is single-sourced from docker-compose.yml, as ci.yml does. Override with
+# Qdrant image is single-sourced from docker-compose.yml, as checks.yml does. Override with
 # SMOKE_QDRANT_IMAGE (e.g. when running from outside the repo root).
 qdrant_image=${SMOKE_QDRANT_IMAGE:-$(docker compose -f docker-compose.yml config --images qdrant 2>/dev/null | head -n1 || true)}
 curl_image=${SMOKE_CURL_IMAGE:-curlimages/curl:8.11.1}

@@ -2,7 +2,7 @@
 #
 # rustup honors this file automatically for every `cargo`/`rustc` invocation
 # anywhere under this directory tree, so local dev needs nothing extra once
-# rustup is installed. CI (.github/workflows/ci.yml) reads the `channel`
+# rustup is installed. CI (.github/workflows/checks.yml) reads the `channel`
 # value out of this file and feeds it explicitly to `dtolnay/rust-toolchain`
 # (that action does not parse this file on its own) and to the Dockerfile's
 # `RUST_VERSION` build arg, so the toolchain CI compiles with and the

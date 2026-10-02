@@ -38,8 +38,8 @@ name: Merge train
 # Trust: this workflow always runs master's copy. The event-driven entry point
 # (train-trigger.yml, pull_request_target) only dispatches it with `--ref master`, so a PR
 # editing the train cannot test itself with its own edits; `select` refuses any other ref.
-# The PR's code does run (it is what is tested), on the self-hosted runners, exactly as
-# ci.yml has always run it. GITHUB_TOKEN only: the train never pushes, so it needs
+# The PR's code does run (it is what is tested), on the self-hosted runners, through
+# the same checks.yml every caller uses. GITHUB_TOKEN only: the train never pushes, so it needs
 # statuses, pull-requests and actions (to dispatch itself), not contents: write. Statuses
 # posted with it are attributed to the GitHub Actions app, which the ruleset can pin the
 # required checks' source to.
