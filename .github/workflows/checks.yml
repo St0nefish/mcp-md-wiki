@@ -143,7 +143,14 @@ jobs:
       - name: Audit dependencies
         run: |
           curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-          cargo binstall cargo-audit --no-confirm
+          # --force when the binary is missing: on a persistent self-hosted runner,
+          # cargo-binstall's install record (CARGO_HOME/.crates2.json) can survive the
+          # binary itself, and it then reports "already installed" without one.
+          if command -v cargo-audit >/dev/null; then
+            cargo binstall cargo-audit --no-confirm
+          else
+            cargo binstall cargo-audit --no-confirm --force
+          fi
           cargo audit
 
   test:
