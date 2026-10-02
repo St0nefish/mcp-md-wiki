@@ -498,8 +498,11 @@ jobs:
   # Opens the PR that moves master's Cargo.toml to the next patch version, as the App —
   # so it needs no exception in auto-merge.yml's owner-only gate, and the train sees it
   # like any other armed PR. Idempotent: an existing roll branch/PR is reused.
+  # Explicit condition: the implicit success() skips a job when anything upstream was
+  # skipped, and verify-full is skipped on every release without full_tests.
   roll:
     needs: [resolve, release]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
