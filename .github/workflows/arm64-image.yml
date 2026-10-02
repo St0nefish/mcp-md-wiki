@@ -1,0 +1,209 @@
+name: arm64 image
+
+# Builds a linux/arm64 image on demand. The pipeline builds linux/amd64 only (the
+# deployment runs on x86; build-image.yml); this is for the occasional arm64 host, e.g.
+# running a release locally on an Apple-silicon machine.
+#
+#   gh workflow run arm64-image.yml --ref master                 # the latest release
+#   gh workflow run arm64-image.yml --ref master -f sha=<commit> # any commit on master
+#
+# Built natively on GitHub's hosted arm64 runner (free for a public repo; no QEMU) and
+# smoke-tested there with the same script every amd64 build passes. It is otherwise NOT
+# merge-train tested: the commit's amd64 image went through the train, but this arm64
+# build of it is checked only by the smoke test.
+#
+# Tags are single-platform and separate from the amd64 tags — never added to `:latest`,
+# `:dev` or `:sha-<commit>`, because rewriting those indexes would change their digests
+# and make Watchtower redeploy the x86 deployment:
+#   :sha-<full commit>-arm64   always
+#   :vX.Y.Z-arm64              when the commit is release vX.Y.Z
+#   :latest-arm64              when the commit is the latest release
+# A commit whose `:sha-<commit>-arm64` already exists is not rebuilt; its tags are
+# re-applied to that digest, so `:latest-arm64` can catch up without a build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit on master to build (default: the latest release)"
+        type: string
+        required: false
+        default: ""
+
+# One build at a time; a second dispatch waits rather than racing it to the same tags.
+concurrency:
+  group: arm64-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the commit and its tags
+        id: resolve
+        env:
+          SHA_INPUT: ${{ inputs.sha }}
+        run: |
+          git fetch --quiet --tags --force origin "+refs/heads/master:refs/remotes/origin/master"
+          # Stable release tags, highest first: "<tag> <commit>".
+          releases=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV |
+            while read -r t; do echo "$t $(git rev-parse "${t}^{commit}")"; done)
+          latest_tag=$(head -n1 <<<"$releases" | cut -d' ' -f1)
+          latest_commit=$(head -n1 <<<"$releases" | cut -d' ' -f2)
+
+          if [[ -n "$SHA_INPUT" ]]; then
+            commit=$(git rev-parse --verify --quiet "${SHA_INPUT}^{commit}") || {
+              echo "::error::'${SHA_INPUT}' is not a commit in this repository."
+              exit 1
+            }
+          elif [[ -n "$latest_commit" ]]; then
+            commit=$latest_commit
+          else
+            echo "::error::no stable release tag exists; pass a sha."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$commit" origin/master; then
+            echo "::error::${commit} is not on master; arm64 images are built from master only."
+            exit 1
+          fi
+
+          release_tag=$(awk -v c="$commit" '$2 == c { print $1; exit }' <<<"$releases")
+          {
+            echo "commit=${commit}"
+            echo "release_tag=${release_tag}"
+            echo "is_latest=$([[ "$commit" == "$latest_commit" ]] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### arm64 image of \`${commit}\`"
+            echo "release: ${release_tag:-none}; latest release: ${latest_tag:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out the commit
+        env:
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+        run: git checkout --quiet --force --detach "$COMMIT"
+
+      # Toolchain pin, version label and revision label come from the commit being built,
+      # matching what build-image.yml stamps on its amd64 build of the same tree.
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: .github/scripts/rust-version.sh
+
+      - name: Read build inputs
+        id: inputs
+        run: |
+          version=$(awk '
+            /^\[/ { in_package = ($0 == "[package]") }
+            in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }
+          ' Cargo.toml)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::could not read a valid [package] version from Cargo.toml (got '${version}')"
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "tree=$(git rev-parse 'HEAD^{tree}')"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A registry error is not "not found" — fail rather than rebuild over a tag that
+      # might exist.
+      - name: Skip a build that already exists
+        id: existing
+        env:
+          IMAGE: ${{ steps.inputs.outputs.image }}
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+        run: |
+          ref="${IMAGE}:sha-${COMMIT}-arm64"
+          if out=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' 2>&1); then
+            digest=$(jq -r '.digest' <<<"$out")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::${ref} resolved to no usable digest: ${out}"
+              exit 1
+            fi
+            echo "${ref} already exists (${digest}); not rebuilding."
+            echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          elif grep -qiE 'not found|manifest unknown' <<<"$out"; then
+            echo "digest=" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Cannot inspect ${ref}: ${out}"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.existing.outputs.digest == ''
+        uses: docker/setup-buildx-action@v3
+
+      # Pushed under a staging tag only; it gets the tags anything reads after the smoke
+      # test. provenance: false keeps it a single image manifest.
+      - name: Build and push
+        id: build
+        if: steps.existing.outputs.digest == ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          build-args: |
+            RUST_VERSION=${{ steps.rust_version.outputs.version }}
+            VERSION=${{ steps.inputs.outputs.version }}
+            REVISION=${{ steps.inputs.outputs.tree }}
+          provenance: false
+          push: true
+          tags: ${{ steps.inputs.outputs.image }}:build-arm64-${{ steps.resolve.outputs.commit }}
+          cache-from: type=registry,ref=${{ steps.inputs.outputs.image }}:buildcache-arm64
+          cache-to: type=registry,ref=${{ steps.inputs.outputs.image }}:buildcache-arm64,mode=max
+
+      - name: Smoke test
+        if: steps.existing.outputs.digest == ''
+        env:
+          IMAGE: ${{ steps.inputs.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: .github/scripts/smoke-test-image.sh "${IMAGE}@${DIGEST}"
+
+      - name: Tag
+        env:
+          IMAGE: ${{ steps.inputs.outputs.image }}
+          DIGEST: ${{ steps.existing.outputs.digest || steps.build.outputs.digest }}
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          IS_LATEST: ${{ steps.resolve.outputs.is_latest }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::no usable digest to tag: '${DIGEST}'"
+            exit 1
+          fi
+          tags=("sha-${COMMIT}-arm64")
+          [[ -n "$RELEASE_TAG" ]] && tags+=("${RELEASE_TAG}-arm64")
+          [[ "$IS_LATEST" == true ]] && tags+=("latest-arm64")
+          args=()
+          for t in "${tags[@]}"; do args+=(--tag "${IMAGE}:${t}"); done
+          # --prefer-index=false: the source is a single manifest; keep it one, so every
+          # tag names the digest that was smoke-tested.
+          docker buildx imagetools create --prefer-index=false "${args[@]}" "${IMAGE}@${DIGEST}"
+          for t in "${tags[@]}"; do
+            got=$(docker buildx imagetools inspect "${IMAGE}:${t}" --format '{{json .Manifest}}' | jq -r '.digest')
+            if [[ "$got" != "$DIGEST" ]]; then
+              echo "::error::${IMAGE}:${t} is ${got} after the retag, expected ${DIGEST}."
+              exit 1
+            fi
+            echo "${IMAGE}:${t} -> ${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
