@@ -496,6 +496,25 @@ jobs:
           echo "and that Watchtower can pull ${IMAGE}:latest."
           exit 1
 
+  # Starts arm64-image.yml for the released commit, so `:latest-arm64` / `:vX.Y.Z-arm64`
+  # follow every release. A separate run, not a job of this one: the release does not wait
+  # for the arm64 build, and an arm64 failure shows as its own red run rather than failing
+  # a release whose amd64 image already shipped. Dispatch is the one GITHUB_TOKEN event
+  # that does start a run. Explicit condition for the same reason as `roll`'s.
+  arm64:
+    needs: [resolve, release]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the arm64 build of the released commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: gh workflow run arm64-image.yml --ref master -f sha="$COMMIT" --repo "$GITHUB_REPOSITORY"
+
   # Opens the PR that moves master's Cargo.toml to the next patch version, as the App —
   # so it needs no exception in auto-merge.yml's owner-only gate, and the train sees it
   # like any other armed PR. Idempotent: an existing roll branch/PR is reused.
