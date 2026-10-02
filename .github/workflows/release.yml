@@ -1,223 +1,262 @@
 name: Release
 
-# Deploys only when the owner publishes a GitHub release — and only then. A merge to
-# master runs CI and builds a dev image (dev.yml); it ships nothing. A release is a
-# promotion, never a build: dev.yml built every master commit once as `:sha-<commit>`
-# (multi-arch); this re-verifies the tagged commit, adds `:latest` and `:<tag>` to that
-# same image-index digest, pulls it onto the atlas host and triggers Watchtower. No
-# `sha-<commit>` image for the tagged commit means no release.
+# A release is a decision, not a side effect of a merge: the owner starts it by hand,
+#   gh workflow run release.yml --ref master                    # releases what :dev names
+#   gh workflow run release.yml --ref master -f sha=<commit>    # or one master commit
+# (add `-f full_tests=true` to re-run the whole checks.yml first). It never builds: it
+# promotes an image the merge train already built and tested (train.yml, `:tree-<tree>`,
+# attached to the merge commit as `:sha-<commit>` by master.yml).
 #
-# Cutting a release:
-#   1. Merge a PR that bumps `version` in Cargo.toml (and Cargo.lock) and moves
-#      CHANGELOG.md's `[Unreleased]` entries under a matching `## [X.Y.Z] - <date>`
-#      heading, with its link reference at the bottom. Merging it publishes nothing.
-#   2. Once dev.yml has built that commit, the owner creates the release for it, naming
-#      the bump commit's SHA rather than `master`:
-#        gh release create vX.Y.Z --target <sha of the bump commit> \
-#          --title vX.Y.Z --notes "..."
-#      With `--target master`, anything merged after the bump would ride along into the
-#      release without a CHANGELOG entry. Publishing the release creates the `vX.Y.Z` tag
-#      and starts this workflow. The notes given there are replaced by the CHANGELOG
-#      section once the image has shipped.
+# The version lives only in Cargo.toml, which on master always holds the NEXT release:
+# after every release the `roll` job opens a PR bumping the patch, and a change that
+# warrants a minor or major bump raises the version itself in its own PR before it
+# merges. Because the version is compiled in (CARGO_PKG_VERSION), it is right before the
+# build, and the tag is derived from it, never typed.
 #
-# No `push` and no `workflow_dispatch` trigger, deliberately: the only way to move
-# `:latest` is an owner-published release of a commit on master, so what is deployed is
-# always a named, CHANGELOG-described version. Only the owner can cause a deploy, and they
-# have to do two things: create the `v*` tag (a tag ruleset lets only repository admins
-# create, move or delete `v*` tags, so neither GITHUB_TOKEN nor the auto-merge App can)
-# and publish the release, which `check` enforces by failing unless the event's sender is
-# the owner. (A release published with a GitHub App installation token does start
-# workflow runs, and the auto-merge App has `contents: write`, so without the sender check
-# it could publish a release on an existing, unpublished `v*` tag.) Nothing in this
-# workflow ever creates or moves a git tag.
+#   resolve   pins the commit and the digest. With no `sha`: the digest :dev names now,
+#             and the newest master commit whose tree is that image's revision label (the
+#             tree hash); with `sha`: that commit's `:sha-<commit>` digest. Either way
+#             `:sha-<commit>` must name the pinned digest. Every later job uses the pin,
+#             so :dev moving mid-release changes nothing.
+#   check     fails closed unless the owner started the run; the commit is on master;
+#             v<version> (Cargo.toml at the commit) is absent and would be the highest
+#             stable v* tag, OR already points at this commit (a resumed release — a tag
+#             at another commit fails); CHANGELOG.md's [Unreleased] section at the commit
+#             is non-empty (it becomes the release notes).
+#   verify    smoke-tests the pinned digest; with full_tests, checks.yml on the commit too.
+#             The full suite is not the default: the train built and tested this exact
+#             tree, so a re-run only tests flakiness and drift in external services.
+#   release   (environment `release`, holds WATCHTOWER_ATLAS_TOKEN) creates the tag and
+#             the release at the commit as the GitHub App (a bypass actor on the `v*` tag
+#             ruleset; GITHUB_TOKEN cannot create a `v*` tag), sets the notes, attaches
+#             the binaries copied out of the tested image, then — guarded again so an
+#             older release can never move :latest backwards — retags the digest
+#             `:vX.Y.Z` and `:latest` and triggers Watchtower.
+#   roll      opens and arms the version-roll PR (patch bump + a fresh [Unreleased]) as
+#             the App, unless master's version already moved past the release. It merges
+#             through the train like any other PR (a version-only change runs no pipeline).
 #
-#   check          GitHub-hosted, read-only. Fails closed unless: the owner published
-#                  the release; the tag is `vX.Y.Z` and names this run's commit; it
-#                  matches Cargo.toml's [package] version at that commit; the commit is
-#                  on master; CHANGELOG.md has a non-empty `## [X.Y.Z]` section.
-#   verify-ci      checks.yml (lint, tests, live-Qdrant suite) on the tagged commit.
-#   verify-image   Finds dev.yml's `sha-<commit>` image (waiting a bounded time for a
-#                  build still running, then failing closed) and smoke-tests that digest.
-#   release        In the `release` environment (deployment policy: `v*` tags only; it
-#                  holds WATCHTOWER_ATLAS_TOKEN). Refuses unless the tag is the highest
-#                  stable release, retags the verified digest as `:latest` and `:<tag>`,
-#                  then triggers Watchtower.
-#   release-notes  Replaces the release's notes with the CHANGELOG section, after the
-#                  image has shipped.
+# Why the check's tag rule makes the train's no-pipeline roll PR safe: until a code
+# change lands after the roll, :dev still names the released commit's build, whose version
+# is already tagged at that commit — a release of it resumes (re-promotes the same digest),
+# never publishes something new.
 #
-# If the tagged commit is genuinely broken, "re-run failed jobs" cannot help — it re-runs
-# the same commit. Merge the fix and release it as a new, higher version (or, as the
-# owner, delete the release and its tag with `gh release delete vX.Y.Z --cleanup-tag` and
-# create it again at the new commit). A transient failure is re-run with
-# `gh run rerun <id> --failed`; every stage is safe to repeat.
+# Every step is idempotent: a failed release is re-run (`gh run rerun <id> --failed`, or
+# dispatch again with the same `sha`), never repaired by hand. If the commit is genuinely
+# broken, merge the fix and release that instead.
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Master commit to release (default: the commit :dev names)"
+        type: string
+        required: false
+        default: ""
+      full_tests:
+        description: "Also run the full checks.yml on the commit before promoting"
+        type: boolean
+        required: false
+        default: false
 
-# One run per tag, never cancelled. GitHub keeps at most one *pending* run per concurrency
-# group and cancels the older pending one when a newer run queues, so a single shared
-# group could silently drop a release. Per tag, nothing is dropped; runs for different
-# tags may overlap, and `:latest` is protected instead by the release job's guard: it
-# fails closed, before moving any tag, unless this release is the highest stable
-# v<x.y.z> tag, so an older release (published late, or re-run) can never move `:latest`
-# backwards.
+# One release at a time, never cancelled. A second dispatch waits (GitHub keeps one
+# pending run per group, replacing an older pending one — two releases started back to
+# back would resolve the same :dev anyway).
 concurrency:
-  group: release-${{ github.event.release.tag_name }}
+  group: release
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  check:
+  resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
+      image: ${{ steps.pin.outputs.image }}
+      commit: ${{ steps.pin.outputs.commit }}
+      digest: ${{ steps.pin.outputs.digest }}
+      version: ${{ steps.pin.outputs.version }}
+      tag: ${{ steps.pin.outputs.tag }}
     steps:
-      - name: Require the release to be published by the owner
-        # The tag ruleset means only the owner can create a `v*` tag, but publishing a
-        # release on an existing tag is a separate act: a GitHub App installation token
-        # with `contents: write` can do it, and unlike GITHUB_TOKEN it does start
-        # workflow runs. Only the owner may.
-        env:
-          SENDER: ${{ github.event.sender.login }}
-        run: |
-          if [[ "$SENDER" != "St0nefish" ]]; then
-            echo "::error::this release was published by '${SENDER}'; only the repository owner may publish a release."
-            exit 1
-          fi
-
-      - name: Checkout the tagged commit
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
-          ref: ${{ github.sha }}
-          # Full history, so the ancestry check below has the commits it needs.
+          ref: master
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Match the release tag to the tagged commit's Cargo.toml version
-        id: version
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pin the commit and the digest
+        id: pin
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          SHA: ${{ inputs.sha }}
         run: |
-          # Stable versions only. A release moves `:latest`, and the release job's
-          # highest-stable-tag guard would refuse a pre-release anyway; failing here
-          # says why before anything else runs.
-          semver='[0-9]+\.[0-9]+\.[0-9]+'
-          if [[ ! "$TAG" =~ ^v${semver}$ ]]; then
-            echo "::error::release tag '${TAG}' is not of the form vX.Y.Z (pre-releases are not supported: a release moves :latest)"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          digest_of() {
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null |
+              jq -r '.digest // empty' || true
+          }
+          git fetch --quiet --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
+
+          if [[ -z "$SHA" ]]; then
+            digest=$(digest_of "${image}:dev")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::${image}:dev resolved to no usable digest ('${digest}')."
+              exit 1
+            fi
+            # The revision label: the tree hash for every build since the merge train
+            # (build-image.yml); a commit sha for the builds before it. Both platform
+            # images carry the same labels; read amd64's.
+            revision=$(docker buildx imagetools inspect "${image}@${digest}" --format '{{json .Image}}' |
+              jq -r 'if has("linux/amd64") then .["linux/amd64"] else . end
+                     | .config.Labels["org.opencontainers.image.revision"] // empty')
+            case "$(git cat-file -t "$revision" 2>/dev/null || true)" in
+              tree)
+                # The newest master commit with exactly that tree (several can share
+                # one, e.g. a revert of a revert; the newest is the natural pick).
+                commit=$(git log --format='%H %T' origin/master | awk -v t="$revision" '$2 == t { print $1; exit }')
+                ;;
+              commit) commit=$revision ;;
+              *) commit="" ;;
+            esac
+            if [[ -z "$commit" ]]; then
+              echo "::error::${image}:dev (${digest}) has revision label '${revision}', which names no tree or commit on master."
+              exit 1
+            fi
+            echo "${image}:dev is ${digest}, built from master commit ${commit}"
+          else
+            if ! commit=$(git rev-parse --verify --quiet "${SHA}^{commit}"); then
+              echo "::error::'${SHA}' is not a commit in this repository."
+              exit 1
+            fi
+            digest=$(digest_of "${image}:sha-${commit}")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::${commit} has no ${image}:sha-${commit} image, so there is nothing tested to promote. A docs-only or version-roll commit has none; release the commit :dev names, or a commit with code changes."
+              exit 1
+            fi
+          fi
+
+          # Whichever way the commit was found, its own sha- tag must name the pinned
+          # digest: that is the image master.yml attached to this commit.
+          sha_digest=$(digest_of "${image}:sha-${commit}")
+          if [[ "$sha_digest" != "$digest" ]]; then
+            echo "::error::${image}:sha-${commit} is '${sha_digest}', not the pinned ${digest}."
             exit 1
           fi
 
-          # For a release event GITHUB_SHA is the commit the tag named when the
-          # release was published. Confirm the tag still names it and that this
-          # checkout is that commit, rather than trust either.
-          if [[ "$GITHUB_REF" != "refs/tags/${TAG}" ]]; then
-            echo "::error::GITHUB_REF is ${GITHUB_REF}, expected refs/tags/${TAG}"
-            exit 1
-          fi
-          git fetch --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
-          tag_commit=$(git rev-parse "refs/tags/${TAG}^{commit}")
-          head_commit=$(git rev-parse HEAD)
-          if [[ "$tag_commit" != "$GITHUB_SHA" || "$head_commit" != "$GITHUB_SHA" ]]; then
-            echo "::error::tag ${TAG} is at ${tag_commit} and the checkout at ${head_commit}, but the release event names ${GITHUB_SHA}"
-            exit 1
-          fi
-
-          # The `version` key of the `[package]` table, without needing a Rust
-          # toolchain on this runner.
-          version=$(awk '
+          # The `version` key of the `[package]` table at the commit.
+          version=$(git show "${commit}:Cargo.toml" | awk '
             /^\[/ { in_package = ($0 == "[package]") }
             in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }
-          ' Cargo.toml)
-          if [[ ! "$version" =~ ^${semver}$ ]]; then
-            echo "::error::could not read a valid version from Cargo.toml at ${GITHUB_SHA} (got '${version}')"
+          ')
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::could not read a valid version from Cargo.toml at ${commit} (got '${version}')"
             exit 1
           fi
-          if [[ "$TAG" != "v${version}" ]]; then
-            echo "::error::release tag ${TAG} does not match Cargo.toml's version ${version} at ${GITHUB_SHA}. Bump the version in a merged PR first, then release that commit."
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "image=${image}"
+            echo "commit=${commit}"
+            echo "digest=${digest}"
+            echo "version=${version}"
+            echo "tag=v${version}"
+          } | tee -a "$GITHUB_OUTPUT"
+          echo "### Releasing v${version}: ${commit} (${digest})" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Require the tagged commit to be on master
+  check:
+    needs: [resolve]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      resume: ${{ steps.tag.outputs.resume }}
+    steps:
+      # A release is the owner's decision. triggering_actor, not actor: a re-run is
+      # attributed to whoever re-ran it.
+      - name: Require the owner to have started the run
+        env:
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         run: |
-          # Fetch master explicitly and fail closed: a failed fetch or a commit
-          # master does not contain both stop the release.
-          #
-          # This catches mistakes; it is not a security boundary. The run uses the
-          # workflow file as it exists at the tagged commit, so a tag on an unmerged
-          # commit could carry a copy of this file without the check. The boundary is
-          # the owner-only `v*` tag ruleset, the `release` environment's `v*`-only
-          # deployment policy, and the owner sender check at the top of this job.
-          git fetch --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
+          if [[ "$TRIGGERING_ACTOR" != "St0nefish" ]]; then
+            echo "::error::this release was started by '${TRIGGERING_ACTOR}'; only the repository owner may release."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the commit to be on master
+        env:
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          git fetch --quiet --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
           status=0
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/master || status=$?
+          git merge-base --is-ancestor "$COMMIT" origin/master || status=$?
           case "$status" in
-            0)
-              echo "${GITHUB_SHA} is on master"
-              ;;
+            0) echo "${COMMIT} is on master" ;;
             1)
-              echo "::error::${GITHUB_SHA} is not an ancestor of master. Release only a commit that has merged to master."
+              echo "::error::${COMMIT} is not an ancestor of master. Release only a commit that has merged to master."
               exit 1
               ;;
             *)
-              echo "::error::git merge-base failed (exit ${status}); cannot tell whether ${GITHUB_SHA} is on master."
+              echo "::error::git merge-base failed (exit ${status}); cannot tell whether ${COMMIT} is on master."
               exit 1
               ;;
           esac
 
-      - name: Require a non-empty CHANGELOG section for the version
-        # The same extraction `release-notes` uses, so a missing or empty section
-        # fails here, before anything is promoted.
+      - name: Require a new highest tag, or this release already tagged here
+        id: tag
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          awk -v heading="## [${VERSION}]" '
-            index($0, heading) == 1 { in_section = 1; next }
-            in_section && (/^## \[/ || /^\[[^]]+\]: /) { exit }
-            in_section { print }
-          ' CHANGELOG.md > "${RUNNER_TEMP}/release-notes.md"
-          if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/release-notes.md"; then
-            echo "::error::CHANGELOG.md's '## [${VERSION}]' section is missing or empty; the release notes are taken from it."
-            exit 1
+          stable='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          tags=$(git ls-remote --tags --refs origin 'refs/tags/v*' | awk '{ sub("^refs/tags/", "", $2); print $2 }' | grep -E "$stable" || true)
+          if grep -qxF "$TAG" <<<"$tags"; then
+            git fetch --quiet --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+            at=$(git rev-parse "refs/tags/${TAG}^{commit}")
+            if [[ "$at" != "$COMMIT" ]]; then
+              echo "::error::${TAG} already exists at ${at}, not at ${COMMIT}. Cargo.toml's version at ${COMMIT} is already released; land the version roll (or a bump) and a change, then release that."
+              exit 1
+            fi
+            echo "${TAG} already points at ${COMMIT}: resuming that release."
+            echo "resume=true" >> "$GITHUB_OUTPUT"
+          else
+            highest=$(printf '%s\n' "$tags" "$TAG" | grep -E "$stable" | sort -V | tail -n 1)
+            if [[ "$highest" != "$TAG" ]]; then
+              echo "::error::${TAG} would not be the highest release tag (${highest} exists); a release never moves :latest backwards."
+              exit 1
+            fi
+            echo "${TAG} is new and the highest release tag."
+            echo "resume=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # The same checks.yml the PR gate and post-merge run, on the exact commit about to be
-  # promoted. It restores master's cargo caches but never saves (checks.yml saves only
-  # when github.ref is master, and here it is the tag).
-  verify-ci:
-    needs: [check]
-    permissions:
-      contents: read
-    uses: ./.github/workflows/checks.yml
-    with:
-      ref: ${{ github.sha }}
+      - name: Require a non-empty [Unreleased] section
+        run: .github/scripts/changelog-section.sh Unreleased CHANGELOG.md
 
-  # Self-hosted: the smoke test runs the image on an amd64 Docker host, the same place
-  # dev.yml smoke-tested it. Read-only on the registry; it names the digest `release`
-  # promotes, so what ships is exactly what was tested here.
-  verify-image:
-    needs: [check]
+  verify-smoke:
+    needs: [resolve, check]
     runs-on: self-hosted
     timeout-minutes: 30
-    # actions: the resolve script reads dev.yml's runs, to stop waiting when the build failed.
     permissions:
       contents: read
       packages: read
-      actions: read
-    outputs:
-      image: ${{ steps.resolve.outputs.image }}
-      digest: ${{ steps.resolve.outputs.digest }}
-      sha_tag: ${{ steps.resolve.outputs.sha_tag }}
     steps:
+      # The smoke test script and the Qdrant pin it reads, as of the released commit.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.resolve.outputs.commit }}
           persist-credentials: false
 
       - name: Login to GHCR
@@ -227,26 +266,46 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve the dev build of the tagged commit
-        id: resolve
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_SHA: ${{ github.sha }}
-        run: .github/scripts/resolve-release-image.sh
+      - name: Smoke test the pinned image
+        run: .github/scripts/smoke-test-image.sh "${{ needs.resolve.outputs.image }}@${{ needs.resolve.outputs.digest }}"
 
-      - name: Smoke test the image
-        run: .github/scripts/smoke-test-image.sh "${{ steps.resolve.outputs.image_ref }}"
+  verify-full:
+    needs: [resolve, check]
+    if: inputs.full_tests
+    permissions:
+      contents: read
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: ${{ needs.resolve.outputs.commit }}
+      fast: true
+      integration: true
 
   release:
-    needs: [check, verify-ci, verify-image]
+    needs: [resolve, check, verify-smoke, verify-full]
+    if: >-
+      !cancelled() && needs.check.result == 'success' && needs.verify-smoke.result == 'success' &&
+      (needs.verify-full.result == 'success' || needs.verify-full.result == 'skipped')
     runs-on: self-hosted
-    timeout-minutes: 15
+    timeout-minutes: 20
     environment: release
-    # packages: the retag pushes :latest and :<tag> to ghcr.
+    # packages: the retag pushes :latest and :<tag> to ghcr. Everything that writes to
+    # the repository (tag, release, assets) uses the App token.
     permissions:
       contents: read
       packages: write
     steps:
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -254,13 +313,61 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Immediately before the retag, so a release published meanwhile is seen. See the
-      # concurrency comment above for why. A run this guard stops stays failed; to ship a
-      # fix on top of a newer release, release it as a new, higher version.
+      # Creating the release creates the tag at the commit. On a resumed release the tag
+      # exists; the release itself may not (a run that died in between), so it is created
+      # on the existing tag then. The notes are (re)set either way.
+      - name: Create the tag and the release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          notes="${RUNNER_TEMP}/release-notes.md"
+          .github/scripts/changelog-section.sh Unreleased CHANGELOG.md > "$notes"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release ${TAG} exists; updating its notes."
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$COMMIT" --title "$TAG" --notes-file "$notes"
+          fi
+          # The tag must name the commit whichever path ran (a tag created by someone
+          # else between `check` and here would not).
+          at=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq '.sha')
+          if [[ "$at" != "$COMMIT" ]]; then
+            echo "::error::${TAG} names ${at}, not ${COMMIT}."
+            exit 1
+          fi
+
+      # Byte-identical to what was tested: copied out of the pinned image, once per
+      # architecture. `docker create` never runs the image, so the arm64 copy needs no
+      # emulation on this amd64 host.
+      - name: Attach the binaries
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          DIGEST: ${{ needs.resolve.outputs.digest }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          dir="${RUNNER_TEMP}/binaries"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          files=()
+          for arch in amd64 arm64; do
+            cid=$(docker create --platform "linux/${arch}" "${IMAGE}@${DIGEST}")
+            docker cp "${cid}:/usr/local/bin/mcp-md-wiki" "${dir}/mcp-md-wiki-linux-${arch}"
+            docker rm "$cid" >/dev/null
+            files+=("${dir}/mcp-md-wiki-linux-${arch}")
+          done
+          gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+
+      # Immediately before the retag, so a release made meanwhile is seen. A run this
+      # guard stops stays failed; to ship a fix on top of a newer release, release it as a
+      # new, higher version.
       - name: Refuse to move :latest backwards
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.check.outputs.tag }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           refs=$(curl -fsSL \
             -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -278,18 +385,19 @@ jobs:
       - name: Tag as latest
         id: retag
         env:
-          IMAGE: ${{ needs.verify-image.outputs.image }}
-          DIGEST: ${{ needs.verify-image.outputs.digest }}
-          SHA_TAG: ${{ needs.verify-image.outputs.sha_tag }}
-          TAG: ${{ needs.check.outputs.tag }}
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          DIGEST: ${{ needs.resolve.outputs.digest }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           digest_of() {
             docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null |
               jq -r '.digest // empty' || true
           }
+          SHA_TAG="sha-${COMMIT}"
 
-          # The digest verify-image smoke-tested must still be what the commit's sha-
-          # tag names.
+          # The digest verify-smoke tested must still be what the commit's sha- tag
+          # names.
           current=$(digest_of "${IMAGE}:${SHA_TAG}")
           if [ -z "${DIGEST}" ] || [ "${current}" != "${DIGEST}" ]; then
             echo "::error::${IMAGE}:${SHA_TAG} is '${current}', not the verified ${DIGEST}."
@@ -301,7 +409,7 @@ jobs:
           # reports updated=0 — which the step below otherwise treats as a failure.
           PREV_DIGEST=$(digest_of "${IMAGE}:latest")
 
-          # No rebuild, no layer push. The source is dev.yml's multi-arch image index,
+          # No rebuild, no layer push. The source is the train's multi-arch image index,
           # and a single index source with no annotations is copied verbatim, so the new
           # tags carry the same digest as :sha-<commit> (--prefer-index=false only
           # matters for a single-manifest source). Verified below rather than trusted.
@@ -328,7 +436,7 @@ jobs:
 
       - name: Trigger Watchtower
         env:
-          IMAGE: ${{ needs.verify-image.outputs.image }}
+          IMAGE: ${{ needs.resolve.outputs.image }}
           WATCHTOWER_URL: ${{ vars.WATCHTOWER_ATLAS_URL }}
           WATCHTOWER_TOKEN: ${{ secrets.WATCHTOWER_ATLAS_TOKEN }}
           DIGEST_CHANGED: ${{ steps.retag.outputs.digest_changed }}
@@ -366,46 +474,98 @@ jobs:
           echo "and that Watchtower can pull ${IMAGE}:latest."
           exit 1
 
-  # Sets the release's notes to the CHANGELOG section once the image has shipped, so a
-  # release whose deploy failed keeps the notes it was published with — a visible sign
-  # it never went out. Edits the existing release only — never creates a release or a
-  # tag (the tag ruleset would refuse GITHUB_TOKEN anyway). Re-running it writes the
-  # same notes again.
-  release-notes:
-    needs: [check, release]
+  # Opens the PR that moves master's Cargo.toml to the next patch version, as the App —
+  # so it needs no exception in auto-merge.yml's owner-only gate, and the train sees it
+  # like any other armed PR. Idempotent: an existing roll branch/PR is reused.
+  roll:
+    needs: [resolve, release]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
-      contents: write
+      contents: read
+      actions: write
     steps:
-      - name: Checkout the tagged commit
-        # Only CHANGELOG.md is read; the release is edited through the API, so the
-        # checkout needs no stored credentials.
-        uses: actions/checkout@v5
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
         with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
-      - name: Replace the release notes with the CHANGELOG section
+      # The App token is kept in the checkout's config so the push below is the App's.
+      - uses: actions/checkout@v5
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Open and arm the version-roll PR
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.check.outputs.tag }}
-          VERSION: ${{ needs.check.outputs.version }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DISPATCH_TOKEN: ${{ github.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          RELEASED: ${{ needs.resolve.outputs.version }}
         run: |
-          # The `## [X.Y.Z]` section, up to the next version heading or the
-          # link-reference block at the end of the file. `check` already ran this
-          # same extraction and required it to be non-empty.
-          awk -v heading="## [${VERSION}]" '
-            index($0, heading) == 1 { in_section = 1; next }
-            in_section && (/^## \[/ || /^\[[^]]+\]: /) { exit }
-            in_section { print }
-          ' CHANGELOG.md > "${RUNNER_TEMP}/release-notes.md"
-          if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/release-notes.md"; then
-            echo "::error::CHANGELOG.md's '## [${VERSION}]' section is empty or missing."
-            exit 1
+          current=$(awk '
+            /^\[/ { in_package = ($0 == "[package]") }
+            in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }
+          ' Cargo.toml)
+          if [[ "$current" != "$RELEASED" ]]; then
+            echo "master's Cargo.toml is at ${current}, not the released ${RELEASED}: a bump already landed; no roll."
+            exit 0
+          fi
+          IFS=. read -r major minor patch <<<"$RELEASED"
+          next="${major}.${minor}.$((patch + 1))"
+          branch="release/roll-v${next}"
+          title="release: roll version to ${next}"
+
+          pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --base master --state open --json number --jq '.[0].number // empty')
+          review=false
+          if [[ -n "$pr" ]]; then
+            echo "#${pr} already rolls to ${next}; reusing it."
+            # One a previous run deliberately left unarmed stays unarmed.
+            if gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json body --jq '.body' | grep -qF 'Needs the owner: not armed.'; then
+              review=true
+            fi
+          else
+            if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+              # A previous run pushed the branch but died before opening the PR.
+              git fetch --quiet origin "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+              git checkout --quiet -B "$branch" "origin/${branch}"
+            else
+              git checkout --quiet -B "$branch" origin/master
+              notes="${RUNNER_TEMP}/released-notes.md"
+              git show "${COMMIT}:CHANGELOG.md" > "${RUNNER_TEMP}/released-changelog.md"
+              .github/scripts/changelog-section.sh Unreleased "${RUNNER_TEMP}/released-changelog.md" > "$notes"
+              rc=0
+              .github/scripts/roll-version.sh "$RELEASED" "$next" "$(date -u +%F)" "$notes" || rc=$?
+              if ((rc == 3)); then review=true; elif ((rc != 0)); then exit "$rc"; fi
+              # rust-toolchain.toml makes this install the pinned toolchain if needed.
+              got=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mcp-md-wiki") | .version')
+              if [[ "$got" != "$next" ]]; then
+                echo "::error::cargo metadata reports ${got} after the roll, expected ${next}."
+                exit 1
+              fi
+              # The App's bot identity, so the commit is attributed to it.
+              uid=$(gh api "users/${APP_SLUG}%5Bbot%5D" --jq '.id')
+              git -c user.name="${APP_SLUG}[bot]" -c user.email="${uid}+${APP_SLUG}[bot]@users.noreply.github.com" \
+                commit --quiet -am "$title"
+              git push --quiet origin "HEAD:refs/heads/${branch}"
+            fi
+            body="Rolls master to the next patch version after releasing v${RELEASED}: \`Cargo.toml\`/\`Cargo.lock\` ${RELEASED} -> ${next}, and CHANGELOG.md's \`[Unreleased]\` section becomes \`[${RELEASED}]\` under a fresh \`[Unreleased]\`. Opened by release.yml."
+            if [[ "$review" == true ]]; then
+              body+=$'\n\n'"**Needs the owner: not armed.** master's \`[Unreleased]\` section changed after the released commit, so it was kept as is and the released section was inserted from the released commit; remove the entries that shipped in v${RELEASED} from \`[Unreleased]\`, then arm auto-merge."
+            fi
+            url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$branch" --title "$title" --body "$body")
+            pr=${url##*/}
+            echo "opened #${pr}"
           fi
 
-          gh release edit "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --notes-file "${RUNNER_TEMP}/release-notes.md"
-          echo "### Set the ${TAG} release notes from CHANGELOG.md" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$review" == true ]]; then
+            echo "::warning::#${pr} left unarmed: CHANGELOG.md needs reconciling by hand (see the PR body)."
+            exit 0
+          fi
+          gh pr merge "$pr" --auto --squash --repo "$GITHUB_REPOSITORY"
+          # Arming fires train-trigger.yml too; dispatching here does not depend on it.
+          GH_TOKEN=$DISPATCH_TOKEN gh workflow run train.yml --ref master --repo "$GITHUB_REPOSITORY"

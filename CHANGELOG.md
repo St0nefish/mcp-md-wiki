@@ -1,6 +1,7 @@
 # Changelog
 
-Releases are cut by publishing a GitHub release (`.github/workflows/release.yml`).
+Releases are cut by the owner running `.github/workflows/release.yml`, which tags the
+version in `Cargo.toml` and promotes the already-tested image.
 The container image `ghcr.io/st0nefish/mcp-md-wiki` has three kinds of tag: `:latest`
 is the most recent release, `:vX.Y.Z` pins one release, and `:dev` follows `master`.
 This file tracks notable, operator-relevant changes: unreleased ones under
@@ -14,6 +15,21 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 <!-- verify-merge-a: inert marker for concurrent-PR auto-merge test, safe to delete -->
 
 ## [Unreleased]
+
+### Deployment
+
+- **PRs merge through a merge train, and releases are started by hand.** Each armed
+  PR is squashed onto `master` and tested once, on exactly the tree that lands; the
+  image is built from that tree before the merge and tagged `:tree-<tree hash>`, and
+  the merge commit then gets `:sha-<commit>`, `:<x.y.z>-dev.<n>` and `:dev` on the
+  same digest without a rebuild. Docs-only merges no longer produce an image, so
+  `:dev` stays on the last code change. A release is now `gh workflow run
+  release.yml` rather than publishing a GitHub release: it tags `v<Cargo.toml
+  version>`, attaches `mcp-md-wiki-linux-amd64`/`-arm64` binaries copied out of the
+  image, retags `:latest`/`:vX.Y.Z`, and opens the next patch-version PR. Image
+  labels change: `org.opencontainers.image.revision` is now the source **tree**
+  hash (not a commit), and `org.opencontainers.image.version` is the plain
+  `Cargo.toml` version.
 
 ## [0.1.0] - 2026-09-29
 

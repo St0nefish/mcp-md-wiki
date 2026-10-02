@@ -13,18 +13,17 @@ is required before a PR can merge. Concretely:
 1. **Branch.** Work on a feature branch, not directly on `master` (you can't push to
    it anyway). There's no enforced naming convention beyond "descriptive" —
    `fix/reranking-timeout`, `docs/backup-recovery`, that kind of thing.
-2. **Open a PR against `master`.** CI (`.github/workflows/ci.yml`) runs on every PR:
-   `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`,
-   and `cargo audit`, followed by a Docker build. The `test` job only runs when your
-   diff touches `src/**`, `assets/**`, `Cargo.toml`/`Cargo.lock`, the `Dockerfile`,
-   `docker-compose.yml`, `migrations/**`, or `ci.yml` itself — a docs-only PR like a
-   `deploy/*.md` or `CONTRIBUTING.md` change skips it. The actual required status
-   check is a gate job, `ci-pass`, which passes whether `test` succeeded *or* was
-   skipped, so a doc-only PR still goes green without spinning up the full suite.
-3. **Auto-merge.** A separate `auto-merge.yml` workflow enables GitHub's native
-   auto-merge (squash) on every PR as soon as it's opened. Once `ci-pass` reports
-   success, GitHub merges it automatically — there's no separate manual merge step
-   for a PR that's ready and green.
+2. **Open a PR against `master`.** `pr-fast` (`.github/workflows/pr-fast.yml`) runs
+   `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
+   and `cargo audit` on your PR, on GitHub-hosted runners, when your diff touches a
+   code path (`.github/scripts/code-paths.sh` has the list; a docs-only PR skips it).
+   It is feedback, not the merge gate.
+3. **Merge.** Once the maintainer has reviewed the PR, they arm GitHub's auto-merge
+   (squash) on it, which queues it for the merge train (`.github/workflows/train.yml`):
+   the train squashes the PR onto current `master`, runs the full suite and image
+   build on exactly that tree, and posts the `ci-fast` and `ci-slow` statuses that
+   let GitHub merge it. If the train reports a conflict or a failure on the PR, push
+   a fix — the new head re-queues automatically.
 4. **Closing issues.** Include `fix #N` (or `Fixes #N`, `Closes #N` — GitHub's usual
    set of magic words) in the PR body or the squash commit message to auto-close the
    corresponding issue when the PR merges. Squash means the *PR's* commit message is
@@ -67,7 +66,7 @@ at the repo root, and everything else derives from it (#235):
 
 - **Local dev** needs nothing extra: rustup reads `rust-toolchain.toml` automatically
   for every `cargo`/`rustc` invocation anywhere under this directory tree.
-- **CI** (`.github/workflows/ci.yml`) extracts the file's `channel` value in a "Read
+- **CI** (`.github/workflows/checks.yml`, via `.github/scripts/rust-version.sh`) extracts the file's `channel` value in a "Read
   pinned Rust toolchain version" step and feeds it explicitly to
   `dtolnay/rust-toolchain@master` (that action doesn't read the file itself) — both the
   `test` and `qdrant-integration` jobs do this, so neither can end up compiling against
@@ -110,10 +109,8 @@ docker compose up -d qdrant
 cargo test -- --ignored
 ```
 
-CI runs this as a separate `qdrant-integration` job, deliberately `continue-on-error`
-for now (see the comment above that job in `ci.yml` for why) — it isn't part of the
-`ci-pass` gate yet, so a failure there won't block your PR, but a genuine regression
-is still worth fixing.
+CI runs this as the `qdrant-integration` job in `checks.yml`; the merge train runs it
+as part of its slow tier, so a failure there blocks the merge (the `ci-slow` status).
 
 ## Style
 
