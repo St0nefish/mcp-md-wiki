@@ -23,8 +23,8 @@ name: Master
 #                                            have no image, and `:dev` stays put (a release
 #                                            targets a commit that has one)
 #
-# Tags (ghcr.io/<owner>/<repo>), all multi-arch (linux/amd64 + linux/arm64), all naming one
-# image-index digest per tree:
+# Tags (ghcr.io/<owner>/<repo>), all naming one image-index digest per tree (linux/amd64;
+# see build-image.yml):
 #   :tree-<tree hash>         train.yml; the build of a tested squash (labels: revision =
 #                             the tree hash, version = Cargo.toml's version)
 #   :sha-<full commit sha>    immutable; what release.yml resolves

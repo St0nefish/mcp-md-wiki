@@ -1,6 +1,8 @@
 name: Build image
 
-# Builds, smoke-tests and tags one multi-arch image (linux/amd64 + linux/arm64). Callers:
+# Builds, smoke-tests and tags one image (an image index holding linux/amd64 only — the
+# deployment runs on x86; adding a platform is one more `build` matrix entry, plus its
+# arch in `BUILD_ARCHES` below and in release.yml's binary extraction). Callers:
 #   - train.yml, on the squash of a PR onto master, tagged `:tree-<tree hash>` — the
 #     train cannot name a build after the merge commit, which does not exist until after
 #     the build, so it names it after what it tested: the tree, which the squash merge
@@ -152,10 +154,10 @@ jobs:
             exit 1
           fi
 
-  # One native build per architecture: amd64 on the self-hosted runners, arm64 on
-  # GitHub's hosted arm64 runner (free for a public repo; atlas has no arm64 host), so
-  # neither needs QEMU. Each pushes its image by digest only — no tag — and hands the
-  # digest to `merge`, which is the only job that names anything.
+  # One native build per architecture (amd64 only, on the self-hosted runners; a native
+  # arm64 build would use GitHub's hosted `ubuntu-24.04-arm` runner, never QEMU). Each
+  # pushes its image by digest only — no tag — and hands the digest to `merge`, which is
+  # the only job that names anything.
   build:
     needs: [prepare]
     if: needs.prepare.outputs.exists == 'false'
@@ -171,8 +173,6 @@ jobs:
         include:
           - arch: amd64
             runner: self-hosted
-          - arch: arm64
-            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
         with:
@@ -201,9 +201,9 @@ jobs:
 
       # VERSION/REVISION feed the Dockerfile's OCI labels. provenance: false keeps each
       # per-arch push a single image manifest, so the index `merge` builds holds exactly
-      # the two platform images and no unknown/unknown attestation entries. The layer
-      # cache is per architecture: the two builds share no layers, and one ref would have
-      # them overwrite each other's cache on every run. `context: .` builds the checked
+      # the platform images and no unknown/unknown attestation entries. The layer cache
+      # is per architecture: builds for different platforms share no layers, and one ref
+      # would have them overwrite each other's cache on every run. `context: .` builds the checked
       # out working tree — the squash, in squash mode — not a fresh git fetch.
       - name: Build and push by digest
         id: build
@@ -283,18 +283,21 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Pushed under the staging tag only; nothing reads build- tags.
-      - name: Create the multi-arch index
+      - name: Create the image index
         id: index
         env:
           IMAGE: ${{ needs.prepare.outputs.image }}
           TAG: ${{ inputs.tag }}
+          # Must match the `build` matrix.
+          BUILD_ARCHES: amd64
         run: |
           refs=()
           for f in "${RUNNER_TEMP}"/digests/*; do
             refs+=("${IMAGE}@sha256:$(basename "$f")")
           done
-          if [ "${#refs[@]}" -ne 2 ]; then
-            echo "::error::expected 2 per-arch digests (amd64, arm64), got ${#refs[@]}: ${refs[*]}"
+          read -ra want <<<"$BUILD_ARCHES"
+          if [ "${#refs[@]}" -ne "${#want[@]}" ]; then
+            echo "::error::expected ${#want[@]} per-arch digests (${BUILD_ARCHES}), got ${#refs[@]}: ${refs[*]}"
             exit 1
           fi
           docker buildx imagetools create --tag "${IMAGE}:build-${TAG}" "${refs[@]}"

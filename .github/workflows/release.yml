@@ -340,8 +340,8 @@ jobs:
           fi
 
       # Byte-identical to what was tested: copied out of the pinned image, once per
-      # architecture. `docker create` never runs the image, so the arm64 copy needs no
-      # emulation on this amd64 host. Each architecture is pulled by its own platform
+      # architecture. `docker create` never runs the image, so a non-amd64 copy would need
+      # no emulation on this amd64 host. Each architecture is pulled by its own platform
       # manifest digest, not the index digest: the classic image store records an index
       # digest against the first platform pulled and refuses the second ("cannot
       # overwrite digest").
@@ -358,8 +358,9 @@ jobs:
           index=$(docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}")
           files=()
           # ELF e_machine (2 bytes at offset 18) of the binary each platform must carry.
+          # The platforms build-image.yml builds.
           declare -A machine=([amd64]=62 [arm64]=183)
-          for arch in amd64 arm64; do
+          for arch in amd64; do
             pdigest=$(jq -r --arg a "$arch" \
               '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest] | if length == 1 then .[0] else empty end' \
               <<<"$index")
@@ -430,7 +431,7 @@ jobs:
           # reports updated=0 — which the step below otherwise treats as a failure.
           PREV_DIGEST=$(digest_of "${IMAGE}:latest")
 
-          # No rebuild, no layer push. The source is the train's multi-arch image index,
+          # No rebuild, no layer push. The source is the train's image index,
           # and a single index source with no annotations is copied verbatim, so the new
           # tags carry the same digest as :sha-<commit> (--prefer-index=false only
           # matters for a single-manifest source). Verified below rather than trusted.

@@ -96,7 +96,7 @@ protection): direct push disabled, status checks required.
   rebuilds the identical commit and asserts its tree), and tests exactly that
   tree. The fast tier (`checks.yml` `lint` + `test`) posts `ci-fast`; then the
   slow tier runs in parallel (`checks.yml` `qdrant-integration`, and
-  `build-image.yml`, which builds the multi-arch image, smoke-tests it and tags
+  `build-image.yml`, which builds the `linux/amd64` image, smoke-tests it and tags
   it `:tree-<tree hash>`) and `ci-slow` is posted. GitHub's auto-merge then
   squash-merges the PR, and the train waits for that before dispatching the
   next run. Every status the train posts carries the run as its target URL and
@@ -191,7 +191,7 @@ commit's `CHANGELOG.md` `[Unreleased]` section is non-empty. `verify-smoke`
 smoke-tests the pinned digest (`verify-full` runs `checks.yml` too, with
 `full_tests`). `release` (environment `release`, self-hosted) creates the tag
 and the release at the commit as the GitHub App (the `[Unreleased]` section is
-the notes), uploads `mcp-md-wiki-linux-amd64`/`-arm64` copied out of the
+the notes), uploads `mcp-md-wiki-linux-amd64` copied out of the
 image, re-checks that the tag is the highest stable one, retags the digest
 `:vX.Y.Z` and `:latest` (no rebuild) and triggers Watchtower on atlas. `roll`
 then opens `release: roll version to <next>` as the App (patch bump in
@@ -205,8 +205,8 @@ Recovery: every step is idempotent — a transient failure is
 `gh run rerun <id> --failed`, or dispatch again with the same `sha`. If the
 released commit is genuinely broken, merge the fix and release that.
 
-Image tags (`ghcr.io/st0nefish/mcp-md-wiki`, all multi-arch, all one digest per
-tested tree):
+Image tags (`ghcr.io/st0nefish/mcp-md-wiki`, `linux/amd64` only, all one digest
+per tested tree):
 
 | Tag | Set by | Meaning |
 |---|---|---|
