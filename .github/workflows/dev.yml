@@ -32,6 +32,10 @@ name: Dev image
 on:
   push:
     branches: [master]
+    # Claude Code config does not affect the image; skip the multi-arch build for it.
+    paths-ignore:
+      - ".claude/**"
+      - "CLAUDE.md"
   workflow_dispatch:
 
 # Keyed by commit: builds of different commits run side by side (the :dev guard below

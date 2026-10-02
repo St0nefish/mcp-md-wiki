@@ -22,6 +22,10 @@ name: Post-Merge
 on:
   push:
     branches: [master]
+    # Claude Code config does not affect the build; skip the full checks run for it.
+    paths-ignore:
+      - ".claude/**"
+      - "CLAUDE.md"
 
 # One run at a time, never cancelled. A pending run is superseded by a newer
 # push's pending run (GitHub keeps one pending run per group), which still
