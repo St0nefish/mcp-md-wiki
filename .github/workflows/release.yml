@@ -341,7 +341,10 @@ jobs:
 
       # Byte-identical to what was tested: copied out of the pinned image, once per
       # architecture. `docker create` never runs the image, so the arm64 copy needs no
-      # emulation on this amd64 host.
+      # emulation on this amd64 host. Each architecture is pulled by its own platform
+      # manifest digest, not the index digest: the classic image store records an index
+      # digest against the first platform pulled and refuses the second ("cannot
+      # overwrite digest").
       - name: Attach the binaries
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -352,12 +355,30 @@ jobs:
           dir="${RUNNER_TEMP}/binaries"
           rm -rf "$dir"
           mkdir -p "$dir"
+          index=$(docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}")
           files=()
+          # ELF e_machine (2 bytes at offset 18) of the binary each platform must carry.
+          declare -A machine=([amd64]=62 [arm64]=183)
           for arch in amd64 arm64; do
-            cid=$(docker create --platform "linux/${arch}" "${IMAGE}@${DIGEST}")
-            docker cp "${cid}:/usr/local/bin/mcp-md-wiki" "${dir}/mcp-md-wiki-linux-${arch}"
+            pdigest=$(jq -r --arg a "$arch" \
+              '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest] | if length == 1 then .[0] else empty end' \
+              <<<"$index")
+            if [[ ! "$pdigest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::${IMAGE}@${DIGEST} has no single linux/${arch} manifest."
+              exit 1
+            fi
+            out="${dir}/mcp-md-wiki-linux-${arch}"
+            cid=$(docker create --platform "linux/${arch}" "${IMAGE}@${pdigest}")
+            docker cp "${cid}:/usr/local/bin/mcp-md-wiki" "$out"
             docker rm "$cid" >/dev/null
-            files+=("${dir}/mcp-md-wiki-linux-${arch}")
+            docker image rm "${IMAGE}@${pdigest}" >/dev/null || true
+            got=$(od -An -tu2 -j18 -N2 "$out" | tr -d ' ')
+            if [[ "$got" != "${machine[$arch]}" ]]; then
+              echo "::error::mcp-md-wiki-linux-${arch} is ELF machine ${got}, expected ${machine[$arch]}."
+              exit 1
+            fi
+            echo "mcp-md-wiki-linux-${arch}: $(stat -c %s "$out") bytes, from ${pdigest}"
+            files+=("$out")
           done
           gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
 
