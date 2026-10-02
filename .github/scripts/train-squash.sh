@@ -66,9 +66,11 @@ main() {
 
   # Pin every identity, date and message input the commit object depends on, and override
   # the runner settings that could change the commit or the tree (signing, hooks, line
-  # ending conversion). The global config is otherwise left alone: a containerized
-  # runner may need its safe.directory entry to use this checkout at all.
-  local -a git_det=(-c commit.gpgsign=false -c core.hooksPath=/dev/null -c core.autocrlf=false)
+  # ending conversion, and rerere, which would silently replay a recorded resolution of a
+  # conflict instead of reporting it). The global config is otherwise left alone: a
+  # containerized runner may need its safe.directory entry to use this checkout at all.
+  local -a git_det=(-c commit.gpgsign=false -c core.hooksPath=/dev/null -c core.autocrlf=false
+    -c rerere.enabled=false)
   export GIT_AUTHOR_NAME="merge train" GIT_AUTHOR_EMAIL="train@invalid"
   export GIT_COMMITTER_NAME="merge train" GIT_COMMITTER_EMAIL="train@invalid"
   export GIT_AUTHOR_DATE="@0 +0000" GIT_COMMITTER_DATE="@0 +0000"
