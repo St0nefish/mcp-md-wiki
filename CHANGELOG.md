@@ -21,7 +21,8 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 - **The image is `linux/amd64` only.** The `linux/arm64` image and the
   `mcp-md-wiki-linux-arm64` release binary are no longer built. Upgrade: nothing to do
   on x86 hosts; an arm64 host pulling `:latest` gets no matching platform from the next
-  release on.
+  release on — use `:latest-arm64` instead, which `gh workflow run arm64-image.yml`
+  builds on demand for the latest release (or `-f sha=<commit>` for any master commit).
 
 ## [0.1.1] - 2026-10-02
 

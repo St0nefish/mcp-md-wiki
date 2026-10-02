@@ -216,6 +216,7 @@ per tested tree):
 | `:dev` | `master.yml` | Newest master commit that has an image (only master's tip moves it) |
 | `:latest` | `release.yml` | Most recent release; the only tag Watchtower deploys |
 | `:vX.Y.Z` | `release.yml` | Pins one release |
+| `:sha-<commit>-arm64`, `:vX.Y.Z-arm64`, `:latest-arm64` | `arm64-image.yml` (on demand) | Single-platform `linux/arm64` builds of a master commit (default: the latest release), smoke-tested but not train-tested; never added to the amd64 tags above, so Watchtower never sees them |
 
 `:build-<tag>` (staging) and `:buildcache-<arch>` (cargo-chef layer cache) also
 exist but are not images to run.
