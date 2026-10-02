@@ -1,8 +1,9 @@
 name: arm64 image
 
-# Builds a linux/arm64 image on demand. The pipeline builds linux/amd64 only (the
-# deployment runs on x86; build-image.yml); this is for the occasional arm64 host, e.g.
-# running a release locally on an Apple-silicon machine.
+# Builds a linux/arm64 image of one master commit. The pipeline builds linux/amd64 only
+# (the deployment runs on x86; build-image.yml); this is for the occasional arm64 host,
+# e.g. running a release locally on an Apple-silicon machine. release.yml dispatches it
+# for every released commit, as a separate run; it can also be run by hand:
 #
 #   gh workflow run arm64-image.yml --ref master                 # the latest release
 #   gh workflow run arm64-image.yml --ref master -f sha=<commit> # any commit on master

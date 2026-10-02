@@ -154,9 +154,10 @@ protection): direct push disabled, status checks required.
   "merged". A green `master.yml` run that tagged an image is the signal the
   commit is releasable (it has its `:sha-<commit>` image). **Watching a
   release** is a separate watch: `release.yml`'s `resolve` → `check` →
-  `verify-smoke` (/ `verify-full`) → `release` → `roll`, and it is not done
-  until Watchtower reports `failed: 0`, `:latest` actually moved to the new
-  digest, and the roll PR (if any) is armed.
+  `verify-smoke` (/ `verify-full`) → `release` → `roll` + `arm64`, and it is not
+  done until Watchtower reports `failed: 0`, `:latest` actually moved to the new
+  digest, the roll PR (if any) is armed, and the `arm64-image.yml` run it
+  dispatched has tagged `:latest-arm64`.
 - `fix #N` in the merge commit auto-closes GitHub issues.
 - Branches auto-delete after merge.
 - Pre-commit hook enforces `cargo fmt` + `cargo clippy` (activate with
@@ -199,7 +200,10 @@ then opens `release: roll version to <next>` as the App (patch bump in
 a fresh `[Unreleased]`, link references updated), arms it, and dispatches the
 train; it skips when `master` already moved past the released version, and
 leaves the PR unarmed for the owner when `master`'s `[Unreleased]` changed
-after the released commit. No `:sha-<commit>` image means no release.
+after the released commit. `arm64` dispatches `arm64-image.yml` for the
+released commit as a separate run (the release does not wait for it, and an
+arm64 failure does not fail the release). No `:sha-<commit>` image means no
+release.
 
 Recovery: every step is idempotent — a transient failure is
 `gh run rerun <id> --failed`, or dispatch again with the same `sha`. If the
@@ -216,7 +220,7 @@ per tested tree):
 | `:dev` | `master.yml` | Newest master commit that has an image (only master's tip moves it) |
 | `:latest` | `release.yml` | Most recent release; the only tag Watchtower deploys |
 | `:vX.Y.Z` | `release.yml` | Pins one release |
-| `:sha-<commit>-arm64`, `:vX.Y.Z-arm64`, `:latest-arm64` | `arm64-image.yml` (on demand) | Single-platform `linux/arm64` builds of a master commit (default: the latest release), smoke-tested but not train-tested; never added to the amd64 tags above, so Watchtower never sees them |
+| `:sha-<commit>-arm64`, `:vX.Y.Z-arm64`, `:latest-arm64` | `arm64-image.yml` (dispatched by every release, or by hand) | Single-platform `linux/arm64` builds of a master commit (default: the latest release), smoke-tested but not train-tested; never added to the amd64 tags above, so Watchtower never sees them |
 
 `:build-<tag>` (staging) and `:buildcache-<arch>` (cargo-chef layer cache) also
 exist but are not images to run.
