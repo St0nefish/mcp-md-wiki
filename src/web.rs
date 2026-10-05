@@ -237,10 +237,11 @@ impl UiState {
     /// request — same convention `KbSearchServer::write_document`/`delete_document`
     /// use, so a token rotated via env var takes effect on the next request with
     /// no restart.
-    fn git_token(&self, config: &ResolvedConfig) -> Option<String> {
-        std::env::var(&config.source.git_token_env)
-            .ok()
-            .filter(|s| !s.is_empty())
+    fn git_token(
+        &self,
+        config: &ResolvedConfig,
+    ) -> Result<Option<String>, oauth_resource_server::env::EnvError> {
+        crate::secrets::git_token(config)
     }
 }
 
@@ -1662,7 +1663,13 @@ async fn post_doc_handler(
     };
 
     let config = state.config();
-    let token = state.git_token(&config);
+    let token = match state.git_token(&config) {
+        Ok(token) => token,
+        Err(e) => {
+            error!("token lookup failed: {e}");
+            return write_error_response(&WriteError::Internal { msg: e.to_string() }, None);
+        }
+    };
     // Only opened for a MOVE — see `UiState::write_deps`'s doc comment on
     // `state_db` for why a plain create/edit skips this entirely. Best-effort:
     // a state DB that fails to open degrades the move to "without link
@@ -1742,7 +1749,13 @@ async fn delete_doc_handler(
         .into_owned();
 
     let config = state.config();
-    let token = state.git_token(&config);
+    let token = match state.git_token(&config) {
+        Ok(token) => token,
+        Err(e) => {
+            error!("token lookup failed: {e}");
+            return write_error_response(&WriteError::Internal { msg: e.to_string() }, None);
+        }
+    };
     // (#229) Best-effort, same as `post_doc_handler`'s own lazy state-DB open
     // for a MOVE: a state DB that fails to open degrades `delete_document`'s
     // inbound-link check to "skip it" (see `UiState::write_deps`'s doc comment

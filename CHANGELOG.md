@@ -16,6 +16,16 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ### Deployment
 
+- **Docker secrets: `<NAME>_FILE` for the three token env vars** (fix #332).
+  `GIT_PULL_TOKEN`, `WEBHOOK_SECRET` and `MCP_BEARER_TOKEN` (or whatever
+  `source.git_token_env` / `webhook.secret_env` / `mcp.bearer_token_env` name) can now be
+  supplied as `<NAME>_FILE=/run/secrets/...`; the file's contents are trimmed. Setting
+  both forms, or pointing `_FILE` at an empty or unreadable file, fails startup. Upgrade:
+  existing env-var deployments behave as before, except that the plain variable's value is
+  now trimmed too (a secret that relied on leading or trailing whitespace must be
+  changed). The embedding and
+  reranking API keys do not support `_FILE`.
+
 - **The image is `linux/amd64` only.** The `linux/arm64` image and the
   `mcp-md-wiki-linux-arm64` release binary are no longer built. Upgrade: nothing to do
   on x86 hosts; an arm64 host pulling `:latest` gets no matching platform from the next

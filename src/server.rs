@@ -2042,9 +2042,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     let shared_config: SharedConfig = config::shared_config(Arc::clone(&config));
 
     // Resolve git token early (reused by ensure_repo and later by WebhookState)
-    let git_pull_token = std::env::var(&config.source.git_token_env)
-        .ok()
-        .filter(|s| !s.is_empty());
+    let git_pull_token = crate::secrets::git_token(&config)?;
 
     // Auto-clone if git_url is set and data_path isn't a repo yet
     if let Some(ref git_url) = config.source.git_url {
@@ -2412,16 +2410,14 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     // Bearer token for MCP auth
     let decision = static_bearer_token(
         &config.mcp.bearer_token_env,
-        std::env::var(&config.mcp.bearer_token_env).ok(),
+        crate::secrets::resolve_secret(&config.mcp.bearer_token_env)?,
         config.mcp.oauth.as_ref(),
         config.mcp.allow_unauthenticated,
     )?;
     let auth = auth_layer(decision, oauth)?;
 
     // Webhook state — optional, skip if secret is unset/empty
-    let webhook_secret = std::env::var(&config.webhook.secret_env)
-        .ok()
-        .filter(|s| !s.is_empty());
+    let webhook_secret = crate::secrets::resolve_secret(&config.webhook.secret_env)?;
 
     // Rate limiting (per-IP via SmartIpKeyExtractor for proxy-aware extraction).
     //
