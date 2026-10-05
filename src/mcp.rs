@@ -39,6 +39,8 @@ use crate::{
 const MAX_QUERY_LEN: usize = 4096;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
+/// Deepest dot-path `update_schema` will nest; see `build_schema_edit`.
+const MAX_SCHEMA_PATH_SEGMENTS: usize = 16;
 const MAX_CONTENT_LEN: usize = 512 * 1024; // 512 KB
 /// Cap on the number of operations a single `write_document` `frontmatter_patch`
 /// call may carry — a document write should rarely need more than a handful of
@@ -389,6 +391,26 @@ fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::Schem
             "field name too long: {} chars (max {})",
             params.field.len(),
             MAX_FILTER_STR_LEN
+        )));
+    }
+    // `field` is a dot-path split into nested containers. Each segment becomes two
+    // levels of YAML nesting, so cap the depth well under the parser's recursion limit
+    // rather than let the round-trip check fail with a 500.
+    if params.field.split('.').count() > MAX_SCHEMA_PATH_SEGMENTS {
+        return Err(invalid(format!(
+            "field path too deep: more than {MAX_SCHEMA_PATH_SEGMENTS} dot-separated segments"
+        )));
+    }
+    // An empty or whitespace-padded segment ("a..b", "a.", "a. b") would create a key no
+    // frontmatter field can match.
+    if params
+        .field
+        .split('.')
+        .any(|seg| seg.is_empty() || seg != seg.trim())
+    {
+        return Err(invalid(format!(
+            "invalid field path '{}': every dot-separated segment must be non-empty with no surrounding whitespace",
+            params.field
         )));
     }
     if let Some(values) = &params.values {
@@ -1471,7 +1493,10 @@ pub struct UpdateSchemaParams {
     /// Which operation to perform.
     pub operation: String,
 
-    /// Field this operation targets (dot-path).
+    /// Field this operation targets, as a dot-path. A nested field such as
+    /// `planning.method` is edited in place under its parent; for add_values and
+    /// set_field, missing parents are created as object fields. Empty segments and
+    /// paths over 16 segments are refused.
     pub field: String,
 
     /// Values, for add_values/remove_values.
@@ -7750,6 +7775,30 @@ mod tests {
     }
 
     #[test]
+    fn update_schema_rejects_a_field_path_that_nests_too_deeply() {
+        let deep = vec!["a"; MAX_SCHEMA_PATH_SEGMENTS + 1].join(".");
+        let err = build_schema_edit(&update_params("remove_field", &deep)).unwrap_err();
+        assert!(err.message.contains("too deep"), "got: {}", err.message);
+        let ok = vec!["a"; MAX_SCHEMA_PATH_SEGMENTS].join(".");
+        assert!(build_schema_edit(&update_params("remove_field", &ok)).is_ok());
+    }
+
+    #[test]
+    fn update_schema_rejects_a_field_path_with_an_empty_segment() {
+        for bad in ["", ".a", "a.", "a..b", "a. .b", "a. b", "a .b"] {
+            let mut params = update_params("remove_field", bad);
+            params.values = Some(vec!["x".into()]);
+            let err = build_schema_edit(&params).unwrap_err();
+            assert!(
+                err.message.contains("non-empty"),
+                "{bad:?} should be rejected, got: {}",
+                err.message
+            );
+        }
+        assert!(build_schema_edit(&update_params("remove_field", "planning.method")).is_ok());
+    }
+
+    #[test]
     fn set_field_rejects_a_string_that_is_not_valid_json() {
         let err = serde_json::from_value::<FieldDefinitionInput>(serde_json::Value::String(
             "not json at all".to_string(),
@@ -7838,8 +7887,9 @@ mod tests {
             "values are sorted for a stable diff"
         );
         assert_eq!(
-            reparsed.fields["planning.prep_minutes"].ty,
-            Some(crate::schema::FieldType::Integer)
+            reparsed.fields["planning"].fields.as_ref().unwrap()["prep_minutes"].ty,
+            Some(crate::schema::FieldType::Integer),
+            "a dotted path nests under a created container, never a dotted top-level key"
         );
     }
 

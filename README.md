@@ -455,6 +455,8 @@ Nested authoring (as above) and flat dot-paths (`planning.prep_minutes:`) are eq
 
 A field can't declare both a scalar `type` and nested `fields:` — it's either a value or a container, not both (`type: object` is the exception, since `object` means "has nested fields"). `update_schema` enforces this the same way a hand-edited `.kb-schema.yaml` does.
 
+Declaring one path twice in a file (nested under `fields:` and as a flat dot-path key) is rejected and freezes the scope. `update_schema` takes a nested field as a dot-path (`planning.method`) and edits it in place; `add_values`/`set_field` create any missing parents as `type: object` fields.
+
 ### Cascade and merge rules
 
 - The **set** of fields unions across cascade levels. A field redefined at a deeper level **replaces** its inherited definition wholesale.

@@ -23,7 +23,7 @@
 //! `frontmatter` block is consulted only when no root `.kb-schema.yaml` exists at all
 //! — see [`SchemaCache::build`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -162,7 +162,7 @@ pub struct RawFieldDef {
     /// Nested authoring sugar, flattened into dot-paths at parse time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(description = "Nested field definitions (dot-path shorthand).")]
-    pub fields: Option<HashMap<String, RawFieldDef>>,
+    pub fields: Option<BTreeMap<String, RawFieldDef>>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -301,11 +301,11 @@ impl FieldDef {
 }
 
 /// One parsed `.kb-schema.yaml`, before merging with ancestors.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaFile {
     #[serde(default)]
-    pub fields: HashMap<String, RawFieldDef>,
+    pub fields: BTreeMap<String, RawFieldDef>,
 }
 
 impl SchemaFile {
@@ -313,6 +313,12 @@ impl SchemaFile {
     pub fn validate_self(&self) -> Result<(), String> {
         for (name, raw) in &self.fields {
             validate_raw(name, raw)?;
+        }
+        // Nested `fields:` and a flat dot-path key spell the same path, and
+        // `flattened()` would silently keep only one of the two declarations.
+        let mut seen = BTreeSet::new();
+        for (name, raw) in &self.fields {
+            check_unique_paths(name, raw, &mut seen)?;
         }
         Ok(())
     }
@@ -390,6 +396,150 @@ fn validate_raw(path: &str, raw: &RawFieldDef) -> Result<(), String> {
     Ok(())
 }
 
+/// Mirror of [`flatten_raw`]'s keys: error if two declarations flatten to one path.
+fn check_unique_paths(
+    path: &str,
+    raw: &RawFieldDef,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    if !seen.insert(path.to_string()) {
+        return Err(format!(
+            "field '{path}' is declared more than once in this file (nested `fields:` \
+             and a flat dot-path key spell the same path); keep only one declaration"
+        ));
+    }
+    for (name, child) in raw.fields.iter().flatten() {
+        check_unique_paths(&format!("{path}.{name}"), child, seen)?;
+    }
+    Ok(())
+}
+
+/// The part of dot-path `path` below `key`, when `key` is a whole-segment prefix of it
+/// (`planning` of `planning.method` is `method`; `plan` is not a prefix).
+fn below_key<'p>(path: &'p str, key: &str) -> Option<&'p str> {
+    path.strip_prefix(key)?.strip_prefix('.')
+}
+
+/// Whether [`find_field_mut`] would find `path`, without needing a mutable borrow.
+fn has_field_path(fields: &BTreeMap<String, RawFieldDef>, path: &str) -> bool {
+    fields.contains_key(path)
+        || fields.iter().any(|(key, raw)| {
+            below_key(path, key)
+                .zip(raw.fields.as_ref())
+                .is_some_and(|(rest, children)| has_field_path(children, rest))
+        })
+}
+
+/// Find the declaration of dot-path `path` among `fields`, whether it is a flat
+/// dot-path key or reached through nested `fields:` (or a mix, at any level).
+fn find_field_mut<'a>(
+    fields: &'a mut BTreeMap<String, RawFieldDef>,
+    path: &str,
+) -> Option<&'a mut RawFieldDef> {
+    if fields.contains_key(path) {
+        return fields.get_mut(path);
+    }
+    for (key, raw) in fields.iter_mut() {
+        if let Some(rest) = below_key(path, key)
+            && let Some(children) = raw.fields.as_mut()
+            && let Some(found) = find_field_mut(children, rest)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// An empty `type: object` container, for a missing parent of a nested edit. Every
+/// other attribute is left unset so it inherits from an ancestor scope.
+fn empty_container() -> RawFieldDef {
+    RawFieldDef {
+        ty: Some(FieldType::Object),
+        required: None,
+        indexed: None,
+        values: None,
+        extend: false,
+        default: None,
+        open: None,
+        fields: Some(BTreeMap::new()),
+    }
+}
+
+/// Like [`find_field_mut`], but declares `path` (with `leaf()`) when absent, creating
+/// any missing parents as `type: object` containers. Errors when a parent on the way
+/// is declared as a non-object type. `full` is the path the caller asked for, for
+/// error messages.
+fn field_entry_mut<'a>(
+    fields: &'a mut BTreeMap<String, RawFieldDef>,
+    path: &str,
+    full: &str,
+    leaf: impl FnOnce() -> RawFieldDef,
+) -> Result<&'a mut RawFieldDef, String> {
+    if has_field_path(fields, path) {
+        return find_field_mut(fields, path).ok_or_else(|| unreachable_lookup(full));
+    }
+    // Longest existing key that is a dot-prefix of `path`; failing that, the first
+    // segment becomes a new container. No dot at all means a plain top-level field.
+    let parent = fields
+        .keys()
+        .filter(|k| below_key(path, k).is_some())
+        .max_by_key(|k| k.len())
+        .cloned()
+        .or_else(|| {
+            path.split_once('.').map(|(head, _)| {
+                fields.insert(head.to_string(), empty_container());
+                head.to_string()
+            })
+        });
+    let Some(parent) = parent else {
+        return Ok(fields.entry(path.to_string()).or_insert_with(leaf));
+    };
+    let rest = &path[parent.len() + 1..];
+    let container = fields
+        .get_mut(&parent)
+        .ok_or_else(|| unreachable_lookup(full))?;
+    if let Some(ty) = container.ty
+        && ty != FieldType::Object
+    {
+        return Err(format!(
+            "'{parent}' is a {} field, not a container, so '{full}' cannot be nested \
+             under it",
+            format!("{ty:?}").to_lowercase()
+        ));
+    }
+    // A typeless parent that carries `values:` is a leniently-enforced scalar (see the
+    // README); nesting under it would make `flatten_raw` retype it as an object.
+    if container.ty.is_none() && container.values.is_some() {
+        return Err(format!(
+            "'{parent}' is a scalar field with a values list, not a container, so \
+             '{full}' cannot be nested under it"
+        ));
+    }
+    let children = container.fields.get_or_insert_with(BTreeMap::new);
+    field_entry_mut(children, rest, full, leaf)
+}
+
+fn unreachable_lookup(full: &str) -> String {
+    format!("internal error: lost track of field '{full}' while editing the schema")
+}
+
+/// Remove the declaration of dot-path `path`, wherever it nests. Returns whether one
+/// was found. An emptied container stays: it may still carry `open: false`.
+fn remove_field_path(fields: &mut BTreeMap<String, RawFieldDef>, path: &str) -> bool {
+    if fields.remove(path).is_some() {
+        return true;
+    }
+    for (key, raw) in fields.iter_mut() {
+        if let Some(rest) = below_key(path, key)
+            && let Some(children) = raw.fields.as_mut()
+            && remove_field_path(children, rest)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn flatten_raw(path: &str, raw: &RawFieldDef, out: &mut BTreeMap<String, RawFieldDef>) {
     if let Some(children) = &raw.fields {
         // The container itself is still a definition (it may declare `open: false`),
@@ -432,25 +582,22 @@ impl SchemaFile {
     pub fn apply(&mut self, edit: &SchemaEdit) -> Result<String, String> {
         match edit {
             SchemaEdit::AddValues { field, values } => {
-                let def = self
-                    .fields
-                    .entry(field.clone())
-                    .or_insert_with(|| RawFieldDef {
-                        ty: Some(FieldType::Enum),
-                        // Left unset rather than `Some(false)`/`Some(true)`: this
-                        // scope may not be the field's first declaration, and a brand
-                        // new definition created just to add a value must not clobber
-                        // whatever an ancestor scope already said about `required`,
-                        // `indexed`, or `open` for this field — see per-attribute
-                        // inheritance in `ResolvedSchema::merged_with`.
-                        required: None,
-                        indexed: None,
-                        values: Some(Vec::new()),
-                        extend: false,
-                        default: None,
-                        open: None,
-                        fields: None,
-                    });
+                let def = field_entry_mut(&mut self.fields, field, field, || RawFieldDef {
+                    ty: Some(FieldType::Enum),
+                    // Left unset rather than `Some(false)`/`Some(true)`: this
+                    // scope may not be the field's first declaration, and a brand
+                    // new definition created just to add a value must not clobber
+                    // whatever an ancestor scope already said about `required`,
+                    // `indexed`, or `open` for this field — see per-attribute
+                    // inheritance in `ResolvedSchema::merged_with`.
+                    required: None,
+                    indexed: None,
+                    values: Some(Vec::new()),
+                    extend: false,
+                    default: None,
+                    open: None,
+                    fields: None,
+                })?;
                 let existing = def.values.get_or_insert_with(Vec::new);
                 let mut added = Vec::new();
                 for value in values {
@@ -470,9 +617,7 @@ impl SchemaFile {
                 }
             }
             SchemaEdit::RemoveValues { field, values } => {
-                let def = self
-                    .fields
-                    .get_mut(field)
+                let def = find_field_mut(&mut self.fields, field)
                     .ok_or_else(|| format!("field '{}' is not declared in this scope", field))?;
                 let existing = def
                     .values
@@ -487,12 +632,14 @@ impl SchemaFile {
                 ))
             }
             SchemaEdit::SetField { field, definition } => {
-                self.fields
-                    .insert(field.clone(), definition.as_ref().clone());
+                // The placeholder is overwritten immediately; only the slot's location
+                // (and its missing parents) matter here.
+                let slot = field_entry_mut(&mut self.fields, field, field, empty_container)?;
+                *slot = definition.as_ref().clone();
                 Ok(format!("declared '{}'", field))
             }
             SchemaEdit::RemoveField { field } => {
-                if self.fields.remove(field).is_none() {
+                if !remove_field_path(&mut self.fields, field) {
                     return Err(format!("field '{}' is not declared in this scope", field));
                 }
                 Ok(format!("removed declaration of '{}'", field))
@@ -502,9 +649,9 @@ impl SchemaFile {
 
     /// Render back to YAML for writing to disk.
     pub fn to_yaml(&self) -> Result<String, String> {
-        // BTreeMap for deterministic key order, so a rewrite produces a minimal diff.
-        let ordered: BTreeMap<&String, &RawFieldDef> = self.fields.iter().collect();
-        let doc = serde_yaml_ng::to_string(&SchemaFileOut { fields: ordered })
+        // `fields` is a BTreeMap at every level, so key order (and a rewrite's diff) is
+        // deterministic.
+        let doc = serde_yaml_ng::to_string(self)
             .map_err(|e| format!("could not serialize schema: {e}"))?;
         Ok(format!(
             "# Frontmatter schema for this directory and everything beneath it.\n\
@@ -512,12 +659,6 @@ impl SchemaFile {
              # valid — a malformed file freezes indexing for this whole subtree.\n{doc}"
         ))
     }
-}
-
-/// Serialization view of [`SchemaFile`] with deterministic field ordering.
-#[derive(serde::Serialize)]
-struct SchemaFileOut<'a> {
-    fields: BTreeMap<&'a String, &'a RawFieldDef>,
 }
 
 /// A fully merged schema for one directory.
@@ -1812,6 +1953,202 @@ mod tests {
         let err = file.validate_self().unwrap_err();
         assert!(err.contains("extend"), "got: {err}");
         assert!(err.contains("$values"), "got: {err}");
+    }
+
+    const NESTED_SCHEMA: &str = "fields:\n  planning:\n    type: object\n    open: false\n    fields:\n      method:\n        type: enum\n        open: false\n        values: [braise, oven]\n";
+
+    fn nested_file() -> SchemaFile {
+        serde_yaml_ng::from_str(NESTED_SCHEMA).unwrap()
+    }
+
+    #[test]
+    fn add_values_on_a_nested_path_edits_the_nested_declaration() {
+        let mut file = nested_file();
+        file.apply(&SchemaEdit::AddValues {
+            field: "planning.method".into(),
+            values: vec!["slow-cooker".into()],
+        })
+        .unwrap();
+
+        assert_eq!(
+            file.fields.len(),
+            1,
+            "no sibling dotted key: {:?}",
+            file.fields
+        );
+        let method = &file.fields["planning"].fields.as_ref().unwrap()["method"];
+        assert_eq!(
+            method.values,
+            Some(vec!["braise".into(), "oven".into(), "slow-cooker".into()])
+        );
+        assert_eq!(method.open, Some(false), "stays closed");
+        file.validate_self().unwrap();
+    }
+
+    #[test]
+    fn set_remove_values_and_remove_field_reach_nested_paths() {
+        let mut file = nested_file();
+        file.apply(&SchemaEdit::RemoveValues {
+            field: "planning.method".into(),
+            values: vec!["oven".into()],
+        })
+        .unwrap();
+        let method = &file.fields["planning"].fields.as_ref().unwrap()["method"];
+        assert_eq!(method.values, Some(vec!["braise".to_string()]));
+
+        let def: RawFieldDef = serde_json::from_value(json!({"type": "text"})).unwrap();
+        file.apply(&SchemaEdit::SetField {
+            field: "planning.method".into(),
+            definition: Box::new(def.clone()),
+        })
+        .unwrap();
+        assert_eq!(file.fields.len(), 1);
+        assert_eq!(
+            file.fields["planning"].fields.as_ref().unwrap()["method"],
+            def
+        );
+
+        file.apply(&SchemaEdit::RemoveField {
+            field: "planning.method".into(),
+        })
+        .unwrap();
+        let planning = &file.fields["planning"];
+        assert!(planning.fields.as_ref().unwrap().is_empty());
+        assert_eq!(planning.open, Some(false), "the emptied container is kept");
+    }
+
+    #[test]
+    fn a_flat_dot_path_key_is_edited_in_place() {
+        let mut file: SchemaFile = serde_yaml_ng::from_str(
+            "fields:\n  planning.method:\n    type: enum\n    values: [a]\n",
+        )
+        .unwrap();
+        file.apply(&SchemaEdit::AddValues {
+            field: "planning.method".into(),
+            values: vec!["b".into()],
+        })
+        .unwrap();
+        assert_eq!(file.fields.len(), 1);
+        assert_eq!(
+            file.fields["planning.method"].values,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_missing_parent_is_created_as_an_object_container() {
+        let mut file = SchemaFile::default();
+        file.apply(&SchemaEdit::AddValues {
+            field: "a.b.c".into(),
+            values: vec!["x".into()],
+        })
+        .unwrap();
+        let a = &file.fields["a"];
+        assert_eq!(a.ty, Some(FieldType::Object));
+        assert_eq!(a.open, None, "inherits open from an ancestor scope");
+        let b = &a.fields.as_ref().unwrap()["b"];
+        assert_eq!(b.ty, Some(FieldType::Object));
+        assert_eq!(
+            b.fields.as_ref().unwrap()["c"].values,
+            Some(vec!["x".to_string()])
+        );
+        file.validate_self().unwrap();
+        assert!(file.flattened().contains_key("a.b.c"));
+    }
+
+    #[test]
+    fn a_flat_dotted_key_inside_a_container_is_found_and_edited() {
+        // `planning.x.y` is spelled as container `planning` + child key `x.y`.
+        let mut file: SchemaFile = serde_yaml_ng::from_str(
+            "fields:\n  planning:\n    type: object\n    fields:\n      x.y:\n        type: enum\n        values: [a]\n",
+        )
+        .unwrap();
+        file.apply(&SchemaEdit::AddValues {
+            field: "planning.x.y".into(),
+            values: vec!["b".into()],
+        })
+        .unwrap();
+        let children = file.fields["planning"].fields.as_ref().unwrap();
+        assert_eq!(children.len(), 1, "no duplicate created: {children:?}");
+        assert_eq!(
+            children["x.y"].values,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        file.validate_self().unwrap();
+    }
+
+    #[test]
+    fn set_field_over_an_existing_container_replaces_its_children() {
+        let mut file = nested_file();
+        let def: RawFieldDef = serde_json::from_value(
+            json!({"type": "object", "fields": {"other": {"type": "text"}}}),
+        )
+        .unwrap();
+        file.apply(&SchemaEdit::SetField {
+            field: "planning".into(),
+            definition: Box::new(def),
+        })
+        .unwrap();
+        let children = file.fields["planning"].fields.as_ref().unwrap();
+        assert_eq!(children.keys().collect::<Vec<_>>(), ["other"]);
+        file.validate_self().unwrap();
+    }
+
+    #[test]
+    fn remove_field_on_a_doubly_declared_path_removes_the_flat_key_first() {
+        // A file damaged by the pre-#268 bug: both spellings of one path. The flat key
+        // is the one `update_schema` removes, leaving the nested declaration valid.
+        let mut file: SchemaFile = serde_yaml_ng::from_str(&format!(
+            "{NESTED_SCHEMA}  planning.method:\n    type: enum\n    values: [slow-cooker]\n"
+        ))
+        .unwrap();
+        assert!(file.validate_self().is_err());
+        file.apply(&SchemaEdit::RemoveField {
+            field: "planning.method".into(),
+        })
+        .unwrap();
+        file.validate_self().unwrap();
+        let method = &file.fields["planning"].fields.as_ref().unwrap()["method"];
+        assert_eq!(method.values, Some(vec!["braise".into(), "oven".into()]));
+    }
+
+    #[test]
+    fn nesting_under_a_scalar_field_is_rejected() {
+        let mut file: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  planning:\n    type: text\n").unwrap();
+        let err = file
+            .apply(&SchemaEdit::AddValues {
+                field: "planning.method".into(),
+                values: vec!["x".into()],
+            })
+            .unwrap_err();
+        assert!(err.contains("not a container"), "got: {err}");
+    }
+
+    #[test]
+    fn nesting_under_a_typeless_field_with_values_is_rejected() {
+        // `values:` with no `type:` is a leniently-enforced scalar; nesting under it
+        // would let `flatten_raw` retype it as an object.
+        let mut file: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  status:\n    values: [a, b]\n").unwrap();
+        let err = file
+            .apply(&SchemaEdit::AddValues {
+                field: "status.sub".into(),
+                values: vec!["x".into()],
+            })
+            .unwrap_err();
+        assert!(err.contains("not a container"), "got: {err}");
+    }
+
+    #[test]
+    fn nested_and_flat_declarations_of_one_path_are_a_validation_error() {
+        let file: SchemaFile = serde_yaml_ng::from_str(&format!(
+            "{NESTED_SCHEMA}  planning.method:\n    type: enum\n    values: [slow-cooker]\n"
+        ))
+        .unwrap();
+        let err = file.validate_self().unwrap_err();
+        assert!(err.contains("planning.method"), "got: {err}");
+        assert!(err.contains("more than once"), "got: {err}");
     }
 
     #[test]

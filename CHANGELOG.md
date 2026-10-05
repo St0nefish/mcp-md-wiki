@@ -14,6 +14,21 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+### MCP tools
+
+- **`update_schema` edits nested fields in place** (fix #268). `field` is a dot-path, but it
+  was used as a literal top-level key, so editing `planning.method` created a sibling
+  `planning.method` key beside the nested `planning` → `method` declaration. Both flattened
+  to the same path and the winner varied per process, which could silently turn a closed
+  enum into an open one. All four operations now resolve the dot-path through nested
+  `fields:` and flat keys alike; `add_values`/`set_field` create missing parents as
+  `type: object` fields. A `field` with an empty segment (`a..b`) or more than 16
+  segments is refused.
+- **Upgrade note:** a `.kb-schema.yaml` that declares one path twice (nested `fields:` plus
+  a flat dot-path key) is now rejected, which freezes that scope until the duplicate is
+  removed. Previously one declaration was silently dropped. A schema already damaged by the
+  old bug will show up this way.
+
 ## [0.1.2] - 2026-10-05
 
 ### Deployment
