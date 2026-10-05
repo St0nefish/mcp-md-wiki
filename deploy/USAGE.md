@@ -164,6 +164,8 @@ Nested authoring (as above) and flat dot-paths (`planning.prep_minutes:`) are eq
 
 A field definition can't declare both a scalar `type` and nested `fields:` — a field is either a value or a container, not both. `type: object` is the exception, since `object` inherently means "has nested fields." `update_schema` rejects this the same way a hand-edited `.kb-schema.yaml` does.
 
+Declaring the same path twice in one file — once under a nested `fields:` and once as a flat dot-path key (`planning.method:` next to `planning: {fields: {method: ...}}`) — is an error that freezes the scope, because the two spellings are the same field and only one could win. `update_schema` addresses a nested field by its dot-path and edits it where it lives, nested or flat; `add_values`/`set_field` on a path whose parents don't exist yet create those parents as `type: object` fields.
+
 **`values:` without a `type:` is enforced leniently.** A field declaring `values:` *and* `type: enum` is checked strictly — any value outside the list fails, whatever its YAML type. A field declaring `values:` with **no** `type:` exempts non-string values from the check, so `status: 3` passes a `values: [active, draft]` list that `status: "retired"` would fail. That is deliberate: it preserves the behaviour of the pre-cascade global `frontmatter.allowed` map so existing deployments don't start failing, and it applies to any field authored that way — including in a `.kb-schema.yaml`, not just the legacy `config.yaml` block. If you want a closed set actually enforced, declare `type: enum`.
 
 `.kb-schema.yaml` files themselves are not indexed as documents.
