@@ -16,15 +16,23 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ### Deployment
 
-- **Docker secrets: `<NAME>_FILE` for the three token env vars** (fix #332).
-  `GIT_PULL_TOKEN`, `WEBHOOK_SECRET` and `MCP_BEARER_TOKEN` (or whatever
-  `source.git_token_env` / `webhook.secret_env` / `mcp.bearer_token_env` name) can now be
-  supplied as `<NAME>_FILE=/run/secrets/...`; the file's contents are trimmed. Setting
-  both forms, or pointing `_FILE` at an empty or unreadable file, fails startup. Upgrade:
-  existing env-var deployments behave as before, except that the plain variable's value is
-  now trimmed too (a secret that relied on leading or trailing whitespace must be
-  changed). The embedding and
-  reranking API keys do not support `_FILE`.
+- **Docker secrets: `<NAME>_FILE` for the secret env vars** (fix #332).
+  `GIT_PULL_TOKEN`, `WEBHOOK_SECRET`, `MCP_BEARER_TOKEN`, `EMBEDDING_API_KEY` and
+  `RERANKING_API_KEY` (or whatever `source.git_token_env` / `webhook.secret_env` /
+  `mcp.bearer_token_env` / `embedding.api_key_env` / `reranking.api_key_env` name) can now
+  be supplied as `<NAME>_FILE=/run/secrets/...`; the file's contents are trimmed. Setting
+  both forms (a blank plain variable yields to the file), or pointing `_FILE` at an empty
+  or unreadable file, fails startup (and a `/admin/reload`). Upgrade: nothing to do —
+  a value in the plain variable is used exactly as before. Built on
+  `oauth-resource-server` 0.4 (`env::config_value_from_env`), which this release raises
+  from 0.1.
+
+- **Three new `mcp.oauth` keys, from `oauth-resource-server` 0.4:** `max_token_age_secs`
+  (refuse a token issued longer ago, by `iat`), `allowed_client_ids` (accept only listed
+  `client_id`/`azp` values — for a shared audience) and `required_claims` (claim name to
+  required value). All default to off, are `restart_required` on `/admin/reload`, and are
+  documented in `docs/oauth.md`. Also from the crate: a rejected `mcp.oauth.issuer` with a
+  query string now echoes the query masked (`?***`) in the startup error.
 
 - **The image is `linux/amd64` only.** The `linux/arm64` image and the
   `mcp-md-wiki-linux-arm64` release binary are no longer built. Upgrade: nothing to do

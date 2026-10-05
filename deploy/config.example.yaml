@@ -450,6 +450,20 @@ mcp:
   #   # Clock-skew allowance on exp/nbf, in seconds. Max 300.
   #   leeway_secs: 60
   #
+  #   # Refuse a token issued longer ago than this many seconds (by `iat`, plus
+  #   # leeway_secs); with it set a token must carry `iat`. 1..=2592000. Unset
+  #   # (the default) checks nothing.
+  #   max_token_age_secs: 3600
+  #
+  #   # OAuth clients whose tokens are accepted: the token's `client_id` claim,
+  #   # else `azp`, must equal an entry. Empty (the default) checks nothing. Use
+  #   # it where the audience is shared by every client of one API.
+  #   allowed_client_ids: []
+  #
+  #   # Top-level claims a token must carry: name -> string/number/boolean value
+  #   # (an array claim passes when it contains the value). Empty by default.
+  #   required_claims: {}
+  #
   #   # Require the JWT header typ to be at+jwt (RFC 9068). Off by default
   #   # because Authentik emits "JWT"; turn it ON if your server emits at+jwt
   #   # (Authelia, Kanidm) — it stops an ID token being replayed as an
@@ -840,9 +854,9 @@ ui:
 #   WEBHOOK_SECRET      — named by webhook.secret_env
 #   MCP_BEARER_TOKEN    — named by mcp.bearer_token_env
 #
-# GIT_PULL_TOKEN, WEBHOOK_SECRET and MCP_BEARER_TOKEN (under whatever name the
-# *_env field gives them) also accept `<NAME>_FILE=/run/secrets/<file>` for Docker
-# secrets. Setting both <NAME> and <NAME>_FILE fails startup.
+# Every secret above (under whatever name its *_env field gives it) also accepts
+# `<NAME>_FILE=/run/secrets/<file>` for Docker secrets. Setting both <NAME> and
+# <NAME>_FILE (or an empty/unreadable file) fails startup.
 #
 # Connection wiring (required, no default):
 #   EMBEDDING_BASE_URL  — base URL of the embedding API

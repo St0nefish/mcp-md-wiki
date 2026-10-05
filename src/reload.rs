@@ -229,15 +229,17 @@ const DIFF_TABLE: &[DiffField] = &[
                 setting: "source.git_token_env (MCP write-tool commits)",
                 note: "create_document/edit_document/delete_document resolve this fresh from \
                        the live config on every call (mcp.rs write_document/delete_document) \
-                       before reading the named env var — the very next write picks up a new \
-                       var name.",
+                       before reading the named env var (or its `_FILE` variant, re-read on \
+                       every call, so a rotated secret file is picked up too) — the very next \
+                       write picks up a new var name.",
             },
             ConsumerEntry {
                 effect: ReloadEffect::RestartRequired,
                 setting: "source.git_token_env (webhook pull / startup clone)",
                 note: "the token is resolved once at server startup (server.rs run_server) and \
                        stored by value on WebhookState and passed to the initial \
-                       git::ensure_repo call; neither re-reads the env var name afterward.",
+                       git::ensure_repo call; neither re-reads the env var (or its `_FILE`) \
+                       afterward.",
             },
         ],
     },
@@ -746,6 +748,35 @@ const DIFF_TABLE: &[DiffField] = &[
             setting: "mcp.oauth.leeway_secs",
             note: "baked into the jsonwebtoken Validation at OAuthValidator construction \
                    (oauth_resource_server).",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.max_token_age_secs",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.max_token_age_secs)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.max_token_age_secs",
+            note: "held by the OAuthValidator built at startup (oauth_resource_server).",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.allowed_client_ids",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.allowed_client_ids)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.allowed_client_ids",
+            note: "held by the OAuthValidator built at startup (oauth_resource_server) — \
+                   security-critical, deliberately not made live.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.required_claims",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.required_claims)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.required_claims",
+            note: "held by the OAuthValidator built at startup (oauth_resource_server) — \
+                   security-critical, deliberately not made live.",
         }],
     },
     DiffField {

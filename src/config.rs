@@ -1354,6 +1354,9 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("mcp.oauth.principal_claims", "mcp"),
     ("mcp.oauth.algorithms", "mcp"),
     ("mcp.oauth.leeway_secs", "mcp"),
+    ("mcp.oauth.max_token_age_secs", "mcp"),
+    ("mcp.oauth.allowed_client_ids", "mcp"),
+    ("mcp.oauth.required_claims", "mcp"),
     ("mcp.oauth.require_at_jwt", "mcp"),
     ("mcp.oauth.allow_unscoped_tokens", "mcp"),
     ("mcp.oauth.allow_insecure_http", "mcp"),
@@ -1667,12 +1670,12 @@ impl Config {
         };
 
         let embedding_api_key_env = self.embedding.api_key_env.clone();
-        let embedding_api_key = std::env::var(&embedding_api_key_env).ok();
+        let embedding_api_key = crate::secrets::resolve_secret(&embedding_api_key_env)?;
         provenance.insert(
             "embedding.api_key",
             match &embedding_api_key {
                 Some(_) => SettingSource::Env {
-                    var: embedding_api_key_env,
+                    var: crate::secrets::source_var(&embedding_api_key_env),
                 },
                 None => SettingSource::Default,
             },
@@ -1725,12 +1728,18 @@ impl Config {
         }
 
         let reranking_api_key_env = self.reranking.api_key_env.clone();
-        let reranking_api_key = std::env::var(&reranking_api_key_env).ok();
+        // Only read when reranking is on: a bad `<NAME>_FILE` for a feature that is off
+        // must not refuse to load the config.
+        let reranking_api_key = if self.reranking.enabled {
+            crate::secrets::resolve_secret(&reranking_api_key_env)?
+        } else {
+            None
+        };
         provenance.insert(
             "reranking.api_key",
             match &reranking_api_key {
                 Some(_) => SettingSource::Env {
-                    var: reranking_api_key_env,
+                    var: crate::secrets::source_var(&reranking_api_key_env),
                 },
                 None => SettingSource::Default,
             },
@@ -2285,11 +2294,28 @@ pub(crate) mod test_support {
             std::env::remove_var("QDRANT_URL");
         }
     }
+
+    /// Removes the named env vars, and the required ones, when dropped — so a failing
+    /// assertion cannot leak them into later tests. Declare it right after taking
+    /// `ENV_MUTEX`: locals drop in reverse order, so it runs while the lock is held.
+    pub(crate) struct EnvCleanup(pub &'static [&'static str]);
+
+    impl Drop for EnvCleanup {
+        fn drop(&mut self) {
+            // SAFETY: the test holds ENV_MUTEX (see above)
+            unsafe {
+                for var in self.0 {
+                    std::env::remove_var(var);
+                }
+            }
+            clear_required_env();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{ENV_MUTEX, clear_required_env, set_required_env};
+    use super::test_support::{ENV_MUTEX, EnvCleanup, clear_required_env, set_required_env};
     use super::*;
 
     impl Config {
@@ -3829,6 +3855,61 @@ mcp:
         clear_required_env();
     }
 
+    /// `<api_key_env>_FILE` feeds the resolved key (trimmed), and setting both forms
+    /// refuses to load (#332).
+    #[test]
+    fn api_key_file_variant_is_read_and_conflicts_with_the_plain_variable() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _cleanup = EnvCleanup(&[
+            "EMBEDDING_API_KEY",
+            "EMBEDDING_API_KEY_FILE",
+            "RERANKING_API_KEY",
+            "RERANKING_API_KEY_FILE",
+            "RERANKING_BASE_URL",
+            "RERANKING_MODEL",
+        ]);
+        set_required_env();
+        let dir = tempfile::tempdir().unwrap();
+        let embed_file = dir.path().join("embed_key");
+        let rerank_file = dir.path().join("rerank_key");
+        std::fs::write(&embed_file, "sk-embed\n").unwrap();
+        std::fs::write(&rerank_file, "sk-rerank\n").unwrap();
+        unsafe {
+            std::env::set_var("EMBEDDING_API_KEY_FILE", &embed_file);
+            std::env::set_var("RERANKING_API_KEY_FILE", &rerank_file);
+            std::env::set_var("RERANKING_BASE_URL", "http://reranker:8081/v1");
+            std::env::set_var("RERANKING_MODEL", "reranker");
+        }
+
+        let yaml = format!("{MINIMAL_CONFIG}\nreranking:\n  enabled: true\n");
+        let cfg = Config::from_str(&yaml).unwrap();
+        assert_eq!(cfg.embedding.api_key.as_deref(), Some("sk-embed"));
+        let reranking = cfg.reranking.expect("reranking should be resolved");
+        assert_eq!(reranking.api_key.as_deref(), Some("sk-rerank"));
+        // Provenance names the `_FILE` variable the key really came from.
+        assert_eq!(
+            cfg.provenance.0.get("embedding.api_key"),
+            Some(&SettingSource::Env {
+                var: "EMBEDDING_API_KEY_FILE".into()
+            })
+        );
+
+        // A bad `_FILE` for a disabled reranker does not refuse to load the config.
+        unsafe {
+            std::env::set_var("RERANKING_API_KEY", "x");
+        }
+        assert!(Config::from_str(MINIMAL_CONFIG).is_ok());
+        unsafe {
+            std::env::remove_var("RERANKING_API_KEY");
+        }
+
+        unsafe {
+            std::env::set_var("EMBEDDING_API_KEY", "sk-plain");
+        }
+        let err = Config::from_str(&yaml).unwrap_err().to_string();
+        assert!(err.contains("EMBEDDING_API_KEY"), "{err}");
+    }
+
     #[test]
     fn reranking_config_defaults() {
         let cfg = Config::from_str_raw("{}").unwrap();
@@ -4189,8 +4270,10 @@ mcp:
         let err = format!("{:#}", resolve_mcp_oauth(cfg.mcp.oauth).unwrap_err());
         let url_err = reqwest::Url::parse("kb.example.test/mcp").unwrap_err();
         let problems = [
-            "mcp.oauth.issuer \"https://idp.example.test/?x=1\" must not contain a query or \
-             fragment"
+            // The crate masks a query value in the issuer it echoes back (it may carry
+            // a credential), so `?x=1` reads `?***` since oauth-resource-server 0.4.
+            "mcp.oauth.issuer \"https://idp.example.test/?***\" (shown normalized, credential \
+             masked) must not contain a query or fragment"
                 .to_string(),
             format!(
                 "mcp.oauth.resource \"kb.example.test/mcp\" is not an absolute URL ({url_err})"
