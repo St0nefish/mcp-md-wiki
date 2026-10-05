@@ -16,6 +16,11 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ### MCP tools
 
+- **`search`'s `query` description no longer calls retrieval semantic-only** (fix #309).
+  The schema said "Semantic query." and the tool description "ranked by semantic
+  relevance", although the default (`search.hybrid: true`) also matches literal terms. The
+  `query` property now says so when `search.hybrid` is on, and still says "Semantic query."
+  when it is off; the tool description just says "ranked by relevance". No reindex needed.
 - **`write_document`'s `frontmatter_patch` keeps untouched formatting** (fix #269). A patch
   used to re-serialize the whole frontmatter block, alphabetizing keys, flattening `>-`
   block scalars to one long line, dropping comments and rewriting `[a, b]` lists. It now

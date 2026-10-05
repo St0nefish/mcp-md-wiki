@@ -1528,7 +1528,7 @@ pub struct SearchParams {
     // effective-set-aware text, or removed when no enabled granularity can
     // use them (`descriptions::search_property_descriptions`, applied in
     // `KbSearchServer::overlay_input_schema`).
-    /// Semantic query. Omit to list every match.
+    /// Query. Omit to list every match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
 
@@ -3282,7 +3282,8 @@ impl KbSearchServer {
             // Properties whose static doc comments assume every granularity
             // and mode is on: rewritten, or removed when nothing enabled can
             // use them.
-            for (name, description) in crate::descriptions::search_property_descriptions(&effective)
+            for (name, description) in
+                crate::descriptions::search_property_descriptions(&effective, config.search.hybrid)
             {
                 match description {
                     Some(text) => {
@@ -9755,6 +9756,26 @@ mod tests {
         let overlaid = server.overlay_input_schema(tool);
         let properties = overlaid.input_schema["properties"].as_object().unwrap();
         assert!(properties.contains_key("heading_prefix"));
+    }
+
+    #[test]
+    fn overlay_input_schema_query_description_follows_search_hybrid() {
+        for (hybrid, expect_literal) in [(true, true), (false, false)] {
+            let mut config = overlay_test_config(&Granularity::ALL, false);
+            Arc::make_mut(&mut config).search.hybrid = hybrid;
+            let server = make_overlay_test_server_with_config(HashMap::new(), config);
+            let tool = KbSearchServer::tool_router()
+                .get("search")
+                .cloned()
+                .unwrap();
+
+            let overlaid = server.overlay_input_schema(tool);
+            let description = overlaid.input_schema["properties"]["query"]["description"]
+                .as_str()
+                .unwrap();
+            assert_eq!(description.contains("literal terms"), expect_literal);
+            assert_eq!(description.starts_with("Semantic query."), !expect_literal);
+        }
     }
 
     /// Every way a text can mention granularity `g` as a choice.
