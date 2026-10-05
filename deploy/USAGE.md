@@ -633,7 +633,7 @@ RUST_LOG=info
 
 If you set `GIT_URL`, also set `GIT_PULL_TOKEN` to a personal access token. Read access is enough for cloning and webhook pulls; grant **write** access if you plan to use the MCP write tools (they push commits back to the repo — see [Agent Write Tools](#agent-write-tools)). The token is injected transiently into the HTTPS clone/fetch URL and never written to disk. SSH URLs don't need a token.
 
-**Docker secrets:** instead of putting `MCP_BEARER_TOKEN`, `GIT_PULL_TOKEN` or `WEBHOOK_SECRET` in the environment, mount the value as a secret and point `<NAME>_FILE` at it (e.g. `GIT_PULL_TOKEN_FILE=/run/secrets/git_pull_token`). Set one form or the other — both is a startup error.
+**Docker secrets:** instead of putting `MCP_BEARER_TOKEN`, `GIT_PULL_TOKEN`, `WEBHOOK_SECRET`, `EMBEDDING_API_KEY` or `RERANKING_API_KEY` in the environment, mount the value as a secret and point `<NAME>_FILE` at it (e.g. `GIT_PULL_TOKEN_FILE=/run/secrets/git_pull_token`). Set one form or the other — both is a startup error.
 
 ### 4. Start the stack
 

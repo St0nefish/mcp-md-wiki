@@ -121,12 +121,12 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # adds no TLS stack of its own. That is not "rustls is absent": async-openai
 # (`rustls` default feature), qdrant-client (`reqwest/rustls-tls`) and tonic
 # (tokio-rustls) already pull rustls 0.23 into the tree.
-oauth-resource-server = { version = "0.1", default-features = false, features = ["native-tls", "serde", "axum", "env"] }
+oauth-resource-server = { version = "0.4", default-features = false, features = ["native-tls", "serde", "axum", "env"] }
 
 [dev-dependencies]
 # Throwaway keys, token minting and a fake JWKS server for `server.rs`'s auth tests.
 # Test-only by construction: the private keys it ships are public knowledge.
-oauth-resource-server = { version = "0.1", default-features = false, features = ["native-tls", "serde", "axum", "env", "testing"] }
+oauth-resource-server = { version = "0.4", default-features = false, features = ["native-tls", "serde", "axum", "env", "testing"] }
 tempfile = "3"
 tower = "0.5"
 # Only for tests: `#[tokio::test(start_paused = true)]` lets reindex.rs's retry/backoff

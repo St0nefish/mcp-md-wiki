@@ -1194,8 +1194,8 @@ fn static_bearer_token(
 ) -> Result<StaticTokenDecision> {
     let Ok(decision) = static_token_policy(env_value, oauth, allow_unauthenticated) else {
         anyhow::bail!(
-            "Environment variable '{env_name}' is not set or empty. Enable mcp.oauth \
-             (recommended — see docs/oauth.md), set it to a bearer token, or set \
+            "Environment variable '{env_name}' (or '{env_name}_FILE') is not set or empty. \
+             Enable mcp.oauth (recommended — see docs/oauth.md), set it to a bearer token, or set \
              mcp.allow_unauthenticated: true in config.yaml to explicitly opt out of \
              authentication."
         );
@@ -1906,7 +1906,8 @@ const OAUTH_METADATA_MCP_PATH: &str = "/.well-known/oauth-protected-resource/mcp
 /// to know `/admin/reload` was equally exposed.
 fn unauthenticated_mcp_warning(bearer_token_env: &str) -> String {
     format!(
-        "SECURITY: bearer token env var '{bearer_token_env}' is not set — {MCP_PATH}, \
+        "SECURITY: bearer token env var '{bearer_token_env}' (or '{bearer_token_env}_FILE') is \
+         not set — {MCP_PATH}, \
          {STATUS_PATH}, {METRICS_PATH} and {ADMIN_RELOAD_PATH} are all reachable WITHOUT \
          authentication. {MCP_PATH} will serve full document content to any caller; \
          {STATUS_PATH} and {METRICS_PATH} expose tag vocabularies, area names and document \
@@ -2041,8 +2042,14 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     // from exactly once.
     let shared_config: SharedConfig = config::shared_config(Arc::clone(&config));
 
-    // Resolve git token early (reused by ensure_repo and later by WebhookState)
-    let git_pull_token = crate::secrets::git_token(&config)?;
+    // Resolve every `<NAME>` / `<NAME>_FILE` secret up front, so a bad combination
+    // refuses to start. The git token is reused by ensure_repo and later by
+    // WebhookState.
+    let crate::secrets::StartupSecrets {
+        git_token: git_pull_token,
+        bearer_token,
+        webhook_secret,
+    } = crate::secrets::StartupSecrets::resolve(&config)?;
 
     // Auto-clone if git_url is set and data_path isn't a repo yet
     if let Some(ref git_url) = config.source.git_url {
@@ -2410,14 +2417,11 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     // Bearer token for MCP auth
     let decision = static_bearer_token(
         &config.mcp.bearer_token_env,
-        crate::secrets::resolve_secret(&config.mcp.bearer_token_env)?,
+        bearer_token,
         config.mcp.oauth.as_ref(),
         config.mcp.allow_unauthenticated,
     )?;
     let auth = auth_layer(decision, oauth)?;
-
-    // Webhook state — optional, skip if secret is unset/empty
-    let webhook_secret = crate::secrets::resolve_secret(&config.webhook.secret_env)?;
 
     // Rate limiting (per-IP via SmartIpKeyExtractor for proxy-aware extraction).
     //
@@ -2481,7 +2485,8 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         info!("  Webhook endpoint: /hooks/reindex");
     } else {
         warn!(
-            "Environment variable '{}' is not set or empty — webhook endpoint disabled",
+            "Environment variable '{0}' (or '{0}_FILE') is not set or empty — webhook endpoint \
+             disabled",
             config.webhook.secret_env
         );
     }
