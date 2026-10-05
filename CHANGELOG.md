@@ -14,6 +14,8 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-05
+
 ### Deployment
 
 - **Docker secrets: `<NAME>_FILE` for the secret env vars** (fix #332).
@@ -560,6 +562,7 @@ operator upgrading an old deployment needs to know happened at some point:
   upgrade note](deploy/USAGE.md#backward-compatibility-and-upgrade-note) in
   `deploy/USAGE.md` for the full detail.
 
-[Unreleased]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/St0nefish/mcp-md-wiki/releases/tag/v0.1.0
