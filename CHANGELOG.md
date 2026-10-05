@@ -16,6 +16,14 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ### MCP tools
 
+- **`write_document`'s `frontmatter_patch` keeps untouched formatting** (fix #269). A patch
+  used to re-serialize the whole frontmatter block, alphabetizing keys, flattening `>-`
+  block scalars to one long line, dropping comments and rewriting `[a, b]` lists. It now
+  edits the document's own block in place: fields the patch does not change are left
+  byte-for-byte as written, a changed field is re-rendered where it sits, and a new field
+  is appended. A dot-path edit re-renders its whole top-level field, and comments on a
+  changed field are dropped. A block that cannot be edited safely (top-level flow style,
+  anchors, duplicate keys) still gets the old full re-render. No reindex is needed.
 - **`update_schema` edits nested fields in place** (fix #268). `field` is a dot-path, but it
   was used as a literal top-level key, so editing `planning.method` created a sibling
   `planning.method` key beside the nested `planning` → `method` declaration. Both flattened
