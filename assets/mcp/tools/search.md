@@ -1,4 +1,4 @@
-Find documents. With `query`, results are ranked by semantic relevance.
+Find documents. With `query`, results are ranked by relevance.
 
 Narrow with `filters`, keyed by frontmatter field (dot-paths for nested fields):
 a scalar means equals, an array any-of, an object all-of or a numeric range

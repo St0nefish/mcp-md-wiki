@@ -291,15 +291,26 @@ pub const ENUMERATION_SENTENCE: &str = "Without a `query`, every match is return
 /// `(property, None)` to remove a property that no enabled granularity can
 /// use. Applied by `KbSearchServer::overlay_input_schema` on every
 /// `list_tools`/`get_tool`, alongside the `granularity` property's own text.
-/// Never names a granularity that isn't enabled.
+/// Never names a granularity that isn't enabled. `hybrid` is `search.hybrid`:
+/// the `query` text says the query is matched literally as well as
+/// semantically only when the sparse arm actually runs (#309).
 pub fn search_property_descriptions(
     effective: &[Granularity],
+    hybrid: bool,
 ) -> Vec<(&'static str, Option<String>)> {
     let enumeration = enumeration_available(effective);
     let text = |s: &str| Some(s.to_string());
+    let query_lead = if hybrid {
+        "Query, matched by literal terms and by semantic similarity."
+    } else {
+        "Semantic query."
+    };
     let mut out = Vec::new();
     if enumeration {
-        out.push(("query", text("Semantic query. Omit to list every match.")));
+        out.push((
+            "query",
+            Some(format!("{query_lead} Omit to list every match.")),
+        ));
         out.push((
             "offset",
             text(
@@ -320,7 +331,10 @@ pub fn search_property_descriptions(
         ));
         out.push(("min_score", text("Relevance floor (with a query).")));
     } else {
-        out.push(("query", text("Semantic query. Required on this server.")));
+        out.push((
+            "query",
+            Some(format!("{query_lead} Required on this server.")),
+        ));
         out.push((
             "offset",
             text(
@@ -692,6 +706,40 @@ fn is_symlink(path: &Path) -> bool {
 mod tests {
     use super::*;
     const ALL: [Granularity; 3] = Granularity::ALL;
+
+    fn query_description(effective: &[Granularity], hybrid: bool) -> String {
+        search_property_descriptions(effective, hybrid)
+            .into_iter()
+            .find(|(name, _)| *name == "query")
+            .and_then(|(_, text)| text)
+            .expect("query description is always set")
+    }
+
+    #[test]
+    fn query_description_names_literal_matching_when_hybrid() {
+        for effective in [&ALL[..], &[Granularity::Chunk][..]] {
+            let text = query_description(effective, true);
+            assert!(text.contains("literal terms"), "{text}");
+            assert!(!text.contains("Semantic query"), "{text}");
+        }
+    }
+
+    #[test]
+    fn query_description_stays_semantic_when_not_hybrid() {
+        for effective in [&ALL[..], &[Granularity::Chunk][..]] {
+            let text = query_description(effective, false);
+            assert!(text.starts_with("Semantic query."), "{text}");
+            assert!(!text.contains("literal"), "{text}");
+        }
+    }
+
+    #[test]
+    fn query_description_keeps_the_enumeration_tail() {
+        assert!(query_description(&ALL, true).ends_with("Omit to list every match."));
+        assert!(
+            query_description(&[Granularity::Chunk], true).ends_with("Required on this server.")
+        );
+    }
 
     // --- compiled bases ------------------------------------------------
 
