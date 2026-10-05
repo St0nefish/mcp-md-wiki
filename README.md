@@ -378,7 +378,7 @@ On create, a **near-duplicate check** runs first: it embeds the content and, if 
 | `content` | string | conditional | Full-replace mode: whole file, including frontmatter |
 | `old_string` | string | conditional | Surgical mode: exact text to find (must be unique) |
 | `new_string` | string | conditional | Surgical mode: replacement text |
-| `frontmatter_patch` | object[] | conditional | Structured frontmatter edits, body untouched: `{operation, field, value}` / `{operation, field, values}` applied in order, `operation` one of `set_field`, `remove_field`, `add_values`, `remove_values`, `field` a dot-path |
+| `frontmatter_patch` | object[] | conditional | Structured frontmatter edits, body untouched, fields not changed keep their exact formatting (a dot-path re-renders its whole top-level field): `{operation, field, value}` / `{operation, field, values}` applied in order, `operation` one of `set_field`, `remove_field`, `add_values`, `remove_values`, `field` a dot-path |
 | `append` | string | conditional | Text added to the end of the body, separated by exactly one newline; never lands inside the frontmatter |
 | `new_path` | string | no | Relocate here; combines with any edit mode, or stands alone for a pure move (or directory move) |
 | `expected_hash` | string | no | Stale-read guard: `content_hash` from a prior `get_document` |

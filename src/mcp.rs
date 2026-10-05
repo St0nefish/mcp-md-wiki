@@ -1647,7 +1647,10 @@ pub struct WriteDocumentParams {
     /// `remove_field` deletes a field (errors if it is not set);
     /// `add_values` appends to a list field, creating it if absent,
     /// de-duplicated (`values`); `remove_values` removes from a list field
-    /// (errors if it is absent). Combines with `append` (the patch applies
+    /// (errors if it is absent). Fields the patch does not change keep their
+    /// exact formatting, order and comments; a changed field is re-rendered
+    /// (a dot-path re-renders its whole top-level field, and comments on a
+    /// changed field are dropped). Combines with `append` (the patch applies
     /// first), not with `content` or `old_string`/`new_string`.
     /// `expected_hash` still guards the whole file.
     #[serde(default, skip_serializing_if = "Option::is_none")]

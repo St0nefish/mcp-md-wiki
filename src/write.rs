@@ -761,6 +761,12 @@ fn remove_by_dotpath(frontmatter: &mut HashMap<String, serde_json::Value>, path:
 /// Render a frontmatter map back to a `---`-delimited YAML block (including
 /// both delimiters and the trailing newline after the closing one).
 ///
+/// This is the whole-block path: used when a document has no frontmatter yet,
+/// and as the fallback when [`splice_frontmatter_block`] cannot safely edit
+/// the author's own block in place (#269). Everything below describes what
+/// THIS path costs; the splice path preserves order, comments and block
+/// scalars for fields the patch did not touch.
+///
 /// Keys are sorted (`BTreeMap`) before serializing — the exact same reasoning
 /// as `SchemaFile::to_yaml`'s identical `BTreeMap` conversion: `HashMap`
 /// iteration order is unspecified (and randomized per-process), so
@@ -790,6 +796,146 @@ fn render_frontmatter_block(
         .map(|line| format!("{}{newline}", line.trim_end_matches('\n')))
         .collect();
     Ok(format!("---{newline}{converted}---{newline}"))
+}
+
+/// Render one top-level frontmatter entry (`key: value`, however many lines
+/// the value needs), every line terminated with `newline`.
+fn render_frontmatter_entry(
+    key: &str,
+    value: &serde_json::Value,
+    newline: &str,
+) -> Result<String, String> {
+    let single: BTreeMap<&str, &serde_json::Value> = BTreeMap::from([(key, value)]);
+    let yaml = serde_yaml_ng::to_string(&single)
+        .map_err(|e| format!("failed to serialize frontmatter: {e}"))?;
+    Ok(yaml
+        .split_inclusive('\n')
+        .map(|line| format!("{}{newline}", line.trim_end_matches('\n')))
+        .collect())
+}
+
+/// The key a top-level frontmatter line introduces, or `None` when the line
+/// is not a plain `key:` line this splicer understands.
+///
+/// Only block-style mappings are recognized: a line opening with a flow
+/// (`{`/`[`), anchor, alias, tag, directive or block-scalar indicator is not
+/// a key line, so the caller reads it as "unsure" and falls back.
+fn top_level_key(line: &str) -> Option<String> {
+    let first = line.chars().next()?;
+    if first.is_whitespace() || "#-{[&*!?|>%@`,]}".contains(first) {
+        return None;
+    }
+    if first == '"' || first == '\'' {
+        let close = line[1..].find(first)? + 1;
+        let rest = &line[close + 1..];
+        if !(rest.starts_with(':') && (rest.len() == 1 || rest[1..].starts_with(' '))) {
+            return None;
+        }
+        return serde_yaml_ng::from_str::<String>(&line[..=close]).ok();
+    }
+    let colon = line
+        .char_indices()
+        .find(|&(i, c)| c == ':' && (i + 1 == line.len() || line[i + 1..].starts_with(' ')))?
+        .0;
+    let key = line[..colon].trim_end();
+    (!key.is_empty() && key != "<<").then(|| key.to_string())
+}
+
+/// Rewrite `old_block` (the original `---`…`---` frontmatter, byte-exact) so
+/// that only the top-level fields that differ between `original` and
+/// `updated` change, keeping every other byte — key order, comments, block
+/// scalars, flow lists, blank lines — exactly as authored.
+///
+/// A top-level entry is its `key:` line plus every following line up to the
+/// next `key:` line (so a block scalar's body, a nested map and a block list
+/// all travel with their key). Trailing blank and `#` comment lines of an
+/// entry are kept when the entry is re-rendered or removed, since they
+/// usually describe what follows. A changed field is re-rendered in place with
+/// `serde_yaml_ng`, so a nested edit (`planning.role`) re-renders its whole
+/// top-level field; a new field is appended in sorted order; a removed one is
+/// dropped.
+///
+/// Returns `None` whenever the block is not plainly segmentable (a line at
+/// column 0 that is neither a key, comment nor list item; tab indentation;
+/// duplicate keys; a key the parsed map disagrees about). The caller treats
+/// that as "fall back to a full re-render", and also re-parses whatever this
+/// returns before trusting it.
+fn splice_frontmatter_block(
+    old_block: &str,
+    original: &HashMap<String, serde_json::Value>,
+    updated: &HashMap<String, serde_json::Value>,
+    newline: &str,
+) -> Option<String> {
+    let lines: Vec<&str> = old_block.split_inclusive('\n').collect();
+    let (open, rest) = lines.split_first()?;
+    let (close, inner) = rest.split_last()?;
+    if !close.trim_end_matches(['\r', '\n']).eq("---") {
+        return None;
+    }
+
+    // (key, lines) per entry; `preamble` is whatever precedes the first key.
+    let mut preamble = String::new();
+    let mut entries: Vec<(String, Vec<&str>)> = Vec::new();
+    for line in inner {
+        let bare = line.trim_end_matches(['\r', '\n']);
+        if bare.starts_with('\t') || bare.starts_with(" \t") {
+            return None;
+        }
+        if let Some(key) = top_level_key(bare) {
+            if entries.iter().any(|(k, _)| *k == key) {
+                return None;
+            }
+            entries.push((key, vec![line]));
+            continue;
+        }
+        let first = bare.chars().next();
+        let continuation = bare.trim().is_empty()
+            || first.is_some_and(|c| c.is_whitespace() || c == '#' || c == '-');
+        if !continuation {
+            return None;
+        }
+        match entries.last_mut() {
+            Some((_, body)) => body.push(line),
+            None if bare.trim().is_empty() || first == Some('#') => preamble.push_str(line),
+            None => return None,
+        }
+    }
+
+    // The segmentation must agree with the parsed map about which keys exist.
+    if entries.len() != original.len() || entries.iter().any(|(k, _)| !original.contains_key(k)) {
+        return None;
+    }
+
+    let mut out = String::from(*open);
+    out.push_str(&preamble);
+    for (key, body) in &entries {
+        let unchanged = original.get(key) == updated.get(key);
+        if unchanged {
+            body.iter().for_each(|l| out.push_str(l));
+            continue;
+        }
+        let tail_start = body
+            .iter()
+            .rposition(|l| {
+                let b = l.trim_end_matches(['\r', '\n']);
+                !(b.trim().is_empty() || b.starts_with('#'))
+            })
+            .map_or(1, |i| i + 1);
+        if let Some(value) = updated.get(key) {
+            out.push_str(&render_frontmatter_entry(key, value, newline).ok()?);
+        }
+        body[tail_start..].iter().for_each(|l| out.push_str(l));
+    }
+    let mut added: Vec<&String> = updated
+        .keys()
+        .filter(|k| !original.contains_key(*k))
+        .collect();
+    added.sort();
+    for key in added {
+        out.push_str(&render_frontmatter_entry(key, &updated[key], newline).ok()?);
+    }
+    out.push_str(close);
+    Some(out)
 }
 
 /// The line ending `content` uses, for round-tripping a rewrite through it.
@@ -844,6 +990,7 @@ pub fn apply_frontmatter_patch(
     let had_frontmatter = !fm_block.is_empty();
 
     let (mut frontmatter, _) = validate::parse_frontmatter_raw(old_content);
+    let original = frontmatter.clone();
 
     for edit in edits {
         match edit {
@@ -898,7 +1045,20 @@ pub fn apply_frontmatter_patch(
         }
     }
 
-    let new_fm_block = render_frontmatter_block(&frontmatter, detect_newline(old_content))?;
+    // Splice the edit into the author's own block when that is provably
+    // safe; the re-parse is what makes it provable, so a segmentation the
+    // splicer got wrong degrades to the full re-render instead of corrupting.
+    let newline = detect_newline(old_content);
+    let spliced = if had_frontmatter {
+        splice_frontmatter_block(fm_block, &original, &frontmatter, newline)
+            .filter(|block| validate::parse_frontmatter_raw(block).0 == frontmatter)
+    } else {
+        None
+    };
+    let new_fm_block = match spliced {
+        Some(block) => block,
+        None => render_frontmatter_block(&frontmatter, newline)?,
+    };
 
     if had_frontmatter {
         Ok(format!("{new_fm_block}{body}"))
@@ -4746,6 +4906,131 @@ mod tests {
         assert!(
             result.contains("# Body\r\ntext\r\n"),
             "body must survive byte-exact: {result:?}"
+        );
+    }
+
+    fn set(field: &str, value: serde_json::Value) -> FrontmatterEdit {
+        FrontmatterEdit::SetField {
+            field: field.into(),
+            value,
+        }
+    }
+
+    const FOLDED_DOC: &str = concat!(
+        "---\n",
+        "title: Samosadillas\n",
+        "description: >-\n",
+        "    Curry-spiced filling folded into tortillas\n",
+        "    and pan-fried until crisp.\n",
+        "# the role drives meal planning\n",
+        "type: recipe\n",
+        "tags: [skillet, appetizer]\n",
+        "\n",
+        "planning:\n",
+        "  servings: 16\n",
+        "  scale_limit: >-\n",
+        "    The batch already sits at the fridge ceiling\n",
+        "    from one cook.\n",
+        "---\n\n# Body\n"
+    );
+
+    /// #269: a patch must leave fields it did not touch byte-for-byte alone.
+    #[test]
+    fn frontmatter_patch_preserves_untouched_formatting() {
+        let new =
+            apply_frontmatter_patch(FOLDED_DOC, &[set("type", serde_json::json!("dish"))]).unwrap();
+        assert_eq!(new, FOLDED_DOC.replace("type: recipe", "type: dish"));
+    }
+
+    #[test]
+    fn frontmatter_patch_rerenders_only_the_changed_field_in_place() {
+        let new =
+            apply_frontmatter_patch(FOLDED_DOC, &[set("tags", serde_json::json!(["skillet"]))])
+                .unwrap();
+        // Key order, the `>-` blocks and the comment survive; the edited
+        // list moves from flow to block style and the blank line stays.
+        assert!(new.starts_with("---\ntitle: Samosadillas\ndescription: >-\n    Curry"));
+        assert!(new.contains(
+            "# the role drives meal planning\ntype: recipe\ntags:\n- skillet\n\nplanning:"
+        ));
+        assert!(new.contains("  scale_limit: >-\n    The batch already"));
+        assert!(new.ends_with("---\n\n# Body\n"));
+    }
+
+    #[test]
+    fn frontmatter_patch_nested_edit_rerenders_its_top_level_field_only() {
+        let new = apply_frontmatter_patch(
+            FOLDED_DOC,
+            &[set("planning.servings", serde_json::json!(8))],
+        )
+        .unwrap();
+        assert!(new.contains("description: >-\n    Curry-spiced"), "{new}");
+        assert!(new.contains("tags: [skillet, appetizer]\n"), "{new}");
+        let (fm, _) = validate::parse_frontmatter_raw(&new);
+        assert_eq!(fm["planning"]["servings"], 8);
+    }
+
+    #[test]
+    fn frontmatter_patch_remove_field_drops_the_whole_entry_and_appends_new_keys() {
+        let new = apply_frontmatter_patch(
+            FOLDED_DOC,
+            &[
+                FrontmatterEdit::RemoveField {
+                    field: "description".into(),
+                },
+                set("status", serde_json::json!("active")),
+            ],
+        )
+        .unwrap();
+        assert!(!new.contains("Curry-spiced"), "{new}");
+        assert!(new.contains("status: active\n---\n"), "{new}");
+        assert!(
+            new.starts_with("---\ntitle: Samosadillas\n# the role"),
+            "{new}"
+        );
+    }
+
+    #[test]
+    fn frontmatter_patch_crlf_splice_keeps_every_line_crlf() {
+        let doc =
+            "---\r\ntitle: X\r\nnote: >-\r\n  a\r\n  b\r\nstatus: draft\r\n---\r\n\r\nBody\r\n";
+        let new =
+            apply_frontmatter_patch(doc, &[set("status", serde_json::json!("active"))]).unwrap();
+        assert_eq!(new, doc.replace("draft", "active"));
+    }
+
+    #[test]
+    fn frontmatter_patch_falls_back_for_flow_style_top_level() {
+        let doc = "---\n{title: X, status: draft}\n---\n\nBody\n";
+        let new =
+            apply_frontmatter_patch(doc, &[set("status", serde_json::json!("active"))]).unwrap();
+        let (fm, body) = validate::parse_frontmatter_raw(&new);
+        assert_eq!(fm["status"], "active");
+        assert_eq!(fm["title"], "X");
+        assert_eq!(body.trim(), "Body");
+    }
+
+    #[test]
+    fn frontmatter_patch_falls_back_for_anchors_and_merge_keys() {
+        let doc = "---\nbase: &b\n  a: 1\nderived:\n  <<: *b\n  c: 2\n---\n\nBody\n";
+        let new = apply_frontmatter_patch(doc, &[set("x", serde_json::json!(1))]).unwrap();
+        let (before, _) = validate::parse_frontmatter_raw(doc);
+        let (after, _) = validate::parse_frontmatter_raw(&new);
+        assert_eq!(after["x"], 1);
+        assert_eq!(after["base"], before["base"]);
+        assert_eq!(after["derived"], before["derived"]);
+    }
+
+    #[test]
+    fn splice_refuses_a_block_it_cannot_segment() {
+        let original: HashMap<String, serde_json::Value> = HashMap::new();
+        assert!(
+            splice_frontmatter_block("---\nstray text\n---\n", &original, &original, "\n")
+                .is_none()
+        );
+        assert!(
+            splice_frontmatter_block("---\na: 1\na: 2\n---\n", &original, &original, "\n")
+                .is_none()
         );
     }
 
