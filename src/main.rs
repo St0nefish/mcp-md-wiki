@@ -14,6 +14,7 @@ mod reload;
 mod rerank;
 mod retrieval;
 mod schema;
+mod secrets;
 mod server;
 mod sparse;
 mod state;

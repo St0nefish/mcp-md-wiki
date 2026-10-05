@@ -3306,6 +3306,13 @@ impl KbSearchServer {
     ) -> Result<RawFileOutcome, McpError> {
         let config = self.config();
 
+        // Resolved before anything touches the filesystem: a bad `<NAME>_FILE`
+        // (both forms set, empty or unreadable file) must fail the call with nothing
+        // written, since an early return after the rename below would leave an
+        // uncommitted schema file in the working tree with no rollback.
+        let token = crate::secrets::git_token(&config)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         // Same resolver the document write tools use. Joining the data root with a
         // caller-supplied path is NOT sufficient on its own: the knowledge base is a
         // synced git repo, and git materializes tracked symlinks on checkout, so a
@@ -3354,10 +3361,6 @@ impl KbSearchServer {
                 error!("Failed to install '{}': {}", abs_path.display(), e);
                 McpError::internal_error(format!("Failed to write file: {}", e), None)
             })?;
-
-        let token = std::env::var(&config.source.git_token_env)
-            .ok()
-            .filter(|s| !s.is_empty());
 
         // `commit_and_sync` distinguishes WHERE it failed — see `git::CommitSyncError`
         // — and the two phases demand opposite handling, exactly as in
@@ -4719,9 +4722,8 @@ impl KbSearchServer {
             ));
         }
 
-        let token = std::env::var(&config.source.git_token_env)
-            .ok()
-            .filter(|s| !s.is_empty());
+        let token = crate::secrets::git_token(&config)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         // Only opened for a MOVE (`dest_path.is_some()`) — `write::write_document`
         // itself never reads `deps.state` outside `write_document_move`, so a
@@ -4840,9 +4842,8 @@ impl KbSearchServer {
         }
 
         let config = self.config();
-        let token = std::env::var(&config.source.git_token_env)
-            .ok()
-            .filter(|s| !s.is_empty());
+        let token = crate::secrets::git_token(&config)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         // Best-effort, same as `run_document_write`'s own lazy state-DB open for a
         // single-document MOVE: a state DB that fails to open degrades the
@@ -5347,9 +5348,8 @@ impl KbSearchServer {
         }
 
         let config = self.config();
-        let token = std::env::var(&config.source.git_token_env)
-            .ok()
-            .filter(|s| !s.is_empty());
+        let token = crate::secrets::git_token(&config)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let deps = WriteDeps {
             retrieval: self.deps(),
@@ -5548,9 +5548,8 @@ impl KbSearchServer {
             .to_string_lossy()
             .into_owned();
 
-        let token = std::env::var(&config.source.git_token_env)
-            .ok()
-            .filter(|s| !s.is_empty());
+        let token = crate::secrets::git_token(&config)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         // (#229) Best-effort, same as `run_document_write`'s and
         // `write_document_move_dir`'s own lazy state-DB opens: a state DB that

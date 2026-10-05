@@ -840,6 +840,10 @@ ui:
 #   WEBHOOK_SECRET      — named by webhook.secret_env
 #   MCP_BEARER_TOKEN    — named by mcp.bearer_token_env
 #
+# GIT_PULL_TOKEN, WEBHOOK_SECRET and MCP_BEARER_TOKEN (under whatever name the
+# *_env field gives them) also accept `<NAME>_FILE=/run/secrets/<file>` for Docker
+# secrets. Setting both <NAME> and <NAME>_FILE fails startup.
+#
 # Connection wiring (required, no default):
 #   EMBEDDING_BASE_URL  — base URL of the embedding API
 #   QDRANT_URL          — Qdrant gRPC endpoint (port 6334, not REST 6333)

@@ -2961,9 +2961,7 @@ async fn index_paths_inner(config: &ResolvedConfig, paths: &[PathBuf], force: bo
 
     // Ensure git repo exists if git_url is configured
     if let Some(ref git_url) = config.source.git_url {
-        let token = std::env::var(&config.source.git_token_env)
-            .ok()
-            .filter(|s| !s.is_empty());
+        let token = crate::secrets::git_token(config)?;
         crate::git::ensure_repo(
             &crate::git::lock_git().await,
             git_url,
