@@ -14,6 +14,8 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-06
+
 ### MCP tools
 
 - **`get_document` can return a document's git history** (closes #257). The new `history`
@@ -649,7 +651,8 @@ operator upgrading an old deployment needs to know happened at some point:
   upgrade note](deploy/USAGE.md#backward-compatibility-and-upgrade-note) in
   `deploy/USAGE.md` for the full detail.
 
-[Unreleased]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/St0nefish/mcp-md-wiki/releases/tag/v0.1.0
