@@ -16,6 +16,13 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ### MCP tools
 
+- **`get_document` can return a document's git history** (closes #257). The new `history`
+  parameter (commit count, clamped 1–100) adds `structured_content.history` and a text
+  summary: each commit's `sha`, author, `timestamp`, `subject` and the `Tool:`/`Operation:`
+  provenance trailers (`tool`, `operation`, `tool_authored`), so an agent can tell tool-made
+  edits from hand-made ones. This was previously reachable only through the web UI's
+  `/api/history`, which now shares the same response builder (its JSON is unchanged).
+  Still six tools; no config or reindex impact.
 - **`search`'s `query` description no longer calls retrieval semantic-only** (fix #309).
   The schema said "Semantic query." and the tool description "ranked by semantic
   relevance", although the default (`search.hybrid: true`) also matches literal terms. The

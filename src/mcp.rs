@@ -1314,6 +1314,54 @@ pub struct GetDocumentParams {
     /// sections. Not combinable with `start_line`/`end_line`.
     #[serde(default)]
     pub outline: Option<bool>,
+    /// Also return this document's own commit history, newest first, as many
+    /// commits as you name (at least 1, at most 100). Each commit has `sha`,
+    /// `author_name`, `author_email`, `timestamp` (Unix seconds), `subject`, and — for a commit
+    /// this server wrote — `tool` and `operation`; `tool_authored` is true when
+    /// both are present, false for a hand-made commit. Combinable with every
+    /// other parameter. Omit it and no history is read.
+    #[serde(default)]
+    pub history: Option<usize>,
+}
+
+/// One line per commit for `get_document`'s text block (the same data is in
+/// `structured_content.history`, for clients that render text only).
+fn render_history_text(history: &serde_json::Value) -> String {
+    if history["available"] != true {
+        return "\n\nHistory: unavailable (this knowledge base is not a git repository)."
+            .to_string();
+    }
+    let commits = history["commits"].as_array().map_or(&[][..], |c| &c[..]);
+    if commits.is_empty() {
+        return "\n\nHistory: no commits touch this document.".to_string();
+    }
+    let mut text = String::from("\n\nHistory (newest first):");
+    for c in commits {
+        let sha = c["sha"].as_str().unwrap_or("");
+        let when = chrono::DateTime::from_timestamp(c["timestamp"].as_i64().unwrap_or(0), 0)
+            .map_or_else(String::new, |d| d.format("%Y-%m-%d %H:%MZ").to_string());
+        let provenance = match (c["tool"].as_str(), c["operation"].as_str()) {
+            (Some(tool), Some(op)) => format!(" [{tool}/{op}]"),
+            _ => String::new(),
+        };
+        text.push_str(&format!(
+            "\n{} {} {}{} — {}",
+            sha.get(..8).unwrap_or(sha),
+            when,
+            c["author_name"].as_str().unwrap_or(""),
+            provenance,
+            c["subject"].as_str().unwrap_or(""),
+        ));
+    }
+    if history["truncated"] == true {
+        // At the cap, raising `history` cannot help — don't suggest it.
+        if history["limit"].as_u64() >= Some(retrieval::MAX_HISTORY_LIMIT as u64) {
+            text.push_str("\n(older commits not shown)");
+        } else {
+            text.push_str("\n(older commits not shown; raise `history`)");
+        }
+    }
+    text
 }
 
 /// `get_document`'s `Content::text` block for a resolved view (#286).
@@ -4643,7 +4691,23 @@ impl KbSearchServer {
                 structured.insert("content_hash".to_string(), serde_json::json!(content_hash));
                 structured.insert("links_out".to_string(), links_out);
                 structured.insert("links_in".to_string(), links_in);
-                let text = render_document_view_text(view, section_max_bytes);
+                let mut text = render_document_view_text(view, section_max_bytes);
+                // Opt-in (#257): a caller that did not ask pays no git
+                // subprocess and sees a byte-identical response.
+                if let Some(limit) = params.history {
+                    let data_path = self.canonical_data_path.to_string_lossy().into_owned();
+                    let history = retrieval::history_json(&data_path, Some(&rel_path), limit)
+                        .await
+                        .map_err(|e| {
+                            error!("get_document history failed for '{rel_path}': {e:#}");
+                            McpError::internal_error(
+                                "failed to read this document's git history".to_string(),
+                                None,
+                            )
+                        })?;
+                    text.push_str(&render_history_text(&history));
+                    structured.insert("history".to_string(), history);
+                }
                 let mut result = CallToolResult::success(vec![Content::text(text)]);
                 result.structured_content = Some(serde_json::Value::Object(structured));
                 Ok(result)
@@ -10381,6 +10445,120 @@ mod tests {
     fn range_test_server(tmp: &tempfile::TempDir) -> KbSearchServer {
         std::fs::write(tmp.path().join("range_doc.md"), RANGE_DOC).unwrap();
         schema_tool_server(tmp)
+    }
+
+    /// Run `git <args>` in `dir`, panicking on failure.
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.email=t@localhost",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    async fn get_with_history(
+        server: &KbSearchServer,
+        history: Option<usize>,
+    ) -> (String, serde_json::Value) {
+        let result = server
+            .get_document(Parameters(GetDocumentParams {
+                path: "range_doc.md".into(),
+                history,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected a text content block, got {other:?}"),
+        };
+        (text, result.structured_content.unwrap())
+    }
+
+    #[tokio::test]
+    async fn get_document_history_reports_provenance_for_this_document_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+        run_git(tmp.path(), &["init", "-q"]);
+        run_git(tmp.path(), &["add", "range_doc.md"]);
+        run_git(
+            tmp.path(),
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "docs: add range_doc.md\n\nTool: mcp-md-wiki\nOperation: write_document",
+            ],
+        );
+        std::fs::write(tmp.path().join("other.md"), "x").unwrap();
+        run_git(tmp.path(), &["add", "other.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "hand edit of other"]);
+
+        let (text, structured) = get_with_history(&server, Some(10)).await;
+
+        let history = &structured["history"];
+        assert_eq!(history["available"], true);
+        assert_eq!(history["path"], "range_doc.md");
+        let commits = history["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 1, "other.md's commit must not appear");
+        assert_eq!(commits[0]["tool"], "mcp-md-wiki");
+        assert_eq!(commits[0]["operation"], "write_document");
+        assert_eq!(commits[0]["tool_authored"], true);
+        assert_eq!(history["truncated"], false);
+        assert!(text.starts_with(RANGE_DOC), "document text comes first");
+        assert!(text.contains("[mcp-md-wiki/write_document]"), "{text}");
+        assert!(text.contains("docs: add range_doc.md"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_document_history_is_clamped_and_reports_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+        run_git(tmp.path(), &["init", "-q"]);
+        for n in 0..3 {
+            std::fs::write(tmp.path().join("range_doc.md"), format!("rev {n}\n")).unwrap();
+            run_git(tmp.path(), &["add", "range_doc.md"]);
+            run_git(tmp.path(), &["commit", "-q", "-m", &format!("rev {n}")]);
+        }
+
+        // 0 clamps up to 1, which leaves older commits unreported.
+        let (text, structured) = get_with_history(&server, Some(0)).await;
+        assert_eq!(structured["history"]["limit"], 1);
+        assert_eq!(structured["history"]["returned"], 1);
+        assert_eq!(structured["history"]["truncated"], true);
+        assert!(text.contains("older commits not shown"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_document_history_degrades_without_a_git_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        let (text, structured) = get_with_history(&server, Some(5)).await;
+
+        assert_eq!(structured["history"]["available"], false);
+        assert_eq!(structured["history"]["commits"], serde_json::json!([]));
+        assert!(text.contains("not a git repository"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_document_without_history_adds_no_history_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        let (text, structured) = get_with_history(&server, None).await;
+
+        assert_eq!(text, RANGE_DOC);
+        assert!(structured.get("history").is_none());
     }
 
     #[tokio::test]

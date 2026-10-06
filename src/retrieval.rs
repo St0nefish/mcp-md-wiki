@@ -1956,6 +1956,77 @@ pub fn document_view_json(view: &DocumentView) -> serde_json::Map<String, serde_
     map
 }
 
+/// Default commit count for a history listing (`/api/history`).
+pub const DEFAULT_HISTORY_LIMIT: usize = 20;
+/// Hard cap on one history listing — `git log -n` bounds the underlying walk
+/// to this directly, so it is also the actual bound on the work one request
+/// can cause, independent of the repository's total history (see
+/// `git::log_commits`).
+pub const MAX_HISTORY_LIMIT: usize = 100;
+
+/// One commit as reported by a history listing.
+#[derive(Debug, serde::Serialize)]
+struct CommitJson {
+    sha: String,
+    author_name: String,
+    author_email: String,
+    /// Unix seconds (committer time), left as a number for the client to format.
+    timestamp: i64,
+    subject: String,
+    tool: Option<String>,
+    operation: Option<String>,
+    /// Both provenance trailers present — the tool- vs hand-authored
+    /// distinction #185 is about, spelled out so no consumer re-derives it.
+    tool_authored: bool,
+}
+
+impl From<crate::git::CommitInfo> for CommitJson {
+    fn from(c: crate::git::CommitInfo) -> Self {
+        let tool_authored = c.is_tool_authored();
+        CommitJson {
+            sha: c.sha,
+            author_name: c.author_name,
+            author_email: c.author_email,
+            timestamp: c.timestamp,
+            subject: c.subject,
+            tool: c.tool,
+            operation: c.operation,
+            tool_authored,
+        }
+    }
+}
+
+/// The one JSON shape for a commit listing, shared by `get_document`'s
+/// `history` (#257) and `/api/history` so the two cannot drift: `available`,
+/// `path` (`null` for the whole repository), `commits`, `limit`, `returned`,
+/// `truncated`. `limit` is clamped to `1..=MAX_HISTORY_LIMIT`. A data
+/// directory that is not a git working copy yields `available: false` and no
+/// commits rather than an error (#185). Read-only, so it takes no `GitLock`.
+pub async fn history_json(
+    data_path: &str,
+    rel_path: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<serde_json::Value> {
+    let limit = limit.clamp(1, MAX_HISTORY_LIMIT);
+    if !crate::git::is_git_repo(data_path) {
+        return Ok(serde_json::json!({"available": false, "path": rel_path, "commits": []}));
+    }
+    let (commits, truncated) = match rel_path {
+        Some(p) => crate::git::document_history(data_path, p, limit).await?,
+        None => crate::git::recent_commits(data_path, limit).await?,
+    };
+    let returned = commits.len();
+    let commits: Vec<CommitJson> = commits.into_iter().map(CommitJson::from).collect();
+    Ok(serde_json::json!({
+        "available": true,
+        "path": rel_path,
+        "commits": commits,
+        "limit": limit,
+        "returned": returned,
+        "truncated": truncated,
+    }))
+}
+
 /// Structured errors from `search`, distinguishing the failing stage so callers
 /// can surface stage-specific messages.
 #[derive(Debug)]
