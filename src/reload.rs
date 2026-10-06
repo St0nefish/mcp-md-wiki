@@ -280,7 +280,8 @@ const DIFF_TABLE: &[DiffField] = &[
             ConsumerEntry {
                 effect: ReloadEffect::Applied,
                 setting: "indexing.exclude",
-                note: "read fresh per indexing run by ingest::discover_files (ingest.rs); \
+                note: "read fresh per indexing run by ingest::discover_files (ingest.rs), \
+                       and by index_paths_generic, which purges a newly excluded file (#266); \
                        unlike indexing.include, no MCP path filter bakes this in.",
             },
             ConsumerEntry {
@@ -299,7 +300,8 @@ const DIFF_TABLE: &[DiffField] = &[
             ConsumerEntry {
                 effect: ReloadEffect::Applied,
                 setting: "indexing.exclude_files",
-                note: "read fresh per indexing run by ingest::discover_files (ingest.rs).",
+                note: "read fresh per indexing run by ingest::discover_files (ingest.rs), \
+                       and by index_paths_generic, which purges a newly excluded file (#266).",
             },
             ConsumerEntry {
                 effect: ReloadEffect::Applied,

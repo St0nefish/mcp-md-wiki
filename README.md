@@ -497,8 +497,8 @@ Four HTTP endpoints, with different audiences and different auth:
 | Endpoint | Auth | Purpose |
 |---|---|---|
 | `/health` | open | Liveness/readiness. Reports Qdrant and embedding-service reachability only. Returns 503 when either is down. |
-| `/status` | bearer / OAuth | Full runtime state as JSON. |
-| `/metrics` | bearer / OAuth | The same data in Prometheus text exposition format. |
+| `/status` | bearer / OAuth | Full runtime state as JSON, including the running `version` and build `revision` (the image's tree hash, `unknown` outside a Docker build). |
+| `/metrics` | bearer / OAuth | The same data in Prometheus text exposition format; `kb_build_info{version,revision}` carries the build. |
 | `POST /admin/reload` | bearer / OAuth | Re-read and re-validate `config.yaml` and swap it in, without a restart. See [Config reload](#config-reload). |
 
 `/status`, `/metrics`, and `/admin/reload` require the same credential as `/mcp` — the static bearer token (`MCP_BEARER_TOKEN`) or, with `mcp.oauth` enabled, a valid OAuth access token — because unlike `/health` they enumerate tag vocabularies, area names and document counts (`/status`/`/metrics`) or can change how the write tools authenticate content and which webhook provider is trusted (`/admin/reload`) — none of that gets a weaker gate than `/mcp` itself. Scrape `/status`/`/metrics` with an `authorization` stanza:
@@ -516,7 +516,7 @@ scrape_configs:
 Both report:
 
 - **Indexing state** — whether a run is in flight right now, its phase (`discovering` → `scanning` → `embedding` → `backfilling` → `removing_orphans`), how far through it is, what triggered it (`cli`, `startup`, `webhook`, `write_tool`), and how long it has been going.
-- **Last run** — outcome, duration, error message on failure, and the full per-outcome tallies (`discovered`, `indexed`, `skipped`, `invalid`, `empty`, `read_errors`, `metadata_backfilled`, `frozen_by_broken_schema`, `broken_schemas`, `orphans_removed`).
+- **Last run** — outcome, duration, error message on failure, and the full per-outcome tallies (`discovered`, `indexed`, `skipped`, `invalid`, `empty`, `read_errors`, `metadata_backfilled`, `frozen_by_broken_schema`, `broken_schemas`, `orphans_removed` — files deleted from disk or newly excluded by `indexing.include`/`exclude`/`exclude_files`, which a reconcile purges from the index).
 - **Store counts** — `indexed_files` (state DB), `documents` (metadata index), and `qdrant_points`. `documents_missing_metadata` is the divergence between the first two; non-zero means the metadata index is behind and the next run will backfill it.
 - **Metadata breakdown** — document counts per value for each indexed field, widest document coverage first, plus a synthetic `area` field grouping by top-level directory. Fields are ordered by how many documents carry them rather than how many values they take, so a scoped schema's twenty recipe fields can't crowd out `type` and `status`. Broad vocabularies like `tags` report their most common values with `truncated: true`. `domain` is omitted (it is derived from the top-level folder, so it duplicates `area`), as are date and timestamp fields.
 - **Payload index health** — which Qdrant payload indexes are in place and which failed. Failures are non-fatal by design, so this is the only lasting signal that a filter may be slow or incomplete.

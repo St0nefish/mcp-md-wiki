@@ -6114,7 +6114,10 @@ impl ServerHandler for KbSearchServer {
             })
             .clone();
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::from_build_env())
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions(instructions)
     }
 
@@ -9390,6 +9393,51 @@ mod tests {
         let info = server.get_info();
         let returned = info.instructions.unwrap();
         assert_eq!(returned, custom_text);
+    }
+
+    #[test]
+    fn get_info_reports_correct_server_name_and_version() {
+        // Verify that serverInfo.name and .version come from CARGO_PKG_NAME
+        // and CARGO_PKG_VERSION, not from rmcp's build env (#277).
+        use rmcp::ServerHandler;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let instructions = Arc::new(RwLock::new("Test instructions".to_string()));
+
+        let qdrant_config = crate::config::ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test".into(),
+        };
+        let qdrant = Arc::new(QdrantStore::new(&qdrant_config).unwrap());
+        let embed_config = crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "test".into(),
+            api_key: None,
+            vector_size: 768,
+            batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
+        };
+        let embed = Arc::new(EmbedClient::new(&embed_config));
+
+        let server = KbSearchServer::new(
+            embed,
+            qdrant,
+            "test".into(),
+            tmp.path().to_path_buf(),
+            &["**/*.md".to_string()],
+            instructions,
+            crate::config::shared_config(make_test_resolved_config(tmp.path())),
+            empty_test_schema_cache(),
+            None,
+            Arc::new(crate::reindex::ReindexQueue::new()),
+            empty_test_description_overlay(),
+        )
+        .unwrap();
+
+        let info = server.get_info();
+        assert_eq!(info.server_info.name, env!("CARGO_PKG_NAME"));
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

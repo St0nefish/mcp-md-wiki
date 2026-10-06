@@ -48,6 +48,44 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   a flat dot-path key) is now rejected, which freezes that scope until the duplicate is
   removed. Previously one declaration was silently dropped. A schema already damaged by the
   old bug will show up this way.
+- **The MCP handshake names this server, not `rmcp`** (fix #277). `initialize` reported
+  `serverInfo` as `{"name":"rmcp","version":"1.8.0"}` because `Implementation::from_build_env()`
+  reads rmcp's own build environment. It now reports `mcp-md-wiki` and this crate's version.
+- **Server instructions no longer list `title`/`description` values** (fix #333). Both are
+  free text, so their `Available title: ...` line was one value per document and could push
+  the instructions past Claude Code's 2048-character cap by itself. Other fields, including
+  declared `values:`, are unchanged. `title` and `description` stay filterable.
+
+### Operations
+
+- **`/status` and `/metrics` report the running build** (fix #264). `/status` gains
+  `revision` and `kb_build_info` gains a `revision` label (`mcp-md-wiki status` prints it
+  too), so "is the release I just published the one that's running" is one `curl`. The value
+  is the image's `REVISION` build arg, i.e. the git **tree** hash the train tested, and equals
+  the `org.opencontainers.image.revision` label (it maps to the `:tree-<hash>` image). A plain
+  `cargo build` reports `unknown`. Dashboards keyed on the exact `kb_build_info{version=...}`
+  label set will see the extra label.
+- **`/api/history?commit=` returns 400 for an unknown revision** (fix #265). A nonexistent,
+  malformed or non-commit revision used to be a 500 `failed to read commit diff` that looked
+  like a server fault. It is now a 400 `unknown revision '<rev>'` logged at `warn`; a real git
+  failure is still a 500 logged at `error`. The revision is also resolved with
+  `--end-of-options`, so a leading-dash value can no longer be read as a git option.
+
+### Indexing and retrieval correctness
+
+- **Newly excluded files are purged from the index** (fix #266). A file indexed before it
+  matched `indexing.exclude`/`exclude_files` (or stopped matching `include`) kept its
+  `indexed_files`, `documents`, `document_fields` and link rows and its Qdrant chunks
+  forever, so it stayed searchable and counted in `/api/graph` and enumeration totals. The
+  next reconcile (a restart, `/admin/reload`, or the periodic sweep) now purges it like a
+  deleted file; the file on disk is untouched. **Upgrade note:** an instance with such
+  stale rows shrinks on its first reconcile after upgrading, and narrowing `include` purges
+  everything it no longer matches. The purge fails closed: an unbuildable path filter, an
+  `include` with no valid pattern, a walk that finds no indexable file at all, or one that
+  would drop more than half of the indexed files while they are still on disk (an unmounted
+  subtree, an `include` typo) purges nothing by exclusion and logs an error; files really
+  gone from disk are still purged. To exclude a majority of the corpus on purpose, apply it in
+  steps or run `index --full`. Excluded paths are reported under `orphans_removed`.
 
 ### Security
 

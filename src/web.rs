@@ -25,7 +25,7 @@ use axum::{
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::config::{ResolvedConfig, SharedConfig};
 use crate::embed::{EmbedClient, QueryEmbedder};
@@ -1211,8 +1211,15 @@ async fn history_handler(
                 )
                     .into_response()
             }
-            Err(e) => {
-                error!("git::document_commit_diff failed for '{rel_path}' @ {commit}: {e:#}");
+            Err(git::CommitDiffError::UnknownRevision(rev)) => {
+                // #265: a revision that is not a commit is bad caller input.
+                // `{rev:?}`: the value is caller-supplied, so newlines/escapes must not
+                // reach the log verbatim.
+                warn!("git::document_commit_diff: unknown revision {rev:?} for {rel_path:?}");
+                bad_request(format!("unknown revision '{rev}'"))
+            }
+            Err(git::CommitDiffError::Git(e)) => {
+                error!("git::document_commit_diff failed for {rel_path:?} @ {commit:?}: {e:#}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": "failed to read commit diff"})),
@@ -2450,6 +2457,30 @@ mod tests {
             body["diff"].as_str().unwrap().contains("A content"),
             "diff should show the added content: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn history_handler_diff_mode_unknown_revision_is_a_400_naming_it() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        history_commit_tool_authored(&work, "docs/a.md", "# A content\n");
+        let state = test_state(&work.path().canonicalize().unwrap());
+
+        for rev in [
+            "0123456789abcdef0123456789abcdef01234567",
+            "not-a-rev",
+            "--foo",
+        ] {
+            let app = ui_router(state.clone());
+            let req = Request::builder()
+                .uri(format!("/api/history?path=docs/a.md&commit={rev}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "rev {rev}");
+            let body = body_json(resp).await;
+            assert_eq!(body["error"], format!("unknown revision '{rev}'"));
+        }
     }
 
     #[tokio::test]

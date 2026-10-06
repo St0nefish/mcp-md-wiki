@@ -140,6 +140,7 @@ discover files (relative paths)
         ▼ (after all files)
  orphan removal: delete Qdrant points + state rows
  for paths in state DB not found on disk
+ or now excluded by indexing.include/exclude/exclude_files
         │
         ▼
  log structured summary:
