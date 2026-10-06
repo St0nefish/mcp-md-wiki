@@ -34,27 +34,16 @@ stores buys you" below for what it saves you over a rebuild.
    result has `qdrant_points_deficit` at or near zero, and `indexed_files`/`documents`
    counts matching your corpus size.
 
-### `index --full` refuses to run: a frozen schema blocks recovery
+### `index --full` refuses to run: an invalid schema blocks recovery
 
-If any `.kb-schema.yaml` in the tree is currently invalid, `index --full` **refuses to
-run at all**, naming the offending directories rather than silently skipping them —
-because a full run drops and rebuilds the whole collection, and a frozen scope's
-documents would be skipped during that rebuild, permanently losing their vectors
-instead of merely staying stale:
+If any `.kb-schema.yaml` in the tree is currently invalid, `index` (with or without
+`--full`) **refuses to run at all**, before anything is dropped or cleared. The error
+starts `Refusing to index while a .kb-schema.yaml is invalid` and lists every invalid
+file with its reason, one `- <path>: <reason>` line each.
 
-```text
-Refusing a full reindex while 1 schema file(s) are invalid (food/recipes). A full
-run rebuilds the collection from scratch and cannot reindex frozen scopes, so
-their vectors would be lost. Fix the schema(s), or run a scoped/incremental
-index instead.
-```
-
-This means a disaster recovery can be blocked by a pre-existing, unrelated schema
-problem — see [Documents stop being reindexed after a schema edit](#documents-stop-being-reindexed-after-a-schema-edit-schema-frozen)
-below for how to find and fix it. Once the schema is valid again, retry
-`index --full`. An incremental `mcp-md-wiki index` (no `--full`) is unaffected by scopes
-frozen elsewhere in the tree and can make partial progress in the meantime, but it
-will not touch the frozen scope's own documents either way.
+So a disaster recovery can be blocked by a pre-existing, unrelated schema problem —
+see [The server refuses to start, or stops indexing, over a schema file](#the-server-refuses-to-start-or-stops-indexing-over-a-schema-file)
+below for how to fix it, then retry `index --full`.
 
 ### A Qdrant wipe with `state.db` intact
 
@@ -75,7 +64,7 @@ zeroes the whole collection at once rather than losing a handful of points. Dete
 is currently passive only — the check tells you something is wrong, it does not
 itself trigger a reindex. If you see this error, or a `kb_qdrant_points_deficit`
 metric that stays large and positive, run `mcp-md-wiki index --full` to force a full
-reconcile (subject to the frozen-schema caveat above).
+reconcile (subject to the invalid-schema caveat above).
 
 ### What backing up the derived stores buys you
 
@@ -371,34 +360,30 @@ The values are swapped — `target_chunk_size` must be the smaller value.
 
 **Fix:** Swap the values in your config. Example: `target_chunk_size: 1000`, `max_chunk_size: 1500`.
 
-### Documents stop being reindexed after a schema edit (schema frozen)
+### The server refuses to start, or stops indexing, over a schema file
 
-**Symptom.** You edit a `.kb-schema.yaml` — or introduce one that's broken from the
-start — and afterward, documents under that directory (and everything beneath it)
-simply stop updating. New files placed there never get indexed, edits to existing
-files never show up in search, and nothing crashes or logs an error against any
-individual document. `mcp-md-wiki index --full` may additionally refuse to run at all,
-printing something like:
+**Symptom.** One of:
 
-```text
-Refusing a full reindex while 1 schema file(s) are invalid (food/recipes). A full
-run rebuilds the collection from scratch and cannot reindex frozen scopes, so
-their vectors would be lost. Fix the schema(s), or run a scoped/incremental
-index instead.
-```
+- The server exits at startup with `Refusing to start: every .kb-schema.yaml in the
+  indexed tree must be valid`, followed by the list of invalid files.
+- A running server keeps working, but nothing new gets indexed: `GET /status` has a
+  `schema_error` entry, `kb_schema_invalid` is 1 in `/metrics`, and the log repeats
+  `schema rebuild REFUSED, keeping the previous schema` on every reconcile sweep, and
+  `Indexing run REFUSED: a .kb-schema.yaml is invalid` after a write. Writes still
+  succeed and validate against the previous schema.
+- Moving a directory fails with `the schema file '<path>' inside it is invalid`.
+- `mcp-md-wiki validate` or `mcp-md-wiki index` fails with `SCHEMA ERRORS`.
 
-**Cause.** A malformed `.kb-schema.yaml` **freezes its whole subtree**: nothing under
-it is indexed or re-indexed, and whatever was indexed there before is left exactly as
-it was — the scope never falls back to the parent directory's rules. This applies to
-any self-contradictory definition (an unrecognized `$`-prefixed placeholder in a
-`values:` list, a field declaring both a scalar `type` and nested `fields:`, malformed
-YAML) and, separately, to a schema file that's simply too large: any
-`.kb-schema.yaml` over 256 KB is refused outright on size alone — never read or
-parsed — and freezes its subtree the same way any other invalid schema does.
-
-Because a frozen scope is left untouched rather than reverted or flagged
-per-document, this is easy to miss at first: nothing about an individual file looks
-wrong, the directory just quietly stops moving.
+**Cause.** A `.kb-schema.yaml` in the indexed tree that is present must be valid, and
+an invalid one is never loaded: at startup that is fatal, and on a running server (the
+file arrived in a push) the rebuild is refused and the last schema that loaded cleanly
+stays in effect — which is also why a directory move carrying the broken file is
+refused. One in a hidden directory, or in one `indexing.exclude` rules out entirely, is
+never read. A file is invalid when it is malformed YAML, uses an
+unknown key (including under `dedup:`), contradicts itself (an unrecognized
+`$`-prefixed placeholder in a `values:` list, a field declaring both a scalar `type`
+and nested `fields:`, one path declared twice, a `dedup.threshold` outside 0.0–1.0), or
+is over 256 KB — refused on size alone, never read or parsed.
 
 **Diagnosis.** Run:
 
@@ -406,41 +391,23 @@ wrong, the directory just quietly stops moving.
 mcp-md-wiki validate
 ```
 
-Broken schema files are reported in a dedicated `SCHEMA ERRORS` section, naming the
-offending file and the parse error:
+Every invalid schema file is listed, with the parse or validation error:
 
 ```text
 SCHEMA ERRORS (1):
   food/recipes/.kb-schema.yaml: field 'planning' declares type 'text' but also nested fields; a field is either a value or a container, not both
-    -> documents in this scope are frozen and will not be indexed
 ```
 
-Every document sitting under a frozen scope is also listed separately, in a `FROZEN`
-section, so you can see exactly what's affected without recognizing the directory
-structure by eye:
+On a running server, `GET /status`'s `schema_error.files` carries the same list.
 
-```text
-FROZEN (12): under an invalid schema, not indexed, not validated
-  food/recipes/lasagna.md
-  food/recipes/chili.md
-  ...
-```
-
-**Fix.** Correct the named `.kb-schema.yaml` — usually a typo'd `$`-prefixed token in
-a `values:` list, a field that mixes a scalar `type` with nested `fields:`, or plain
-invalid YAML. See [Directory Schemas](USAGE.md#directory-schemas-kb-schemayaml) in
-USAGE.md for the authoring rules. Once the file is valid again, an incremental
-`mcp-md-wiki index` is enough to catch the scope back up — the fix is detected via the
-per-file `schema_hash` fingerprint, the same mechanism that revalidates a file after
-any other schema change, so there's no need to force a full reindex just to pick it up.
-
-While the schema is still broken, you can keep making progress everywhere else: an
-incremental `mcp-md-wiki index` is unaffected by scopes frozen elsewhere in the tree.
-`mcp-md-wiki index --full`, however, refuses to run at all while any scope is frozen — a
-full run drops and rebuilds the whole Qdrant collection, and a frozen scope's
-documents would be skipped during that rebuild, permanently losing their vectors
-rather than merely staying stale. Fix the schema first, or stick to incremental
-indexing until you do.
+**Fix.** Correct (or revert) the named `.kb-schema.yaml` in the knowledge base's git
+repository and push. `update_schema` can't edit a file that no longer parses, and the
+document tools refuse schema-file paths. See
+[Directory Schemas](USAGE.md#directory-schemas-kb-schemayaml) in USAGE.md for the
+authoring rules. On a running server the push's webhook queues a full reconcile: the
+rebuild succeeds, `schema_error` clears, and every document written or changed while
+the schema was refused is indexed. A server that would not start just needs starting
+again once the file is fixed.
 
 ### Qdrant connection refused
 

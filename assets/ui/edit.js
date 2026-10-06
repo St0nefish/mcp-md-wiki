@@ -287,14 +287,6 @@
   function renderSchema(schema) {
     els.schemaContent.innerHTML = "";
 
-    if (schema && schema.frozen) {
-      const p = document.createElement("p");
-      p.className = "muted";
-      p.textContent =
-        "This location's schema failed to parse — writes here will fail until it's fixed.";
-      els.schemaContent.appendChild(p);
-    }
-
     const fields = (schema && schema.fields) || [];
     if (!fields.length) {
       const p = document.createElement("p");

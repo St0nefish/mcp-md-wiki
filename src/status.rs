@@ -169,8 +169,6 @@ pub struct RunCounters {
     pub empty: u64,
     pub read_errors: u64,
     pub metadata_backfilled: u64,
-    pub frozen_by_broken_schema: u64,
-    pub broken_schemas: u64,
     pub orphans_removed: u64,
     /// Files rejected this run by `validation.strict` — see `ingest::FileOutcome::Rejected`.
     /// Unlike every other counter here, a non-zero value is not fully explained by this
@@ -183,7 +181,7 @@ pub struct RunCounters {
 impl RunCounters {
     /// Name/value pairs for the Prometheus encoder, so adding a counter above cannot
     /// silently fail to appear in `/metrics`.
-    pub fn as_pairs(&self) -> [(&'static str, u64); 11] {
+    pub fn as_pairs(&self) -> [(&'static str, u64); 9] {
         [
             ("discovered", self.discovered),
             ("indexed", self.indexed),
@@ -192,8 +190,6 @@ impl RunCounters {
             ("empty", self.empty),
             ("read_errors", self.read_errors),
             ("metadata_backfilled", self.metadata_backfilled),
-            ("frozen_by_broken_schema", self.frozen_by_broken_schema),
-            ("broken_schemas", self.broken_schemas),
             ("orphans_removed", self.orphans_removed),
             ("strict_rejected", self.strict_rejected),
         ]
@@ -268,6 +264,23 @@ pub struct StrictRejection {
     pub reason: String,
 }
 
+/// A runtime schema rebuild that was refused because one or more `.kb-schema.yaml`
+/// files are invalid. The server keeps serving the last schema cache that built
+/// cleanly; this records that it is doing so, since when, and what to fix.
+///
+/// Set by [`IndexStatus::record_schema_error`] on every failed rebuild (keeping the
+/// original `since`, refreshing `files`), cleared by
+/// [`IndexStatus::clear_schema_error`] on the next successful one. Never set at
+/// startup — an invalid schema there is fatal, so the process never gets this far.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchemaErrorState {
+    /// When the first refused rebuild of this unbroken streak happened.
+    pub since_unix: i64,
+    pub since_at: String,
+    /// Every invalid file the most recent refused rebuild found.
+    pub files: Vec<crate::schema::InvalidSchemaFile>,
+}
+
 /// Everything the status endpoints read, captured under one lock acquisition.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusSnapshot {
@@ -292,6 +305,11 @@ pub struct StatusSnapshot {
     /// [`StrictRejection`] for why an entry is removed on healing rather than marked ok.
     #[serde(default)]
     pub strict_rejected_files: BTreeMap<String, StrictRejection>,
+    /// Present while the server is serving a previous schema because the current
+    /// `.kb-schema.yaml` tree is invalid — see [`SchemaErrorState`]. Backs the
+    /// `kb_schema_invalid` and `kb_schema_invalid_files` gauges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_error: Option<SchemaErrorState>,
 }
 
 #[derive(Debug)]
@@ -322,9 +340,10 @@ struct Inner {
     last_success_unix: Option<i64>,
     payload_indexes: BTreeMap<String, PayloadIndexState>,
     strict_rejected_files: BTreeMap<String, StrictRejection>,
+    schema_error: Option<SchemaErrorState>,
     /// Sticky latch backing [`IndexStatus::is_bulk_indexing`]'s "results may be
     /// incomplete" note: true from the moment a reconcile scan
-    /// (`ingest::scan_for_dirty`) finds a non-frozen file chunked under a
+    /// (`ingest::scan_for_dirty`) finds a file chunked under a
     /// stale fingerprint ([`ReconcileScan::mark_rechunk`]), until
     /// [`IndexStatus::clear_stale_chunking`] confirms none remain — either a
     /// later scan finds none, or the run that consumed a scan's worklist
@@ -333,10 +352,6 @@ struct Inner {
     /// guard only spans one scan plus the one run right after it, which left
     /// the note dark during retry backoff, after a permanent give-up, and
     /// while a reload's queued reconcile waited for the worker to pick it up.
-    /// A frozen scope's stale files never set this — `scan_for_dirty` skips
-    /// them before the fingerprint check ever runs — so they can never pin
-    /// the note on forever, by design: they are also never re-chunked until
-    /// the schema is fixed, so nothing here is claiming otherwise.
     stale_chunking: bool,
 }
 
@@ -552,7 +567,7 @@ impl IndexStatus {
     /// a full rebuild, or a run whose path list has more than one entry (a
     /// reconcile that found many files dirty — e.g. every file after a
     /// chunking change). Also true from the moment a reconcile scan finds a
-    /// non-frozen file chunked under different chunking settings
+    /// file chunked under different chunking settings
     /// ([`ReconcileScan::mark_rechunk`]) until [`Self::clear_stale_chunking`]
     /// confirms none remain — so the scan itself, any retry backoff, a
     /// permanent give-up, and the wait for the next reconcile all keep this
@@ -572,7 +587,7 @@ impl IndexStatus {
     }
 
     /// Clear the "stale chunking remains" latch behind [`Self::is_bulk_indexing`].
-    /// Call once no non-frozen file is known to be chunked under a stale
+    /// Call once no file is known to be chunked under a stale
     /// fingerprint any more: `ingest::scan_and_index` calls this both when a
     /// reconcile scan itself found nothing to re-chunk (`!scan.rechunk_detected()`)
     /// and, separately, when the indexing run that consumed a scan's complete
@@ -584,6 +599,33 @@ impl IndexStatus {
     /// indexing run actually succeeds.
     pub fn clear_stale_chunking(&self) {
         self.with(|inner| inner.stale_chunking = false);
+    }
+
+    /// Record a refused runtime schema rebuild. Keeps the `since` of an already
+    /// recorded error (the streak's start) and replaces its file list with this
+    /// rebuild's, so `/status` always names what is invalid now.
+    pub fn record_schema_error(&self, err: &crate::schema::SchemaBuildError) {
+        self.with(|inner| {
+            let since_unix = inner
+                .schema_error
+                .as_ref()
+                .map_or_else(unix_now, |prev| prev.since_unix);
+            inner.schema_error = Some(SchemaErrorState {
+                since_unix,
+                since_at: format_unix(since_unix),
+                files: err.invalid.clone(),
+            });
+        });
+    }
+
+    /// Clear the refused-rebuild record: a schema rebuild just succeeded.
+    pub fn clear_schema_error(&self) {
+        self.with(|inner| inner.schema_error = None);
+    }
+
+    /// The current refused-rebuild record, if any.
+    pub fn schema_error(&self) -> Option<SchemaErrorState> {
+        self.read(|inner| inner.schema_error.clone())
     }
 
     /// Start tracking one reconcile scan (`ingest::scan_for_dirty`) for
@@ -625,6 +667,7 @@ impl IndexStatus {
             last_success_at: inner.last_success_unix.map(format_unix),
             payload_indexes: inner.payload_indexes.clone(),
             strict_rejected_files: inner.strict_rejected_files.clone(),
+            schema_error: inner.schema_error.clone(),
         })
     }
 }
@@ -1037,14 +1080,10 @@ pub struct ReconcileScan<'a> {
 }
 
 impl ReconcileScan<'_> {
-    /// Record that the scan found a non-frozen file whose stored chunking
-    /// fingerprint differs from the current one: a chunking change (or an
-    /// upgrade) is about to re-chunk it, and while that happens documents not
-    /// yet reached lack current heading metadata. Idempotent. Never called
-    /// for a frozen scope's files — `scan_for_dirty` skips those before this
-    /// check ever runs, since they are never re-chunked until the schema is
-    /// fixed, and this latch must not stay on forever over a file that will
-    /// never be touched.
+    /// Record that the scan found a file whose stored chunking fingerprint
+    /// differs from the current one: a chunking change (or an upgrade) is
+    /// about to re-chunk it, and while that happens documents not yet reached
+    /// lack current heading metadata. Idempotent.
     pub fn mark_rechunk(&self) {
         if !self.rechunk.swap(true, Ordering::Relaxed) {
             self.status.with(|inner| inner.stale_chunking = true);
@@ -1440,17 +1479,46 @@ mod tests {
             empty: 5,
             read_errors: 6,
             metadata_backfilled: 7,
-            frozen_by_broken_schema: 8,
-            broken_schemas: 9,
-            orphans_removed: 10,
-            strict_rejected: 11,
+            orphans_removed: 8,
+            strict_rejected: 9,
         };
         let pairs = c.as_pairs();
         // Every field is distinct and non-zero above, so a missing or duplicated entry
         // in as_pairs() shows up as a sum mismatch.
-        assert_eq!(pairs.iter().map(|(_, v)| v).sum::<u64>(), 66);
+        assert_eq!(pairs.iter().map(|(_, v)| v).sum::<u64>(), 45);
         let names: std::collections::BTreeSet<_> = pairs.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 9);
+    }
+
+    #[test]
+    fn schema_error_keeps_its_start_across_refusals_and_clears_on_success() {
+        use crate::schema::{InvalidSchemaFile, SchemaBuildError};
+        let err = |path: &str| SchemaBuildError {
+            invalid: vec![InvalidSchemaFile {
+                path: path.into(),
+                reason: "bad".into(),
+            }],
+        };
+        let s = IndexStatus::new();
+        assert!(s.snapshot().schema_error.is_none());
+
+        s.record_schema_error(&err("a/.kb-schema.yaml"));
+        let first = s.schema_error().unwrap();
+        s.with(|inner| inner.schema_error.as_mut().unwrap().since_unix -= 100);
+        s.record_schema_error(&err("b/.kb-schema.yaml"));
+        let second = s.snapshot().schema_error.unwrap();
+        assert_eq!(
+            second.since_unix,
+            first.since_unix - 100,
+            "streak start kept"
+        );
+        assert_eq!(
+            second.files[0].path,
+            std::path::Path::new("b/.kb-schema.yaml")
+        );
+
+        s.clear_schema_error();
+        assert!(s.snapshot().schema_error.is_none());
     }
 
     #[test]

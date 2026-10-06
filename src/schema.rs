@@ -43,8 +43,10 @@ pub const SCHEMA_FILE_NAME: &str = ".kb-schema.yaml";
 /// YAML costs superlinear time to parse — hundreds of kilobytes can burn seconds of
 /// CPU before the parser's own recursion guard even rejects it — and this parse runs
 /// on every write, every instructions refresh, and every index run. A real schema is
-/// a few kilobytes; anything approaching this cap is not a schema.
-const MAX_SCHEMA_FILE_BYTES: u64 = 256 * 1024;
+/// a few kilobytes; anything approaching this cap is not a schema. A file over it
+/// is an invalid schema file like any other (see [`SchemaCache::build`]), and
+/// `update_schema` refuses to write one.
+pub(crate) const MAX_SCHEMA_FILE_BYTES: u64 = 256 * 1024;
 
 /// Declared type of a frontmatter field. Undeclared fields are not type-checked.
 #[derive(
@@ -306,11 +308,36 @@ impl FieldDef {
 pub struct SchemaFile {
     #[serde(default)]
     pub fields: BTreeMap<String, RawFieldDef>,
+    /// Per-directory override of the global `write.dedup_*` near-duplicate gate
+    /// (#272). Hand-edited; `update_schema` never writes it but preserves it. A
+    /// malformed block (unknown key, wrong type, threshold outside `0.0..=1.0`) is a
+    /// schema error like any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup: Option<RawDedup>,
+}
+
+/// The `dedup:` block of a `.kb-schema.yaml`. Each key is independently optional;
+/// an unset key inherits from the nearest ancestor that sets it, then from `write.*`
+/// in `config.yaml` (#272).
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawDedup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
 }
 
 impl SchemaFile {
     /// Check every definition for internal contradictions.
     pub fn validate_self(&self) -> Result<(), String> {
+        if let Some(threshold) = self.dedup.as_ref().and_then(|d| d.threshold)
+            && !(0.0..=1.0).contains(&threshold)
+        {
+            return Err(format!(
+                "dedup.threshold must be between 0.0 and 1.0, got {threshold}"
+            ));
+        }
         for (name, raw) in &self.fields {
             validate_raw(name, raw)?;
         }
@@ -333,7 +360,8 @@ impl SchemaFile {
     }
 }
 
-/// Reject definitions that contradict themselves before they can freeze a scope.
+/// Reject definitions that contradict themselves, so a schema file carrying one never
+/// loads.
 fn validate_raw(path: &str, raw: &RawFieldDef) -> Result<(), String> {
     if raw.fields.is_some()
         && let Some(ty) = raw.ty
@@ -560,8 +588,9 @@ fn flatten_raw(path: &str, raw: &RawFieldDef, out: &mut BTreeMap<String, RawFiel
 
 /// A constrained edit to a schema file.
 ///
-/// Deliberately not free-form text: a bad schema silently freezes a whole subtree, so
-/// callers describe intent and the server renders the YAML.
+/// Deliberately not free-form text: an invalid schema file stops the server from
+/// starting and is refused by a running one, so callers describe intent and the
+/// server renders the YAML.
 #[derive(Debug, Clone)]
 pub enum SchemaEdit {
     /// Add values to a field's permitted set, creating the field if absent.
@@ -656,7 +685,8 @@ impl SchemaFile {
         Ok(format!(
             "# Frontmatter schema for this directory and everything beneath it.\n\
              # Managed by the update_schema MCP tool; hand edits are fine but must stay\n\
-             # valid — a malformed file freezes indexing for this whole subtree.\n{doc}"
+             # valid — a malformed file stops the server from starting, and a running\n\
+             # server refuses it and keeps the previous schema.\n{doc}"
         ))
     }
 }
@@ -668,6 +698,12 @@ pub struct ResolvedSchema {
     /// Which schema file contributed each field's current definition. Drives error
     /// messages and `get_schema` provenance.
     pub origin: BTreeMap<String, String>,
+    /// Near-duplicate gate override from the `dedup:` cascade (#272). `None` means
+    /// "use `write.dedup_enabled`": the cache is built without `WriteConfig`, so the
+    /// global value is resolved at the gate, not baked in here.
+    pub dedup_enabled: Option<bool>,
+    /// As `dedup_enabled`, for `write.dedup_threshold`.
+    pub dedup_threshold: Option<f32>,
 }
 
 impl ResolvedSchema {
@@ -712,7 +748,11 @@ impl ResolvedSchema {
             .map(|k| (k.clone(), "config.yaml".to_string()))
             .collect();
 
-        Self { fields, origin }
+        Self {
+            fields,
+            origin,
+            ..Self::default()
+        }
     }
 
     /// Test-only accessor for the private merge, so validation tests can build a
@@ -755,9 +795,12 @@ impl ResolvedSchema {
             fields.insert(path, def);
         }
 
+        let dedup = child.dedup.as_ref();
         Self {
             fields,
             origin: origins,
+            dedup_enabled: dedup.and_then(|d| d.enabled).or(self.dedup_enabled),
+            dedup_threshold: dedup.and_then(|d| d.threshold).or(self.dedup_threshold),
         }
     }
 
@@ -788,6 +831,10 @@ impl ResolvedSchema {
     /// Used to detect that a document needs revalidating because the rules changed,
     /// even though its content did not. Must not depend on map iteration order, or
     /// every incremental run would look like a schema change.
+    ///
+    /// Deliberately excludes `dedup_enabled`/`dedup_threshold` (#272): the near-duplicate
+    /// gate affects neither validation nor indexing, so changing it must not mark a
+    /// subtree's documents for revalidation.
     pub fn fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -828,11 +875,120 @@ pub struct SchemaCache {
     /// Raw, unmerged schema files by governing directory, so a proposed edit can be
     /// re-cascaded exactly rather than approximated.
     raw: BTreeMap<PathBuf, SchemaFile>,
-    /// Directories whose schema file failed to parse, and why.
-    broken: BTreeMap<PathBuf, String>,
     root: ResolvedSchema,
     /// KB root, so a scope's raw schema file can be read back for editing.
     root_path: PathBuf,
+}
+
+/// One `.kb-schema.yaml` that [`SchemaCache::build`] refused, and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct InvalidSchemaFile {
+    /// KB-relative path of the schema file itself (not its governing directory).
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// Every invalid `.kb-schema.yaml` found by one [`SchemaCache::build`] walk, sorted
+/// by path (`read_dir` order is unspecified, and this list is shown in startup
+/// errors and `/status`). Never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaBuildError {
+    pub invalid: Vec<InvalidSchemaFile>,
+}
+
+impl std::fmt::Display for SchemaBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} invalid {} file(s); a schema file that is present must be valid:",
+            self.invalid.len(),
+            SCHEMA_FILE_NAME
+        )?;
+        for file in &self.invalid {
+            write!(f, "\n  - {}: {}", file.path.display(), file.reason)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SchemaBuildError {}
+
+/// True when `rel_path`'s file name is [`SCHEMA_FILE_NAME`] — a schema file, not a
+/// document, whichever directory it sits in.
+pub fn is_schema_file_path(rel_path: &Path) -> bool {
+    rel_path.file_name().is_some_and(|n| n == SCHEMA_FILE_NAME)
+}
+
+/// Parse and self-validate one `.kb-schema.yaml`'s text — the per-file check
+/// [`SchemaCache::build`] applies, and the reason it gives on failure. Also
+/// enforces [`MAX_SCHEMA_FILE_BYTES`] on the text itself, for callers that already
+/// hold the content (`write::move_directory`, checking the schema files it is about
+/// to carry along).
+pub(crate) fn parse_schema_text(text: &str) -> Result<SchemaFile, String> {
+    if text.len() as u64 > MAX_SCHEMA_FILE_BYTES {
+        return Err(format!(
+            "file is {} bytes, over the {} byte limit; a schema this large is not parsed",
+            text.len(),
+            MAX_SCHEMA_FILE_BYTES
+        ));
+    }
+    let file = serde_yaml_ng::from_str::<SchemaFile>(text).map_err(|e| e.to_string())?;
+    file.validate_self()?;
+    Ok(file)
+}
+
+/// Which directories' `.kb-schema.yaml` files are part of the schema tree (#272):
+/// every directory except a hidden one (any path component starting with `.`) and
+/// one whose every document `indexing.exclude` rules out
+/// ([`crate::ingest::PathFilter::excludes_dir`]). A schema in such a directory
+/// governs nothing that is indexed, so [`SchemaCache::build`] never reads it — it
+/// cannot stop startup or a rebuild — and a changed one never queues a full
+/// reconcile ([`Self::governs`]).
+///
+/// Fails OPEN: an `indexing` glob set that cannot be built (the same failure
+/// `ingest::partition_indexable` fails open on) reads every non-hidden directory,
+/// logged at error level, rather than silently dropping schema files that may
+/// govern indexed documents.
+pub(crate) struct SchemaWalkFilter {
+    paths: Option<crate::ingest::PathFilter>,
+}
+
+impl SchemaWalkFilter {
+    pub(crate) fn from_config(indexing: &crate::config::IndexingConfig) -> Self {
+        match crate::ingest::PathFilter::from_config(indexing) {
+            Ok(f) => Self { paths: Some(f) },
+            Err(e) => {
+                tracing::error!(
+                    "Failed to build indexing path filter; reading {SCHEMA_FILE_NAME} in \
+                     every non-hidden directory, excluded ones included: {e:#}"
+                );
+                Self { paths: None }
+            }
+        }
+    }
+
+    /// Whether a schema file in KB-relative directory `rel_dir` is read.
+    pub(crate) fn reads_dir(&self, rel_dir: &Path) -> bool {
+        let hidden = rel_dir
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
+        if hidden {
+            return false;
+        }
+        if rel_dir.as_os_str().is_empty() {
+            return true;
+        }
+        !self
+            .paths
+            .as_ref()
+            .is_some_and(|f| f.excludes_dir(&rel_dir.to_string_lossy()))
+    }
+
+    /// Whether KB-relative `rel_path` is a `.kb-schema.yaml` that is part of the
+    /// schema tree — the test a changed path must pass to queue a schema rebuild.
+    pub(crate) fn governs(&self, rel_path: &Path) -> bool {
+        is_schema_file_path(rel_path) && self.reads_dir(rel_path.parent().unwrap_or(Path::new("")))
+    }
 }
 
 /// A `SchemaCache` shared across the server, kept current by a single owner rather
@@ -872,6 +1028,52 @@ pub fn store_shared(shared: &SharedSchemaCache, new: SchemaCache) {
     match shared.write() {
         Ok(mut guard) => *guard = new,
         Err(poisoned) => *poisoned.into_inner() = new,
+    }
+}
+
+/// Apply the result of a runtime [`SchemaCache::build`] to `shared` — the one
+/// policy every runtime rebuild (the reindex worker, `update_schema`) goes through.
+///
+/// `Ok`: swap it in and clear `status`'s schema error. `Err`: refuse it —
+/// `shared` keeps the last cache that built cleanly, so no document is ever
+/// validated or indexed under a schema known to be invalid, and the refusal is
+/// logged at error level (every invalid file, path and reason) and recorded as
+/// `status`'s schema error for `/status` and `/metrics`. `/health` is
+/// deliberately unaffected: the server keeps serving correctly under the previous
+/// schema. Startup has no previous cache and treats the same error as fatal
+/// instead (`server::run_server`).
+///
+/// `status` is `crate::status::INDEX_STATUS` in production — a parameter so tests
+/// can observe a private instance instead of the process-global one other tests
+/// also write to.
+///
+/// Returns whether the new cache was applied.
+pub fn apply_rebuild(
+    shared: &SharedSchemaCache,
+    built: Result<SchemaCache, SchemaBuildError>,
+    status: &crate::status::IndexStatus,
+    context: &str,
+) -> bool {
+    match built {
+        Ok(schemas) => {
+            store_shared(shared, schemas);
+            if status.schema_error().is_some() {
+                tracing::info!(
+                    "{context}: every {SCHEMA_FILE_NAME} is valid again; the rebuilt schema \
+                     is now in effect"
+                );
+            }
+            status.clear_schema_error();
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                invalid_files = e.invalid.len(),
+                "{context}: schema rebuild REFUSED, keeping the previous schema — {e}"
+            );
+            status.record_schema_error(&e);
+            false
+        }
     }
 }
 
@@ -992,18 +1194,36 @@ impl SchemaCache {
     /// `frontmatter` block the current host's `config.yaml` happens to declare.
     ///
     /// A thin wrapper around [`merge_cascade`]: this function's own job is just the
-    /// disk walk and per-file parse/validate, which is also the only place a schema
-    /// file can be discovered as [`SchemaCache::broken`] — a parse failure needs the
-    /// underlying I/O error, which an in-memory cascade merge (see
+    /// disk walk and per-file parse/validate, which is also the only place an invalid
+    /// schema file can be discovered — a parse failure needs the underlying I/O
+    /// error, which an in-memory cascade merge (see
     /// [`SchemaCache::with_remapped_scopes`], the merge algorithm's other caller) has
     /// no way to produce, since it starts from content that already parsed.
-    pub fn build(data_path: &Path, fallback: &FrontmatterConfig) -> Self {
+    ///
+    /// Fail-fast: a `.kb-schema.yaml` that is present must be valid. Any file that
+    /// cannot be read, is over [`MAX_SCHEMA_FILE_BYTES`], fails to parse, or fails
+    /// [`SchemaFile::validate_self`] makes the whole build an error — every such file
+    /// is collected into the one [`SchemaBuildError`], not just the first, so one
+    /// pass names everything to fix. There is no partial cache: documents are never
+    /// validated or indexed under rules that are known to be wrong. Callers decide
+    /// what that means — fatal at startup and in the CLI, "keep the last good cache"
+    /// for a runtime rebuild.
+    ///
+    /// Only the indexed tree is walked: a hidden directory, or one `indexing.exclude`
+    /// rules out entirely, is never read (see [`SchemaWalkFilter`]), so a broken
+    /// schema under `templates/**` cannot stop anything (#272).
+    pub fn build(
+        data_path: &Path,
+        fallback: &FrontmatterConfig,
+        indexing: &crate::config::IndexingConfig,
+    ) -> Result<Self, SchemaBuildError> {
         let config_root = ResolvedSchema::from_config(fallback);
+        let walk = SchemaWalkFilter::from_config(indexing);
         let mut discovered: Vec<(PathBuf, PathBuf)> = Vec::new();
-        collect_schema_files(data_path, data_path, &mut discovered);
+        collect_schema_files(data_path, data_path, &walk, &mut discovered);
 
         let mut raw: BTreeMap<PathBuf, SchemaFile> = BTreeMap::new();
-        let mut broken: BTreeMap<PathBuf, String> = BTreeMap::new();
+        let mut invalid: Vec<InvalidSchemaFile> = Vec::new();
 
         for (rel_dir, abs_file) in discovered {
             let parsed = std::fs::metadata(&abs_file)
@@ -1023,36 +1243,51 @@ impl SchemaCache {
                 .and_then(|()| {
                     std::fs::read_to_string(&abs_file).map_err(|e| format!("could not read: {e}"))
                 })
-                .and_then(|text| {
-                    serde_yaml_ng::from_str::<SchemaFile>(&text).map_err(|e| e.to_string())
-                })
-                .and_then(|file| file.validate_self().map(|()| file));
+                .and_then(|text| parse_schema_text(&text));
 
             match parsed {
                 Ok(file) => {
                     debug!(scope = %rel_dir.display(), "loaded schema");
                     raw.insert(rel_dir, file);
                 }
-                Err(e) => {
-                    warn!(
-                        scope = %rel_dir.display(),
-                        "invalid {}: {} — documents in this scope will not be indexed",
-                        SCHEMA_FILE_NAME, e
-                    );
-                    broken.insert(rel_dir, e);
-                }
+                Err(reason) => invalid.push(InvalidSchemaFile {
+                    path: rel_dir.join(SCHEMA_FILE_NAME),
+                    reason,
+                }),
             }
+        }
+
+        if !invalid.is_empty() {
+            invalid.sort_by(|a, b| a.path.cmp(&b.path));
+            return Err(SchemaBuildError { invalid });
         }
 
         let scopes = merge_cascade(&raw, &config_root);
 
-        Self {
+        Ok(Self {
             scopes,
             raw,
-            broken,
             root: config_root,
             root_path: data_path.to_path_buf(),
-        }
+        })
+    }
+
+    /// [`SchemaCache::build`] for tests whose fixtures are known-valid: panics with
+    /// the full error when they are not. Walks with the default `indexing` filter;
+    /// see [`Self::build_for_test_with`] to pass one.
+    #[cfg(test)]
+    pub fn build_for_test(data_path: &Path, fallback: &FrontmatterConfig) -> Self {
+        Self::build_for_test_with(data_path, fallback, &Default::default())
+    }
+
+    /// [`Self::build_for_test`] with an explicit `indexing` filter.
+    #[cfg(test)]
+    pub fn build_for_test_with(
+        data_path: &Path,
+        fallback: &FrontmatterConfig,
+        indexing: &crate::config::IndexingConfig,
+    ) -> Self {
+        Self::build(data_path, fallback, indexing).unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// A NEW, detached cache with every schema file's governing directory passed
@@ -1061,12 +1296,10 @@ impl SchemaCache {
     /// what every OTHER scope under either the old or new directory resolves to,
     /// not just the relocated one); `None` leaves it exactly where it is.
     ///
-    /// Purely in-memory: `raw` already holds fully parsed content, so this never
-    /// touches the filesystem and never discovers a NEW parse failure — `broken`
-    /// carries over from `self` completely unchanged (a directory that was
-    /// unparseable before a remap is still not present in `raw` to relocate, and a
-    /// directory that parsed fine before is not going to stop parsing just because
-    /// its key moved). The result is never registered into a [`SharedSchemaCache`]
+    /// Purely in-memory: `raw` already holds fully parsed, validated content, so this
+    /// never touches the filesystem and cannot fail — a schema file that parsed fine
+    /// is not going to stop parsing just because its key moved. The result is never
+    /// registered into a [`SharedSchemaCache`]
     /// — it is a local value for exactly one hypothetical-resolution pass (see
     /// `write::move_directory`'s use of it), the same "in-memory, not-for-storage"
     /// role [`SchemaCache::resolve_with_candidate`] plays for a single substituted
@@ -1098,7 +1331,6 @@ impl SchemaCache {
         SchemaCache {
             scopes,
             raw,
-            broken: self.broken.clone(),
             root: self.root.clone(),
             root_path: self.root_path.clone(),
         }
@@ -1179,7 +1411,6 @@ impl SchemaCache {
         Self {
             scopes: Vec::new(),
             raw: BTreeMap::new(),
-            broken: BTreeMap::new(),
             root: ResolvedSchema::from_config(fallback),
             root_path: PathBuf::new(),
         }
@@ -1199,24 +1430,6 @@ impl SchemaCache {
             .find(|(dir, _)| dir.as_os_str().is_empty())
             .map(|(_, schema)| schema)
             .unwrap_or(&self.root)
-    }
-
-    /// Whether a document lies under a scope whose schema failed to parse.
-    ///
-    /// Such documents are frozen: not indexed, not re-indexed, and left exactly as they
-    /// are in the index. Falling back to the parent schema would silently apply rules we
-    /// know to be wrong across a whole subtree.
-    pub fn is_frozen(&self, rel_path: &Path) -> Option<&str> {
-        let dir = rel_path.parent().unwrap_or(Path::new(""));
-        self.broken
-            .iter()
-            .find(|(broken_dir, _)| path_covers(broken_dir, dir))
-            .map(|(_, reason)| reason.as_str())
-    }
-
-    /// Directories whose schema file failed to parse, with the reason.
-    pub fn broken_scopes(&self) -> impl Iterator<Item = (&PathBuf, &str)> {
-        self.broken.iter().map(|(dir, why)| (dir, why.as_str()))
     }
 
     /// Every dot-path declared `indexed` anywhere in the tree, with its index kind.
@@ -1298,8 +1511,18 @@ impl SchemaCache {
     }
 
     /// Scopes that declare their own schema, shallowest first.
+    #[cfg(test)]
     pub fn scope_paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.scopes.iter().map(|(dir, _)| dir)
+    }
+
+    /// Scopes whose resolved schema carries at least one field rule, shallowest
+    /// first. A scope that only sets `dedup:` has no frontmatter rules to advertise.
+    pub fn field_scope_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.scopes
+            .iter()
+            .filter(|(_, schema)| !schema.fields.is_empty())
+            .map(|(dir, _)| dir)
     }
 }
 
@@ -1320,11 +1543,19 @@ fn nearest_schema<'a>(
         .map(|(_, schema)| schema)
 }
 
-/// Recursively collect `(relative dir, absolute schema file)` pairs.
-///
-/// Deliberately independent of `indexing.include`/`exclude`: a schema governs its
-/// subtree even where the markdown there is not indexed.
-fn collect_schema_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) {
+/// Recursively collect `(relative dir, absolute schema file)` pairs, skipping
+/// (and not descending into) any directory `walk` does not read — hidden ones and
+/// ones `indexing.exclude` rules out entirely (#272).
+fn collect_schema_files(
+    root: &Path,
+    dir: &Path,
+    walk: &SchemaWalkFilter,
+    out: &mut Vec<(PathBuf, PathBuf)>,
+) {
+    let rel_dir = dir.strip_prefix(root).unwrap_or(Path::new(""));
+    if !walk.reads_dir(rel_dir) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1340,18 +1571,9 @@ fn collect_schema_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf
         }
 
         if file_type.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name == ".git" || name.starts_with('.') {
-                continue;
-            }
-            collect_schema_files(root, &path, out);
+            collect_schema_files(root, &path, walk, out);
         } else if file_type.is_file() && entry.file_name() == SCHEMA_FILE_NAME {
-            let rel_dir = dir
-                .strip_prefix(root)
-                .unwrap_or(Path::new(""))
-                .to_path_buf();
-            out.push((rel_dir, path));
+            out.push((rel_dir.to_path_buf(), path));
         }
     }
 }
@@ -1609,7 +1831,7 @@ mod tests {
             "fields:\n  cook_minutes:\n    type: integer\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("kitchen/recipes/chili.md"));
 
         assert!(schema.fields["title"].required, "root field is inherited");
@@ -1636,7 +1858,7 @@ mod tests {
             "fields:\n  status:\n    values: [wip]\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("scratch/note.md"));
 
         assert_eq!(
@@ -1669,7 +1891,7 @@ mod tests {
             "fields:\n  status:\n    required: false\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("scratch/note.md"));
 
         assert!(!schema.fields["status"].required);
@@ -1693,7 +1915,7 @@ mod tests {
             "fields:\n  status:\n    required: true\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("scratch/note.md"));
 
         assert_eq!(
@@ -1717,7 +1939,7 @@ mod tests {
         );
         write_schema(dir.path(), "child", "fields:\n  note:\n    indexed: true\n");
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("child/doc.md"));
         let note = &schema.fields["note"];
 
@@ -1741,7 +1963,7 @@ mod tests {
             "fields:\n  x:\n    type: enum\n    values: [one, two]\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("a/b/doc.md"));
         let x = &schema.fields["x"];
 
@@ -1759,7 +1981,7 @@ mod tests {
         write_schema(dir.path(), "", "fields:\n  tags:\n    values: [a, b]\n");
         write_schema(dir.path(), "child", "fields:\n  tags:\n    values: [c]\n");
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("child/doc.md"));
 
         assert_eq!(
@@ -1780,7 +2002,7 @@ mod tests {
             "fields:\n  tags:\n    values: [$values, c]\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("child/doc.md"));
 
         assert_eq!(
@@ -1799,7 +2021,7 @@ mod tests {
             "fields:\n  tags:\n    values: [c, $values]\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("child/doc.md"));
 
         assert_eq!(
@@ -1820,7 +2042,7 @@ mod tests {
             "fields:\n  tags:\n    values: [b, $values, c]\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("child/doc.md"));
 
         assert_eq!(
@@ -1838,7 +2060,7 @@ mod tests {
         // see `merge_values`'s doc for why this degrades rather than hard-erroring),
         // and any literal tokens still in the list are the complete permitted set.
         let dir = TempDir::new().unwrap();
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let candidate: SchemaFile =
             serde_yaml_ng::from_str("fields:\n  tags:\n    values: [$values, only]\n").unwrap();
 
@@ -1858,7 +2080,7 @@ mod tests {
         // the moment a document sets the field; `None` would fail silently by not
         // checking at all. See `merge_values`'s doc for the full reasoning.
         let dir = TempDir::new().unwrap();
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let candidate: SchemaFile =
             serde_yaml_ng::from_str("fields:\n  tags:\n    values: [$values]\n").unwrap();
 
@@ -1888,7 +2110,7 @@ mod tests {
             "fields:\n  tags:\n    values: [$values, c]\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("domain/sub/doc.md"));
 
         assert_eq!(
@@ -1911,7 +2133,7 @@ mod tests {
             "fields:\n  tags:\n    type: list\n    required: true\n    extend: true\n    values: [recipe]\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("kitchen/chili.md"));
 
         assert_eq!(
@@ -2152,16 +2374,17 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_using_the_unrecognized_token_freezes_its_scope() {
+    fn a_schema_using_the_unrecognized_token_fails_the_build() {
         // The parse-time rejection above must actually reach the cascade build, not
-        // just the standalone validator — a broken schema freezes its subtree like any
-        // other invalid one.
+        // just the standalone validator.
         let dir = TempDir::new().unwrap();
         write_schema(dir.path(), "bad", "fields:\n  tags:\n    values: [$oops]\n");
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let err = SchemaCache::build(dir.path(), &empty_config(), &Default::default()).unwrap_err();
 
-        assert!(cache.is_frozen(Path::new("bad/doc.md")).is_some());
+        assert_eq!(err.invalid.len(), 1);
+        assert_eq!(err.invalid[0].path, Path::new("bad/.kb-schema.yaml"));
+        assert!(err.invalid[0].reason.contains("$oops"), "got: {err}");
     }
 
     #[test]
@@ -2171,7 +2394,7 @@ mod tests {
         write_schema(dir.path(), "a", "fields:\n  scope:\n    values: [mid]\n");
         fs::create_dir_all(dir.path().join("a/b")).unwrap();
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("a/b/doc.md"));
 
         assert_eq!(
@@ -2187,7 +2410,7 @@ mod tests {
         write_schema(dir.path(), "a", "fields:\n  only_a:\n    required: true\n");
         write_schema(dir.path(), "b", "fields:\n  only_b:\n    required: true\n");
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
 
         assert!(
             !cache
@@ -2214,7 +2437,7 @@ mod tests {
             "fields:\n  level:\n    values: [abc]\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
 
         // a/b/ has no schema of its own; it must fall to a/, not root and not a/b/c.
         assert_eq!(
@@ -2272,13 +2495,12 @@ mod tests {
             ..Default::default()
         };
 
-        let cache = SchemaCache::build(dir.path(), &config);
+        let cache = SchemaCache::build_for_test(dir.path(), &config);
 
         assert!(
             cache.resolve_for(Path::new("doc.md")).fields["title"].required,
             "existing deployments keep working untouched"
         );
-        assert_eq!(cache.broken_scopes().count(), 0);
     }
 
     #[test]
@@ -2301,7 +2523,7 @@ mod tests {
             ..Default::default()
         };
 
-        let cache = SchemaCache::build(dir.path(), &config);
+        let cache = SchemaCache::build_for_test(dir.path(), &config);
         let root = cache.root();
 
         assert!(
@@ -2330,7 +2552,7 @@ mod tests {
             ..Default::default()
         };
 
-        let cache = SchemaCache::build(dir.path(), &config);
+        let cache = SchemaCache::build_for_test(dir.path(), &config);
         let resolved = cache.resolve_for(Path::new("food/chili.md"));
 
         assert!(
@@ -2354,7 +2576,7 @@ mod tests {
             required: vec!["legacy_required".into()],
             ..Default::default()
         };
-        let cache = SchemaCache::build(dir.path(), &config);
+        let cache = SchemaCache::build_for_test(dir.path(), &config);
 
         let candidate: SchemaFile =
             serde_yaml_ng::from_str("fields:\n  title:\n    required: true\n").unwrap();
@@ -2381,7 +2603,7 @@ mod tests {
             required: vec!["title".into()],
             ..Default::default()
         };
-        let cache = SchemaCache::build(dir.path(), &config);
+        let cache = SchemaCache::build_for_test(dir.path(), &config);
 
         let candidate: SchemaFile =
             serde_yaml_ng::from_str("fields:\n  cook_minutes:\n    type: integer\n").unwrap();
@@ -2399,54 +2621,140 @@ mod tests {
         );
     }
 
-    // -- broken schemas -----------------------------------------------------
+    // -- invalid schemas ----------------------------------------------------
 
     #[test]
-    fn malformed_schema_freezes_its_scope_without_failing_the_tree() {
+    fn a_malformed_schema_fails_the_whole_build() {
+        // A valid sibling and root do not rescue the tree: there is no partial
+        // cache, so no document is ever validated under rules known to be wrong.
         let dir = TempDir::new().unwrap();
         write_schema(dir.path(), "", "fields:\n  title:\n    required: true\n");
         write_schema(dir.path(), "bad", "fields: [this is not a map\n");
         write_schema(dir.path(), "good", "fields:\n  ok:\n    required: true\n");
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let err = SchemaCache::build(dir.path(), &empty_config(), &Default::default()).unwrap_err();
 
-        assert!(
-            cache.is_frozen(Path::new("bad/doc.md")).is_some(),
-            "documents under a broken schema must not be indexed under guessed rules"
+        let paths: Vec<_> = err.invalid.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("bad/.kb-schema.yaml")]);
+    }
+
+    /// #272: only the indexed tree is walked. A broken schema under a directory
+    /// `indexing.exclude` rules out entirely, or under a hidden directory, is never
+    /// read — it neither fails the build nor contributes rules — while the same
+    /// file under an included directory still fails it.
+    #[test]
+    fn schemas_outside_the_indexed_tree_are_never_read() {
+        let indexing = crate::config::IndexingConfig {
+            exclude: vec!["templates/**".into(), "archive/*/*.md".into()],
+            ..Default::default()
+        };
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "fields:\n  title:\n    required: true\n");
+        write_schema(dir.path(), "templates", "fields: [this is not a map\n");
+        write_schema(dir.path(), "templates/deep", "fields: [nor this\n");
+        write_schema(dir.path(), ".obsidian", "fields: [nor this\n");
+        write_schema(
+            dir.path(),
+            "notes",
+            "fields:\n  topic:\n    required: true\n",
         );
-        assert!(cache.is_frozen(Path::new("good/doc.md")).is_none());
-        assert!(cache.is_frozen(Path::new("doc.md")).is_none());
-        assert_eq!(cache.broken_scopes().count(), 1);
+
+        let cache = SchemaCache::build_for_test_with(dir.path(), &empty_config(), &indexing);
+        let scopes: Vec<_> = cache.scope_paths().cloned().collect();
+        assert_eq!(scopes, vec![PathBuf::new(), PathBuf::from("notes")]);
+
+        // `archive/*/*.md` still indexes `archive/x.md`, so archive/ is not
+        // wholly excluded and its schema is read — and an invalid one fails.
+        write_schema(dir.path(), "archive", "fields: [broken\n");
+        let err = SchemaCache::build(dir.path(), &empty_config(), &indexing).unwrap_err();
+        let paths: Vec<_> = err.invalid.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("archive/.kb-schema.yaml")]);
+
+        // With no exclude rule for it, templates/ is part of the tree again.
+        let err = SchemaCache::build(dir.path(), &empty_config(), &Default::default()).unwrap_err();
+        let paths: Vec<_> = err.invalid.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("archive/.kb-schema.yaml"),
+                PathBuf::from("templates/.kb-schema.yaml"),
+                PathBuf::from("templates/deep/.kb-schema.yaml"),
+            ]
+        );
     }
 
     #[test]
-    fn freezing_covers_the_whole_subtree() {
-        let dir = TempDir::new().unwrap();
-        write_schema(dir.path(), "bad", "not: a: valid: mapping:\n");
-        fs::create_dir_all(dir.path().join("bad/deeper")).unwrap();
-
-        let cache = SchemaCache::build(dir.path(), &empty_config());
-
-        assert!(cache.is_frozen(Path::new("bad/deeper/doc.md")).is_some());
+    fn schema_walk_filter_reads_only_the_indexed_tree() {
+        let walk = SchemaWalkFilter::from_config(&crate::config::IndexingConfig {
+            exclude: vec!["templates/**".into(), "**/drafts/**".into()],
+            ..Default::default()
+        });
+        for dir in ["", "notes", "notes/sub", "templatesque"] {
+            assert!(walk.reads_dir(Path::new(dir)), "{dir:?}");
+        }
+        for dir in [
+            "templates",
+            "templates/a",
+            "notes/drafts",
+            ".git",
+            "a/.hidden",
+        ] {
+            assert!(!walk.reads_dir(Path::new(dir)), "{dir:?}");
+        }
+        assert!(walk.governs(Path::new("notes/.kb-schema.yaml")));
+        assert!(!walk.governs(Path::new("templates/.kb-schema.yaml")));
+        assert!(!walk.governs(Path::new("notes/a.md")));
     }
 
     #[test]
-    fn an_oversized_schema_file_is_rejected_without_parsing() {
-        // Schema files arrive via git sync and are untrusted; deeply nested YAML costs
-        // superlinear parse time, and this parse runs on every write and refresh tick.
+    fn build_error_lists_every_invalid_file_not_just_the_first() {
         let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "fields:\n  title:\n    required: true\n");
+        write_schema(dir.path(), "parse", "not: a: valid: mapping:\n");
+        write_schema(dir.path(), "dedup", "dedup:\n  threshold: 2.0\n");
+        write_schema(dir.path(), "unknown", "fieldz:\n  title: {}\n");
         let huge = format!("fields:\n{}", "  a: {}\n".repeat(60_000));
         assert!(huge.len() as u64 > super::MAX_SCHEMA_FILE_BYTES);
         write_schema(dir.path(), "big", &huge);
+        write_schema(dir.path(), "good", "fields:\n  ok:\n    required: true\n");
 
         let started = std::time::Instant::now();
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let err = SchemaCache::build(dir.path(), &empty_config(), &Default::default()).unwrap_err();
         let elapsed = started.elapsed();
 
+        let mut by_path: BTreeMap<String, String> = err
+            .invalid
+            .iter()
+            .map(|f| (f.path.to_string_lossy().into_owned(), f.reason.clone()))
+            .collect();
+        assert_eq!(by_path.len(), 4, "got: {err}");
+        assert!(by_path.remove("parse/.kb-schema.yaml").is_some());
         assert!(
-            cache.is_frozen(Path::new("big/doc.md")).is_some(),
-            "an unparseable-by-policy schema freezes its scope like any other"
+            by_path
+                .remove("dedup/.kb-schema.yaml")
+                .unwrap()
+                .contains("dedup.threshold")
         );
+        assert!(
+            by_path
+                .remove("unknown/.kb-schema.yaml")
+                .unwrap()
+                .contains("fieldz")
+        );
+        assert!(
+            by_path
+                .remove("big/.kb-schema.yaml")
+                .unwrap()
+                .contains("byte limit")
+        );
+
+        let shown = err.to_string();
+        for dir in ["parse", "dedup", "unknown", "big"] {
+            assert!(shown.contains(&format!("{dir}/.kb-schema.yaml")), "{shown}");
+        }
+        assert!(!shown.contains("good/"), "{shown}");
+        // Schema files arrive via git sync and are untrusted; deeply nested YAML
+        // costs superlinear parse time, so the size cap must short-circuit first.
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "the cap must short-circuit before parsing, took {elapsed:?}"
@@ -2454,13 +2762,64 @@ mod tests {
     }
 
     #[test]
+    fn build_error_lists_invalid_files_sorted_by_path() {
+        let dir = TempDir::new().unwrap();
+        for d in ["zeta", "alpha", "mid/deep", "beta"] {
+            write_schema(dir.path(), d, "fields: [not a map\n");
+        }
+
+        let err = SchemaCache::build(dir.path(), &empty_config(), &Default::default()).unwrap_err();
+
+        let paths: Vec<_> = err.invalid.iter().map(|f| f.path.clone()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
+        assert_eq!(paths.len(), 4);
+    }
+
+    #[test]
     fn a_normal_sized_schema_is_still_accepted() {
         let dir = TempDir::new().unwrap();
         write_schema(dir.path(), "ok", "fields:\n  title:\n    required: true\n");
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
 
-        assert!(cache.is_frozen(Path::new("ok/doc.md")).is_none());
         assert!(cache.resolve_for(Path::new("ok/doc.md")).fields["title"].required);
+    }
+
+    #[test]
+    fn apply_rebuild_keeps_the_last_good_cache_and_tracks_the_status_error() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "fields:\n  title:\n    required: true\n");
+        let shared: SharedSchemaCache = Arc::new(RwLock::new(Arc::new(
+            SchemaCache::build_for_test(dir.path(), &empty_config()),
+        )));
+        let good = load_shared(&shared);
+        let status = crate::status::IndexStatus::new();
+
+        write_schema(dir.path(), "bad", "fields: [not a map\n");
+        let built = SchemaCache::build(dir.path(), &empty_config(), &Default::default());
+        assert!(!apply_rebuild(&shared, built, &status, "test"));
+        assert!(
+            Arc::ptr_eq(&good, &load_shared(&shared)),
+            "previous cache kept"
+        );
+        let recorded = status.schema_error().expect("refusal recorded");
+        assert_eq!(recorded.files[0].path, Path::new("bad/.kb-schema.yaml"));
+
+        fs::remove_dir_all(dir.path().join("bad")).unwrap();
+        write_schema(dir.path(), "", "fields:\n  title:\n    required: false\n");
+        let built = SchemaCache::build(dir.path(), &empty_config(), &Default::default());
+        assert!(apply_rebuild(&shared, built, &status, "test"));
+        assert!(!load_shared(&shared).root().fields["title"].required);
+        assert!(status.schema_error().is_none(), "cleared by a good rebuild");
+    }
+
+    #[test]
+    fn is_schema_file_path_matches_the_file_name_only() {
+        assert!(is_schema_file_path(Path::new(".kb-schema.yaml")));
+        assert!(is_schema_file_path(Path::new("a/b/.kb-schema.yaml")));
+        assert!(!is_schema_file_path(Path::new("a/.kb-schema.yaml.md")));
+        assert!(!is_schema_file_path(Path::new(".kb-schema.yaml/doc.md")));
     }
 
     #[test]
@@ -2468,6 +2827,133 @@ mod tests {
         let parsed: Result<SchemaFile, _> =
             serde_yaml_ng::from_str("fields:\n  title:\n    requried: true\n");
         assert!(parsed.is_err(), "a typo'd key must not be silently ignored");
+    }
+
+    // -- dedup override (#272) ----------------------------------------------
+
+    #[test]
+    fn dedup_cascades_per_key_nearest_wins_without_sibling_leak() {
+        let dir = TempDir::new().unwrap();
+        write_schema(
+            dir.path(),
+            "food",
+            "dedup:\n  enabled: false\n  threshold: 0.8\n",
+        );
+        write_schema(dir.path(), "food/recipes", "dedup:\n  threshold: 0.97\n");
+        write_schema(
+            dir.path(),
+            "food/plans",
+            "fields:\n  title:\n    required: true\n",
+        );
+        write_schema(dir.path(), "dev", "fields:\n  title:\n    required: true\n");
+
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+
+        let food = cache.resolve_for(Path::new("food/x.md"));
+        assert_eq!(food.dedup_enabled, Some(false));
+        assert_eq!(food.dedup_threshold, Some(0.8));
+
+        let recipes = cache.resolve_for(Path::new("food/recipes/x.md"));
+        assert_eq!(recipes.dedup_enabled, Some(false), "inherited from parent");
+        assert_eq!(
+            recipes.dedup_threshold,
+            Some(0.97),
+            "child overrides one key"
+        );
+
+        let plans = cache.resolve_for(Path::new("food/plans/x.md"));
+        assert_eq!(plans.dedup_enabled, Some(false), "no dedup block inherits");
+        assert_eq!(plans.dedup_threshold, Some(0.8));
+
+        let dev = cache.resolve_for(Path::new("dev/x.md"));
+        assert_eq!(dev.dedup_enabled, None, "sibling scope does not leak");
+        assert_eq!(dev.dedup_threshold, None);
+    }
+
+    #[test]
+    fn root_schema_file_dedup_applies_everywhere() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "dedup:\n  threshold: 0.99\n");
+
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+
+        let resolved = cache.resolve_for(Path::new("any/deep/x.md"));
+        assert_eq!(resolved.dedup_threshold, Some(0.99));
+        assert_eq!(resolved.dedup_enabled, None);
+    }
+
+    #[test]
+    fn dedup_typos_and_out_of_range_thresholds_are_rejected() {
+        assert!(serde_yaml_ng::from_str::<SchemaFile>("dedup:\n  treshold: 0.9\n").is_err());
+        assert!(serde_yaml_ng::from_str::<SchemaFile>("dedup:\n  enabled: maybe\n").is_err());
+
+        for bad in ["1.5", "-0.1"] {
+            let file: SchemaFile =
+                serde_yaml_ng::from_str(&format!("dedup:\n  threshold: {bad}\n")).unwrap();
+            let err = file.validate_self().unwrap_err();
+            assert!(err.contains("dedup.threshold"), "got: {err}");
+        }
+        let ok: SchemaFile = serde_yaml_ng::from_str("dedup:\n  threshold: 1.0\n").unwrap();
+        ok.validate_self().unwrap();
+    }
+
+    #[test]
+    fn a_bad_dedup_block_fails_the_build_like_any_schema_error() {
+        for bad in [
+            "dedup:\n  threshold: 2.0\n",
+            "dedup:\n  treshold: 0.9\n",
+            "dedup:\n  enabled: maybe\n",
+            "dedup: [0.9]\n",
+        ] {
+            let dir = TempDir::new().unwrap();
+            write_schema(dir.path(), "bad", bad);
+
+            let err =
+                SchemaCache::build(dir.path(), &empty_config(), &Default::default()).unwrap_err();
+
+            assert_eq!(err.invalid.len(), 1, "{bad:?}: {err}");
+            assert_eq!(err.invalid[0].path, Path::new("bad/.kb-schema.yaml"));
+        }
+    }
+
+    #[test]
+    fn dedup_block_survives_an_edit_and_yaml_round_trip() {
+        let mut file: SchemaFile = serde_yaml_ng::from_str(
+            "dedup:\n  enabled: false\n  threshold: 0.9\nfields:\n  tags:\n    values: [a]\n",
+        )
+        .unwrap();
+        file.apply(&SchemaEdit::AddValues {
+            field: "tags".into(),
+            values: vec!["b".into()],
+        })
+        .unwrap();
+
+        let reparsed: SchemaFile = serde_yaml_ng::from_str(&file.to_yaml().unwrap()).unwrap();
+        let dedup = reparsed.dedup.expect("dedup block preserved");
+        assert_eq!(dedup.enabled, Some(false));
+        assert_eq!(dedup.threshold, Some(0.9));
+
+        let plain: SchemaFile = serde_yaml_ng::from_str("fields: {}\n").unwrap();
+        assert!(
+            !plain.to_yaml().unwrap().contains("dedup"),
+            "an absent block is not serialized"
+        );
+    }
+
+    #[test]
+    fn fingerprint_ignores_dedup_keys() {
+        let base = ResolvedSchema::default();
+        let plain: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  t:\n    required: true\n").unwrap();
+        let with_dedup: SchemaFile = serde_yaml_ng::from_str(
+            "dedup:\n  enabled: false\n  threshold: 0.9\nfields:\n  t:\n    required: true\n",
+        )
+        .unwrap();
+
+        let a = base.merged_with_for_test(&plain, "x");
+        let b = base.merged_with_for_test(&with_dedup, "x");
+        assert_ne!(a, b);
+        assert_eq!(a.fingerprint(), b.fingerprint());
     }
 
     // -- indexed field union ------------------------------------------------
@@ -2482,7 +2968,7 @@ mod tests {
             "fields:\n  planning.prep_minutes:\n    type: integer\n    indexed: true\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let fields = cache.all_indexed_fields();
         let named = |name: &str| fields.iter().find(|f| f.name == name);
 
@@ -2509,7 +2995,7 @@ mod tests {
             "recipes",
             "fields:\n  cook_minutes:\n    type: integer\n",
         );
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
 
         let candidate: SchemaFile =
             serde_yaml_ng::from_str("fields:\n  format:\n    required: true\n").unwrap();
@@ -2542,7 +3028,7 @@ mod tests {
             "archive",
             "fields:\n  status:\n    type: enum\n    values: [archived]\n",
         );
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
 
         let candidate: SchemaFile = serde_yaml_ng::from_str(
             "fields:\n  status:\n    type: enum\n    values: [active]\n    required: true\n",
@@ -2567,7 +3053,7 @@ mod tests {
     #[test]
     fn documents_outside_the_edited_subtree_are_unaffected() {
         let dir = TempDir::new().unwrap();
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let candidate: SchemaFile =
             serde_yaml_ng::from_str("fields:\n  x:\n    required: true\n").unwrap();
 
@@ -2585,7 +3071,7 @@ mod tests {
     #[test]
     fn a_candidate_for_a_directory_with_no_schema_yet_still_applies() {
         let dir = TempDir::new().unwrap();
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let candidate: SchemaFile =
             serde_yaml_ng::from_str("fields:\n  x:\n    required: true\n").unwrap();
 
@@ -2634,7 +3120,7 @@ mod tests {
             "fields:\n  size:\n    type: text\n    indexed: true\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let fields = cache.all_indexed_fields();
 
         // One collection cannot hold two index kinds for one payload path.
@@ -2839,7 +3325,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_schema(dir.path(), "old", "fields:\n  x:\n    required: true\n");
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let remapped = cache.with_remapped_scopes(|d| {
             if d == Path::new("old") {
                 Some(PathBuf::from("new"))
@@ -2889,7 +3375,7 @@ mod tests {
             "fields:\n  z:\n    type: text\n    default: hi\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let remapped = cache.with_remapped_scopes(|d| {
             if d == Path::new("old") || d.starts_with("old") {
                 let suffix = d.strip_prefix("old").unwrap();
@@ -2917,7 +3403,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_schema(dir.path(), "old", "fields:\n  x:\n    required: true\n");
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let remapped = cache.with_remapped_scopes(|d| {
             if d == Path::new("old") {
                 Some(PathBuf::from("new"))
@@ -2938,29 +3424,6 @@ mod tests {
     }
 
     #[test]
-    fn with_remapped_scopes_leaves_broken_scopes_untouched() {
-        let dir = TempDir::new().unwrap();
-        write_schema(dir.path(), "old", "fields:\n  x:\n    required: true\n");
-        write_schema(dir.path(), "bad", "fields:\n  y:\n    values: [$oops]\n");
-
-        let cache = SchemaCache::build(dir.path(), &empty_config());
-        assert!(cache.is_frozen(Path::new("bad/doc.md")).is_some());
-
-        let remapped = cache.with_remapped_scopes(|d| {
-            if d == Path::new("old") {
-                Some(PathBuf::from("new"))
-            } else {
-                None
-            }
-        });
-
-        assert!(
-            remapped.is_frozen(Path::new("bad/doc.md")).is_some(),
-            "broken scopes carry over unchanged — remapping never re-parses anything"
-        );
-    }
-
-    #[test]
     fn with_remapped_scopes_leaves_unmatched_directories_in_place() {
         let dir = TempDir::new().unwrap();
         write_schema(dir.path(), "old", "fields:\n  x:\n    required: true\n");
@@ -2970,7 +3433,7 @@ mod tests {
             "fields:\n  w:\n    required: true\n",
         );
 
-        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let remapped = cache.with_remapped_scopes(|d| {
             if d == Path::new("old") {
                 Some(PathBuf::from("new"))

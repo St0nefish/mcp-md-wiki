@@ -14,6 +14,78 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+### Breaking: an invalid `.kb-schema.yaml` is never loaded
+
+The "frozen scope" mechanism is gone. A `.kb-schema.yaml` in the indexed tree that is
+present must be valid; a root one is still optional (config.yaml's `frontmatter` block
+still stands in when there is none). A file is invalid when it cannot be read, is over
+256 KB, does not parse (unknown key, wrong type, bad `dedup:` block), or contradicts itself.
+
+- **Only the indexed tree's schema files are read.** A `.kb-schema.yaml` in a hidden
+  directory, or in a directory whose every document `indexing.exclude` rules out (for
+  example `templates/**`), is never loaded or validated, so it cannot stop startup or a
+  rebuild, and a push that changes one queues no reconcile. Previously every non-hidden
+  directory's schema file was read, excluded or not. `include` and `exclude_files` do not
+  remove a directory from the schema tree.
+- **Startup is fatal.** `serve` refuses to start while any schema file is invalid, and
+  the error lists every invalid file with its reason, not just the first. Previously the
+  server started and silently stopped indexing the bad file's whole subtree. **Upgrade
+  note:** run `mcp-md-wiki validate` before upgrading; a schema file the old version had
+  frozen will now stop the server from starting.
+- **`index` and `validate` fail the same way.** `index` (incremental or `--full`) aborts
+  before touching anything. `validate` prints a `SCHEMA ERRORS` list and exits non-zero
+  whether or not `--strict` is set; it no longer prints a `FROZEN` list or validates
+  documents against the rest of the tree.
+- **At runtime a bad schema is refused, and the previous one kept.** When a push
+  (webhook), a reconcile or a moved directory brings in an invalid schema file, the
+  rebuild is refused: every write and read keeps using the last schema that loaded
+  cleanly, nothing is indexed until the file is fixed, and the refusal is logged at error
+  level on every reconcile sweep while it lasts. `/status` gains `schema_error` (`since_unix`,
+  `since_at`, and `files[]` with `path` and `reason`), and `/metrics` gains the
+  `kb_schema_invalid` (0/1) and `kb_schema_invalid_files` gauges. Both clear on the next
+  rebuild that succeeds. `/health` stays healthy. An indexing run that hits the invalid
+  file (a document written in the meantime) is dropped without retrying, logs every
+  invalid file at error level, and sets `schema_error` at once rather than at the next
+  sweep. The fix itself queues a full reconcile, and the first rebuild that succeeds after
+  a refusal queues one too, which indexes everything written in the meantime.
+- **A pushed schema change now rebuilds the schema.** The webhook used to drop a changed
+  `.kb-schema.yaml` with the other non-document paths, so a schema pushed straight to the
+  knowledge base's git host was not picked up until the next periodic sweep. A changed
+  schema file in a push, in a write's own rebase, or carried by a directory move now
+  queues a full reconcile, which rebuilds the schema and re-validates the documents it
+  governs.
+- **Document tools refuse `.kb-schema.yaml` paths.** `write_document` (create, edit and
+  move), `delete_document`, batch writes and the web UI's `POST`/`DELETE /api/doc/...`
+  reject a path whose file name is `.kb-schema.yaml`, whatever `indexing.include` says,
+  and point at `update_schema` (an invalid params error over MCP, a 400 over HTTP).
+  Moving a directory that contains schema files still carries them along, but is refused
+  while one of them is invalid on disk (see below).
+- **`update_schema` refuses a file over 256 KB** — the same cap a rebuild enforces — and,
+  if another schema file is invalid when it rebuilds, says its own change is committed but
+  not in effect yet.
+- **Response shapes:** `get_schema`'s `structured_content` and the web UI's
+  `/api/schema/...` drop `frozen` and `frozen_reason`, and `get_schema`'s text loses its
+  "this scope is frozen" warning. The write error for a frozen scope is gone, and so is
+  directory moves' "frozen" error. A directory move whose source carries a schema file
+  that is invalid on disk (while the server is still using that directory's last good
+  rules) is refused with an invalid params error naming the file and the reason, and
+  `data.invalid_schema_file`/`data.reason`; fix or revert the file in git, then move. `/status`'s
+  per-run counters drop `frozen_by_broken_schema` and `broken_schemas`, and so do the
+  matching `kb_index_last_run_files{outcome=...}` series in `/metrics`.
+
+### MCP tools
+
+- **Near-duplicate detection can be overridden per directory** (closes #272).
+  `write.dedup_enabled` and `write.dedup_threshold` were global only, so structurally
+  templated folders (meal plans, recipes) tripped the check on every create. A
+  `.kb-schema.yaml` may now carry `dedup: {enabled, threshold}`; each key cascades
+  independently, nearest scope wins, and a key no schema sets falls back to the global
+  `write.*` value. Hand-edited only (`update_schema` has no operation for it but preserves
+  an existing block); `get_schema` reports the effective override when set. A threshold
+  outside 0.0–1.0, a wrong-typed value or an unknown key makes the file invalid like any
+  other schema error (see above). The block is not part of the schema fingerprint, so
+  editing it revalidates and reindexes nothing. No config change or reindex needed.
+
 ## [0.1.3] - 2026-10-06
 
 ### MCP tools
@@ -47,9 +119,9 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   `type: object` fields. A `field` with an empty segment (`a..b`) or more than 16
   segments is refused.
 - **Upgrade note:** a `.kb-schema.yaml` that declares one path twice (nested `fields:` plus
-  a flat dot-path key) is now rejected, which freezes that scope until the duplicate is
-  removed. Previously one declaration was silently dropped. A schema already damaged by the
-  old bug will show up this way.
+  a flat dot-path key) is now rejected as an invalid schema file, which stops the server
+  from starting until the duplicate is removed. Previously one declaration was silently
+  dropped. A schema already damaged by the old bug will show up this way.
 - **The MCP handshake names this server, not `rmcp`** (fix #277). `initialize` reported
   `serverInfo` as `{"name":"rmcp","version":"1.8.0"}` because `Implementation::from_build_env()`
   reads rmcp's own build environment. It now reports `mcp-md-wiki` and this crate's version.

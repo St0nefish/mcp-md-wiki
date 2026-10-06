@@ -1025,7 +1025,6 @@ struct SchemaFieldEntry {
 
 #[derive(Debug, Serialize, PartialEq)]
 struct SchemaResponse {
-    frozen: bool,
     fields: Vec<SchemaFieldEntry>,
 }
 
@@ -1076,7 +1075,6 @@ async fn get_schema_handler(
     };
 
     let resolved = schemas.resolve_for(&lookup);
-    let frozen = schemas.is_frozen(&lookup).is_some();
 
     let fields: Vec<SchemaFieldEntry> = resolved
         .fields
@@ -1097,7 +1095,7 @@ async fn get_schema_handler(
         })
         .collect();
 
-    Json(SchemaResponse { frozen, fields }).into_response()
+    Json(SchemaResponse { fields }).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,12 +1366,11 @@ fn write_success_response(success: WriteSuccess) -> Response {
 /// HTTP contract's status codes:
 ///
 /// - 422 `{"outcome": "failed_no_change", "field_errors": [...]}}` — frontmatter
-///   validation failed (and `Frozen`, which is the same "nothing was written,
-///   here's why" shape one level up: the schema governing the write couldn't
-///   even be resolved).
+///   validation failed.
 /// - 409 — `expected_hash` mismatch, create-on-existing, edit/delete-on-missing,
 ///   or a near-duplicate document blocking a create (`DedupHit`).
-/// - 400 — an unsafe path or a commit message git/the log would mangle.
+/// - 400 — an unsafe path, a `.kb-schema.yaml` path (`SchemaFile`), or a commit
+///   message git/the log would mangle.
 /// - 500 `{"outcome": "failed_inconsistent_state"}` — the pre-commit rollback
 ///   itself failed; filesystem and git state may disagree.
 /// - 500 `{"outcome": "failed_no_change"}` — any other pre-commit failure
@@ -1388,16 +1385,12 @@ fn write_success_response(success: WriteSuccess) -> Response {
 /// the same arm. Pass `None` for every call with no destination in play.
 fn write_error_response(err: &WriteError, dest_path: Option<&str>) -> Response {
     match err {
-        WriteError::Frozen { reason } => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "outcome": "failed_no_change",
-                "error": format!(
-                    "the schema governing this directory is invalid: {reason}"
-                ),
-            })),
-        )
-            .into_response(),
+        WriteError::SchemaFile { rel_path } => bad_request(format!(
+            "'{rel_path}' is a {} file, not a document: schema files cannot be written, \
+             moved or deleted here. Use the update_schema MCP tool to change a \
+             directory's schema.",
+            schema::SCHEMA_FILE_NAME
+        )),
         WriteError::Validation { result } => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
@@ -3414,7 +3407,7 @@ mod tests {
 
         let config = test_config(&canonical);
         let schema_cache: SharedSchemaCache = Arc::new(RwLock::new(Arc::new(
-            schema::SchemaCache::build(&canonical, &config.frontmatter),
+            schema::SchemaCache::build_for_test(&canonical, &config.frontmatter),
         )));
         let state = UiState::new(
             crate::config::shared_config(Arc::clone(&config)),
@@ -3437,7 +3430,7 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
-        assert_eq!(json["frozen"], false);
+        assert!(json.get("frozen").is_none());
         let fields = json["fields"].as_array().unwrap();
         let status_field = fields.iter().find(|f| f["field"] == "status").unwrap();
         assert_eq!(status_field["required"], true);
@@ -3496,16 +3489,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_error_response_frozen_is_422() {
+    async fn write_error_response_schema_file_is_400_and_points_at_update_schema() {
         let resp = write_error_response(
-            &WriteError::Frozen {
-                reason: "invalid yaml".into(),
+            &WriteError::SchemaFile {
+                rel_path: "notes/.kb-schema.yaml".into(),
             },
             None,
         );
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let json = body_json(resp).await;
-        assert_eq!(json["outcome"], "failed_no_change");
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("notes/.kb-schema.yaml"), "{error}");
+        assert!(error.contains("update_schema"), "{error}");
     }
 
     #[tokio::test]

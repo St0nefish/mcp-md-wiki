@@ -955,6 +955,20 @@ pub fn render_prometheus(
         );
     }
 
+    metric(
+        "kb_schema_invalid",
+        "1 while a runtime schema rebuild is being refused because a .kb-schema.yaml \
+         is invalid (the previous schema stays in effect), 0 otherwise.",
+        "gauge",
+        &plain(if idx.schema_error.is_some() { 1.0 } else { 0.0 }),
+    );
+    metric(
+        "kb_schema_invalid_files",
+        "Invalid .kb-schema.yaml files found by the most recent refused schema rebuild.",
+        "gauge",
+        &plain(idx.schema_error.as_ref().map_or(0, |e| e.files.len()) as f64),
+    );
+
     if let Some(n) = status.store.indexed_files {
         metric(
             "kb_indexed_files",
@@ -1579,7 +1593,7 @@ async fn build_instructions(
     // Directory names are filesystem-controlled and may legally contain newlines, so
     // they are sanitized before reaching the instructions string.
     let scoped: Vec<String> = schemas
-        .scope_paths()
+        .field_scope_paths()
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| sanitize_facet_value(&format!("{}/", p.display())))
         .collect();
@@ -2088,6 +2102,20 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
     app
 }
 
+/// Build the startup schema cache off the async executor (a recursive walk over the
+/// whole KB is blocking filesystem work), turning an invalid `.kb-schema.yaml`
+/// anywhere in the tree into a startup error that names every invalid file and why.
+async fn build_startup_schema_cache(
+    data_path: std::path::PathBuf,
+    frontmatter: crate::config::FrontmatterConfig,
+    indexing: crate::config::IndexingConfig,
+) -> Result<SchemaCache> {
+    tokio::task::spawn_blocking(move || SchemaCache::build(&data_path, &frontmatter, &indexing))
+        .await
+        .context("Schema walk panicked during startup")?
+        .context("Refusing to start: every .kb-schema.yaml in the indexed tree must be valid")
+}
+
 pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf) -> Result<()> {
     let config = Arc::new(config);
     // The live handle `POST /admin/reload` swaps into. Every consumer built from
@@ -2109,7 +2137,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     } = crate::secrets::StartupSecrets::resolve(&config)?;
 
     // Auto-clone if git_url is set and data_path isn't a repo yet
-    if let Some(ref git_url) = config.source.git_url {
+    let fresh_clone = if let Some(ref git_url) = config.source.git_url {
         // Nothing else is running yet — the server has not bound a listener, so
         // this acquisition is uncontended. Taken anyway so that every git
         // invocation in the process goes through the same gate, with no "except
@@ -2137,37 +2165,42 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         // any read of it.
         git::recover_interrupted_state(&git_lock, Path::new(config.data_path())).await;
         drop(git_lock);
-
-        if fresh {
-            info!("Fresh clone — running initial full index");
-            ingest::scan_and_index(&config, true, crate::status::Trigger::Startup)
-                .await
-                .context("Initial index after clone failed")?;
-        }
-    }
-
-    // Set up shared services
-    let embed_client = Arc::new(EmbedClient::new(&config.embedding));
-    let qdrant = Arc::new(QdrantStore::new(&config.qdrant).context("Failed to connect to Qdrant")?);
+        fresh
+    } else {
+        false
+    };
 
     // The schema tree, built once here and shared for the rest of the process's
     // life: the payload-index list below, the instructions builder (both the
     // initial one and the refresh timer's), every MCP write/read tool via
     // `KbSearchServer::schema_cache`, and the reindex worker, which rebuilds and
-    // swaps it whenever a dirty path is a `.kb-schema.yaml` (see
-    // `reindex::run_worker`). A recursive walk over the whole KB is blocking
-    // filesystem work, hence `spawn_blocking` even for this one-time startup build.
+    // swaps it whenever a `.kb-schema.yaml` changes (see `reindex::run_worker`).
+    //
+    // Fatal on any invalid `.kb-schema.yaml`: a schema file that is present must
+    // be valid, and with no previous good cache to fall back on there is nothing
+    // safe to serve. Built before the fresh-clone index below so that index never
+    // runs under a bad schema either.
     let instructions_data_path = config.canonical_data_path();
-    let startup_data_path = instructions_data_path.clone();
-    let startup_frontmatter = config.frontmatter.clone();
-    let initial_schemas = tokio::task::spawn_blocking(move || {
-        SchemaCache::build(&startup_data_path, &startup_frontmatter)
-    })
-    .await
-    .context("Schema walk panicked during startup")?;
+    let initial_schemas = build_startup_schema_cache(
+        instructions_data_path.clone(),
+        config.frontmatter.clone(),
+        config.indexing.clone(),
+    )
+    .await?;
     let shared_schema_cache: schema::SharedSchemaCache =
         Arc::new(RwLock::new(Arc::new(initial_schemas)));
     let schemas = schema::load_shared(&shared_schema_cache);
+
+    if fresh_clone {
+        info!("Fresh clone — running initial full index");
+        ingest::scan_and_index(&config, true, crate::status::Trigger::Startup)
+            .await
+            .context("Initial index after clone failed")?;
+    }
+
+    // Set up shared services
+    let embed_client = Arc::new(EmbedClient::new(&config.embedding));
+    let qdrant = Arc::new(QdrantStore::new(&config.qdrant).context("Failed to connect to Qdrant")?);
 
     // The single dirty-path queue for this process. Every producer — the MCP
     // write tools (`KbSearchServer`), the web UI's write routes (`UiState`), the
@@ -2910,6 +2943,87 @@ mod tests {
             out.contains("kb_query_embed_latency_seconds_count 0"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn prometheus_reports_a_refused_schema_rebuild() {
+        let out = render_prometheus(&sample_status(), &empty_retrieval(), false);
+        assert!(out.contains("kb_schema_invalid 0"), "{out}");
+        assert!(out.contains("kb_schema_invalid_files 0"), "{out}");
+
+        let s = crate::status::IndexStatus::new();
+        s.record_schema_error(&crate::schema::SchemaBuildError {
+            invalid: vec![
+                crate::schema::InvalidSchemaFile {
+                    path: "a/.kb-schema.yaml".into(),
+                    reason: "bad".into(),
+                },
+                crate::schema::InvalidSchemaFile {
+                    path: "b/.kb-schema.yaml".into(),
+                    reason: "worse".into(),
+                },
+            ],
+        });
+        let mut status = sample_status();
+        status.indexing = s.snapshot();
+        let out = render_prometheus(&status, &empty_retrieval(), false);
+        assert!(out.contains("kb_schema_invalid 1"), "{out}");
+        assert!(out.contains("kb_schema_invalid_files 2"), "{out}");
+        assert_every_metric_is_declared(&out);
+
+        // ...and in `/status`'s JSON, path and reason per file.
+        let json = serde_json::to_value(&status.indexing).unwrap();
+        assert_eq!(
+            json["schema_error"]["files"][1]["path"],
+            serde_json::json!("b/.kb-schema.yaml")
+        );
+        assert_eq!(
+            json["schema_error"]["files"][1]["reason"],
+            serde_json::json!("worse")
+        );
+        assert!(json["schema_error"]["since_unix"].is_i64());
+    }
+
+    /// Startup has no previous schema to fall back on: any invalid file is fatal,
+    /// and the error names every one of them.
+    #[tokio::test]
+    async fn startup_schema_build_refuses_an_invalid_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (sub, body) in [
+            ("a", "fields: [not a map\n"),
+            ("b", "dedup:\n  threshold: 7\n"),
+            ("ok", "fields:\n  title:\n    required: true\n"),
+        ] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+            std::fs::write(
+                dir.path().join(sub).join(crate::schema::SCHEMA_FILE_NAME),
+                body,
+            )
+            .unwrap();
+        }
+
+        let err = build_startup_schema_cache(
+            dir.path().to_path_buf(),
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect_err("an invalid schema file must stop startup");
+        let shown = format!("{err:#}");
+        assert!(shown.contains("Refusing to start"), "{shown}");
+        assert!(shown.contains("a/.kb-schema.yaml"), "{shown}");
+        assert!(shown.contains("b/.kb-schema.yaml"), "{shown}");
+        assert!(!shown.contains("ok/.kb-schema.yaml"), "{shown}");
+
+        std::fs::remove_dir_all(dir.path().join("a")).unwrap();
+        std::fs::remove_dir_all(dir.path().join("b")).unwrap();
+        build_startup_schema_cache(
+            dir.path().to_path_buf(),
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("a valid tree starts");
     }
 
     #[test]
@@ -4007,7 +4121,7 @@ mod tests {
             ..Default::default()
         };
 
-        let schemas = SchemaCache::build(dir.path(), &config.frontmatter);
+        let schemas = SchemaCache::build_for_test(dir.path(), &config.frontmatter);
         let fields = crate::qdrant::all_indexed_fields(&config, &schemas);
         let named = |n: &str| fields.iter().find(|f| f.name == n);
 
@@ -4047,7 +4161,7 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let schemas = SchemaCache::build(dir.path(), &frontmatter);
+        let schemas = SchemaCache::build_for_test(dir.path(), &frontmatter);
 
         let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
             url: "http://127.0.0.1:1".into(),
@@ -4090,7 +4204,7 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let schemas = SchemaCache::build(dir.path(), &frontmatter);
+        let schemas = SchemaCache::build_for_test(dir.path(), &frontmatter);
         let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
             url: "http://127.0.0.1:1".into(),
             collection: "unused".into(),
@@ -4120,6 +4234,51 @@ mod tests {
         );
     }
 
+    /// A scope whose schema file sets only `dedup:` has no frontmatter rules, so the
+    /// instructions must not list it as having "stricter frontmatter rules".
+    #[tokio::test]
+    async fn build_instructions_skips_dedup_only_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("food")).unwrap();
+        std::fs::create_dir_all(dir.path().join("dev")).unwrap();
+        std::fs::write(
+            dir.path().join("food/.kb-schema.yaml"),
+            "fields:\n  prep:\n    type: integer\n    indexed: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("dev/.kb-schema.yaml"),
+            "dedup:\n  enabled: false\n",
+        )
+        .unwrap();
+        let frontmatter = FrontmatterConfig::default();
+        let schemas = SchemaCache::build_for_test(dir.path(), &frontmatter);
+        assert_eq!(schemas.scope_paths().count(), 2, "both scopes are loaded");
+        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
+            url: "http://127.0.0.1:1".into(),
+            collection: "unused".into(),
+        })
+        .expect("client construction is lazy and must not require a live server");
+
+        let instructions = build_instructions(
+            "base",
+            &qdrant,
+            "unused",
+            dir.path(),
+            &schemas,
+            &frontmatter,
+            &config::Granularity::ALL,
+            &[],
+        )
+        .await;
+
+        assert!(instructions.contains("food/"), "{instructions}");
+        assert!(
+            !instructions.contains("dev/"),
+            "dedup-only scope must not be listed: {instructions}"
+        );
+    }
+
     // --- build_instructions cross-references omit a disabled tool ---------
 
     /// Both the top-level-areas sentence (names `search`) and the scoped-schema
@@ -4136,7 +4295,7 @@ mod tests {
         )
         .unwrap();
         let frontmatter = FrontmatterConfig::default();
-        let schemas = SchemaCache::build(dir.path(), &frontmatter);
+        let schemas = SchemaCache::build_for_test(dir.path(), &frontmatter);
 
         let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
             url: "http://127.0.0.1:1".into(),
@@ -4243,7 +4402,7 @@ mod tests {
         .unwrap();
 
         let frontmatter = FrontmatterConfig::default();
-        let schemas = SchemaCache::build(dir.path(), &frontmatter);
+        let schemas = SchemaCache::build_for_test(dir.path(), &frontmatter);
         let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
             url: "http://127.0.0.1:1".into(),
             collection: "unused".into(),
@@ -4339,7 +4498,7 @@ mod tests {
             collection: "unused".into(),
         })
         .expect("client construction is lazy and must not require a live server");
-        let schemas = SchemaCache::build(dir.path(), &config.frontmatter);
+        let schemas = SchemaCache::build_for_test(dir.path(), &config.frontmatter);
 
         // This test relies on the fail-safe default rather than mutating the
         // process-global `INDEX_STATUS` itself: see

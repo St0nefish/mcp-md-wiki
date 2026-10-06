@@ -303,6 +303,17 @@ pub async fn handle_webhook(
         // reconcile would never do (#278). `ingest::partition_indexable` also
         // fails open on a glob-build error rather than 500ing an otherwise-
         // successful pull.
+        //
+        // A changed `.kb-schema.yaml` is never indexable, so the filter drops it;
+        // checked first so the push still rebuilds the shared schema cache (and
+        // re-validates every document it governs) via a full reconcile — or, when
+        // the pushed schema is invalid, gets refused loudly by that rebuild.
+        if state
+            .reindex_queue
+            .mark_schema_changes(&config.indexing, &changed)
+        {
+            info!("Webhook push changed a .kb-schema.yaml; queued a full reconcile");
+        }
         let (indexable, filtered_out) =
             crate::ingest::partition_indexable(&config.indexing, changed);
 
@@ -919,6 +930,44 @@ mod tests {
         assert!(
             !pending.contains(&std::path::PathBuf::from("README.md")),
             "README.md is in the default exclude_files list and must not be marked dirty"
+        );
+    }
+
+    /// A pushed `.kb-schema.yaml` is never an indexable document, so the include
+    /// filter drops it from the marked paths — but the push must still make the
+    /// worker rebuild the shared schema cache, which a full reconcile does.
+    #[tokio::test]
+    async fn handle_webhook_queues_a_full_reconcile_when_a_schema_file_changed() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let local = crate::git::tests::clone_bare_repo(bare.path(), "master");
+
+        push_file_from_a_fresh_clone(
+            bare.path(),
+            "master",
+            "food/.kb-schema.yaml",
+            "fields:\n  title:\n    required: true\n",
+        );
+
+        let secret = "test-secret";
+        let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
+        let sig = compute_hmac(secret, body);
+        let config = git_backed_config(bare.path(), local.path());
+        let queue = Arc::new(reindex::ReindexQueue::new());
+
+        let status = deliver_webhook(config, secret, &sig, &queue).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(local.path().join("food/.kb-schema.yaml").exists());
+
+        let snap = queue.snapshot();
+        assert!(
+            snap.full_pending,
+            "a schema change must queue a full reconcile"
+        );
+        assert!(
+            !queue
+                .snapshot_paths()
+                .contains(&std::path::PathBuf::from("food/.kb-schema.yaml")),
+            "the schema file itself is not a document to index"
         );
     }
 
