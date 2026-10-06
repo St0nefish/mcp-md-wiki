@@ -117,7 +117,8 @@ frontmatter:
   # allowed values; a present field whose value isn't in the list fails
   # validation. Absent fields are governed by `required`, not here. Leave a
   # field out of this map to keep it open-ended (e.g. tags). `domain` isn't
-  # author-set at all — it's derived from the folder — so it never belongs here.
+  # author-set at all — it's derived from the folder — so it never belongs here
+  # (nor in `required` or `defaults`, which are ignored for it).
   allowed:
     type: [guide, reference, research, config, troubleshooting, architecture, project, decision-record, migration]
     status: [active, draft, archived]
@@ -365,7 +366,7 @@ Both tools run the same pipeline server-side:
 2. **Validate frontmatter** — required fields, `allowed` enums, and any `validation.lint_command`, against the *destination* directory's schema when the call also relocates the document. Failures come back as structured `field_errors` (see [Frontmatter Validation](#frontmatter-validation)) so the agent can self-correct.
 3. **Write to disk** — in the container-owned KB clone.
 4. **Commit with provenance** — the commit message gets `Tool: mcp-md-wiki` and `Operation: <tool>` trailers, authored under the `write.commit_author_*` identity. Tool-authored commits are trivially distinguishable from your own in `git log`.
-5. **Push to the remote** — `add → commit → fetch → rebase → push`, so the KB's git host stays the source of truth. The write already brought the clone up to date before reading the document, under the same lock. If the push loses a race or the rebase conflicts, the write's own commit is dropped, the clone re-synced with the remote and the change re-applied (up to three attempts in all), and a genuine conflict is refused. Any other failure (the remote unreachable, a push a hook refuses) keeps the local commit and still reports success; the next write rebases and pushes it (see [Concurrent writers](../README.md#write)).
+5. **Push to the remote** — `add → commit → fetch → rebase → push`, so the KB's git host stays the source of truth. The write already brought the clone up to date before reading the document, under the same lock. If the push loses a race or the rebase conflicts, the write's own commit is dropped, the clone re-synced with the remote and the change re-applied (up to three attempts in all); one that no longer fits the fresh document, or loses the race every time, is refused as edited by someone else. Any other failure (the remote unreachable, a push a hook refuses) keeps the local commit and still reports success; the next write rebases and pushes it (see [Concurrent writers](../README.md#write)).
 6. **Reindex** — queued, not run inline: the call returns once the push is done, and the single background worker that also serves the webhook indexes the path shortly after. Every git operation on the clone takes one lock, so a write and a webhook-triggered pull never touch it at the same time.
 
 Each tool returns one compact JSON object: `path`, `action`, the document's new `version` (not for a delete) and, for an edit or a move, the unified `diff`. It never carries a commit SHA or git state; the [README](../README.md#write) lists every field.

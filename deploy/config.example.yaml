@@ -282,7 +282,7 @@ embedding:
 validation:
 
   # Master switch. When false, frontmatter is still parsed and stored
-  # (so Qdrant and the list_documents metadata index stay accurate) but
+  # (so Qdrant and the metadata index behind search's enumeration mode stay accurate) but
   # required/allowed/lint checks are skipped, and all files are indexed
   # regardless of their frontmatter.
   enabled: true

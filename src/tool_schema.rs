@@ -530,7 +530,9 @@ mod tests {
     /// written in its position: alone (a single-schema keyword, or an object-only
     /// one), as a map's value, or as an array's element. Built from the key lists
     /// themselves, so a dropped or mistyped entry fails every test that walks it.
-    fn position_cases() -> Vec<(&'static str, fn(Value) -> Value)> {
+    type Wrap = fn(Value) -> Value;
+
+    fn position_cases() -> Vec<(&'static str, Wrap)> {
         let alone: fn(Value) -> Value = |sub| sub;
         let in_map: fn(Value) -> Value = |sub| json!({ "a": sub });
         let in_array: fn(Value) -> Value = |sub| json!([sub]);

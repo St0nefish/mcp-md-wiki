@@ -280,11 +280,11 @@ does its whole read-edit-validate-save under one lock, so writes never interleav
   changed after the server checked it.
 - A push that loses a race, or a rebase that conflicts with what reached the remote in
   the meantime, drops that write's own commit and runs the write again against the fresh
-  remote state, up to three attempts; then it is refused as edited by someone else,
-  leaving none of its own commits behind, so a later webhook fast-forwards normally.
-  Changes an earlier outage left unpushed are kept and go out with the next write that
-  gets through. A push that fails because the remote is unreachable still keeps the
-  local save and reports success.
+  remote state, up to three attempts; then it is refused as edited by someone else, with
+  none of its own commits left behind to diverge from the remote. Changes an earlier
+  outage left unpushed are kept and go out with the next write that gets through. A push
+  that fails because the remote is unreachable still keeps the local save and reports
+  success.
 - `write_document` and `delete_document` now declare `destructiveHint: true`,
   `idempotentHint: false`; `search`, `get_document` and `get_schema` declare
   `readOnlyHint: true`.
