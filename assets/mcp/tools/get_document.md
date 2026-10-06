@@ -21,3 +21,5 @@ links to) and `links_in` (documents linking here). Each entry's `kind` is
 `markdown` (a link in the body) or `semantic` (an inferred similarity neighbor,
 only when semantic edges are enabled); `exists: false` in `links_out` marks a
 broken link. Both lists are capped per call — check `has_more`/`total`.
+
+`history: N` adds its last N commits.

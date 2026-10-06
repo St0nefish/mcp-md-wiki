@@ -1121,13 +1121,6 @@ async fn get_schema_handler(
 // history" without building a general git API (#185 explicitly asks for
 // restraint there).
 
-/// Default page size for a `/api/history` commit listing.
-const DEFAULT_HISTORY_LIMIT: usize = 20;
-/// Hard cap on a single `/api/history` commit listing — `git log -n` bounds
-/// the underlying walk to this directly, so this is also the actual bound on
-/// how much work one request can cause, independent of total repo history
-/// size (see `git::log_commits`'s doc comment).
-const MAX_HISTORY_LIMIT: usize = 100;
 /// Cap on a single commit's diff returned by `/api/history?commit=...`,
 /// mirroring `mcp::MAX_STRUCTURED_DIFF_BYTES` (private to that module) —
 /// same reasoning: bound one response's size regardless of how large a
@@ -1147,42 +1140,6 @@ struct HistoryQueryParams {
     /// LIST to that one commit's diff for `path`.
     #[serde(default)]
     commit: Option<String>,
-}
-
-/// One commit as reported by `/api/history`'s list mode.
-#[derive(Debug, Serialize)]
-struct ApiCommitInfo {
-    sha: String,
-    author_name: String,
-    author_email: String,
-    /// Unix seconds (committer time) — same clock every other timestamp this
-    /// API surfaces uses, left as a number for the client to format rather
-    /// than pre-rendered server-side.
-    timestamp: i64,
-    subject: String,
-    tool: Option<String>,
-    operation: Option<String>,
-    /// Convenience flag mirroring `git::CommitInfo::is_tool_authored` — both
-    /// `tool` and `operation` present. A client could derive this itself, but
-    /// this is exactly the provenance distinction #185 is about, so it rides
-    /// along explicitly rather than asking every consumer to re-derive it.
-    tool_authored: bool,
-}
-
-impl From<git::CommitInfo> for ApiCommitInfo {
-    fn from(c: git::CommitInfo) -> Self {
-        let tool_authored = c.is_tool_authored();
-        ApiCommitInfo {
-            sha: c.sha,
-            author_name: c.author_name,
-            author_email: c.author_email,
-            timestamp: c.timestamp,
-            subject: c.subject,
-            tool: c.tool,
-            operation: c.operation,
-            tool_authored,
-        }
-    }
 }
 
 async fn history_handler(
@@ -1268,37 +1225,16 @@ async fn history_handler(
     // List mode.
     let limit = params
         .limit
-        .unwrap_or(DEFAULT_HISTORY_LIMIT)
-        .clamp(1, MAX_HISTORY_LIMIT);
+        .unwrap_or(retrieval::DEFAULT_HISTORY_LIMIT)
+        .clamp(1, retrieval::MAX_HISTORY_LIMIT);
     let rel_path = params
         .path
         .as_deref()
         .map(|p| retrieval::kb_root_relative(p.trim()).to_string())
         .filter(|p| !p.is_empty());
 
-    let result = match &rel_path {
-        Some(p) => git::document_history(&data_path, p, limit).await,
-        None => git::recent_commits(&data_path, limit).await,
-    };
-
-    match result {
-        Ok((commits, truncated)) => {
-            let returned = commits.len();
-            let commits_json: Vec<ApiCommitInfo> =
-                commits.into_iter().map(ApiCommitInfo::from).collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "available": true,
-                    "path": rel_path,
-                    "commits": commits_json,
-                    "limit": limit,
-                    "returned": returned,
-                    "truncated": truncated,
-                })),
-            )
-                .into_response()
-        }
+    match retrieval::history_json(&data_path, rel_path.as_deref(), limit).await {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
         Err(e) => {
             error!("git history lookup failed (path={rel_path:?}): {e:#}");
             (
