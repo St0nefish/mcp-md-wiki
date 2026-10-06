@@ -27,7 +27,6 @@ still stands in when there is none). A file is invalid when it cannot be read, i
   rebuild, and a push that changes one queues no reconcile. Previously every non-hidden
   directory's schema file was read, excluded or not. `include` and `exclude_files` do not
   remove a directory from the schema tree.
-
 - **Startup is fatal.** `serve` refuses to start while any schema file is invalid, and
   the error lists every invalid file with its reason, not just the first. Previously the
   server started and silently stopped indexing the bad file's whole subtree. **Upgrade
@@ -86,6 +85,11 @@ still stands in when there is none). A file is invalid when it cannot be read, i
   outside 0.0–1.0, a wrong-typed value or an unknown key makes the file invalid like any
   other schema error (see above). The block is not part of the schema fingerprint, so
   editing it revalidates and reindexes nothing. No config change or reindex needed.
+
+## [0.1.3] - 2026-10-06
+
+### MCP tools
+
 - **`get_document` can return a document's git history** (closes #257). The new `history`
   parameter (commit count, clamped 1–100) adds `structured_content.history` and a text
   summary: each commit's `sha`, author, `timestamp`, `subject` and the `Tool:`/`Operation:`
@@ -719,7 +723,8 @@ operator upgrading an old deployment needs to know happened at some point:
   upgrade note](deploy/USAGE.md#backward-compatibility-and-upgrade-note) in
   `deploy/USAGE.md` for the full detail.
 
-[Unreleased]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/St0nefish/mcp-md-wiki/releases/tag/v0.1.0
