@@ -72,6 +72,15 @@ pub fn inject_token_into_url(url: &str, token: &str) -> String {
     }
 }
 
+/// `url` with `token` injected for an authenticated clone, fetch or push, or `url`
+/// unchanged when there is no token (an empty one counts as none).
+pub(crate) fn authenticated_url(url: &str, token: Option<&str>) -> String {
+    match token {
+        Some(t) if !t.is_empty() => inject_token_into_url(url, t),
+        _ => url.to_string(),
+    }
+}
+
 /// Redact tokens embedded in URLs (e.g. `https://token@host/path` → `https://***@host/path`).
 /// Handles URLs embedded in larger strings (like git stderr output).
 pub fn redact_url(s: &str) -> String {
@@ -123,10 +132,7 @@ pub async fn ensure_repo(
         .await
         .with_context(|| format!("Failed to create data directory: {}", data_path))?;
 
-    let clone_url = match token {
-        Some(t) if !t.is_empty() => inject_token_into_url(git_url, t),
-        _ => git_url.to_string(),
-    };
+    let clone_url = authenticated_url(git_url, token);
 
     info!(
         "Cloning {} (branch: {}) into {}",
@@ -908,11 +914,11 @@ pub enum CommitDiffError {
     Git(#[from] anyhow::Error),
 }
 
-/// The outcome of a failed [`commit_and_sync`] call, split by whether a commit landed.
+/// The outcome of a failed [`commit_and_sync`] call, split by what became of the commit.
 ///
 /// `commit_and_sync` runs five git operations in sequence — add, commit, fetch,
-/// rebase, push — and the two ways it can fail demand OPPOSITE recovery, so this is a
-/// hard enum rather than a flattened `anyhow::Error`:
+/// rebase, push — and its three kinds of failure demand different recovery, so this
+/// is a hard enum rather than a flattened `anyhow::Error`:
 ///
 /// - [`PreCommit`](Self::PreCommit): `git add` or `git commit` failed. HEAD is
 ///   untouched — the attempted change exists only in the working tree (and possibly
@@ -920,12 +926,24 @@ pub enum CommitDiffError {
 ///   it and report that nothing changed; that discarding is exactly what
 ///   [`restore_from_head`] / [`unstage`] are for.
 /// - [`PostCommit`](Self::PostCommit): `git fetch`, `git rebase`, or `git push`
-///   failed, but the commit itself landed — HEAD already includes it. Discarding the
-///   working-tree change at this point would silently resurrect (on a delete) or
-///   revert (on a create/edit) content that is genuinely, durably gone/changed as far
-///   as the local repo is concerned. The only thing that failed is telling the remote
-///   about it, so the correct move is to leave it exactly as it is and report that the
-///   sync is pending.
+///   failed (other than by the remote disagreeing with the commit, which is
+///   `Conflict`), but the commit itself landed — HEAD already includes it.
+///   Discarding the working-tree change at this point would silently resurrect (on a
+///   delete) or revert (on a create/edit) content that is genuinely, durably
+///   gone/changed as far as the local repo is concerned. The only thing that failed
+///   is telling the remote about it, so the correct move is to leave it exactly as it
+///   is and report that the sync is pending.
+/// - [`Conflict`](Self::Conflict): the commit landed, but the remote disagrees with
+///   it — the rebase conflicted, or the push lost a race to a newer remote tip.
+///   `commit_and_sync` has already dropped its OWN commit by the time this is
+///   returned (the rebase aborted, the branch reset to HEAD as it was right before
+///   that commit, so the commit's change to the working tree goes with it), which
+///   leaves the caller nothing to roll back; a commit an earlier outage left
+///   unpushed stays on the branch. The correct move is to sync again
+///   ([`sync_to_remote`], which rebases such a commit onto the remote and parks it
+///   under `refs/mcp-md-wiki/unsynced/<sha>` only if it conflicts itself), then
+///   re-read, re-apply the change and commit again, or refuse. A commit that cannot
+///   be dropped is still HEAD, so that failure is reported as `PostCommit`.
 ///
 /// Being a plain enum (not `anyhow::Error`) means there is no `?`-friendly blanket
 /// conversion into it — a caller has to name a variant to get at the underlying
@@ -939,9 +957,351 @@ pub enum CommitSyncError {
     PreCommit(anyhow::Error),
 
     /// `sha` is a real local commit — do not roll it back. `redact_url` has already
-    /// been applied to any git stderr folded into the cause.
+    /// been applied to any git stderr folded into the cause. Only a failure that is
+    /// not a disagreement with the remote's content lands here — the remote being
+    /// unreachable, a push refused by a hook, a rebase that failed for a reason
+    /// other than a conflict — so an outage never blocks writes: the commit syncs
+    /// with a later write. The one exception is a [`CommitSyncError::Conflict`]
+    /// whose commit could not be dropped: it is still HEAD, and the cause says so.
     #[error("commit {sha} landed locally but syncing to the remote failed: {source:#}")]
     PostCommit { sha: String, source: anyhow::Error },
+
+    /// The remote had moved in a way this commit could not be layered on: the
+    /// rebase conflicted, or the push was rejected because the remote advanced
+    /// again after the fetch. The rebase was aborted and the branch reset to HEAD
+    /// as it was before this call's commit, so this call's commit is GONE and
+    /// nothing older is: a commit an earlier outage left unpushed stays on the
+    /// branch. The caller syncs again ([`sync_to_remote`]), which brings the clone
+    /// onto the remote tip with any such commit rebased on top (or parked under a
+    /// recovery ref if it conflicts itself), then re-reads, re-applies its change
+    /// and commits again, or refuses.
+    #[error("the remote changed underneath this commit: {source:#}")]
+    Conflict { source: anyhow::Error },
+}
+
+/// Points in a write where a test can interleave a concurrent writer
+/// deterministically (see [`test_hook`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Each variant names the step the hook runs *before*; dropping the shared
+// prefix would make `HookPoint::Push` read as "during the push".
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum HookPoint {
+    /// After a write's pre-lock read and validation, immediately before it
+    /// acquires [`GIT_LOCK`].
+    BeforeLock,
+    /// Inside [`commit_and_sync`], after the local commit and before the fetch.
+    BeforeSync,
+    /// Inside [`commit_and_sync`], after the rebase and before the push.
+    BeforePush,
+}
+
+/// A test's interleaving callback, scoped to one task with
+/// `TEST_HOOK.scope(hook, fut)`.
+#[cfg(test)]
+pub(crate) type TestHook = std::sync::Arc<
+    dyn Fn(HookPoint) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_HOOK: TestHook;
+}
+
+/// Run the current task's test hook for `point`, if a test installed one. A
+/// no-op in non-test builds.
+pub(crate) async fn test_hook(point: HookPoint) {
+    #[cfg(test)]
+    {
+        if let Ok(hook) = TEST_HOOK.try_with(|h| h.clone()) {
+            hook(point).await;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = point;
+}
+
+/// The caller-facing version of a document: its git blob id, the SHA-1 object id
+/// `git hash-object` gives those bytes, computed in-process. Opaque to callers, it
+/// also keys the 3-way merge base: [`cat_blob`] looks a stale caller's version up
+/// by it. That finds the version only where the bytes git stored are the bytes on
+/// disk, i.e. in a SHA-1 repository where no eol conversion or clean filter
+/// (`.gitattributes` `text`/`eol`/`filter`, `core.autocrlf`) changes a document
+/// between working tree and commit. Under such a filter the hash of the checkout
+/// (CRLF, say) names no stored object, and a SHA-256 repository stores no SHA-1 id
+/// at all; the lookup then misses and a stale full replace ends as
+/// `EditedElsewhere` (the safe fallback) instead of being merged. Comparing two
+/// versions is unaffected: both sides hash the working tree.
+pub fn blob_id(bytes: &[u8]) -> String {
+    let mut hasher = sha1_smol::Sha1::new();
+    hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
+    hasher.update(bytes);
+    hasher.digest().to_string()
+}
+
+/// Run one git command in `data_path` (with `safe.directory` set), timing out at
+/// [`GIT_TIMEOUT`]. Returns the raw output; a non-zero exit is the caller's to
+/// interpret.
+async fn git_output(
+    data_path: &str,
+    args: &[&str],
+    author: Option<(&str, &str)>,
+) -> anyhow::Result<std::process::Output> {
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", &format!("safe.directory={}", data_path)])
+        .args(args)
+        .current_dir(data_path);
+    if let Some((name, email)) = author {
+        cmd.env("GIT_AUTHOR_NAME", name)
+            .env("GIT_AUTHOR_EMAIL", email)
+            .env("GIT_COMMITTER_NAME", name)
+            .env("GIT_COMMITTER_EMAIL", email);
+    }
+    let joined = args.first().copied().unwrap_or_default();
+    timeout(GIT_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("git {} timed out after {:?}", joined, GIT_TIMEOUT))?
+        .with_context(|| format!("Failed to spawn git {}", joined))
+}
+
+/// Like [`git_output`], but a non-zero exit is an error. The whole message is
+/// redacted, not only git's stderr: on a fetch or push `args` itself carries the
+/// token-bearing remote URL.
+async fn git_ok(
+    data_path: &str,
+    args: &[&str],
+    author: Option<(&str, &str)>,
+) -> anyhow::Result<std::process::Output> {
+    let out = git_output(data_path, args, author).await?;
+    if !out.status.success() {
+        anyhow::bail!("{}", git_failure_message(args, &out.stderr));
+    }
+    Ok(out)
+}
+
+/// `git <args> failed: <stderr>`, with every URL-embedded token redacted.
+fn git_failure_message(args: &[&str], stderr: &[u8]) -> String {
+    redact_url(&format!(
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(stderr)
+    ))
+}
+
+/// HEAD's sha, or `None` when `data_path` is not a git repository (or has no
+/// commit yet) — the write pipeline then runs without any git bookkeeping.
+pub(crate) async fn head_if_repo(lock: &GitLock, data_path: &str) -> Option<String> {
+    if !is_git_repo(data_path) {
+        return None;
+    }
+    rev_parse_head(lock, data_path).await.ok()
+}
+
+/// Reset the clone to `FETCH_HEAD` (the remote tip the last fetch saw), so it
+/// never stays diverged from the remote. [`sync_to_remote`] does this once local
+/// commits a remote outage left unpushed genuinely conflict with the remote, and
+/// [`drop_own_commit`] when HEAD before the commit it drops is unknown.
+///
+/// The reset loses every local commit the remote does not have, so unless git
+/// confirms there is none, HEAD is first saved under
+/// `refs/mcp-md-wiki/unsynced/<sha>` and logged at error level for an operator to
+/// recover. A count git could not produce is unknown, not zero: those commits are
+/// writes already reported as saved, and the ref costs nothing.
+async fn reset_to_fetch_head(lock: &GitLock, data_path: &str) -> anyhow::Result<()> {
+    let count = git_ok(
+        data_path,
+        &["rev-list", "--count", "FETCH_HEAD..HEAD"],
+        None,
+    )
+    .await
+    .ok()
+    .and_then(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<usize>()
+            .ok()
+    });
+    if count != Some(0) {
+        let head = rev_parse_head(lock, data_path).await?;
+        let backup = format!("refs/mcp-md-wiki/unsynced/{head}");
+        git_ok(data_path, &["update-ref", &backup, &head], None).await?;
+        let dropped = count.map_or_else(|| "an unknown number of".to_string(), |n| n.to_string());
+        error!(
+            "Resetting the clone to the remote tip drops {dropped} unsynced local \
+             commit(s) that conflict with the remote; saved them under {backup} for \
+             manual recovery"
+        );
+    }
+    git_ok(data_path, &["reset", "--hard", "FETCH_HEAD"], None).await?;
+    Ok(())
+}
+
+/// Undo [`commit_and_sync`]'s own commit once the remote moved underneath it (its
+/// [`CommitSyncError::Conflict`] paths, any rebase already aborted): reset the
+/// branch to `pre_commit_head`, HEAD as it was right before that commit.
+///
+/// Neither `FETCH_HEAD` nor `HEAD~1` is a safe target. The first also drops every
+/// older commit a remote outage left unpushed — writes already reported to their
+/// callers as saved — and the second drops one of those whenever the rebase
+/// emptied this call's commit (its change was already upstream). Older commits
+/// stay on the branch for the caller's next [`sync_to_remote`], which rebases
+/// them onto the remote and parks them only if they themselves conflict. With
+/// HEAD unknown before the commit (`None`: unborn, or unreadable) this falls back
+/// to [`reset_to_fetch_head`], which saves HEAD under a recovery ref first.
+async fn drop_own_commit(
+    lock: &GitLock,
+    data_path: &str,
+    pre_commit_head: Option<&str>,
+) -> anyhow::Result<()> {
+    match pre_commit_head {
+        Some(sha) => {
+            git_ok(data_path, &["reset", "--hard", sha], None).await?;
+            Ok(())
+        }
+        None => reset_to_fetch_head(lock, data_path).await,
+    }
+}
+
+/// The paths a stopped rebase left unmerged, newline-separated. Only a genuine
+/// content conflict leaves any; empty too when git cannot say, which callers
+/// read as "not a conflict" — the direction that drops nothing. `rebase --abort`
+/// clears them, so read this before aborting.
+async fn unmerged_paths(data_path: &str) -> String {
+    git_ok(data_path, &["diff", "--name-only", "--diff-filter=U"], None)
+        .await
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Whether a failed `git push`'s stderr says the remote rejected it because it
+/// moved on (a non-fast-forward), as opposed to a transport failure or a hook.
+fn is_non_fast_forward_rejection(stderr: &str) -> bool {
+    stderr.contains("! [rejected]")
+        && (stderr.contains("fetch first") || stderr.contains("non-fast-forward"))
+}
+
+/// Bring the clone up to date with the remote branch before a write reads
+/// anything: fetch, then fast-forward. Every read-modify-write starts with this,
+/// under the same [`GitLock`] acquisition as the rest of the write, so the
+/// document the write reads includes every change that already reached the
+/// remote. A schema file the sync pulls in does not yet govern that write:
+/// `write::sync_clone` only queues a full reconcile for it
+/// (`ReindexQueue::mark_schema_changes`), and the reindex worker rebuilds the
+/// shared schema cache when it runs that, so the write in flight still validates
+/// against the cache that was in force before the sync.
+///
+/// Never fails the write. No remote configured → nothing to do. A fetch failure
+/// (the remote is unreachable) is logged and the write proceeds on local state —
+/// an outage must not block writes. Local commits a previous outage left
+/// unpushed are rebased onto the remote (they are pushed with this write). Only a
+/// rebase that genuinely conflicts resets the clone to the remote tip, with those
+/// commits saved under a recovery ref first (see [`reset_to_fetch_head`]) rather
+/// than left diverged. A rebase that fails for any other reason — a dirty or
+/// staged tracked file, say — is aborted and logged and the clone left as it is:
+/// the write commits on top and syncs later, as during an outage, and neither a
+/// commit nor the uncommitted change is dropped.
+pub(crate) async fn sync_to_remote(
+    lock: &GitLock,
+    git_url: Option<&str>,
+    branch: &str,
+    data_path: &str,
+    token: Option<&str>,
+    author_name: &str,
+    author_email: &str,
+) {
+    let Some(url) = git_url else { return };
+    if !is_git_repo(data_path) {
+        return;
+    }
+    let auth_url = authenticated_url(url, token);
+    if let Err(e) = git_ok(data_path, &["fetch", "--no-tags", &auth_url, branch], None).await {
+        warn!("Pre-write fetch failed; writing on the local clone, it syncs later: {e:#}");
+        return;
+    }
+    if git_ok(data_path, &["merge", "--ff-only", "FETCH_HEAD"], None)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    let author = Some((author_name, author_email));
+    let Err(rebase_err) = git_ok(data_path, &["rebase", "FETCH_HEAD"], author).await else {
+        return;
+    };
+    let conflicted = unmerged_paths(data_path).await;
+    let _ = git_output(data_path, &["rebase", "--abort"], None).await;
+    if conflicted.is_empty() {
+        warn!(
+            "Pre-write sync could not rebase unpushed local commits onto the remote, and \
+             not because of a conflict; writing on the local clone, it syncs later: \
+             {rebase_err:#}"
+        );
+        return;
+    }
+    if let Err(e) = reset_to_fetch_head(lock, data_path).await {
+        error!("Pre-write sync could not reset the clone to the remote tip: {e:#}");
+    }
+}
+
+/// The content of the blob `id`, or `None` when the object store has no such
+/// blob (or `id` is not a well-formed object id).
+pub(crate) async fn cat_blob(
+    _lock: &GitLock,
+    data_path: &str,
+    id: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if id.len() != 40 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    let out = git_output(data_path, &["cat-file", "blob", id], None).await?;
+    Ok(out.status.success().then_some(out.stdout))
+}
+
+/// Three-way merge of text (`git merge-file -p`): `ours` and `theirs` both
+/// descend from `base`. `Some(merged)` on a clean merge, `None` on a conflict.
+/// The three inputs are staged as scratch files inside `.git/`, which only the
+/// lock holder touches.
+pub(crate) async fn merge_text(
+    _lock: &GitLock,
+    data_path: &str,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+) -> anyhow::Result<Option<String>> {
+    let git_dir = Path::new(data_path).join(".git");
+    let files = [
+        (git_dir.join("mcp-md-wiki-merge-ours"), ours),
+        (git_dir.join("mcp-md-wiki-merge-base"), base),
+        (git_dir.join("mcp-md-wiki-merge-theirs"), theirs),
+    ];
+    for (path, bytes) in &files {
+        tokio::fs::write(path, bytes)
+            .await
+            .with_context(|| format!("Failed to stage merge input {}", path.display()))?;
+    }
+    let names: Vec<String> = files
+        .iter()
+        .map(|(p, _)| p.to_string_lossy().into_owned())
+        .collect();
+    let out = git_output(
+        data_path,
+        &["merge-file", "-p", &names[0], &names[1], &names[2]],
+        None,
+    )
+    .await;
+    for (path, _) in &files {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    let out = out?;
+    match out.status.code() {
+        Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned())),
+        Some(n) if (1..=127).contains(&n) => Ok(None),
+        _ => anyhow::bail!(
+            "git merge-file failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    }
 }
 
 /// Stage `rel_path`, commit with `message`, then (if `git_url` is Some) fetch the
@@ -952,9 +1312,11 @@ pub enum CommitSyncError {
 /// commit — e.g. a document move can stage the old path's removal and the new path's
 /// addition as one call rather than two. `message` already includes any provenance
 /// trailer. If `git_url` is None, commit locally only (no fetch/rebase/push).
-/// On a rebase conflict, abort the rebase (so the working tree is left clean at the local
-/// commit) and return an Err whose message clearly identifies it as a rebase/merge conflict
-/// on the file, distinct from other git failures.
+/// On a rebase conflict — or a push rejected because the remote advanced again after
+/// the fetch — abort the rebase, reset the branch to HEAD as it was before this
+/// call's commit (dropping that commit and nothing older — see [`drop_own_commit`])
+/// and return [`CommitSyncError::Conflict`]; the caller syncs again and re-applies
+/// against fresh content.
 ///
 /// `paths` must not be empty — see the pathspec-scoping comment below on why an
 /// unscoped commit is dangerous. An empty slice returns `CommitSyncError::PreCommit`
@@ -1032,6 +1394,14 @@ pub async fn commit_and_sync(
         )));
     }
 
+    // HEAD before this call's own commit: where a conflict with the remote resets
+    // the branch to, dropping this commit and nothing older (see
+    // `drop_own_commit`). Only a sync can conflict; `None` when HEAD is unborn.
+    let pre_commit_head = match git_url {
+        Some(_) => rev_parse_head(lock, data_path).await.ok(),
+        None => None,
+    };
+
     // --- git commit -m <message> -- <paths...> ---
     // Set the author identity inline so the command is self-contained even in
     // environments without a global git user configured. Both author and committer
@@ -1084,11 +1454,10 @@ pub async fn commit_and_sync(
 
     let mut rebased_paths: Vec<std::path::PathBuf> = Vec::new();
 
+    test_hook(HookPoint::BeforeSync).await;
+
     if let Some(url) = git_url {
-        let auth_url = match token {
-            Some(t) if !t.is_empty() => inject_token_into_url(url, t),
-            _ => url.to_string(),
-        };
+        let auth_url = authenticated_url(url, token);
 
         // `local_sha` doubles as "HEAD right after our own commit and before the
         // fetch". Diffing this against HEAD once the rebase completes isolates
@@ -1151,22 +1520,14 @@ pub async fn commit_and_sync(
             // failure (e.g. "Committer identity unknown") was reported as a phantom
             // conflict on an innocent file, sending you looking for a merge problem
             // that never existed.
-            let conflicted = timeout(
-                GIT_TIMEOUT,
-                git_cmd(&["diff", "--name-only", "--diff-filter=U"]).output(),
-            )
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .unwrap_or_default();
+            let conflicted = unmerged_paths(data_path).await;
 
             // Abort the rebase so the working tree is left clean at the local commit.
             let _ = git_cmd(&["rebase", "--abort"]).output().await;
 
-            // Either way, our own commit (`local_sha`) is still there — the rebase
-            // touched nothing durable, it just couldn't finish. Still PostCommit.
+            // A non-conflict failure leaves our own commit (`local_sha`) in place —
+            // the rebase touched nothing durable, it just couldn't finish. Still
+            // PostCommit.
             if conflicted.is_empty() {
                 return Err(CommitSyncError::PostCommit {
                     sha: local_sha.clone(),
@@ -1177,15 +1538,24 @@ pub async fn commit_and_sync(
                     ),
                 });
             }
-            return Err(CommitSyncError::PostCommit {
-                sha: local_sha.clone(),
-                source: anyhow::anyhow!(
-                    "rebase conflict: git rebase onto FETCH_HEAD conflicted on {}. \
-                     Rebase aborted. stderr: {}",
-                    conflicted.replace('\n', ", "),
-                    stderr
-                ),
-            });
+            // A genuine conflict: the remote changed what a local commit changed.
+            // Keeping this call's commit would leave the clone diverged — every
+            // later webhook ff-merge would fail — so drop it, and only it; the
+            // caller syncs again and re-applies against the fresh content or
+            // refuses.
+            let source = anyhow::anyhow!(
+                "rebase conflict: git rebase onto FETCH_HEAD conflicted on {}. \
+                 Rebase aborted. stderr: {}",
+                conflicted.replace('\n', ", "),
+                stderr
+            );
+            if let Err(e) = drop_own_commit(lock, data_path, pre_commit_head.as_deref()).await {
+                return Err(CommitSyncError::PostCommit {
+                    sha: local_sha.clone(),
+                    source: source.context(format!("dropping the commit failed: {e:#}")),
+                });
+            }
+            return Err(CommitSyncError::Conflict { source });
         }
 
         // The rebase just succeeded, which means it may have REPLAYED our commit
@@ -1220,6 +1590,8 @@ pub async fn commit_and_sync(
                 source: e.context("Failed to diff the rebase range"),
             })?;
 
+        test_hook(HookPoint::BeforePush).await;
+
         // --- git push <auth_url> HEAD:<branch> ---
         info!("Pushing to {} branch {}", redact_url(&auth_url), branch);
         let push_refspec = format!("HEAD:{}", branch);
@@ -1238,6 +1610,21 @@ pub async fn commit_and_sync(
         })?;
         if !push_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&push_out.stderr));
+            // The remote advanced again between the fetch and the push. Same
+            // treatment as a rebase conflict: drop this call's commit rather than
+            // keep one the remote has already moved past. The rebase is complete,
+            // so this also undoes its replay of any older unpushed commit, whose
+            // original the reset keeps on the branch.
+            if is_non_fast_forward_rejection(&stderr) {
+                let source = anyhow::anyhow!("git push rejected: {}", stderr);
+                if let Err(e) = drop_own_commit(lock, data_path, pre_commit_head.as_deref()).await {
+                    return Err(CommitSyncError::PostCommit {
+                        sha: post_rebase_sha.clone(),
+                        source: source.context(format!("dropping the commit failed: {e:#}")),
+                    });
+                }
+                return Err(CommitSyncError::Conflict { source });
+            }
             return Err(CommitSyncError::PostCommit {
                 sha: post_rebase_sha.clone(),
                 source: anyhow::anyhow!("git push failed: {}", stderr),
@@ -1342,6 +1729,16 @@ pub async fn unstage(_lock: &GitLock, data_path: &str, rel_path: &str) -> anyhow
         anyhow::bail!("git reset -- {} failed: {}", rel_path, stderr);
     }
     Ok(())
+}
+
+/// Whether git's index tracks `rel_path`. `update_schema` asks before removing a
+/// superseded legacy schema file: only a tracked path can be named in the commit
+/// that records its removal (`git add` of a missing untracked path fails) or be
+/// restored from HEAD on rollback. Takes the guard because the answer is only good
+/// for as long as no other writer can stage or commit in between.
+pub async fn is_tracked(_lock: &GitLock, data_path: &str, rel_path: &str) -> anyhow::Result<bool> {
+    let out = git_ok(data_path, &["ls-files", "-z", "--", rel_path], None).await?;
+    Ok(!out.stdout.is_empty())
 }
 
 /// Clean up git state left behind by a process that was killed mid-operation —
@@ -1909,6 +2306,55 @@ pub(crate) mod tests {
         assert!(result.contains("https://***@host2/r.git"));
     }
 
+    /// `git_ok`'s failure message puts the argv next to git's stderr, and on a
+    /// fetch or push the argv carries the token-bearing URL (`user:token@` or
+    /// `token@`): every occurrence in either part is redacted.
+    #[test]
+    fn git_failure_message_redacts_tokens_in_argv_and_stderr() {
+        let msg = git_failure_message(
+            &["push", "https://user:tok1@host/r.git", "HEAD:main"],
+            b"fatal: unable to access 'https://tok2@host/r.git/': error",
+        );
+        assert_eq!(
+            msg,
+            "git push https://***@host/r.git HEAD:main failed: \
+             fatal: unable to access 'https://***@host/r.git/': error"
+        );
+    }
+
+    /// A fetch `git_ok` runs against an unreachable remote fails with an error
+    /// that names the command, without the token its URL argument carries.
+    #[tokio::test]
+    async fn git_ok_failure_does_not_leak_a_token_from_its_argv() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let url = "http://x-access-token:SECRET123@127.0.0.1:1/r.git";
+        let err = git_ok(
+            work.path().to_str().unwrap(),
+            &["fetch", "--no-tags", url, "main"],
+            None,
+        )
+        .await
+        .expect_err("nothing listens on port 1");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("SECRET123"), "token leaked: {msg}");
+        assert!(
+            msg.starts_with("git fetch --no-tags http://***@127.0.0.1:1/r.git main failed"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn authenticated_url_injects_only_a_non_empty_token() {
+        let url = "https://gitea.example.com/user/repo.git";
+        assert_eq!(
+            authenticated_url(url, Some("tok")),
+            "https://tok@gitea.example.com/user/repo.git"
+        );
+        assert_eq!(authenticated_url(url, Some("")), url);
+        assert_eq!(authenticated_url(url, None), url);
+    }
+
     // --- history (#185) tests ---
 
     #[test]
@@ -2457,18 +2903,48 @@ pub(crate) mod tests {
         )
         .await;
 
-        // A rebase conflict happens after B's own commit has already landed locally
-        // (fetch/rebase run after `git commit`), so this must be PostCommit, not
-        // PreCommit — B's commit is real and must not be treated as discardable.
+        // A conflict drops B's commit, so the clone is never left diverged (a
+        // later ff-only merge must work).
         let err = match result {
-            Err(CommitSyncError::PostCommit { source, .. }) => source,
-            other => panic!("expected CommitSyncError::PostCommit, got: {:?}", other),
+            Err(CommitSyncError::Conflict { source }) => source,
+            other => panic!("expected CommitSyncError::Conflict, got: {:?}", other),
         };
         let msg = err.to_string();
         assert!(
             msg.starts_with("rebase conflict:"),
             "Error should start with 'rebase conflict:', got: {}",
             msg
+        );
+        // B is back where it was before its own commit — an ancestor of the
+        // remote tip — and the caller's next sync brings it onto that tip.
+        let work_b_path = work_b.path().to_str().unwrap();
+        assert_eq!(
+            rev_parse_head(&lock, work_b_path).await.unwrap(),
+            parent_sha,
+            "only B's own commit is dropped"
+        );
+        assert!(!work_b.path().join("conflict.md").exists());
+        sync_to_remote(
+            &lock,
+            Some(&bare_url),
+            "main",
+            work_b_path,
+            None,
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await;
+        let head_a = rev_parse_head(&lock, work_a.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rev_parse_head(&lock, work_b_path).await.unwrap(),
+            head_a,
+            "the next sync brings B onto the remote tip"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work_b.path().join("conflict.md")).unwrap(),
+            "version A"
         );
     }
 
@@ -3657,6 +4133,372 @@ pub(crate) mod tests {
             .output()
             .unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // --- what a sync or a conflict keeps: unpushed commits, uncommitted edits ---
+
+    /// Helper: commit `rel_path` in the clone at `clone` and push it to that
+    /// clone's `origin` — a peer landing a change on the remote.
+    fn push_from_peer(clone: &Path, rel_path: &str, content: &str) {
+        commit_hand_authored(
+            clone.to_str().unwrap(),
+            rel_path,
+            content,
+            &format!("peer: add {rel_path}"),
+        );
+        let out = git_test_cmd(clone)
+            .args(["push", "origin", "main"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "peer push failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Helper: the `refs/mcp-md-wiki/unsynced/*` recovery refs in `work_path`.
+    fn unsynced_refs(work_path: &str) -> String {
+        git_out(
+            work_path,
+            &["for-each-ref", "--format=%(refname)", "refs/mcp-md-wiki/"],
+        )
+    }
+
+    /// Helper: `sync_to_remote` against `bare_url` with no token.
+    async fn sync(lock: &GitLock, bare_url: &str, work_path: &str) {
+        sync_to_remote(
+            lock,
+            Some(bare_url),
+            "main",
+            work_path,
+            None,
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await;
+    }
+
+    /// A pre-write sync whose rebase fails for a reason other than a conflict —
+    /// here a dirty tracked file, which makes git refuse to start it — leaves the
+    /// clone alone: the commit an earlier outage left unpushed stays on the
+    /// branch, the uncommitted edit stays in the working tree, nothing is parked.
+    #[tokio::test]
+    async fn sync_to_remote_keeps_unpushed_commits_and_dirty_files_on_a_non_conflict_failure() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+        let peer = clone_bare_repo(bare.path(), "main");
+        // A global `rebase.autoStash` would stash the edit and let the rebase run.
+        git_out(work_path, &["config", "rebase.autoStash", "false"]);
+
+        commit_hand_authored(work_path, "unpushed.md", "earlier write", "add unpushed.md");
+        push_from_peer(peer.path(), "peer.md", "from the peer");
+        std::fs::write(work.path().join("README.md"), "an uncommitted edit").unwrap();
+
+        let lock = lock_git().await;
+        let unpushed = rev_parse_head(&lock, work_path).await.unwrap();
+        sync(&lock, &bare_url, work_path).await;
+
+        assert_eq!(
+            rev_parse_head(&lock, work_path).await.unwrap(),
+            unpushed,
+            "the unpushed commit must stay on the branch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("README.md")).unwrap(),
+            "an uncommitted edit"
+        );
+        assert_eq!(unsynced_refs(work_path), "", "nothing may be parked");
+        assert!(!work.path().join(".git/rebase-merge").exists());
+    }
+
+    /// Unpushed commits that genuinely conflict with the remote are parked under a
+    /// recovery ref, and the clone is reset to the remote tip rather than left
+    /// diverged.
+    #[tokio::test]
+    async fn sync_to_remote_parks_conflicting_unpushed_commits_and_resets_to_the_remote() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+        let peer = clone_bare_repo(bare.path(), "main");
+
+        commit_hand_authored(work_path, "shared.md", "local version", "add shared.md");
+        push_from_peer(peer.path(), "shared.md", "the peer's version");
+
+        let lock = lock_git().await;
+        let unpushed = rev_parse_head(&lock, work_path).await.unwrap();
+        sync(&lock, &bare_url, work_path).await;
+
+        assert_eq!(
+            rev_parse_head(&lock, work_path).await.unwrap(),
+            git_out(work_path, &["rev-parse", "FETCH_HEAD"]).trim()
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("shared.md")).unwrap(),
+            "the peer's version"
+        );
+        assert_eq!(
+            unsynced_refs(work_path).trim(),
+            format!("refs/mcp-md-wiki/unsynced/{unpushed}")
+        );
+        assert_eq!(git_out(work_path, &["status", "--porcelain"]), "");
+    }
+
+    /// A push the remote rejects because a peer pushed between this call's fetch
+    /// and its push drops this call's commit and nothing older: a commit an
+    /// earlier outage left unpushed (already reported to its caller as saved)
+    /// stays on the branch, and the caller's next sync rebases it onto the peer's
+    /// change.
+    #[tokio::test]
+    async fn commit_and_sync_push_rejection_drops_only_its_own_commit() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+        let peer = clone_bare_repo(bare.path(), "main");
+
+        commit_hand_authored(work_path, "unpushed.md", "earlier write", "add unpushed.md");
+        let lock = lock_git().await;
+        let unpushed = rev_parse_head(&lock, work_path).await.unwrap();
+
+        let peer_path = peer.path().to_path_buf();
+        let hook: TestHook = std::sync::Arc::new(move |point| {
+            let peer_path = peer_path.clone();
+            Box::pin(async move {
+                if point == HookPoint::BeforePush {
+                    push_from_peer(&peer_path, "peer.md", "from the peer");
+                }
+            })
+        });
+        std::fs::write(work.path().join("mine.md"), "this write").unwrap();
+        let result = TEST_HOOK
+            .scope(
+                hook,
+                commit_and_sync(
+                    &lock,
+                    Some(&bare_url),
+                    "main",
+                    work_path,
+                    None,
+                    &["mine.md"],
+                    "add mine.md",
+                    "test-bot",
+                    "test-bot@localhost",
+                ),
+            )
+            .await;
+        match result {
+            Err(CommitSyncError::Conflict { source }) => {
+                let msg = format!("{source:#}");
+                assert!(msg.starts_with("git push rejected"), "{msg}");
+            }
+            other => panic!("expected CommitSyncError::Conflict, got: {other:?}"),
+        }
+
+        assert_eq!(
+            rev_parse_head(&lock, work_path).await.unwrap(),
+            unpushed,
+            "the unpushed commit must stay the branch tip; only this call's commit goes"
+        );
+        assert!(!work.path().join("mine.md").exists());
+        assert!(work.path().join("unpushed.md").exists());
+        assert_eq!(unsynced_refs(work_path), "", "nothing may be parked");
+
+        sync(&lock, &bare_url, work_path).await;
+        assert_eq!(
+            git_out(work_path, &["rev-parse", "HEAD~1"]),
+            git_out(work_path, &["rev-parse", "FETCH_HEAD"]),
+            "the unpushed commit is rebased onto the peer's change"
+        );
+        assert!(work.path().join("unpushed.md").exists());
+        assert!(work.path().join("peer.md").exists());
+    }
+
+    /// A rebase conflict on this call's own file drops this call's commit and
+    /// nothing older: an earlier unpushed commit that does not conflict stays on
+    /// the branch, and the caller's next sync rebases it onto the remote.
+    #[tokio::test]
+    async fn commit_and_sync_rebase_conflict_keeps_an_older_unpushed_commit() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+        let peer = clone_bare_repo(bare.path(), "main");
+
+        commit_hand_authored(work_path, "unpushed.md", "earlier write", "add unpushed.md");
+        push_from_peer(peer.path(), "shared.md", "the peer's version");
+
+        let lock = lock_git().await;
+        let unpushed = rev_parse_head(&lock, work_path).await.unwrap();
+        std::fs::write(work.path().join("shared.md"), "this write's version").unwrap();
+        let result = commit_and_sync(
+            &lock,
+            Some(&bare_url),
+            "main",
+            work_path,
+            None,
+            &["shared.md"],
+            "add shared.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await;
+        match result {
+            Err(CommitSyncError::Conflict { source }) => {
+                let msg = format!("{source:#}");
+                assert!(
+                    msg.starts_with("rebase conflict:") && msg.contains("shared.md"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected CommitSyncError::Conflict, got: {other:?}"),
+        }
+
+        assert_eq!(
+            rev_parse_head(&lock, work_path).await.unwrap(),
+            unpushed,
+            "the unpushed commit must stay the branch tip; only this call's commit goes"
+        );
+        assert!(!work.path().join("shared.md").exists());
+        assert_eq!(unsynced_refs(work_path), "", "nothing may be parked");
+        assert_eq!(git_out(work_path, &["status", "--porcelain"]), "");
+
+        sync(&lock, &bare_url, work_path).await;
+        assert_eq!(
+            git_out(work_path, &["rev-parse", "HEAD~1"]),
+            git_out(work_path, &["rev-parse", "FETCH_HEAD"]),
+            "the unpushed commit is rebased onto the peer's change"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("shared.md")).unwrap(),
+            "the peer's version"
+        );
+        assert!(work.path().join("unpushed.md").exists());
+    }
+
+    /// When the rebase empties this call's commit (the remote already has the same
+    /// change) and the push is then rejected, HEAD is the replayed older unpushed
+    /// commit, not this call's: the reset must still keep that older commit.
+    #[tokio::test]
+    async fn commit_and_sync_push_rejection_after_an_emptied_commit_keeps_the_older_one() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+        let peer = clone_bare_repo(bare.path(), "main");
+
+        commit_hand_authored(work_path, "unpushed.md", "earlier write", "add unpushed.md");
+        push_from_peer(peer.path(), "README.md", "# Same edit");
+        let lock = lock_git().await;
+        let unpushed = rev_parse_head(&lock, work_path).await.unwrap();
+
+        let peer_path = peer.path().to_path_buf();
+        let hook: TestHook = std::sync::Arc::new(move |point| {
+            let peer_path = peer_path.clone();
+            Box::pin(async move {
+                if point == HookPoint::BeforePush {
+                    push_from_peer(&peer_path, "peer.md", "from the peer");
+                }
+            })
+        });
+        std::fs::write(work.path().join("README.md"), "# Same edit").unwrap();
+        let result = TEST_HOOK
+            .scope(
+                hook,
+                commit_and_sync(
+                    &lock,
+                    Some(&bare_url),
+                    "main",
+                    work_path,
+                    None,
+                    &["README.md"],
+                    "edit README.md",
+                    "test-bot",
+                    "test-bot@localhost",
+                ),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(CommitSyncError::Conflict { .. })),
+            "expected CommitSyncError::Conflict, got: {result:?}"
+        );
+
+        assert_eq!(
+            rev_parse_head(&lock, work_path).await.unwrap(),
+            unpushed,
+            "the older unpushed commit must stay the branch tip"
+        );
+        assert_eq!(unsynced_refs(work_path), "", "nothing may be parked");
+        sync(&lock, &bare_url, work_path).await;
+        assert!(work.path().join("unpushed.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("README.md")).unwrap(),
+            "# Same edit"
+        );
+    }
+
+    /// A reset to the remote tip whose count of the local commits it drops is
+    /// unreadable still saves HEAD under a recovery ref first, instead of
+    /// assuming there are none.
+    #[tokio::test]
+    async fn reset_to_fetch_head_saves_head_when_the_unpushed_count_is_unreadable() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        commit_hand_authored(work_path, "first.md", "first", "add first.md");
+        let lock = lock_git().await;
+        let first = rev_parse_head(&lock, work_path).await.unwrap();
+        commit_hand_authored(work_path, "second.md", "second", "add second.md");
+        let head = rev_parse_head(&lock, work_path).await.unwrap();
+        git_out(work_path, &["fetch", "--no-tags", &bare_url, "main"]);
+        // Lose the older commit's (loose) object: HEAD still resolves, but the
+        // walk `rev-list --count FETCH_HEAD..HEAD` needs fails.
+        std::fs::remove_file(
+            work.path()
+                .join(".git/objects")
+                .join(&first[..2])
+                .join(&first[2..]),
+        )
+        .unwrap();
+        let count = git_test_cmd(work_path)
+            .args(["rev-list", "--count", "FETCH_HEAD..HEAD"])
+            .output()
+            .unwrap();
+        assert!(!count.status.success(), "test setup: the count must fail");
+
+        reset_to_fetch_head(&lock, work_path).await.unwrap();
+
+        assert_eq!(
+            unsynced_refs(work_path).trim(),
+            format!("refs/mcp-md-wiki/unsynced/{head}")
+        );
+        assert_eq!(
+            rev_parse_head(&lock, work_path).await.unwrap(),
+            git_out(work_path, &["rev-parse", "FETCH_HEAD"]).trim()
+        );
+    }
+
+    /// `is_tracked` answers from the index: a committed or staged path is
+    /// tracked, an untracked or missing one is not.
+    #[tokio::test]
+    async fn is_tracked_answers_from_the_index() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+        std::fs::write(work.path().join("untracked.md"), "x").unwrap();
+        std::fs::write(work.path().join("staged.md"), "x").unwrap();
+        git_out(work_path, &["add", "--", "staged.md"]);
+
+        let lock = lock_git().await;
+        assert!(is_tracked(&lock, work_path, "README.md").await.unwrap());
+        assert!(is_tracked(&lock, work_path, "staged.md").await.unwrap());
+        assert!(!is_tracked(&lock, work_path, "untracked.md").await.unwrap());
+        assert!(!is_tracked(&lock, work_path, "missing.md").await.unwrap());
     }
 
     // --- restore_from_head / unstage tests ---

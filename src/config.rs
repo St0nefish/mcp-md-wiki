@@ -535,7 +535,9 @@ pub struct McpConfig {
     /// without a restart. Still honored when set — logged once at startup as
     /// deprecated — but a `server.md` extension file, if present, wins.
     pub instructions: Option<String>,
-    /// How often (in seconds) to refresh discovered metadata from Qdrant.
+    /// How often (in seconds) to recompose the server instructions (the
+    /// top-level areas) and the tool descriptions, including the extension files
+    /// under `extensions_path`. Nothing is read from Qdrant.
     #[serde(default = "default_metadata_refresh_secs")]
     pub metadata_refresh_secs: u64,
     /// Hostnames accepted in the inbound `Host` header. Entries may include a
@@ -889,7 +891,7 @@ fn default_mcp_port() -> u16 {
 pub struct WriteConfig {
     /// If true, creating a new document runs a similarity check against the
     /// existing collection and refuses if a near-duplicate exists. A directory's
-    /// `.kb-schema.yaml` `dedup:` block overrides this (and `dedup_threshold`)
+    /// schema file's `dedup:` block overrides this (and `dedup_threshold`)
     /// for its subtree; this is the fallback where none sets it (#272).
     #[serde(default = "default_dedup_enabled")]
     pub dedup_enabled: bool,

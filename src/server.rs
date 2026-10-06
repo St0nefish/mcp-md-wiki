@@ -21,7 +21,7 @@ use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{self, FrontmatterConfig, ResolvedConfig, SharedConfig};
+use crate::config::{self, ResolvedConfig, SharedConfig};
 use crate::descriptions;
 use crate::embed::EmbedClient;
 use crate::git;
@@ -160,7 +160,7 @@ const MAX_BREAKDOWN_FIELDS: usize = 20;
 const MAX_VALUES_PER_BREAKDOWN: i64 = 50;
 /// Free-text frontmatter fields: unique per document by design (and promoted to
 /// columns, so they never reach `document_fields` anyway). Neither a metrics breakdown
-/// nor an `Available <field>:` instructions line can say anything useful about them —
+/// nor a vocabulary listing can say anything useful about them —
 /// the latter would list one value per document (#333).
 const FREE_TEXT_FIELDS: [&str; 2] = ["title", "description"];
 /// Fields never broken down, in addition to [`FREE_TEXT_FIELDS`].
@@ -957,14 +957,14 @@ pub fn render_prometheus(
 
     metric(
         "kb_schema_invalid",
-        "1 while a runtime schema rebuild is being refused because a .kb-schema.yaml \
+        "1 while a runtime schema rebuild is being refused because a schema file \
          is invalid (the previous schema stays in effect), 0 otherwise.",
         "gauge",
         &plain(if idx.schema_error.is_some() { 1.0 } else { 0.0 }),
     );
     metric(
         "kb_schema_invalid_files",
-        "Invalid .kb-schema.yaml files found by the most recent refused schema rebuild.",
+        "Invalid schema files found by the most recent refused schema rebuild.",
         "gauge",
         &plain(idx.schema_error.as_ref().map_or(0, |e| e.files.len()) as f64),
     );
@@ -1372,7 +1372,15 @@ fn mcp_transport_config(
     }
 }
 
-/// Sanitize a single facet value before embedding it into MCP instructions.
+/// Sanitize one knowledge-base-controlled string before it is echoed to the model.
+///
+/// Folder names, schema scope paths and frontmatter field names and values come
+/// from a synced git repository, so each is as untrusted as document text. Every
+/// place such a string reaches the model goes through here: the top-level areas
+/// line of the server instructions, `get_schema`'s field keys, `values`,
+/// `default`s, `declared_in`, `in_use` keys and `other_fields_in_use`, the
+/// fields and allowed values a refused `search` filter lists, and the
+/// `[declared in …]` origin a validation error names.
 ///
 /// - Replaces control characters (including newlines and tabs) with a single space.
 /// - Truncates to `MAX_FACET_VALUE_LEN` characters (Unicode scalar boundary), appending `…`
@@ -1397,68 +1405,6 @@ pub(crate) fn sanitize_facet_value(s: &str) -> String {
     }
 }
 
-/// Build the write-authoring section of MCP instructions from frontmatter config.
-///
-/// Does NOT name any tool — `tools/list` already transmits tool names and
-/// descriptions as structured data, so naming them here again would be a tool
-/// tour that inevitably drifts (this function used to open with a sentence
-/// naming `create_document`/`edit_document`, both long gone). What this
-/// function generates is genuinely config-derived and belongs nowhere else:
-/// - A "Required frontmatter fields" line when `frontmatter.required` is non-empty.
-/// - Per-field "must be one of" clauses for every entry in `frontmatter.allowed`,
-///   iterated in stable (sorted) order so output is deterministic.
-/// - The "do NOT write a `domain` field" rule, unconditionally — see its own
-///   comment below for why that one is a real mechanic, not authoring advice.
-///
-/// This section is APPENDED to any base instructions (custom or default), so a
-/// custom `mcp.instructions` override cannot suppress the authoring guidance.
-pub fn build_authoring_section(frontmatter: &FrontmatterConfig) -> String {
-    let mut lines: Vec<String> = Vec::new();
-
-    if !frontmatter.required.is_empty() {
-        lines.push(format!(
-            "Required frontmatter fields: {}.",
-            frontmatter.required.join(", ")
-        ));
-    }
-
-    if !frontmatter.allowed.is_empty() {
-        // Sort by field name for deterministic output.
-        let mut allowed_pairs: Vec<(&String, &Vec<String>)> = frontmatter.allowed.iter().collect();
-        allowed_pairs.sort_by_key(|(k, _)| k.as_str());
-
-        let clauses: Vec<String> = allowed_pairs
-            .into_iter()
-            .map(|(field, values)| format!("{field} must be one of: {}", values.join(", ")))
-            .collect();
-        lines.push(format!("Fixed-value fields — {}.", clauses.join("; ")));
-    }
-
-    if !frontmatter.required.is_empty() || !frontmatter.allowed.is_empty() {
-        lines.push(
-            "Other fields (e.g. tags) are open; see the \"Available ...\" lines above \
-             for values already in use."
-                .to_string(),
-        );
-    }
-
-    // `domain` used to be listed as an open field here, next to `tags`. It is a search
-    // filter, not an authored one: since the reorg it is derived from the top-level
-    // folder and any authored value is overridden server-side. Naming it alongside the
-    // "Available domain: ..." facet line told agents to write it, and they did — the
-    // resulting `domain:` key is invisible to search but fails the knowledge base's own
-    // frontmatter lint, so an MCP-authored document plants a pre-commit failure that
-    // surfaces later in an unrelated commit.
-    lines.push(
-        "Do NOT write a `domain` field: it is derived from the document's top-level \
-         folder, so the directory you write to sets it. It remains a search filter, but \
-         authoring it is an error."
-            .to_string(),
-    );
-
-    format!("\n\n{}", lines.join("\n"))
-}
-
 /// Top-level folder names, which are what the knowledge base's areas actually are now
 /// that `domain` is no longer a distinguished frontmatter field.
 fn top_level_areas(data_path: &Path) -> Vec<String> {
@@ -1478,220 +1424,61 @@ fn top_level_areas(data_path: &Path) -> Vec<String> {
     areas
 }
 
-/// Build MCP server instructions by combining config narrative with the discovered
-/// vocabulary for each root-level indexed field, then appending write-authoring
-/// guidance derived from the frontmatter schema.
+/// Build the compiled + corpus-dependent server instructions: `base`, the
+/// top-level areas line, and — while `get_schema` is enabled — the one pointer
+/// to it for field values and per-folder rules.
 ///
-/// Per field, a schema-declared closed set (`values:` on a `.kb-schema.yaml` field, or
-/// the legacy `config.yaml` `allowed` map — both surface as `FieldDef::values`, see
-/// `ResolvedSchema::from_config`) is *permitted*, whether or not it has been used yet;
-/// Qdrant facets only describe what's currently *in use*, which understates the
-/// permitted set and drifts as the corpus changes. So declared values win when a field
-/// has them, and facets are consulted only for fields with no declared set to fall back
-/// to (issue #77 — a permitted-but-unused value like `archived` must still be
-/// advertised, not silently hidden until something adopts it).
-#[allow(clippy::too_many_arguments)]
-async fn build_instructions(
-    base: &str,
-    qdrant: &QdrantStore,
-    collection: &str,
-    data_path: &Path,
-    schemas: &SchemaCache,
-    frontmatter: &FrontmatterConfig,
-    effective_granularities: &[config::Granularity],
-    disabled_tools: &[String],
-) -> String {
-    const MAX_VALUES_PER_FIELD: usize = 50;
-    /// Cap on scoped-schema directories listed, so instruction size stays bounded
-    /// however many schema files exist.
-    const MAX_SCOPES_LISTED: usize = 40;
+/// Field vocabularies, scoped folders and authoring rules are deliberately not
+/// enumerated here: they were root-level only (misleading for filtering, never
+/// enough for writing into a scoped folder), paid in every session, and
+/// duplicated `get_schema`. Instead `get_schema` serves them on demand (with
+/// `values_in_use` for open fields), a `search` filter on an unknown field or
+/// value is refused with the options listed, and an authored derived field is
+/// a validation error naming the folder rule.
+fn build_instructions(base: &str, data_path: &Path, disabled_tools: &[String]) -> String {
+    /// Cap on the areas listed, so the line stays bounded however many
+    /// top-level directories a knowledge base grows.
+    const MAX_AREAS_LISTED: usize = 30;
 
-    let mut instructions = base.to_string();
-
-    let areas = top_level_areas(data_path);
-    let mut areas_listed = false;
-    if !areas.is_empty() {
-        // Only offers an exhaustive no-query listing when an enabled
-        // granularity can serve one (#286); dropped entirely when `search`
-        // itself is disabled (`mcp.disabled_tools`).
-        if let Some(sentence) = descriptions::top_level_areas_sentence(
-            &areas,
-            effective_granularities,
-            descriptions::tool_enabled("search", disabled_tools),
-        ) {
-            instructions.push('\n');
-            instructions.push_str(&sentence);
-            areas_listed = true;
-        }
+    let mut lines = vec![base.to_string()];
+    let mut areas = top_level_areas(data_path);
+    let overflow = areas.len().saturating_sub(MAX_AREAS_LISTED);
+    areas.truncate(MAX_AREAS_LISTED);
+    if overflow > 0 {
+        areas.push(format!("+{overflow} more"));
     }
-
-    // Only root-level vocabularies are enumerated here. Listing every scope's values
-    // would grow without bound as schemas nest, and most of it is irrelevant to any
-    // given call — get_schema is the targeted way to ask.
-    for field in schemas.root().indexed_fields() {
-        if field == "file_path" || FREE_TEXT_FIELDS.contains(&field.as_str()) {
-            continue;
-        }
-        // Field NAMES are attacker-influenceable too — they come from .kb-schema.yaml
-        // files in a synced repo and from update_schema parameters — so they get the
-        // same control-character stripping and length cap as facet values. Without it,
-        // a field name containing newlines injects text into every agent's system
-        // prompt on the next refresh tick.
-        let display_field = sanitize_facet_value(&field);
-
-        // Prefer the schema's declared permitted set over facets — see the function
-        // doc for why. Root-only lookup matches the "only root-level vocabularies are
-        // enumerated here" scoping above.
-        if let Some(values) = schemas
-            .root()
-            .fields
-            .get(field.as_str())
-            .and_then(|def| def.values.as_ref())
-            .filter(|values| !values.is_empty())
-        {
-            let mut display: Vec<String> = values.iter().map(|v| sanitize_facet_value(v)).collect();
-            display.sort();
-            display.dedup();
-            let overflow = display.len().saturating_sub(MAX_VALUES_PER_FIELD);
-            display.truncate(MAX_VALUES_PER_FIELD);
-            let mut joined = display.join(", ");
-            if overflow > 0 {
-                joined.push_str(&format!(" (+{overflow} more)"));
-            }
-            instructions.push_str(&format!("\nAvailable {display_field}: {joined}"));
-            continue;
-        }
-
-        // No declared closed set for this field, so facets — what's actually in use —
-        // are the only vocabulary available at all.
-        let field = field.as_str();
-        // Fetch one extra so we can detect when there are more than the cap.
-        match qdrant
-            .fetch_facet_values(collection, field, (MAX_VALUES_PER_FIELD + 1) as u64)
-            .await
-        {
-            Ok(values) if !values.is_empty() => {
-                let overflow = values.len().saturating_sub(MAX_VALUES_PER_FIELD);
-                let display: Vec<String> = values
-                    .iter()
-                    .take(MAX_VALUES_PER_FIELD)
-                    .map(|v| sanitize_facet_value(v))
-                    .collect();
-                let mut joined = display.join(", ");
-                if overflow > 0 {
-                    joined.push_str(&format!(" (+{overflow} more)"));
-                }
-                instructions.push_str(&format!("\nAvailable {display_field}: {joined}"));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!(field, collection, "Failed to fetch facet values: {e:#}");
-            }
-        }
+    if let Some(sentence) = descriptions::top_level_areas_sentence(&areas) {
+        lines.push(sentence);
     }
-
-    // Directory names are filesystem-controlled and may legally contain newlines, so
-    // they are sanitized before reaching the instructions string.
-    let scoped: Vec<String> = schemas
-        .field_scope_paths()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| sanitize_facet_value(&format!("{}/", p.display())))
-        .collect();
-    // When every top-level area already listed above has its own schema,
-    // naming them all again would repeat the areas line verbatim — the
-    // instructions share Claude Code's 2048-char cap with the KB's `server.md`
-    // extension, so the line says "every top-level area" and lists only the
-    // deeper scopes.
-    let every_area_scoped = areas_listed
-        && areas
-            .iter()
-            .all(|area| scoped.iter().any(|s| *s == format!("{area}/")));
-    if !scoped.is_empty() {
-        if every_area_scoped {
-            let deeper: Vec<&str> = scoped
-                .iter()
-                .filter(|s| !areas.iter().any(|area| **s == format!("{area}/")))
-                .map(String::as_str)
-                .take(MAX_SCOPES_LISTED)
-                .collect();
-            if deeper.is_empty() {
-                instructions
-                    .push_str("\nEvery top-level area has its own stricter frontmatter rules.");
-            } else {
-                instructions.push_str(&format!(
-                    "\nEvery top-level area has its own stricter frontmatter rules, as do: {}.",
-                    deeper.join(", ")
-                ));
-            }
-        } else {
-            let listed: Vec<&str> = scoped
-                .iter()
-                .map(String::as_str)
-                .take(MAX_SCOPES_LISTED)
-                .collect();
-            instructions.push_str(&format!(
-                "\nDirectories with their own stricter frontmatter rules: {}.",
-                listed.join(", ")
-            ));
-        }
-        // The call-to-action names `get_schema` specifically, so it is dropped
-        // when that tool is disabled (`mcp.disabled_tools`) rather than
-        // pointing a caller at a tool `tools/call` would refuse.
-        if descriptions::tool_enabled("get_schema", disabled_tools) {
-            instructions.push_str(
-                " Call get_schema with a path before writing there — the rules above are \
-                 root-level only.",
-            );
-        }
+    if descriptions::tool_enabled("get_schema", disabled_tools) {
+        lines.push(descriptions::SCHEMA_POINTER_SENTENCE.to_string());
     }
-
-    instructions.push_str(&build_authoring_section(frontmatter));
-    instructions
+    lines.join("\n")
 }
 
 /// Compose the full MCP server instructions for the current config/corpus —
-/// the compiled mechanics and config-derived retrieval-mode sentence
-/// (`descriptions::compose_server_mechanics`), then the corpus-dependent parts
-/// of category 2 ([`build_instructions`]: facet vocabularies, schema scopes,
-/// authoring rules), then the KB's `server.md` extension — or, failing that,
+/// the compiled mechanics (`descriptions::compose_server_mechanics`), then the
+/// corpus-dependent lines ([`build_instructions`]: top-level areas, the
+/// `get_schema` pointer), then the KB's `server.md` extension — or, failing that,
 /// the deprecated `mcp.instructions` — appended last via
 /// `descriptions::append_extension`. See `descriptions.rs`'s module doc for
 /// why the KB extension must come after everything else. The result goes
 /// through `descriptions::warn_if_over_client_cap`.
 ///
 /// Called once at startup and again on every metadata-refresh tick, so every
-/// input here must be read fresh from `config`/`schemas` rather than captured
-/// once — this is what makes `mcp.extensions_path`, `mcp.instructions`,
-/// `search.hybrid`, and `search.phrase` observe a `POST /admin/reload` within
+/// input here must be read fresh from `config` and the KB on disk rather than
+/// captured once — this is what makes `mcp.extensions_path`, `mcp.instructions` and
+/// `mcp.disabled_tools` observe a `POST /admin/reload` within
 /// `mcp.metadata_refresh_secs` instead of requiring a restart.
 pub(crate) async fn compose_server_instructions(
     config: &ResolvedConfig,
-    qdrant: &QdrantStore,
     data_path: &Path,
-    schemas: &SchemaCache,
 ) -> String {
-    // Effective, not raw: same `config AND confirmed-available` gate the
-    // per-tool overlay below and the search handlers in `mcp.rs` use, so the
-    // instructions never assert quoted-phrase support the server can't back up
-    // (e.g. an older Qdrant that rejected the phrase-matching text index).
-    let phrase_effective =
-        config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available();
-    let mechanics = descriptions::compose_server_mechanics(
-        config.search.hybrid,
-        phrase_effective,
-        descriptions::tool_enabled("search", &config.mcp.disabled_tools),
-    );
     let full = build_instructions(
-        &mechanics,
-        qdrant,
-        &config.qdrant.collection,
+        &descriptions::compose_server_mechanics(),
         data_path,
-        schemas,
-        &config.frontmatter,
-        &config.effective_granularities(),
         &config.mcp.disabled_tools,
-    )
-    .await;
+    );
 
     // The only filesystem access left in this function: resolving the
     // extensions directory (a canonicalize of its ancestors) and reading
@@ -1725,10 +1512,28 @@ pub(crate) async fn compose_server_instructions(
 /// on every metadata-refresh tick, same reload contract as
 /// [`compose_server_instructions`].
 fn compose_tool_overlay(config: &ResolvedConfig, data_path: &Path) -> HashMap<String, String> {
+    compose_tool_overlay_with(
+        config,
+        data_path,
+        crate::status::INDEX_STATUS.phrase_matching_available(),
+    )
+}
+
+/// [`compose_tool_overlay`] with `phrase_matching_available` — what
+/// `status::INDEX_STATUS.phrase_matching_available()` reports — passed in, so a
+/// test can set either state without touching the process-global status.
+/// `search`'s description advertises phrase syntax only when `search.phrase` is
+/// on AND that holds: the same gate every search handler applies before it
+/// sends a phrase filter, so the model is never offered syntax the handler
+/// would not honour.
+fn compose_tool_overlay_with(
+    config: &ResolvedConfig,
+    data_path: &Path,
+    phrase_matching_available: bool,
+) -> HashMap<String, String> {
     let extensions_dir =
         descriptions::resolve_extensions_dir(data_path, &config.mcp.extensions_path);
-    let phrase_effective =
-        config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available();
+    let phrase_effective = config.search.phrase && phrase_matching_available;
     // Same effective set `KbSearchServer::overlay_input_schema` computes for
     // the `search` tool's schema `enum` — see
     // `ResolvedConfig::effective_granularities`'s doc comment for why the
@@ -1738,7 +1543,6 @@ fn compose_tool_overlay(config: &ResolvedConfig, data_path: &Path) -> HashMap<St
         extensions_dir.as_deref(),
         phrase_effective,
         &effective_granularities,
-        config.chunking.heading_metadata,
     )
 }
 
@@ -2103,7 +1907,7 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
 }
 
 /// Build the startup schema cache off the async executor (a recursive walk over the
-/// whole KB is blocking filesystem work), turning an invalid `.kb-schema.yaml`
+/// whole KB is blocking filesystem work), turning an invalid schema file
 /// anywhere in the tree into a startup error that names every invalid file and why.
 async fn build_startup_schema_cache(
     data_path: std::path::PathBuf,
@@ -2113,7 +1917,7 @@ async fn build_startup_schema_cache(
     tokio::task::spawn_blocking(move || SchemaCache::build(&data_path, &frontmatter, &indexing))
         .await
         .context("Schema walk panicked during startup")?
-        .context("Refusing to start: every .kb-schema.yaml in the indexed tree must be valid")
+        .context("Refusing to start: every schema file in the indexed tree must be valid")
 }
 
 pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf) -> Result<()> {
@@ -2171,12 +1975,12 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     };
 
     // The schema tree, built once here and shared for the rest of the process's
-    // life: the payload-index list below, the instructions builder (both the
-    // initial one and the refresh timer's), every MCP write/read tool via
-    // `KbSearchServer::schema_cache`, and the reindex worker, which rebuilds and
-    // swaps it whenever a `.kb-schema.yaml` changes (see `reindex::run_worker`).
+    // life: the payload-index list below, every MCP write/read tool via
+    // `KbSearchServer::schema_cache`, the web UI, and the reindex worker, which
+    // rebuilds and swaps it whenever a schema file changes (see
+    // `reindex::run_worker`).
     //
-    // Fatal on any invalid `.kb-schema.yaml`: a schema file that is present must
+    // Fatal on any invalid schema file: a schema file that is present must
     // be valid, and with no previous good cache to fall back on there is nothing
     // safe to serve. Built before the fresh-clone index below so that index never
     // runs under a bad schema either.
@@ -2228,13 +2032,11 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     // Build dynamic MCP instructions and the per-tool description overlay —
     // see `descriptions.rs` for the three-layer composition this implements
     // (compiled mechanics, config-derived sentences, KB extension). The
-    // cascade itself is refreshed by the reindex worker, not by this call or
-    // the timer below — both now just read whatever `shared_schema_cache`
-    // currently holds. A schema file added after boot is still picked up
-    // without a restart, just via the worker's dirty-path detection instead of
-    // a walk here.
-    let initial_instructions =
-        compose_server_instructions(&config, &qdrant, &instructions_data_path, &schemas).await;
+    // corpus-dependent parts are the KB's top-level folders and its
+    // `server.md`/`tools/<tool>.md` extension files, read from disk here and
+    // again on every tick of the timer below; neither reads Qdrant or the
+    // schema cache.
+    let initial_instructions = compose_server_instructions(&config, &instructions_data_path).await;
     let shared_instructions = Arc::new(RwLock::new(initial_instructions));
 
     let initial_overlay = compose_tool_overlay(&config, &instructions_data_path);
@@ -2258,13 +2060,12 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     // Spawn metadata refresh task
     let refresh_instructions = Arc::clone(&shared_instructions);
     let refresh_overlay = Arc::clone(&shared_description_overlay);
-    let refresh_qdrant = Arc::clone(&qdrant);
     let refresh_data_path = instructions_data_path.clone();
-    let refresh_schema_cache = Arc::clone(&shared_schema_cache);
-    // Live handle, not a captured `mcp.instructions`/`frontmatter`/
-    // `metadata_refresh_secs` snapshot: this loop re-reads all three from
-    // `shared_config` on every iteration below, which is what makes them
-    // `reload::ReloadEffect::Applied` rather than restart-required (see
+    // Live handle, not a captured snapshot of what this loop consumes
+    // (`mcp.instructions`, `mcp.extensions_path`, `mcp.disabled_tools`,
+    // `search.phrase`/`search.granularities` and `metadata_refresh_secs`): it
+    // re-reads them from `shared_config` on every iteration below, which is what
+    // makes them `reload::ReloadEffect::Applied` rather than restart-required (see
     // `reload.rs`'s classification table).
     let refresh_shared_config = Arc::clone(&shared_config);
 
@@ -2333,37 +2134,28 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
                     break;
                 }
             }
-            // This used to re-walk the whole KB (in `spawn_blocking`, since a
-            // recursive read_dir is blocking filesystem work) on every tick. Now it
-            // just reads whatever the reindex worker last swapped in — a lock
-            // acquisition and an `Arc` clone — for the corpus-dependent parts.
-            // `compose_server_instructions`/`compose_tool_overlay` below still do
-            // their own small, synchronous `std::fs::read`/`canonicalize` to load
-            // the KB's `server.md`/`tools/<tool>.md` extension files; each is capped
-            // at 8 KB (see `descriptions::MAX_EXTENSION_BODY_BYTES`), so the impact
-            // of running it on this async task's thread is low, and the read itself
-            // is wrapped in `spawn_blocking` to keep it off the executor regardless.
-            // The timer still polls rather than being woken by the worker: `build_instructions`
-            // also re-fetches Qdrant facet values (tag/type/domain vocabularies),
-            // which drift with ordinary indexing independent of any schema change, so
-            // something has to poll regardless — collapsing this into a
-            // worker-pushed signal would only remove the schema-change case, not the
-            // facet-drift case, for the cost of a second notification channel.
+            // A tick recomposes the instructions and the tool-description overlay
+            // from the live config and the KB on disk — its top-level folders and
+            // its `server.md`/`tools/<tool>.md` extension files — never from Qdrant
+            // or the schema cache.
+            // `compose_server_instructions`/`compose_tool_overlay` below do their
+            // own small, synchronous `std::fs::read`/`canonicalize` to load the
+            // extension files; each is capped at 8 KB (see
+            // `descriptions::MAX_EXTENSION_BODY_BYTES`), so the impact of running it
+            // on this async task's thread is low, and the read itself is wrapped in
+            // `spawn_blocking` to keep it off the executor regardless.
+            // The timer polls rather than being woken by the worker: the
+            // extension files and the top-level area list change with ordinary
+            // pushes, independent of any indexing run.
             //
             // Read again (post-sleep) rather than reusing the pre-sleep snapshot
             // above: a reload may have landed during the sleep, and
-            // `mcp.instructions`/`mcp.extensions_path`/`frontmatter`/`search.*`
+            // `mcp.instructions`/`mcp.extensions_path`/`mcp.disabled_tools`/`search.*`
             // should reflect whatever is live AT refresh time, not whatever was
             // live when this iteration started waiting.
             let live_config = config::load_shared_config(&refresh_shared_config);
-            let refreshed_schemas = schema::load_shared(&refresh_schema_cache);
-            let updated_instructions = compose_server_instructions(
-                &live_config,
-                &refresh_qdrant,
-                &refresh_data_path,
-                &refreshed_schemas,
-            )
-            .await;
+            let updated_instructions =
+                compose_server_instructions(&live_config, &refresh_data_path).await;
             match refresh_instructions.write() {
                 Ok(mut guard) => *guard = updated_instructions,
                 Err(poisoned) => {
@@ -2673,6 +2465,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::FrontmatterConfig;
     use axum::{body::Body, http::Request, routing::get};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use tower::ServiceExt;
@@ -3011,9 +2804,9 @@ mod tests {
         .expect_err("an invalid schema file must stop startup");
         let shown = format!("{err:#}");
         assert!(shown.contains("Refusing to start"), "{shown}");
-        assert!(shown.contains("a/.kb-schema.yaml"), "{shown}");
-        assert!(shown.contains("b/.kb-schema.yaml"), "{shown}");
-        assert!(!shown.contains("ok/.kb-schema.yaml"), "{shown}");
+        assert!(shown.contains("a/.schema.yaml"), "{shown}");
+        assert!(shown.contains("b/.schema.yaml"), "{shown}");
+        assert!(!shown.contains("ok/.schema.yaml"), "{shown}");
 
         std::fs::remove_dir_all(dir.path().join("a")).unwrap();
         std::fs::remove_dir_all(dir.path().join("b")).unwrap();
@@ -4134,235 +3927,12 @@ mod tests {
         );
     }
 
-    // --- build_instructions vocabulary source (issue #77) ---
+    // --- build_instructions: areas + one get_schema pointer ---------------
 
-    /// A schema-declared enum value that nothing has used yet must still be advertised.
-    /// Facets alone would hide `archived` here, since nothing in the (nonexistent)
-    /// corpus uses it — pointing Qdrant at a closed port makes that concrete: every
-    /// facet query gracefully degrades to empty (see
-    /// `fetch_facet_values_degrades_to_empty_on_query_failure` in `qdrant.rs`), so any
-    /// value that *does* show up in the instructions came from the schema, not Qdrant.
-    ///
-    /// `tags` carries no declared closed set, so it exercises the other branch: with
-    /// facets unreachable, it gets no "Available" line at all, rather than one
-    /// silently sourced from somewhere else.
-    #[tokio::test]
-    async fn build_instructions_advertises_declared_values_over_facets() {
-        let dir = tempfile::tempdir().unwrap();
-        let frontmatter = FrontmatterConfig {
-            indexed_fields: vec!["status".into(), "tags".into()],
-            allowed: std::collections::HashMap::from([(
-                "status".to_string(),
-                vec![
-                    "active".to_string(),
-                    "draft".to_string(),
-                    "archived".to_string(),
-                ],
-            )]),
-            ..Default::default()
-        };
-        let schemas = SchemaCache::build_for_test(dir.path(), &frontmatter);
-
-        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
-            url: "http://127.0.0.1:1".into(),
-            collection: "unused".into(),
-        })
-        .expect("client construction is lazy and must not require a live server");
-
-        let instructions = build_instructions(
-            "base",
-            &qdrant,
-            "unused",
-            dir.path(),
-            &schemas,
-            &frontmatter,
-            &config::Granularity::ALL,
-            &[],
-        )
-        .await;
-
-        assert!(
-            instructions.contains("Available status: active, archived, draft"),
-            "declared-but-unused value 'archived' must still be advertised: {instructions}"
-        );
-        assert!(
-            !instructions.contains("Available tags"),
-            "an undeclared field falls back to facets, which are unreachable here: {instructions}"
-        );
-    }
-
-    /// `title`/`description` are free text, so an `Available title:` line would be a
-    /// per-document list rather than a vocabulary (#333). Other fields are unaffected.
-    #[tokio::test]
-    async fn build_instructions_skips_free_text_fields() {
-        let dir = tempfile::tempdir().unwrap();
-        let frontmatter = FrontmatterConfig {
-            indexed_fields: vec!["title".into(), "description".into(), "status".into()],
-            allowed: std::collections::HashMap::from([(
-                "status".to_string(),
-                vec!["active".to_string(), "draft".to_string()],
-            )]),
-            ..Default::default()
-        };
-        let schemas = SchemaCache::build_for_test(dir.path(), &frontmatter);
-        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
-            url: "http://127.0.0.1:1".into(),
-            collection: "unused".into(),
-        })
-        .expect("client construction is lazy and must not require a live server");
-
-        let instructions = build_instructions(
-            "base",
-            &qdrant,
-            "unused",
-            dir.path(),
-            &schemas,
-            &frontmatter,
-            &config::Granularity::ALL,
-            &[],
-        )
-        .await;
-
-        assert!(!instructions.contains("Available title"), "{instructions}");
-        assert!(
-            !instructions.contains("Available description"),
-            "{instructions}"
-        );
-        assert!(
-            instructions.contains("Available status: active, draft"),
-            "other fields are unchanged: {instructions}"
-        );
-    }
-
-    /// A scope whose schema file sets only `dedup:` has no frontmatter rules, so the
-    /// instructions must not list it as having "stricter frontmatter rules".
-    #[tokio::test]
-    async fn build_instructions_skips_dedup_only_scopes() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("food")).unwrap();
-        std::fs::create_dir_all(dir.path().join("dev")).unwrap();
-        std::fs::write(
-            dir.path().join("food/.kb-schema.yaml"),
-            "fields:\n  prep:\n    type: integer\n    indexed: true\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("dev/.kb-schema.yaml"),
-            "dedup:\n  enabled: false\n",
-        )
-        .unwrap();
-        let frontmatter = FrontmatterConfig::default();
-        let schemas = SchemaCache::build_for_test(dir.path(), &frontmatter);
-        assert_eq!(schemas.scope_paths().count(), 2, "both scopes are loaded");
-        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
-            url: "http://127.0.0.1:1".into(),
-            collection: "unused".into(),
-        })
-        .expect("client construction is lazy and must not require a live server");
-
-        let instructions = build_instructions(
-            "base",
-            &qdrant,
-            "unused",
-            dir.path(),
-            &schemas,
-            &frontmatter,
-            &config::Granularity::ALL,
-            &[],
-        )
-        .await;
-
-        assert!(instructions.contains("food/"), "{instructions}");
-        assert!(
-            !instructions.contains("dev/"),
-            "dedup-only scope must not be listed: {instructions}"
-        );
-    }
-
-    // --- build_instructions cross-references omit a disabled tool ---------
-
-    /// Both the top-level-areas sentence (names `search`) and the scoped-schema
-    /// call-to-action (names `get_schema`) must stop naming their tool once
-    /// `mcp.disabled_tools` disables it, so instructions never point a caller
-    /// at a tool `tools/call` would refuse.
-    async fn build_instructions_for_disabled_tools_test(disabled_tools: &[String]) -> String {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("dev")).unwrap();
-        std::fs::create_dir_all(dir.path().join("food")).unwrap();
-        std::fs::write(
-            dir.path().join("food/.kb-schema.yaml"),
-            "fields:\n  prep:\n    type: integer\n    indexed: true\n",
-        )
-        .unwrap();
-        let frontmatter = FrontmatterConfig::default();
-        let schemas = SchemaCache::build_for_test(dir.path(), &frontmatter);
-
-        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
-            url: "http://127.0.0.1:1".into(),
-            collection: "unused".into(),
-        })
-        .expect("client construction is lazy and must not require a live server");
-
-        build_instructions(
-            "base",
-            &qdrant,
-            "unused",
-            dir.path(),
-            &schemas,
-            &frontmatter,
-            &config::Granularity::ALL,
-            disabled_tools,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn build_instructions_drops_the_top_level_areas_sentence_when_search_is_disabled() {
-        let enabled = build_instructions_for_disabled_tools_test(&[]).await;
-        assert!(
-            enabled.contains("Top-level areas of this knowledge base"),
-            "{enabled}"
-        );
-
-        let disabled = build_instructions_for_disabled_tools_test(&["search".to_string()]).await;
-        assert!(
-            !disabled.contains("Top-level areas of this knowledge base"),
-            "search is disabled, so the sentence pointing at it must be dropped: {disabled}"
-        );
-    }
-
-    #[tokio::test]
-    async fn build_instructions_drops_the_get_schema_call_to_action_when_get_schema_is_disabled() {
-        let enabled = build_instructions_for_disabled_tools_test(&[]).await;
-        assert!(
-            enabled.contains("Directories with their own stricter frontmatter rules"),
-            "{enabled}"
-        );
-        assert!(enabled.contains("Call get_schema with a path"), "{enabled}");
-
-        let disabled =
-            build_instructions_for_disabled_tools_test(&["get_schema".to_string()]).await;
-        assert!(
-            disabled.contains("Directories with their own stricter frontmatter rules"),
-            "the directory listing itself is not tool-specific and must survive: {disabled}"
-        );
-        assert!(
-            !disabled.contains("get_schema"),
-            "get_schema is disabled, so the call-to-action naming it must be dropped: {disabled}"
-        );
-    }
-
-    // --- server instructions length budget --------------------------------
-
-    /// The compiled + config-derived + corpus-dependent server instructions,
-    /// for a corpus shaped like a real personal knowledge base (15 top-level
-    /// areas, each with its own schema, plus two nested schema scopes and
-    /// three root vocabularies), must stay within
-    /// `descriptions::COMPILED_DESCRIPTION_BUDGET` under the configuration
-    /// that makes them longest — leaving room for the KB's `server.md`
-    /// extension under Claude Code's truncation cap.
-    #[tokio::test]
-    async fn server_instructions_for_a_realistic_corpus_fit_the_budget() {
+    /// A corpus shaped like a real personal knowledge base: 15 top-level
+    /// areas, each with its own schema, two nested scopes, and root
+    /// vocabularies for status/tags/type.
+    fn realistic_corpus() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let areas = [
             "3d-printing",
@@ -4394,140 +3964,153 @@ mod tests {
             dir.path().join(".kb-schema.yaml"),
             "fields:\n\
              \x20 status:\n    type: enum\n    indexed: true\n    values: [active, archived, draft]\n\
-             \x20 tags:\n    type: list\n    indexed: true\n    values: [claude-code, docker, \
-             node:apollo, node:ares, node:argos, node:atlas, node:hermes, node:pfsense]\n\
-             \x20 type:\n    type: enum\n    indexed: true\n    values: [architecture, config, \
-             decision-record, guide, migration, project, reference, research, troubleshooting]\n",
+             \x20 tags:\n    type: list\n    indexed: true\n    values: [claude-code, docker]\n\
+             \x20 type:\n    type: enum\n    indexed: true\n    values: [guide, reference]\n",
         )
         .unwrap();
+        dir
+    }
 
-        let frontmatter = FrontmatterConfig::default();
-        let schemas = SchemaCache::build_for_test(dir.path(), &frontmatter);
-        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
-            url: "http://127.0.0.1:1".into(),
-            collection: "unused".into(),
-        })
-        .expect("client construction is lazy and must not require a live server");
+    /// The compiled + corpus-dependent server instructions name the areas and
+    /// point at `get_schema` once — no root vocabularies, no scoped-folder
+    /// list, no authoring rules (those come from `get_schema`, from a refused
+    /// filter, or from a refused write) — and stay within
+    /// `descriptions::COMPILED_DESCRIPTION_BUDGET`, leaving room for the KB's
+    /// `server.md` extension under Claude Code's truncation cap.
+    #[test]
+    fn server_instructions_for_a_realistic_corpus_name_areas_and_point_at_get_schema() {
+        let dir = realistic_corpus();
+        let instructions =
+            build_instructions(&descriptions::compose_server_mechanics(), dir.path(), &[]);
 
-        let instructions = build_instructions(
-            &descriptions::compose_server_mechanics(true, true, true),
-            &qdrant,
-            "unused",
-            dir.path(),
-            &schemas,
-            &frontmatter,
-            &config::Granularity::ALL,
-            &[],
-        )
-        .await;
-
-        // Guard against a fixture that silently stopped exercising the
-        // corpus-dependent lines this budget exists for.
-        for line in [
-            "Top-level areas of this knowledge base: 3d-printing,",
-            "Available status: active, archived, draft",
-            "Available tags: claude-code,",
-            "Available type: architecture,",
-            "Every top-level area has its own stricter frontmatter rules, as do: \
-             food/plans/, food/recipes/.",
-            "Call get_schema",
+        assert!(
+            instructions.contains("Top-level areas: 3d-printing, dev,"),
+            "{instructions}"
+        );
+        assert!(
+            instructions.contains(descriptions::SCHEMA_POINTER_SENTENCE),
+            "{instructions}"
+        );
+        for absent in [
+            "Available",
+            "food/plans",
+            "stricter frontmatter rules",
+            "domain",
+            "kb-schema",
+            "path_prefix",
+            "phrase",
         ] {
             assert!(
-                instructions.contains(line),
-                "missing {line:?}: {instructions}"
+                !instructions.contains(absent),
+                "{absent:?} must not be in the instructions: {instructions}"
             );
         }
         let len = instructions.chars().count();
         assert!(
             len <= descriptions::COMPILED_DESCRIPTION_BUDGET,
             "server instructions are {len} chars for a realistic corpus, over the {}-char \
-             budget that leaves room for the KB's server.md extension:\n{instructions}",
+             budget:\n{instructions}",
             descriptions::COMPILED_DESCRIPTION_BUDGET
         );
-
-        // With `search` disabled the areas line is not emitted, so "every
-        // top-level area" would have nothing to refer to: the scoped
-        // directories are listed by name instead.
-        let without_search = build_instructions(
-            &descriptions::compose_server_mechanics(true, true, false),
-            &qdrant,
-            "unused",
-            dir.path(),
-            &schemas,
-            &frontmatter,
-            &config::Granularity::ALL,
-            &["search".to_string()],
-        )
-        .await;
-        assert!(
-            without_search
-                .contains("Directories with their own stricter frontmatter rules: 3d-printing/,"),
-            "{without_search}"
-        );
-        assert!(
-            !without_search.contains("Every top-level area"),
-            "{without_search}"
-        );
-        // Nothing describing `search`'s matching or parameters survives.
-        for search_only in ["path_prefix", "Search fuses", "Document *text*"] {
-            assert!(
-                !without_search.contains(search_only),
-                "{search_only:?} describes the disabled search tool: {without_search}"
-            );
-        }
     }
 
-    // --- compose_server_instructions phrase-flag gating (effective, not raw) ---
+    /// The pointer names `get_schema`, so it goes when that tool is disabled;
+    /// the areas line names no tool and stays whichever tools are enabled.
+    #[test]
+    fn build_instructions_drops_the_get_schema_pointer_only_when_get_schema_is_disabled() {
+        let dir = realistic_corpus();
+        let base = descriptions::compose_server_mechanics();
 
-    /// Regression: `compose_server_instructions` must gate the phrase-syntax
-    /// sentence on the EFFECTIVE flag (config AND the confirmed-available "text"
-    /// payload index), the same as `compose_tool_overlay` and the search
-    /// handlers in `mcp.rs` — not the raw `config.search.phrase` value. On an
-    /// older Qdrant where the phrase-matching text index failed to build,
-    /// `INDEX_STATUS.phrase_matching_available()` is false; the instructions
-    /// must not then claim quoted-phrase support just because the config flag
-    /// is on.
+        let no_schema = build_instructions(&base, dir.path(), &["get_schema".to_string()]);
+        assert!(!no_schema.contains("get_schema"), "{no_schema}");
+        assert!(no_schema.contains("Top-level areas:"), "{no_schema}");
+
+        let no_search = build_instructions(&base, dir.path(), &["search".to_string()]);
+        assert!(no_search.contains("Top-level areas:"), "{no_search}");
+        assert!(
+            no_search.contains(descriptions::SCHEMA_POINTER_SENTENCE),
+            "{no_search}"
+        );
+    }
+
+    #[test]
+    fn build_instructions_caps_the_areas_line() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..40 {
+            std::fs::create_dir_all(dir.path().join(format!("area{i:02}"))).unwrap();
+        }
+        let text = build_instructions("base", dir.path(), &[]);
+        assert!(text.contains("area29, +10 more."), "{text}");
+        assert!(!text.contains("area30"), "{text}");
+    }
+
+    /// `compose_server_instructions` appends the KB's `server.md` extension
+    /// after the compiled + corpus-dependent lines, and — whatever
+    /// `search.phrase`/`search.hybrid` say — carries no retrieval-mode
+    /// sentence: phrase syntax is described on `search` alone.
     #[tokio::test]
-    async fn compose_server_instructions_respects_effective_phrase_flag_not_raw_config() {
+    async fn compose_server_instructions_appends_the_extension_and_no_retrieval_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("meta/mcp")).unwrap();
+        std::fs::write(dir.path().join("meta/mcp/server.md"), "KB policy line.").unwrap();
+        let mut config = crate::mcp::make_test_resolved_config(dir.path());
+        {
+            let c = Arc::make_mut(&mut config);
+            c.search.phrase = true;
+            c.search.hybrid = true;
+            c.mcp.extensions_path = "meta/mcp".into();
+        }
+        let instructions = compose_server_instructions(&config, dir.path()).await;
+        assert!(
+            instructions.starts_with(&descriptions::compose_server_mechanics()),
+            "{instructions}"
+        );
+        assert!(instructions.ends_with("KB policy line."), "{instructions}");
+        assert!(!instructions.contains("phrase"), "{instructions}");
+    }
+
+    /// `search`'s description carries the phrase-syntax sentence only when
+    /// `search.phrase` is on AND Qdrant has confirmed phrase matching — never
+    /// for a syntax the search handler would not honour.
+    #[test]
+    fn compose_tool_overlay_advertises_phrase_syntax_only_when_configured_and_available() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = crate::mcp::make_test_resolved_config(dir.path());
-        Arc::make_mut(&mut config).search.phrase = true;
-
-        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
-            url: "http://127.0.0.1:1".into(),
-            collection: "unused".into(),
-        })
-        .expect("client construction is lazy and must not require a live server");
-        let schemas = SchemaCache::build_for_test(dir.path(), &config.frontmatter);
-
-        // This test relies on the fail-safe default rather than mutating the
-        // process-global `INDEX_STATUS` itself: see
-        // `index_paths_records_a_failed_run_in_the_global_status` in `ingest.rs`
-        // for why only one test in the suite is allowed to drive that global,
-        // and nothing in the default (non-`#[ignore]`d) test run ever records a
-        // "text" payload index outcome, so this reads as false throughout.
-        assert!(
-            !crate::status::INDEX_STATUS.phrase_matching_available(),
-            "test relies on the fail-safe default: nothing in this suite records \
-             a 'text' payload index outcome"
+        let effective = config.effective_granularities();
+        let search_description = |phrase: bool| {
+            descriptions::compose_tool_description("search", phrase, &effective, None).unwrap()
+        };
+        let (with_phrase, without_phrase) = (search_description(true), search_description(false));
+        assert_ne!(
+            with_phrase, without_phrase,
+            "fixture: the phrase flag must change search's description"
         );
 
-        let instructions =
-            compose_server_instructions(&config, &qdrant, dir.path(), &schemas).await;
+        for (configured, available) in [(true, true), (true, false), (false, true), (false, false)]
+        {
+            Arc::make_mut(&mut config).search.phrase = configured;
+            let overlay = compose_tool_overlay_with(&config, dir.path(), available);
+            let expected = if configured && available {
+                &with_phrase
+            } else {
+                &without_phrase
+            };
+            assert_eq!(
+                &overlay["search"], expected,
+                "search.phrase={configured}, phrase matching available={available}"
+            );
+        }
 
-        // `retrieval_mode_sentence(true, true)` (the raw-flag, buggy result) is the
-        // only one of the four hybrid x phrase combinations containing "exact
-        // phrase"; `retrieval_mode_sentence(true, false)` (the effective, fixed
-        // result — hybrid stays on, phrase is unavailable) does not.
-        assert!(
-            !instructions.contains("exact phrase"),
-            "phrase syntax must not be advertised when phrase matching is unavailable, \
-             even though config.search.phrase is true: {instructions}"
-        );
-        assert!(
-            instructions.contains(descriptions::retrieval_mode_sentence(true, false)),
-            "instructions must use the hybrid-on/phrase-off sentence: {instructions}"
-        );
+        // The production entry point reads the process-global status, which no unit
+        // test drives: Qdrant has confirmed nothing, so even `search.phrase = true`
+        // advertises no phrase syntax.
+        if !crate::status::INDEX_STATUS.phrase_matching_available() {
+            Arc::make_mut(&mut config).search.phrase = true;
+            assert_eq!(
+                compose_tool_overlay(&config, dir.path())["search"],
+                without_phrase
+            );
+        }
     }
 
     // --- sanitize_facet_value unit tests ---
@@ -4995,7 +4578,6 @@ mod tests {
                 None,
                 false,
                 &config.effective_granularities(),
-                config.chunking.heading_metadata,
             ))),
         )
         .unwrap();
@@ -5708,7 +5290,6 @@ mod tests {
                 None,
                 false,
                 &effective_granularities,
-                test_config.chunking.heading_metadata,
             ))),
         )
         .unwrap();
@@ -5857,7 +5438,6 @@ mod tests {
                 name,
                 false,
                 &effective_granularities,
-                default_config.chunking.heading_metadata,
                 None,
             )
             .unwrap_or_else(|| panic!("no compiled description for tool '{name}'"));
@@ -5931,7 +5511,6 @@ mod tests {
                 None,
                 false,
                 &effective_granularities,
-                config.chunking.heading_metadata,
             ))),
         )
         .unwrap();
@@ -6106,154 +5685,5 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    }
-
-    // --- build_authoring_section tests ---
-
-    #[test]
-    fn authoring_section_never_presents_domain_as_writable() {
-        // `domain` is derived from the top-level folder and overridden server-side, so
-        // an authored `domain:` key is invisible to search but fails the knowledge
-        // base's frontmatter lint — planting a pre-commit failure that surfaces later
-        // in an unrelated commit. Listing it as an open field made agents write it.
-        for fm in [
-            FrontmatterConfig::default(),
-            FrontmatterConfig {
-                required: vec!["title".into(), "type".into()],
-                ..Default::default()
-            },
-            FrontmatterConfig {
-                required: vec!["title".into()],
-                allowed: {
-                    let mut m = std::collections::HashMap::new();
-                    m.insert("status".into(), vec!["active".into()]);
-                    m
-                },
-                ..Default::default()
-            },
-        ] {
-            let section = build_authoring_section(&fm);
-            assert!(
-                !section.contains("e.g. domain"),
-                "domain must not be offered as an open field: {section}"
-            );
-            assert!(
-                section.contains("Do NOT write a `domain` field"),
-                "the derivation must be stated explicitly: {section}"
-            );
-        }
-    }
-
-    #[test]
-    fn authoring_section_with_required_and_allowed() {
-        let fm = FrontmatterConfig {
-            required: vec![
-                "title".into(),
-                "description".into(),
-                "type".into(),
-                "tags".into(),
-            ],
-            allowed: {
-                let mut m = std::collections::HashMap::new();
-                m.insert(
-                    "type".into(),
-                    vec!["guide".into(), "reference".into(), "research".into()],
-                );
-                m.insert(
-                    "status".into(),
-                    vec!["active".into(), "draft".into(), "archived".into()],
-                );
-                m
-            },
-            ..Default::default()
-        };
-
-        let section = build_authoring_section(&fm);
-
-        // No tool tour — see this function's doc comment. `tools/list` already
-        // transmits tool names as structured data.
-        assert!(
-            !section.contains("create_document") && !section.contains("edit_document"),
-            "must not name tools that no longer exist: {section}"
-        );
-
-        // Required fields line.
-        assert!(
-            section.contains("Required frontmatter fields:"),
-            "should contain required fields line: {section}"
-        );
-        assert!(
-            section.contains("title"),
-            "should list required field 'title': {section}"
-        );
-        assert!(
-            section.contains("tags"),
-            "should list required field 'tags': {section}"
-        );
-
-        // Fixed-value fields — stable (sorted) order: status before type.
-        let status_pos = section
-            .find("status must be one of")
-            .expect("status clause missing");
-        let type_pos = section
-            .find("type must be one of")
-            .expect("type clause missing");
-        assert!(
-            status_pos < type_pos,
-            "status should appear before type (sorted): {section}"
-        );
-
-        // Both fields list their values.
-        assert!(
-            section.contains("active"),
-            "should list 'active' for status: {section}"
-        );
-        assert!(
-            section.contains("guide"),
-            "should list 'guide' for type: {section}"
-        );
-    }
-
-    #[test]
-    fn authoring_section_empty_required_and_allowed() {
-        let fm = FrontmatterConfig::default(); // required: [], allowed: {}
-
-        let section = build_authoring_section(&fm);
-
-        // The domain rule is unconditional, so the section is never blank even
-        // when required/allowed are both empty.
-        assert!(
-            section.contains("Do NOT write a `domain` field"),
-            "domain rule should still be present: {section}"
-        );
-
-        // No required or fixed-value lines when config is empty.
-        assert!(
-            !section.contains("Required frontmatter fields"),
-            "should not emit required line when required is empty: {section}"
-        );
-        assert!(
-            !section.contains("must be one of"),
-            "should not emit fixed-value clause when allowed is empty: {section}"
-        );
-    }
-
-    #[test]
-    fn authoring_section_is_deterministic() {
-        let fm = FrontmatterConfig {
-            required: vec!["title".into(), "type".into()],
-            allowed: {
-                let mut m = std::collections::HashMap::new();
-                m.insert("type".into(), vec!["guide".into(), "reference".into()]);
-                m.insert("status".into(), vec!["active".into(), "draft".into()]);
-                m.insert("domain".into(), vec!["dev".into(), "ops".into()]);
-                m
-            },
-            ..Default::default()
-        };
-
-        let first = build_authoring_section(&fm);
-        let second = build_authoring_section(&fm);
-        assert_eq!(first, second, "output must be identical across calls");
     }
 }

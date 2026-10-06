@@ -14,14 +14,95 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
-### Breaking: an invalid `.kb-schema.yaml` is never loaded
+### Smaller up-front context; vocabularies on demand
 
-The "frozen scope" mechanism is gone. A `.kb-schema.yaml` in the indexed tree that is
+- **Smaller descriptions and schemas.** Every tool description now says what the tool
+  does and the cross-parameter workflow only — per-parameter rules live on the
+  parameter, response shapes are left to the (self-describing) response, and the
+  server instructions repeat nothing a tool says. Compiled + config-derived text per
+  description is budgeted at 600 characters (was 1500), leaving ~1400 for a KB
+  extension. Input schemas are compacted when served (no `$schema`, no `null` arm on
+  optional properties, no `"default": null`, no non-standard `format`), batch entries
+  no longer repeat their top-level twins' descriptions, `update_schema`'s field `type`
+  is a flat enum, and `update_schema`'s `operation`, `frontmatter_patch[].operation`
+  and `search`'s `order_by` advertise an `enum` — the server accepts the same strings
+  and aliases as before. `definition.extend` (deprecated) is still accepted but no
+  longer advertised; `definition.values` now says it replaces the inherited set unless
+  it includes `$values`.
+- **Server instructions no longer enumerate vocabularies.** The `Available
+  status/tags/type` lines, the list of folders with their own rules, the retrieval-mode
+  sentence, the text-matching paragraph and the "Do NOT write a `domain` field" rule
+  are gone. What remains is the base line, `Top-level areas: …` (capped at 30) and one
+  pointer: "Field values and per-folder rules: get_schema with a path." (dropped when
+  `get_schema` is disabled). Server instructions no longer query Qdrant facets.
+- **Filters teach on error.** `search` refuses, in both modes, a filter that could only
+  match nothing: one on a field no schema declares and no document carries (`unknown
+  filter field '…'; filterable fields: …`, `data.filterable_fields`), or on a value
+  outside the field's closed value set (`… is not an allowed value; allowed: …`, or
+  `… are not allowed values; …` for several, with `data.field`/`data.allowed`), lists
+  capped at 30. A list of values is refused only when none of them could match, an
+  `all_of` as soon as one could not. The closed set is the union over the scopes
+  `path_prefix` names (all scopes otherwise), `path_prefix` being read as `search`
+  matches it: a trailing `/` is ignored, a leading one is not, so `/food` names no
+  top-level scope. Any value a document actually uses is accepted, so a refusal never
+  hides a match. Previously these returned an empty result (an unknown field with a
+  query got a "not indexed" error).
+- **`get_schema` `values_in_use`.** New optional flag: open fields gain `in_use` (the 20
+  most-used values under the path, with document counts) and the result gains
+  `other_fields_in_use` (fields documents there carry that no schema declares, derived
+  ones such as `domain` aside).
+- **Writing `domain` is a validation error.** A write whose frontmatter sets `domain`
+  (derived from the top-level folder at index time) is refused with `rule: "derived"`
+  and "`domain` is set by the document's top-level folder; remove it from the
+  frontmatter". Indexing and the `validate` CLI still accept existing documents that
+  carry one, so nothing is reindexed — but an edit or a single-document move of such a
+  document now has to remove the key (a `frontmatter_patch` `remove_field` in the same
+  call works). A `required` or `default` a schema gives `domain` is ignored, so it
+  cannot make every write fail, and `get_schema` never lists the field, even when a
+  schema declares it (to filter on it).
+
+### Schema files are now `.schema.yaml`; the legacy name still works
+
+- **Canonical name `.schema.yaml`.** `.kb-schema.yaml` no longer fits a server that
+  hosts more than knowledge bases. The legacy name is still read everywhere the new one
+  is, so the rename needs nothing on upgrade and reindexes nothing. The next
+  `update_schema` in a directory on the legacy name writes `.schema.yaml` and removes
+  `.kb-schema.yaml` in the same commit, so a corpus migrates one directory at a time as
+  it is edited (or all at once with a `git mv`). A directory holding **both** names is
+  an invalid schema file — fatal at startup, refused at runtime — until they are merged
+  into `.schema.yaml`. **Downgrade:** a server from before this change reads only
+  `.kb-schema.yaml`, so it silently ignores every directory already migrated to
+  `.schema.yaml`; rename those files back before rolling back.
+- **Schemas are named by directory in everything the model reads.** Tool descriptions,
+  `get_schema`'s `declared_in` (and the web UI's `/api/schema`), validation errors'
+  `[declared in …]`, and `update_schema`'s results and errors name the scope directory
+  (`food/recipes/`, the root as `/`) instead of a schema file path. `update_schema`'s
+  result `path` is now that directory.
+  Logs, `/status`'s `schema_error`, the `validate` CLI and the `kb_schema_invalid*`
+  metric names are unchanged and keep real file paths.
+- **A directory move names the schemas it carries by directory.** A validation
+  refusal's `moved_schema_files` is now `moved_schema_dirs` (`from`/`to` directories),
+  and a successful move reports the schemas it carried there too, no longer as entries
+  in `moved` (which now lists documents only).
+- **Fix: `add_values` in a subdirectory no longer narrows the inherited set.** When the
+  subdirectory's schema had no `values` of its own for the field, `add_values` wrote a
+  fresh list of only the new values, which replaced the inherited set (and forced
+  `type: enum`). It now writes `[$values, ...new]` and keeps the inherited `type`
+  (`enum`, as for a new field, when no ancestor gives a type or values), so
+  root `[a, b]` plus a child `add_values [c]` resolves to `[a, b, c]`. A child list that
+  already exists without `$values` is still appended to as-is, and a value the scope
+  already inherits is not written again (a call with nothing else to add is refused as
+  already permitted). Schema files written by the old behavior are not rewritten;
+  re-add `$values` to them by hand if the narrowing was not intended.
+
+### Breaking: an invalid schema file is never loaded
+
+The "frozen scope" mechanism is gone. A schema file in the indexed tree that is
 present must be valid; a root one is still optional (config.yaml's `frontmatter` block
 still stands in when there is none). A file is invalid when it cannot be read, is over
 256 KB, does not parse (unknown key, wrong type, bad `dedup:` block), or contradicts itself.
 
-- **Only the indexed tree's schema files are read.** A `.kb-schema.yaml` in a hidden
+- **Only the indexed tree's schema files are read.** A schema file in a hidden
   directory, or in a directory whose every document `indexing.exclude` rules out (for
   example `templates/**`), is never loaded or validated, so it cannot stop startup or a
   rebuild, and a push that changes one queues no reconcile. Previously every non-hidden
@@ -49,42 +130,227 @@ still stands in when there is none). A file is invalid when it cannot be read, i
   sweep. The fix itself queues a full reconcile, and the first rebuild that succeeds after
   a refusal queues one too, which indexes everything written in the meantime.
 - **A pushed schema change now rebuilds the schema.** The webhook used to drop a changed
-  `.kb-schema.yaml` with the other non-document paths, so a schema pushed straight to the
+  schema file with the other non-document paths, so a schema pushed straight to the
   knowledge base's git host was not picked up until the next periodic sweep. A changed
   schema file in a push, in a write's own rebase, or carried by a directory move now
   queues a full reconcile, which rebuilds the schema and re-validates the documents it
   governs.
-- **Document tools refuse `.kb-schema.yaml` paths.** `write_document` (create, edit and
+- **Document tools refuse schema file paths.** `write_document` (create, edit and
   move), `delete_document`, batch writes and the web UI's `POST`/`DELETE /api/doc/...`
-  reject a path whose file name is `.kb-schema.yaml`, whatever `indexing.include` says,
+  reject a path whose file name is `.schema.yaml` or `.kb-schema.yaml`, whatever `indexing.include` says,
   and point at `update_schema` (an invalid params error over MCP, a 400 over HTTP).
   Moving a directory that contains schema files still carries them along, but is refused
   while one of them is invalid on disk (see below).
 - **`update_schema` refuses a file over 256 KB** — the same cap a rebuild enforces — and,
-  if another schema file is invalid when it rebuilds, says its own change is committed but
+  if another schema file is invalid when it rebuilds, says its own change is saved but
   not in effect yet.
 - **Response shapes:** `get_schema`'s `structured_content` and the web UI's
   `/api/schema/...` drop `frozen` and `frozen_reason`, and `get_schema`'s text loses its
   "this scope is frozen" warning. The write error for a frozen scope is gone, and so is
   directory moves' "frozen" error. A directory move whose source carries a schema file
   that is invalid on disk (while the server is still using that directory's last good
-  rules) is refused with an invalid params error naming the file and the reason, and
-  `data.invalid_schema_file`/`data.reason`; fix or revert the file in git, then move. `/status`'s
-  per-run counters drop `frozen_by_broken_schema` and `broken_schemas`, and so do the
-  matching `kb_index_last_run_files{outcome=...}` series in `/metrics`.
+  rules) is refused with an invalid params error naming the directory and the reason, and
+  `data.invalid_schema_dir`/`data.reason`; fix or revert the file in git, then move.
+  That includes a schema file the move would bring into the schema tree out of a hidden
+  or excluded directory, which no rebuild ever read: a file is checked when it is in the
+  tree at its source or at its destination. `/status`'s per-run counters drop
+  `frozen_by_broken_schema` and `broken_schemas`, and so do the matching
+  `kb_index_last_run_files{outcome=...}` series in `/metrics`.
+
+### Breaking: tool results are one compact JSON object
+
+**Breaking response-shape change** for every MCP tool result. Claude Code shows the
+model only `structured_content`, so a fact carried only by the prose text block never
+reached it — notably `update_schema`'s "saved but not in effect yet" warning. Each result
+is now a single JSON object: `structured_content`, with the text block its compact
+serialization (the MCP spec's fallback for text-only clients). The prose renderings are
+gone. Keys that would be `false`, `null`, empty or a default are omitted throughout.
+Errors are unchanged (plain messages). The web UI's HTTP API keeps its own shapes except
+where noted.
+
+- **Writes** return `path` and `action` (`created`/`updated`/`moved` with `from`, or
+  `deleted`). `diff` comes only with an edit or move — never a create or delete — and
+  `diff_truncated`/`diff_total_bytes` only when it was cut. Batch entries carry `action`
+  instead of `is_create`. Empty `rewritten_paths`/`referencing_paths` are omitted.
+- **`update_schema`**: a change saved but not in effect yet carries `warning`. `dry_run:
+  false` is gone; `invalidated`/`would_invalidate` appear only when non-empty and
+  `casualties_total`/`casualties_truncated` only when capped. A dry run returns `field`
+  and `definition` (the field as the scope would resolve it) instead of the whole
+  `yaml`. It now declares `destructiveHint: true`, `idempotentHint: false`, and reads the
+  inherited definition from its parent scopes under the write lock rather than from the
+  cache before it.
+- **`get_schema`**: `fields` is an object keyed by field name; each definition carries
+  only `type`/`values` when set, `required`/`indexed` when true, `default` when set,
+  `open: false` on a closed object, and `declared_in`. The config-derived root is `/`,
+  never `config.yaml` — in `declared_in`, the web UI's `/api/schema`, and validation
+  errors' `[declared in …]`. `path` is `/` for the root; `omitted_fields` only when > 0.
+- **`search`**: chunk snippets start at the chunk's own text — the heading breadcrumb and
+  description prepended for the embedding no longer fill half of every snippet — and a
+  cut one ends in `…` (the web UI's `/api/search` and the `search` CLI command start at
+  the chunk's own text too). Chunk rows drop
+  `chunk_index`, `domain`, `text_truncated`, and unset per-arm scores; `explain` adds
+  `mode` to the response. Document rows drop `title`/`description`/`domain` from
+  `frontmatter` (`domain` stays when named in `fields`) and `mtime` unless enumerating
+  ordered by it. Enumeration drops `offset` and `has_more: false`; section rows drop
+  `scope: "section"` and an empty `heading_path`. Every score is rounded to four
+  significant digits.
+- **`get_document`**: a whole read omits `start_line`/`end_line`/`partial`; `outline_only`,
+  `oversized`, `truncated`, `partial` appear only when true, `total_entries` only on a
+  capped outline, `intro` only when there is one, and outline/section entries drop
+  `heading` (the last element of `heading_path`) — the same in `/api/doc` (the web UI
+  reads only `content`, `truncated` and `version`, so it is unaffected). The link graph
+  comes only with a whole-document read (including one the size cap cuts short or turns
+  into an outline) or the new `links: true`, as path lists — `links_out`, `broken_links`,
+  `links_in`, `similar` (`{path, score}`) — capped at 20 per direction (was 100), with
+  `links_out_total`/`links_in_total` (every kind of link counted) when cut. `history` is
+  now `{changes: [{date, author, subject, operation?}], truncated?}` or
+  `{available: false}`: no revision id, email or provenance trailer (the web UI's
+  `/api/history` is unchanged).
+
+**Reindex:** chunk payloads gain `text_body_offset`, so the chunker version is bumped and
+the next reconcile re-chunks and re-embeds every document once, automatically. Until a
+document is reached, its snippets drop only a leading description.
+
+### Tool results no longer expose git
+
+**Breaking response-shape change** for MCP clients that read the write tools' results.
+How the server versions the knowledge base is an internal detail, so nothing about it
+reaches an MCP tool caller any more — not in results, errors or descriptions. Logs,
+`/status`, `/metrics` and the reindex worker are unchanged, and so is the web UI's HTTP
+API (`/api/doc/...` still returns `outcome`/`sha`; its version fields are renamed — see
+below).
+
+- **Success results** of `write_document` (single, batch and directory move),
+  `delete_document` and `update_schema` drop `outcome`, `sha`, `rebased_paths` and
+  `sync_failure_cause` from `structured_content`, and the text drops `(commit <sha>)` and
+  the "committed locally, but the push … failed" wording. A change saved locally whose
+  push to the knowledge base's remote failed is reported as an ordinary success (it is
+  still logged at `warn`); the next write pushes it along with its own. If it then
+  conflicts with what reached the remote in the meantime, the server resets its copy to
+  the remote and keeps the unpushed commits under `refs/mcp-md-wiki/unsynced/<sha>`,
+  logging an error, for an operator to recover.
+- Concurrent changes to *other* documents are no longer reported at all (they used to be
+  listed in `rebased_paths`); they are still marked for reindexing. A concurrent change
+  to the caller's own document is covered below.
+- **Failures** carry no `data.outcome` and no git output. A change that could not be
+  saved and was fully undone says so ("could not be saved. Nothing was changed; try
+  again"); one whose undo also failed tells the caller not to retry and to report it to
+  the operator. The cause, including git's own output, is logged where it happened. A
+  bad server-side git credential is reported as a server misconfiguration, without the
+  variable's name.
+- **Wording:** the server instructions describe the corpus as "versioned" rather than
+  "git-backed", tool descriptions no longer say a write "commits and pushes", and the
+  batch `message` refusal and invalid-`message` errors no longer say "commit".
+  `get_document`'s opt-in `history` (#257) is git-free too — see the previous section.
+
+### Breaking: concurrent writes are safe, and replacing a document needs its version
+
+Two writers editing the same knowledge base — two agents, an agent and the web UI, or a
+write racing a push from elsewhere — could overwrite each other's changes or leave the
+server's copy diverged from the remote. Every write now syncs with the remote first and
+does its whole read-edit-validate-save under one lock, so writes never interleave.
+
+- **`content_hash` is now `version`, and `expected_hash` is now `expected_version`** — in
+  `get_document`'s result, `write_document`'s parameters (single and per batch entry),
+  and the web UI's `GET`/`POST /api/doc/...`. `version` is still opaque and still covers
+  the whole file, but its value changed: a hash a client stored from an older server
+  will not match. Write results now also carry the document's new `version`.
+- **`expected_version` is required** to replace an existing document with `content`, to
+  move a single document, to delete one (`delete_document` and `DELETE /api/doc/...`
+  take it now), and for a batch entry that replaces an existing document. Without it the
+  call is refused and told to pass the `version` from `get_document`. Creating a new
+  document and the relative edits (`old_string`/`new_string`, `frontmatter_patch`,
+  `append`) do not need it. A create that does pass one is refused as not found — the
+  document it was read from was deleted or moved: find it, or omit `expected_version`
+  to create a new document.
+- **Relative edits apply to the current document**, so a concurrent change elsewhere in it
+  is kept; when the edit passed an `expected_version` that is no longer current, the
+  result says so (`merged_with_other_changes: true`). An `old_string` someone else's
+  change removed is refused with "the document was edited by someone else; re-read it
+  and try again". `update_schema` operations work the same way: two concurrent
+  operations on one schema both land.
+- **A stale full replace is merged, not refused or clobbered**: when `expected_version`
+  is older than the document, the changes made since are three-way merged with the
+  caller's. A clean merge is re-validated and saved, and the result says so
+  (`merged_with_other_changes: true`; the tool description says to re-read);
+  overlapping changes are refused — as is every stale full replace in a repository that
+  converts content on checkout (`.gitattributes` `eol` or filters, `core.autocrlf`) or
+  stores SHA-256 object ids, where the old version cannot be found to merge against. A
+  stale move or delete is refused. A directory move is refused if anything under it
+  changed after the server checked it.
+- A push that loses a race, or a rebase that conflicts with what reached the remote in
+  the meantime, drops that write's own commit and runs the write again against the fresh
+  remote state, up to three attempts; then it is refused as edited by someone else,
+  leaving none of its own commits behind, so a later webhook fast-forwards normally.
+  Changes an earlier outage left unpushed are kept and go out with the next write that
+  gets through. A push that fails because the remote is unreachable still keeps the
+  local save and reports success.
+- `write_document` and `delete_document` now declare `destructiveHint: true`,
+  `idempotentHint: false`; `search`, `get_document` and `get_schema` declare
+  `readOnlyHint: true`.
+- Web UI: the editor sends the version it loaded on save and move, and the document view
+  sends the version it rendered on delete, so a document changed since it was opened is
+  never deleted unseen (the view refreshes and says so). A stale save's or delete's 409
+  body carries `edited_elsewhere: true` (replacing the old `expected_hash`/`actual_hash`
+  pair).
+
+No config change is needed. (The first reconcile after upgrading does re-chunk every
+document once, for the reason given under "Breaking: tool results are one compact JSON
+object".)
 
 ### MCP tools
 
 - **Near-duplicate detection can be overridden per directory** (closes #272).
   `write.dedup_enabled` and `write.dedup_threshold` were global only, so structurally
   templated folders (meal plans, recipes) tripped the check on every create. A
-  `.kb-schema.yaml` may now carry `dedup: {enabled, threshold}`; each key cascades
+  schema file may now carry `dedup: {enabled, threshold}`; each key cascades
   independently, nearest scope wins, and a key no schema sets falls back to the global
   `write.*` value. Hand-edited only (`update_schema` has no operation for it but preserves
   an existing block); `get_schema` reports the effective override when set. A threshold
   outside 0.0–1.0, a wrong-typed value or an unknown key makes the file invalid like any
   other schema error (see above). The block is not part of the schema fingerprint, so
-  editing it revalidates and reindexes nothing. No config change or reindex needed.
+  editing it revalidates and reindexes nothing. No config change needed.
+
+### Fixed
+
+Bugs in behavior that shipped in 0.1.3 or earlier.
+
+- **`delete_document`'s `path` description no longer promises a basename.** It said a
+  unique basename would resolve, as it does in `get_document`; it never did (a bare
+  basename is "document does not exist"), so the description now reads "Path relative to
+  the KB root."
+- **A near-duplicate refusal reports clean numbers.** `similarity` and `threshold` in its
+  error data carried float noise (`0.9300000071525574`); both are rounded to four
+  significant digits, over MCP and the web UI alike.
+- **An edit that changes nothing succeeds.** Saving unchanged content, or applying a
+  `frontmatter_patch` that is already in effect, failed with "could not be saved … try
+  again" over MCP (a 500 from the web UI) because there was nothing to commit. It now
+  returns the document's current `version` with no `diff` and no commit; a batch whose
+  entries all change nothing does the same.
+- **A write that fails partway leaves no half-written document.** A `write_document`
+  create or edit that hit a disk or I/O error left the file truncated and uncommitted in
+  the server's copy; the previous content is restored (a partly written new file is
+  removed). The same for the failing entry of a batch, which was left truncated while
+  the entries before it were rolled back; its error names any document the undo could
+  not restore.
+- **The web UI's saves and deletes finish when the browser disconnects.** `POST` and
+  `DELETE /api/doc/...` ran inside the request, so a client that went away mid-write
+  could leave an uncommitted change behind; the write now runs to completion on its own.
+- **A directory move no longer panics on `./notes`, `.` or `/`.** Such a source crashed
+  the request instead of answering. A `.` segment and doubled slashes are dropped from
+  both directories (`./notes/` is `notes`), including from the moved paths, and the
+  knowledge-base root itself is refused as a source.
+- **`get_schema` and `update_schema` accept `.` as the root path** (it was refused as an
+  invalid path) and read `food/./recipes` and `food//recipes` as `food/recipes` (they
+  were carried into scope names and commit messages as written).
+- **`update_schema` no longer follows a symlinked schema file.** The schema walk already
+  ignored one, but `update_schema` read through it: a link to another file on the server
+  could surface that file's text in a parse error, and a link to a device read without
+  bound. A symlink now counts as no schema file there too, and a schema file over 256 KB
+  is refused before it is read.
+- **A document already over the 512 KB write limit can be shrunk or moved over MCP.** An
+  edit that shrinks it, and a move, were refused as too large; an edit is now refused
+  only when it would grow the document past the limit.
 
 ## [0.1.3] - 2026-10-06
 

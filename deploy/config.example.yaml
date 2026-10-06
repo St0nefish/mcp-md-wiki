@@ -71,7 +71,7 @@ indexing:
 
   # Glob patterns for directories/files to skip entirely. A directory whose
   # every document is excluded (e.g. "templates/**") is also left out of the
-  # schema tree: a .kb-schema.yaml there is never read or validated, so it
+  # schema tree: a .schema.yaml there is never read or validated, so it
   # cannot stop the server from starting. Hidden directories are always left
   # out. `include` and `exclude_files` never remove a directory's schema.
   exclude:
@@ -103,22 +103,24 @@ indexing:
 #
 # DEPRECATED: this block is deployment config on the container host, not
 # part of the knowledge base's own git repo, so its rules don't travel with
-# the KB when it's cloned or served elsewhere. Prefer a root `.kb-schema.yaml`
+# the KB when it's cloned or served elsewhere. Prefer a root `.schema.yaml`
 # committed to the knowledge base itself instead — same syntax used by every
-# subdirectory's `.kb-schema.yaml` (cascading like CLAUDE.md), see the README
+# subdirectory's `.schema.yaml` (cascading like CLAUDE.md), see the README
 # for syntax, cascade/merge rules, and the `get_schema` / `update_schema` MCP
 # tools.
 #
-# This block is used ONLY when no root `.kb-schema.yaml` exists at all — every
+# This block is used ONLY when no root `.schema.yaml` exists at all — every
 # index run logs a warning while that's the case. The moment a root
-# `.kb-schema.yaml` exists, it REPLACES this block outright (not a merge):
+# `.schema.yaml` exists, it REPLACES this block outright (not a merge):
 # required/indexed_fields/defaults/allowed below stop applying unless the same
-# field is also declared in the root `.kb-schema.yaml` — and every index run
+# field is also declared in the root `.schema.yaml` — and every index run
 # logs a warning about that too, so the switch is never silent.
 frontmatter:
 
   # Fields that MUST be present in every file's frontmatter. Files missing
   # required fields are skipped during indexing (with a warning).
+  # `domain` is derived from the folder, never author-written, so listing it
+  # here has no effect.
   # Example: [title, description, type, tags]
   required: []
 
@@ -132,6 +134,7 @@ frontmatter:
 
   # Default values applied to frontmatter before validation. If a file is
   # missing a key listed here, the default is injected automatically.
+  # A default for `domain` is never applied: it is derived from the folder.
   # Example: { status: "active" }
   defaults: {}
 
@@ -529,9 +532,10 @@ mcp:
   # so it takes effect within metadata_refresh_secs of a POST /admin/reload.
   # instructions: "Homelab infrastructure wiki covering networking, Docker, storage, and monitoring. Read with search/get_document; write with write_document, delete_document."
 
-  # How often (in seconds) to refresh discovered metadata (filter values)
-  # from Qdrant. Appended to the instructions so agents know what filters
-  # are available. Default: 300 (5 minutes).
+  # How often (in seconds) to recompose the server instructions (the
+  # top-level areas) and the tool descriptions, including the extension files
+  # below. Field vocabularies are not listed up front: get_schema serves them
+  # on demand. Default: 300 (5 minutes).
   # Live-reloadable: governs the timer's OWN next sleep, so a reload changes
   # how long until the following refresh, not the one already in progress.
   # metadata_refresh_secs: 300
@@ -539,7 +543,7 @@ mcp:
   # Where per-KB MCP tool/server description extensions live, relative to the
   # knowledge base root: server.md and tools/<tool>.md, appended to each
   # compiled description after any config-derived sentences (e.g. the
-  # retrieval-mode sentence generated from search.hybrid/search.phrase).
+  # quoted-phrase sentence on search, generated from search.phrase).
   # These files are indexed KB documents like any other — they carry
   # frontmatter to satisfy the KB's own schema, which is stripped before the
   # body reaches a tool description — and are editable through write_document
@@ -548,7 +552,7 @@ mcp:
   # (logged once at startup). Empty ("") disables extension loading entirely.
   # Length: Claude Code truncates each tool description and the server
   # instructions at 2048 characters. The compiled + config-derived text stays
-  # under 1500, so keep each extension body under ~500 characters; a composed
+  # under 600, so keep each extension body under ~1400 characters; a composed
   # description over 2048 is logged as a warning naming the tool.
   # Live-reloadable: re-resolved by the periodic metadata-refresh timer below,
   # so a change takes effect within metadata_refresh_secs of a POST
@@ -598,7 +602,7 @@ write:
   # structured error naming the duplicate file. The agent can override the
   # check by passing `force_new=true` in the tool call.
   # Set to false to disable the check entirely (e.g. during bulk migrations).
-  # A directory's .kb-schema.yaml can override this (and dedup_threshold) for
+  # A directory's .schema.yaml can override this (and dedup_threshold) for
   # its subtree with a `dedup: {enabled: ..., threshold: ...}` block; this
   # value is the fallback wherever no schema sets it. A malformed block makes
   # that schema file invalid, which stops the server from starting.

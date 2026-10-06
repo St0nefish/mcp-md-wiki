@@ -264,7 +264,7 @@ pub struct StrictRejection {
     pub reason: String,
 }
 
-/// A runtime schema rebuild that was refused because one or more `.kb-schema.yaml`
+/// A runtime schema rebuild that was refused because one or more schema
 /// files are invalid. The server keeps serving the last schema cache that built
 /// cleanly; this records that it is doing so, since when, and what to fix.
 ///
@@ -306,7 +306,7 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub strict_rejected_files: BTreeMap<String, StrictRejection>,
     /// Present while the server is serving a previous schema because the current
-    /// `.kb-schema.yaml` tree is invalid — see [`SchemaErrorState`]. Backs the
+    /// schema file tree is invalid — see [`SchemaErrorState`]. Backs the
     /// `kb_schema_invalid` and `kb_schema_invalid_files` gauges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_error: Option<SchemaErrorState>,

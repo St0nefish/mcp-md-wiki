@@ -36,9 +36,9 @@ stores buys you" below for what it saves you over a rebuild.
 
 ### `index --full` refuses to run: an invalid schema blocks recovery
 
-If any `.kb-schema.yaml` in the tree is currently invalid, `index` (with or without
+If any schema file (`.schema.yaml`, or the legacy `.kb-schema.yaml`) in the tree is currently invalid, `index` (with or without
 `--full`) **refuses to run at all**, before anything is dropped or cleared. The error
-starts `Refusing to index while a .kb-schema.yaml is invalid` and lists every invalid
+starts `Refusing to index while a schema file is invalid` and lists every invalid
 file with its reason, one `- <path>: <reason>` line each.
 
 So a disaster recovery can be blocked by a pre-existing, unrelated schema problem —
@@ -364,25 +364,28 @@ The values are swapped — `target_chunk_size` must be the smaller value.
 
 **Symptom.** One of:
 
-- The server exits at startup with `Refusing to start: every .kb-schema.yaml in the
+- The server exits at startup with `Refusing to start: every schema file in the
   indexed tree must be valid`, followed by the list of invalid files.
 - A running server keeps working, but nothing new gets indexed: `GET /status` has a
   `schema_error` entry, `kb_schema_invalid` is 1 in `/metrics`, and the log repeats
   `schema rebuild REFUSED, keeping the previous schema` on every reconcile sweep, and
-  `Indexing run REFUSED: a .kb-schema.yaml is invalid` after a write. Writes still
+  `Indexing run REFUSED: a schema file is invalid` after a write. Writes still
   succeed and validate against the previous schema.
-- Moving a directory fails with `the schema file '<path>' inside it is invalid`.
+- Moving a directory fails with `the schema for '<dir>/' inside it is invalid`.
 - `mcp-md-wiki validate` or `mcp-md-wiki index` fails with `SCHEMA ERRORS`.
 
-**Cause.** A `.kb-schema.yaml` in the indexed tree that is present must be valid, and
+**Cause.** A `.schema.yaml` in the indexed tree that is present must be valid, and
 an invalid one is never loaded: at startup that is fatal, and on a running server (the
 file arrived in a push) the rebuild is refused and the last schema that loaded cleanly
 stays in effect — which is also why a directory move carrying the broken file is
 refused. One in a hidden directory, or in one `indexing.exclude` rules out entirely, is
-never read. A file is invalid when it is malformed YAML, uses an
+never read, until a directory move would carry it into the schema tree: that move checks
+it first and is refused the same way. A file is invalid when it is malformed YAML, uses an
 unknown key (including under `dedup:`), contradicts itself (an unrecognized
 `$`-prefixed placeholder in a `values:` list, a field declaring both a scalar `type`
-and nested `fields:`, one path declared twice, a `dedup.threshold` outside 0.0–1.0), or
+and nested `fields:`, one path declared twice, a `dedup.threshold` outside 0.0–1.0), sits
+in a directory that also holds the other name (`.schema.yaml` and the legacy
+`.kb-schema.yaml` together — merge them into `.schema.yaml`), or
 is over 256 KB — refused on size alone, never read or parsed.
 
 **Diagnosis.** Run:
@@ -395,15 +398,15 @@ Every invalid schema file is listed, with the parse or validation error:
 
 ```text
 SCHEMA ERRORS (1):
-  food/recipes/.kb-schema.yaml: field 'planning' declares type 'text' but also nested fields; a field is either a value or a container, not both
+  food/recipes/.schema.yaml: field 'planning' declares type 'text' but also nested fields; a field is either a value or a container, not both
 ```
 
 On a running server, `GET /status`'s `schema_error.files` carries the same list.
 
-**Fix.** Correct (or revert) the named `.kb-schema.yaml` in the knowledge base's git
+**Fix.** Correct (or revert) the named schema file in the knowledge base's git
 repository and push. `update_schema` can't edit a file that no longer parses, and the
 document tools refuse schema-file paths. See
-[Directory Schemas](USAGE.md#directory-schemas-kb-schemayaml) in USAGE.md for the
+[Directory Schemas](USAGE.md#directory-schemas-schemayaml) in USAGE.md for the
 authoring rules. On a running server the push's webhook queues a full reconcile: the
 rebuild succeeds, `schema_error` clears, and every document written or changed while
 the schema was refused is indexed. A server that would not start just needs starting
@@ -442,7 +445,10 @@ The webhook verified successfully but the in-container `git fetch` or `git merge
 - **Wrong `GIT_URL`** — check the URL is correct and reachable from inside the container.
 - **Bad or expired `GIT_PULL_TOKEN`** — for private HTTPS repos, the token needs read repository access for webhook pulls (and **write** access if you use the MCP write tools, which push commits back). Regenerate it in your forge's settings.
 - **SSH URL without keys** — SSH URLs bypass token injection, but the container needs SSH keys configured. For Docker deployments, HTTPS with a token is simpler.
-- **Diverged history** — the merge uses `--ff-only` and will fail if the local branch has diverged. This usually means someone modified files directly in the bind-mounted directory. Using a named volume (recommended) avoids this by keeping the repo inaccessible from the host.
+- **Diverged history** — the merge uses `--ff-only` and will fail if the local branch has diverged. Three things cause that:
+  - Someone modified files directly in the bind-mounted directory. Using a named volume (recommended) avoids this by keeping the repo inaccessible from the host.
+  - A write's push failed (the remote was unreachable, or a hook refused it), leaving its commit unpushed in the clone, and the remote has moved since. Every webhook then returns 500 until the next write, which rebases that commit onto the remote and pushes it.
+  - The KB remote was force-pushed. The clone still holds the commits the force-push dropped, and the next write replays them onto the new history and pushes them back, so reset the server's clone to the remote's new tip (or recreate the volume) before anything writes.
 
 **Fix:** Check `docker logs mcp-md-wiki` for the specific error (tokens are redacted in log output). Verify the URL and token work from the host:
 

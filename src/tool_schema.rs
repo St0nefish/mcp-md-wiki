@@ -17,7 +17,9 @@
 //!
 //! Called from `mcp.rs`'s `list_tools`/`get_tool` as the step after
 //! `overlay_input_schema` (#286), on the same `Tool::input_schema` — see that
-//! `ServerHandler` impl.
+//! `ServerHandler` impl. [`self_contained`] then runs [`compact`], which drops
+//! what costs context without constraining anything (`$schema`, null arms of
+//! optional properties, `"default": null`, non-standard `format`s).
 
 use rmcp::model::{JsonObject, Tool};
 use serde_json::Value;
@@ -45,6 +47,10 @@ const SINGLE_SUBSCHEMA_KEYS: &[&str] = &[
 const SUBSCHEMA_MAP_KEYS: &[&str] = &["properties", "patternProperties", "dependentSchemas"];
 /// Array-of-schemas keywords: every element is a schema.
 const SUBSCHEMA_ARRAY_KEYS: &[&str] = &["prefixItems", "anyOf", "oneOf", "allOf"];
+/// Keywords that hold a schema only when written as an object. A boolean here is
+/// the conventional `deny_unknown_fields` form (`additionalProperties: false`),
+/// not a subschema, and is left untouched.
+const OBJECT_ONLY_SUBSCHEMA_KEYS: &[&str] = &["additionalProperties", "unevaluatedProperties"];
 
 /// `Tool`-level wrapper for the two `mcp.rs` call sites: clones the schema out
 /// of the `Arc`, rewrites it, and reassigns — the same clone-don't-mutate-through-
@@ -54,8 +60,123 @@ const SUBSCHEMA_ARRAY_KEYS: &[&str] = &["prefixItems", "anyOf", "oneOf", "allOf"
 pub fn self_contained(mut tool: Tool) -> Tool {
     let mut schema: JsonObject = (*tool.input_schema).clone();
     make_self_contained(&mut schema);
+    compact(&mut schema);
     tool.input_schema = std::sync::Arc::new(schema);
     tool
+}
+
+/// `format` values defined by JSON Schema itself. schemars also emits Rust
+/// numeric widths (`uint`, `uint64`, `float`, ...), which no client acts on —
+/// [`compact`] drops those and keeps these.
+const STANDARD_FORMATS: &[&str] = &[
+    "date-time",
+    "date",
+    "time",
+    "duration",
+    "email",
+    "idn-email",
+    "hostname",
+    "idn-hostname",
+    "ipv4",
+    "ipv6",
+    "uri",
+    "uri-reference",
+    "iri",
+    "iri-reference",
+    "uuid",
+    "uri-template",
+    "json-pointer",
+    "relative-json-pointer",
+    "regex",
+];
+
+/// Shrinks an already self-contained schema (see [`make_self_contained`])
+/// without changing what it accepts in practice — every tool schema is paid in
+/// context on every `tools/list`: drops the root `$schema` (MCP input schemas
+/// default to draft 2020-12), every `"default": null`, every non-standard
+/// `format`, and the `null` arm of each optional property — `"type": [X,
+/// "null"]` becomes `X`, `anyOf: [S, {"type": "null"}]` becomes `S` with the
+/// property's own keywords (its `description`) merged over it, and `null` leaves
+/// an `enum`. A property is optional when its parent's `required` does not
+/// name it; the server still accepts an explicit `null` for one, since every
+/// such field deserializes into an `Option`. Introduces no `$ref` and no
+/// boolean subschema, so the #288 guarantees hold.
+pub fn compact(schema: &mut JsonObject) {
+    schema.remove("$schema");
+    compact_node(schema);
+}
+
+/// [`compact`]'s recursive step over one object schema.
+fn compact_node(obj: &mut JsonObject) {
+    if matches!(obj.get("default"), Some(Value::Null)) {
+        obj.remove("default");
+    }
+    if let Some(Value::String(format)) = obj.get("format")
+        && !STANDARD_FORMATS.contains(&format.as_str())
+    {
+        obj.remove("format");
+    }
+
+    let required: Vec<String> = match obj.get("required") {
+        Some(Value::Array(names)) => names
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if let Some(Value::Object(props)) = obj.get_mut("properties") {
+        for (name, prop) in props.iter_mut() {
+            if let Value::Object(prop) = prop
+                && !required.contains(name)
+            {
+                drop_null_arm(prop);
+            }
+        }
+    }
+
+    for_each_subschema(obj, |sub| {
+        if let Value::Object(sub) = sub {
+            compact_node(sub);
+        }
+    });
+}
+
+/// Removes the `null` alternative from one optional property's schema — see
+/// [`compact`].
+fn drop_null_arm(prop: &mut JsonObject) {
+    let is_null_type = |v: &Value| v.as_str() == Some("null");
+    if let Some(Value::Array(types)) = prop.get_mut("type") {
+        types.retain(|t| !is_null_type(t));
+        if types.len() == 1 {
+            let only = types.remove(0);
+            prop.insert("type".to_string(), only);
+        }
+    }
+    if let Some(Value::Array(values)) = prop.get_mut("enum") {
+        values.retain(|v| !v.is_null());
+    }
+    for key in ["anyOf", "oneOf"] {
+        let Some(Value::Array(arms)) = prop.get_mut(key) else {
+            continue;
+        };
+        let is_null_arm = |arm: &Value| {
+            arm.as_object()
+                .is_some_and(|a| a.len() == 1 && a.get("type").is_some_and(is_null_type))
+        };
+        if !arms.iter().any(is_null_arm) {
+            continue;
+        }
+        arms.retain(|arm| !is_null_arm(arm));
+        if arms.len() == 1
+            && let Some(Value::Object(only)) = arms.pop()
+        {
+            prop.remove(key);
+            // The property's own keywords (its description) win over the arm's.
+            let own = std::mem::take(prop);
+            *prop = only;
+            prop.extend(own);
+        }
+    }
 }
 
 /// Rewrites `schema` in place: every `{"$ref": "#/$defs/Name", ...siblings}` (or
@@ -197,37 +318,46 @@ fn resolve_and_walk(obj: &mut JsonObject, defs: &JsonObject, stack: &mut Vec<Str
     walk_keywords(obj, defs, stack);
 }
 
-/// Recurses into every schema-valued keyword of `obj` — the subschema
-/// positions a JSON Schema can hold one in. Deliberately does not touch
+/// Recurses into every schema-valued keyword of `obj` — see
+/// [`for_each_subschema`] — resolving refs and replacing boolean subschemas.
+fn walk_keywords(obj: &mut JsonObject, defs: &JsonObject, stack: &mut Vec<String>) {
+    for_each_subschema(obj, |sub| process_schema_position(sub, defs, stack));
+}
+
+/// Calls `visit` on the value in every subschema position of `obj` — the places a
+/// JSON Schema can hold one: a single-schema keyword's value (whatever its JSON
+/// type, so a boolean subschema reaches `visit`), each value of a map keyword, each
+/// element of an array keyword, and an [`OBJECT_ONLY_SUBSCHEMA_KEYS`] value that is
+/// an object. The one traversal [`walk_keywords`] and [`compact_node`] share, so
+/// the two cannot disagree about where a subschema sits. Deliberately does not touch
 /// data-valued keywords (`enum`, `const`, `default`, `examples`, `required`,
 /// `type`, ...): a `default` value that happens to contain a `"$ref"` key must
 /// stay literal data, not be mistaken for an actual reference.
-fn walk_keywords(obj: &mut JsonObject, defs: &JsonObject, stack: &mut Vec<String>) {
+fn for_each_subschema(obj: &mut JsonObject, mut visit: impl FnMut(&mut Value)) {
     for key in SINGLE_SUBSCHEMA_KEYS {
         if let Some(v) = obj.get_mut(*key) {
-            process_schema_position(v, defs, stack);
+            visit(v);
         }
     }
     for key in SUBSCHEMA_MAP_KEYS {
         if let Some(Value::Object(map)) = obj.get_mut(*key) {
             for v in map.values_mut() {
-                process_schema_position(v, defs, stack);
+                visit(v);
             }
         }
     }
     for key in SUBSCHEMA_ARRAY_KEYS {
         if let Some(Value::Array(items)) = obj.get_mut(*key) {
             for v in items {
-                process_schema_position(v, defs, stack);
+                visit(v);
             }
         }
     }
-    // Schema-valued only when written as an object; a boolean here is the
-    // conventional `deny_unknown_fields` form (`additionalProperties: false`)
-    // and is deliberately left untouched — see the module doc comment.
-    for key in ["additionalProperties", "unevaluatedProperties"] {
-        if matches!(obj.get(key), Some(Value::Object(_))) {
-            process_schema_position(obj.get_mut(key).unwrap(), defs, stack);
+    for key in OBJECT_ONLY_SUBSCHEMA_KEYS {
+        if let Some(v) = obj.get_mut(*key)
+            && v.is_object()
+        {
+            visit(v);
         }
     }
 }
@@ -396,29 +526,35 @@ mod tests {
         );
     }
 
+    /// Every subschema keyword the traversal handles, with how a subschema is
+    /// written in its position: alone (a single-schema keyword, or an object-only
+    /// one), as a map's value, or as an array's element. Built from the key lists
+    /// themselves, so a dropped or mistyped entry fails every test that walks it.
+    fn position_cases() -> Vec<(&'static str, fn(Value) -> Value)> {
+        let alone: fn(Value) -> Value = |sub| sub;
+        let in_map: fn(Value) -> Value = |sub| json!({ "a": sub });
+        let in_array: fn(Value) -> Value = |sub| json!([sub]);
+        let single = SINGLE_SUBSCHEMA_KEYS.iter().map(|k| (*k, alone));
+        let map = SUBSCHEMA_MAP_KEYS.iter().map(|k| (*k, in_map));
+        let array = SUBSCHEMA_ARRAY_KEYS.iter().map(|k| (*k, in_array));
+        let object_only = OBJECT_ONLY_SUBSCHEMA_KEYS.iter().map(|k| (*k, alone));
+        single.chain(map).chain(array).chain(object_only).collect()
+    }
+
     #[test]
     fn every_schema_position_keyword_resolves_refs_and_replaces_booleans() {
         // Each keyword the walker claims to handle gets a `$ref` and a boolean
         // subschema in its own position shape (single / map / array), so a
         // typo'd or dropped entry in the keyword lists fails here.
-        let single = SINGLE_SUBSCHEMA_KEYS
-            .iter()
-            .map(|k| (*k, json!({ "$ref": "#/$defs/S" }), json!(true)));
-        let map = SUBSCHEMA_MAP_KEYS.iter().map(|k| {
-            (
-                *k,
-                json!({ "a": { "$ref": "#/$defs/S" } }),
-                json!({ "a": true }),
-            )
-        });
-        let array = SUBSCHEMA_ARRAY_KEYS
-            .iter()
-            .map(|k| (*k, json!([{ "$ref": "#/$defs/S" }]), json!([true])));
-        let object_only = ["additionalProperties", "unevaluatedProperties"]
-            .into_iter()
-            .map(|k| (k, json!({ "$ref": "#/$defs/S" }), json!({ "items": true })));
-
-        for (key, ref_value, bool_value) in single.chain(map).chain(array).chain(object_only) {
+        for (key, in_position) in position_cases() {
+            let ref_value = in_position(json!({ "$ref": "#/$defs/S" }));
+            // A boolean `additionalProperties` is the conventional form and is left
+            // alone by design, so for those keywords the boolean sits a level down.
+            let bool_value = if OBJECT_ONLY_SUBSCHEMA_KEYS.contains(&key) {
+                json!({ "items": true })
+            } else {
+                in_position(json!(true))
+            };
             let mut schema = obj(json!({
                 "type": "object",
                 "properties": {
@@ -468,6 +604,126 @@ mod tests {
         let foo = &schema["properties"]["foo"];
         assert_eq!(foo["$ref"], json!(7));
         assert_eq!(foo["items"], json!({}));
+    }
+
+    #[test]
+    fn compact_drops_schema_null_defaults_and_nonstandard_formats() {
+        let mut schema = obj(json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "limit": { "type": ["integer", "null"], "format": "uint64", "minimum": 0,
+                           "default": null },
+                "when": { "type": "string", "format": "date-time" },
+                "flag": { "type": "boolean", "default": false }
+            }
+        }));
+        compact(&mut schema);
+        assert!(!schema.contains_key("$schema"));
+        assert_eq!(
+            schema["properties"]["limit"],
+            json!({ "type": "integer", "minimum": 0 })
+        );
+        assert_eq!(schema["properties"]["when"]["format"], json!("date-time"));
+        assert_eq!(schema["properties"]["flag"]["default"], json!(false));
+    }
+
+    #[test]
+    fn compact_unwraps_the_null_arm_of_optional_properties_only() {
+        let mut schema = obj(json!({
+            "type": "object",
+            "required": ["must"],
+            "properties": {
+                "must": { "type": ["string", "null"] },
+                "opt": { "type": ["string", "null"], "enum": ["a", "b", null] },
+                "obj": {
+                    "description": "outer",
+                    "anyOf": [
+                        { "type": "object", "description": "inner",
+                          "properties": { "x": { "type": ["boolean", "null"] } } },
+                        { "type": "null" }
+                    ]
+                },
+                "multi": { "anyOf": [{ "type": "string" }, { "type": "integer" },
+                                     { "type": "null" }] }
+            }
+        }));
+        compact(&mut schema);
+        let props = &schema["properties"];
+        assert_eq!(props["must"]["type"], json!(["string", "null"]));
+        assert_eq!(
+            props["opt"],
+            json!({ "type": "string", "enum": ["a", "b"] })
+        );
+        assert_eq!(props["obj"]["description"], json!("outer"));
+        assert_eq!(props["obj"]["type"], json!("object"));
+        assert!(props["obj"].get("anyOf").is_none());
+        // Nested optional properties are compacted too.
+        assert_eq!(props["obj"]["properties"]["x"]["type"], json!("boolean"));
+        assert_eq!(
+            props["multi"]["anyOf"],
+            json!([{ "type": "string" }, { "type": "integer" }])
+        );
+    }
+
+    #[test]
+    fn compact_keeps_the_self_contained_guarantees() {
+        let mut schema = obj(json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "foo": { "anyOf": [{ "$ref": "#/$defs/Foo" }, { "type": "null" }] },
+                "any": { "type": "array", "items": true }
+            },
+            "$defs": { "Foo": { "type": "object", "additionalProperties": false,
+                                "properties": { "v": true } } }
+        }));
+        make_self_contained(&mut schema);
+        compact(&mut schema);
+        let text = serde_json::to_string(&schema).unwrap();
+        assert!(!text.contains("$ref") && !text.contains("$defs"), "{text}");
+        assert!(!text.contains("null"), "{text}");
+        assert!(!text.contains(":true"), "{text}");
+        assert_eq!(
+            schema["properties"]["foo"]["additionalProperties"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn compact_reaches_every_schema_position_keyword() {
+        // A nullable optional property one level inside each keyword's position: it
+        // is compacted only if `compact` descends through that keyword.
+        for (key, in_position) in position_cases() {
+            let mut schema = obj(json!({
+                "type": "object",
+                "properties": {
+                    "holder": {
+                        key: in_position(json!({
+                            "properties": {
+                                "inner": {
+                                    "type": ["string", "null"],
+                                    "format": "uint",
+                                    "default": null
+                                }
+                            }
+                        }))
+                    }
+                }
+            }));
+            let before = serde_json::to_string(&schema).unwrap();
+            assert!(
+                before.contains(r#""type":["string","null"]"#),
+                "'{key}': {before}"
+            );
+
+            compact(&mut schema);
+            let after = serde_json::to_string(&schema).unwrap();
+            assert!(
+                after.contains(r#""inner":{"type":"string"}"#),
+                "'{key}': not compacted: {after}"
+            );
+        }
     }
 
     #[test]

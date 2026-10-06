@@ -69,6 +69,9 @@ globset = "0.4"
 
 # Hashing
 sha2 = "0.10"
+# Git blob ids for the caller-facing document `version` (already in the tree
+# transitively).
+sha1_smol = "1"
 hmac = "0.12"
 hex = "0.4"
 subtle = "2"

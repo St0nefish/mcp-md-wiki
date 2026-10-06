@@ -198,7 +198,7 @@ impl PathFilter {
 
     /// Whether `exclude` rules out every document under the KB-relative directory
     /// `rel_dir` — the question the schema walk asks before reading a
-    /// `.kb-schema.yaml` there (#272), since a schema governing only excluded
+    /// schema file there (#272), since a schema governing only excluded
     /// documents governs nothing.
     ///
     /// Globs match file paths, never directories, so this probes two synthetic
@@ -412,9 +412,10 @@ pub fn compute_hash_from_bytes(content: &[u8]) -> String {
 ///
 /// History: `1` — #286 (heading model in `heading.rs`, section payload fields,
 /// normalized `heading_prefixes` and `section_key` paths joined with
-/// `heading::HEADING_KEY_SEPARATOR`). There is no `0`: rows written before fingerprints
-/// existed carry `''`, which never matches.
-pub(crate) const CHUNKER_VERSION: u32 = 1;
+/// `heading::HEADING_KEY_SEPARATOR`). `2` — the `text_body_offset` payload field, so a
+/// search snippet starts past the breadcrumb/description prefix. There is no `0`: rows
+/// written before fingerprints existed carry `''`, which never matches.
+pub(crate) const CHUNKER_VERSION: u32 = 2;
 
 /// Stable fingerprint of everything that determines a file's chunks and their payload,
 /// apart from the file's own bytes and its schema (tracked separately as
@@ -898,7 +899,7 @@ async fn process_file(
         .unwrap_or(0);
 
     // Skip unchanged files unless forced. The schema fingerprint is part of the
-    // condition: editing a .kb-schema.yaml changes no document's bytes, so without this
+    // condition: editing a schema file changes no document's bytes, so without this
     // a tightened rule would never be applied to anything already indexed. The chunking
     // fingerprint is part of it for the same reason: a changed `chunking.*` setting (or
     // a `CHUNKER_VERSION` bump) changes no bytes either, and skipping here would leave
@@ -1113,6 +1114,10 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
             payload.insert(
                 CHUNK_TEXT_KEY.to_string(),
                 serde_json::Value::String(chunk.text.clone()),
+            );
+            payload.insert(
+                crate::qdrant::CHUNK_BODY_OFFSET_KEY.to_string(),
+                serde_json::Value::Number(chunk.body_offset.into()),
             );
             payload.insert(
                 "line_start".to_string(),
@@ -1699,6 +1704,35 @@ async fn remove_orphans<Q: VectorStore>(
     Ok(())
 }
 
+/// The frontmatter key [`with_derived_domain`] sets from a document's
+/// top-level folder.
+pub const DERIVED_DOMAIN_FIELD: &str = "domain";
+
+/// Every frontmatter key ingest derives rather than reads — the one list the
+/// write path's refusal of an authored value ([`authored_derived_field`]) and
+/// `search`'s filter vocabulary are keyed on.
+pub const DERIVED_FIELDS: &[&str] = &[DERIVED_DOMAIN_FIELD];
+
+/// The first derived field `frontmatter` sets, with the validation message a
+/// write that authors it is refused with. Ingest overrides an authored value
+/// anyway, so writing one is never what the caller meant.
+pub fn authored_derived_field(
+    frontmatter: &HashMap<String, serde_json::Value>,
+) -> Option<(&'static str, String)> {
+    DERIVED_FIELDS
+        .iter()
+        .find(|field| frontmatter.contains_key(**field))
+        .map(|field| {
+            (
+                *field,
+                format!(
+                    "`{field}` is set by the document's top-level folder; remove it from \
+                     the frontmatter"
+                ),
+            )
+        })
+}
+
 /// Frontmatter with `domain` set from the document's top-level folder.
 ///
 /// Applied identically to the Qdrant payload and the metadata index so a `domain`
@@ -1709,7 +1743,9 @@ fn with_derived_domain(
     rel_path: &str,
 ) -> HashMap<String, serde_json::Value> {
     let mut out = frontmatter.clone();
-    let authored = frontmatter.get("domain").and_then(|v| v.as_str());
+    let authored = frontmatter
+        .get(DERIVED_DOMAIN_FIELD)
+        .and_then(|v| v.as_str());
 
     match derive_domain(rel_path) {
         Some(domain) => {
@@ -1728,7 +1764,10 @@ fn with_derived_domain(
                     domain
                 );
             }
-            out.insert("domain".to_string(), serde_json::Value::String(domain));
+            out.insert(
+                DERIVED_DOMAIN_FIELD.to_string(),
+                serde_json::Value::String(domain),
+            );
         }
         None => {
             if authored.is_some() {
@@ -1738,7 +1777,7 @@ fn with_derived_domain(
                      root belong to no area"
                 );
             }
-            out.remove("domain");
+            out.remove(DERIVED_DOMAIN_FIELD);
         }
     }
     out
@@ -2765,14 +2804,14 @@ async fn discover_relative(config: &ResolvedConfig) -> Result<(PathBuf, Vec<Path
 
 /// Build the schema cache one scan or indexing run validates against, from disk.
 ///
-/// An invalid `.kb-schema.yaml` anywhere in the tree aborts the run: nothing is
+/// An invalid schema file anywhere in the tree aborts the run: nothing is
 /// scanned or indexed under rules known to be wrong, and the
 /// [`crate::schema::SchemaBuildError`] stays in the error chain so the reindex
 /// worker classifies the failure as permanent (`reindex::is_permanent_failure`) —
 /// no retry can fix a file on disk, and the fix itself queues a full reconcile.
 fn build_run_schemas(data_path: &Path, config: &ResolvedConfig) -> Result<SchemaCache> {
     SchemaCache::build(data_path, &config.frontmatter, &config.indexing).map_err(|e| {
-        anyhow::Error::new(e).context("Refusing to index while a .kb-schema.yaml is invalid")
+        anyhow::Error::new(e).context("Refusing to index while a schema file is invalid")
     })
 }
 
@@ -2823,7 +2862,7 @@ const SCAN_PAGE_SIZE: i64 = 1000;
 /// run that follows (and any retry of it) takes, until [`scan_and_index`]
 /// confirms nothing stale remains (#286; round-6 review L1).
 ///
-/// An invalid `.kb-schema.yaml` anywhere in the tree fails the scan before any
+/// An invalid schema file anywhere in the tree fails the scan before any
 /// row is read (see [`build_run_schemas`]).
 pub async fn scan_for_dirty(
     config: &ResolvedConfig,
@@ -3235,7 +3274,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         }
     };
 
-    // Discover and merge every .kb-schema.yaml once. Resolution afterwards is an
+    // Discover and merge every schema file once. Resolution afterwards is an
     // in-memory prefix lookup, so this stays O(schema files) rather than O(paths).
     // Before anything is touched — a full reindex included — so an invalid schema
     // file aborts the run with nothing dropped, cleared or indexed.
@@ -3683,7 +3722,7 @@ async fn detect_qdrant_wipe<Q: VectorStore>(
 /// deliberately routed through this existing branch rather than spliced in
 /// elsewhere (e.g. after `ensure_collection` inside `index_paths_generic`) because
 /// this branch already carries the schema build that refuses any run while a
-/// `.kb-schema.yaml` is invalid (before anything is dropped), the collection drop,
+/// schema file is invalid (before anything is dropped), the collection drop,
 /// and the `state.clear()` — all "for free," rather than needing to be re-derived at a second
 /// call site. Escalating here also means the check runs once per reconcile sweep
 /// rather than once per write, keeping the added Qdrant round trip cheap.
@@ -5457,12 +5496,12 @@ mod tests {
             )
         );
         assert_eq!(
-            CHUNKER_VERSION, 1,
+            CHUNKER_VERSION, 2,
             "bumped? update the golden hash below too (sha256 of the canonical string)"
         );
         assert_eq!(
             chunking_fingerprint(&default),
-            "7222485585dc86e2c0679340753d74d3aacbf22f5978cecd737d4a104181d381",
+            "23b2eb529f4afa12f1c3a6377e5a61ec43b630715a9119ff06a8c6af128b1c89",
             "golden fingerprint drifted — see this test's comment"
         );
     }
@@ -8010,6 +8049,7 @@ mod tests {
                 heading_level: 0,
                 section_line_start: 1,
                 section_line_end: chunk_count * 10,
+                body_offset: 0,
             })
             .collect();
         PendingFile {
@@ -8540,6 +8580,7 @@ mod tests {
             heading_level: 1,
             section_line_start: 1,
             section_line_end: 2,
+            body_offset: 0,
         };
         assert_ne!(
             section_key("a.md", &chunk_with(single)),

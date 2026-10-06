@@ -1660,6 +1660,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha1_smol",
  "sha2",
  "similar",
  "sqlx",

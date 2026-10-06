@@ -51,7 +51,10 @@
  *     in-browser editor, a separate script) drives: it is unchanged from
  *     the graph-era UI — showDetail(path) now navigates to the doc view,
  *     refreshGraph() re-fetches api/graph and re-renders whatever is on
- *     screen, removeNodeById(path) drops a deleted doc everywhere.
+ *     screen, removeNodeById(path) drops a deleted doc everywhere —
+ *     plus getCurrentVersion(), the `version` of the body the doc view
+ *     rendered, which is what a delete from that view names (the Delete
+ *     button is in the doc view, so edit.js has no other copy of it).
  *   - The Cytoscape canvas is drawn from a JS style array, which can't
  *     read CSS custom properties; themeColors()/buildStyle() supply the
  *     canvas-relevant colors for whichever mode prefers-color-scheme
@@ -98,6 +101,10 @@
 
   let activeRoute = { view: "home" };
   let currentDetailId = null; // doc shown in the doc view
+  // `version` (api/doc) of the body painted for currentDetailId: what the user
+  // is looking at, and so what a delete from this view must name (see
+  // KBViz.getCurrentVersion). null until that body has loaded and rendered.
+  let currentDetailVersion = null;
   let docFetchToken = 0; // invalidates in-flight body fetches
   let searchDebounceTimer = null;
   let searchToken = 0;
@@ -363,6 +370,7 @@
   function removeNodeById(id) {
     if (currentDetailId === id) {
       currentDetailId = null;
+      currentDetailVersion = null;
       navigate("#/");
     }
     if (bundleCache) {
@@ -655,6 +663,9 @@
 
   async function renderDoc(id) {
     currentDetailId = id;
+    // Dropped with the previous body: until THIS one has painted, the view
+    // holds no version a delete could name.
+    currentDetailVersion = null;
     // Fallback data keeps the view functional for a path the index
     // doesn't know (stale bookmark, mid-reindex): the body fetch below
     // is independent of the metadata index.
@@ -735,6 +746,11 @@
       const body = stripFrontmatter(doc.content || "");
       bodyEl.innerHTML = renderMarkdown(body);
       rewriteInternalLinks(bodyEl, id);
+      // Kept only once the body is on screen, so it names what was shown. A
+      // response without a version leaves it null and a delete refuses.
+      if (typeof doc.version === "string" && doc.version) {
+        currentDetailVersion = doc.version;
+      }
     } catch (err) {
       if (token === docFetchToken) {
         bodyEl.innerHTML = '<p class="muted">Failed to load document.</p>';
@@ -1517,6 +1533,9 @@
     getNode: (id) => nodeIndex[id],
     getNodeIds: () => Object.keys(nodeIndex),
     getCurrentId: () => currentDetailId,
+    // The `version` of the body the doc view last painted for getCurrentId(),
+    // or null while it is loading, failed to load, or carried no version.
+    getCurrentVersion: () => currentDetailVersion,
     showDetail,
     refreshGraph,
     removeNodeById,
