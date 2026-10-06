@@ -822,6 +822,30 @@ pub struct RateLimitConfig {
     pub requests_per_second: u64,
     #[serde(default = "default_rate_limit_burst_size")]
     pub burst_size: u32,
+    /// Where the per-client rate-limit key comes from. See `ClientIpSource`.
+    #[serde(default)]
+    pub client_ip_source: ClientIpSource,
+}
+
+/// Which address keys the rate limiter's per-client bucket (#275).
+///
+/// Every variant exists because a forwarding header is only as trustworthy as the
+/// hop that wrote it: a header a caller can set themselves lets them mint a fresh
+/// bucket per request, or drain someone else's. Pick the one that matches the
+/// proxy chain actually in front of this server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientIpSource {
+    /// The socket peer address only; every forwarding header is ignored. Safe
+    /// anywhere, but behind a reverse proxy every caller shares the proxy's bucket.
+    #[default]
+    Peer,
+    /// `CF-Connecting-IP`, falling back to the peer address. Only safe when
+    /// Cloudflare is the outermost hop, since it overwrites the header.
+    CfConnectingIp,
+    /// The rightmost parseable `X-Forwarded-For` entry (the one the last trusted
+    /// proxy appended), falling back to the peer address.
+    XForwardedForRightmost,
 }
 
 impl RateLimitConfig {
@@ -842,6 +866,7 @@ impl Default for RateLimitConfig {
             enabled: true,
             requests_per_second: default_rate_limit_requests_per_second(),
             burst_size: default_rate_limit_burst_size(),
+            client_ip_source: ClientIpSource::default(),
         }
     }
 }
@@ -1364,6 +1389,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("rate_limit.enabled", "rate_limit"),
     ("rate_limit.requests_per_second", "rate_limit"),
     ("rate_limit.burst_size", "rate_limit"),
+    ("rate_limit.client_ip_source", "rate_limit"),
     ("write.dedup_enabled", "write"),
     ("write.dedup_threshold", "write"),
     ("write.commit_author_name", "write"),
@@ -2419,6 +2445,24 @@ mcp:
         assert!(cfg.validation.enabled);
         assert_eq!(cfg.rate_limit.requests_per_second, 20);
         assert_eq!(cfg.rate_limit.burst_size, 50);
+        assert_eq!(cfg.rate_limit.client_ip_source, ClientIpSource::Peer);
+    }
+
+    #[test]
+    fn client_ip_source_parses_each_variant_and_rejects_unknown() {
+        for (text, want) in [
+            ("peer", ClientIpSource::Peer),
+            ("cf_connecting_ip", ClientIpSource::CfConnectingIp),
+            (
+                "x_forwarded_for_rightmost",
+                ClientIpSource::XForwardedForRightmost,
+            ),
+        ] {
+            let cfg: RateLimitConfig =
+                serde_yaml_ng::from_str(&format!("client_ip_source: {text}")).unwrap();
+            assert_eq!(cfg.client_ip_source, want, "{text}");
+        }
+        assert!(serde_yaml_ng::from_str::<RateLimitConfig>("client_ip_source: smart").is_err());
     }
 
     #[test]
@@ -3721,6 +3765,7 @@ rate_limit:
             enabled: true,
             requests_per_second: 25,
             burst_size: 100,
+            client_ip_source: ClientIpSource::Peer,
         };
         assert_eq!(cfg.replenish_period(), Duration::from_millis(40));
 
@@ -3728,6 +3773,7 @@ rate_limit:
             enabled: true,
             requests_per_second: 1,
             burst_size: 1,
+            client_ip_source: ClientIpSource::Peer,
         };
         assert_eq!(one_per_second.replenish_period(), Duration::from_secs(1));
     }

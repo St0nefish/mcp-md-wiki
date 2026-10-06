@@ -897,6 +897,16 @@ const DIFF_TABLE: &[DiffField] = &[
                    once at startup (server.rs run_server).",
         }],
     },
+    DiffField {
+        path: "rate_limit.client_ip_source",
+        get: |c| Some(d(&c.rate_limit.client_ip_source)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "rate_limit.client_ip_source",
+            note: "baked into the rate limiter's key extractor when it is built once at \
+                   startup (server.rs run_server).",
+        }],
+    },
     // ── write ────────────────────────────────────────────────────────────────
     DiffField {
         path: "write.dedup_enabled",

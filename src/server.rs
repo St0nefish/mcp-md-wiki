@@ -17,9 +17,7 @@ use rmcp::transport::streamable_http_server::{
 };
 use std::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tower_governor::{
-    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
-};
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{debug, error, info, warn};
 
@@ -1890,6 +1888,52 @@ const OAUTH_METADATA_ROOT_PATH: &str = PROTECTED_RESOURCE_METADATA_PREFIX;
 #[cfg(test)]
 const OAUTH_METADATA_MCP_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
 
+/// The rate limiter's key: the client address chosen by `rate_limit.client_ip_source`
+/// (#275).
+///
+/// Replaces tower_governor's `SmartIpKeyExtractor`, which took the leftmost
+/// `X-Forwarded-For` entry — the one a caller writes themselves, since each proxy
+/// appends rather than replaces — so rotating it minted a fresh bucket per request.
+/// Each source here reads only a value the configured trust boundary produced, and
+/// every one falls back to the socket peer rather than to another header.
+#[derive(Debug, Clone, Copy)]
+struct ClientIpKeyExtractor {
+    source: config::ClientIpSource,
+}
+
+impl tower_governor::key_extractor::KeyExtractor for ClientIpKeyExtractor {
+    type Key = std::net::IpAddr;
+
+    fn extract<T>(
+        &self,
+        req: &axum::http::Request<T>,
+    ) -> Result<Self::Key, tower_governor::GovernorError> {
+        use config::ClientIpSource;
+        let headers = req.headers();
+        let from_header = match self.source {
+            ClientIpSource::Peer => None,
+            ClientIpSource::CfConnectingIp => headers
+                .get("cf-connecting-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse().ok()),
+            ClientIpSource::XForwardedForRightmost => headers
+                .get_all("x-forwarded-for")
+                .iter()
+                .next_back()
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.rsplit(',').next())
+                .and_then(|s| s.trim().parse().ok()),
+        };
+        from_header
+            .or_else(|| {
+                req.extensions()
+                    .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                    .map(|c| c.0.ip())
+            })
+            .ok_or(tower_governor::GovernorError::UnableToExtractKey)
+    }
+}
+
 /// The startup warning `run_server` logs when `mcp.allow_unauthenticated: true` and
 /// no bearer token is configured — i.e. every route in the `STATUS_PATH`/
 /// `METRICS_PATH`/`ADMIN_RELOAD_PATH`/`MCP_PATH` group above is reachable by anyone.
@@ -2423,7 +2467,8 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     )?;
     let auth = auth_layer(decision, oauth)?;
 
-    // Rate limiting (per-IP via SmartIpKeyExtractor for proxy-aware extraction).
+    // Rate limiting, per client address as chosen by `rate_limit.client_ip_source`
+    // (see `ClientIpKeyExtractor` for why this is not `SmartIpKeyExtractor`, #275).
     //
     // Use `.period()`, never `.per_second()`. Despite the name, tower_governor's
     // `per_second(n)` sets the interval between replenished tokens to n *seconds*
@@ -2435,7 +2480,9 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         GovernorConfigBuilder::default()
             .period(config.rate_limit.replenish_period())
             .burst_size(config.rate_limit.burst_size)
-            .key_extractor(SmartIpKeyExtractor)
+            .key_extractor(ClientIpKeyExtractor {
+                source: config.rate_limit.client_ip_source,
+            })
             .use_headers()
             .finish()
             .unwrap(),
@@ -4439,7 +4486,9 @@ mod tests {
             GovernorConfigBuilder::default()
                 .per_second(1)
                 .burst_size(burst_size)
-                .key_extractor(SmartIpKeyExtractor)
+                .key_extractor(ClientIpKeyExtractor {
+                    source: config::ClientIpSource::XForwardedForRightmost,
+                })
                 .finish()
                 .unwrap(),
         );
@@ -4491,7 +4540,9 @@ mod tests {
             GovernorConfigBuilder::default()
                 .per_second(1)
                 .burst_size(2)
-                .key_extractor(SmartIpKeyExtractor)
+                .key_extractor(ClientIpKeyExtractor {
+                    source: config::ClientIpSource::XForwardedForRightmost,
+                })
                 .finish()
                 .unwrap(),
         );
@@ -4588,6 +4639,86 @@ mod tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    fn key_for(
+        source: config::ClientIpSource,
+        headers: &[(&str, &str)],
+        peer: Option<&str>,
+    ) -> Option<std::net::IpAddr> {
+        use tower_governor::key_extractor::KeyExtractor;
+        let mut req = Request::builder().uri("/test");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let mut req = req.body(Body::empty()).unwrap();
+        if let Some(peer) = peer {
+            let addr: SocketAddr = format!("{peer}:1234").parse().unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(addr));
+        }
+        ClientIpKeyExtractor { source }.extract(&req).ok()
+    }
+
+    /// #275: the leftmost `X-Forwarded-For` entry is caller-written, so varying it
+    /// must not change the bucket.
+    #[test]
+    fn rightmost_xff_ignores_forged_leftmost_entries() {
+        use config::ClientIpSource::XForwardedForRightmost as S;
+        let a = key_for(S, &[("x-forwarded-for", "1.1.1.1, 10.0.0.9")], None);
+        let b = key_for(S, &[("x-forwarded-for", "2.2.2.2, 10.0.0.9")], None);
+        assert_eq!(a, Some("10.0.0.9".parse().unwrap()));
+        assert_eq!(a, b);
+        // A header split across several lines: the last line's last entry wins.
+        let c = key_for(
+            S,
+            &[
+                ("x-forwarded-for", "3.3.3.3"),
+                ("x-forwarded-for", "10.0.0.9"),
+            ],
+            None,
+        );
+        assert_eq!(c, a);
+    }
+
+    #[test]
+    fn cf_connecting_ip_wins_over_xff_and_falls_back_to_peer() {
+        use config::ClientIpSource::CfConnectingIp as S;
+        let k = key_for(
+            S,
+            &[
+                ("cf-connecting-ip", "203.0.113.7"),
+                ("x-forwarded-for", "1.1.1.1"),
+            ],
+            Some("10.0.0.1"),
+        );
+        assert_eq!(k, Some("203.0.113.7".parse().unwrap()));
+        let k = key_for(S, &[("x-forwarded-for", "1.1.1.1")], Some("10.0.0.1"));
+        assert_eq!(k, Some("10.0.0.1".parse().unwrap()));
+        let k = key_for(S, &[("cf-connecting-ip", "garbage")], Some("10.0.0.1"));
+        assert_eq!(k, Some("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn peer_source_ignores_every_forwarding_header() {
+        use config::ClientIpSource::Peer as S;
+        let k = key_for(
+            S,
+            &[
+                ("cf-connecting-ip", "203.0.113.7"),
+                ("x-forwarded-for", "1.1.1.1"),
+                ("x-real-ip", "2.2.2.2"),
+                ("forwarded", "for=3.3.3.3"),
+            ],
+            Some("10.0.0.1"),
+        );
+        assert_eq!(k, Some("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn no_resolvable_address_is_an_extraction_error() {
+        use config::ClientIpSource::XForwardedForRightmost as S;
+        assert_eq!(key_for(S, &[("x-forwarded-for", "nonsense")], None), None);
     }
 
     // --- router assembly: the real `run_server` router, not a hand-rolled stand-in ---
