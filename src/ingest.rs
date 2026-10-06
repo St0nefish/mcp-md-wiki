@@ -195,6 +195,50 @@ impl PathFilter {
 
         true
     }
+
+    /// The filter [`index_paths_generic`] uses to decide that a path still on disk
+    /// but no longer indexable (newly added to `exclude_files`/`exclude`, or no
+    /// longer matching `include`) must be purged from the index (#266), or `None`
+    /// when no such purge may happen this run.
+    ///
+    /// Fails CLOSED, the opposite of [`partition_indexable`]: failing open there
+    /// only marks a few extra paths dirty, while failing open here would purge
+    /// documents that are still meant to be indexed. So a filter that cannot be
+    /// built, or an `include` list with no pattern that compiled (an empty or
+    /// all-invalid list matches nothing, which would make every file look
+    /// excluded), disables exclusion purges entirely; deleted files are still
+    /// purged as before.
+    fn for_exclusion_purge(indexing: &IndexingConfig) -> Option<Self> {
+        // Count silently: `from_config` below already logs each invalid pattern.
+        let valid_includes = indexing
+            .include
+            .iter()
+            .filter(|p| Glob::new(p).is_ok())
+            .count();
+        exclusion_purge_filter(Self::from_config(indexing), valid_includes)
+    }
+}
+
+/// The decision behind [`PathFilter::for_exclusion_purge`], split out so the
+/// fail-closed handling of a filter-build error can be tested directly.
+fn exclusion_purge_filter(built: Result<PathFilter>, valid_includes: usize) -> Option<PathFilter> {
+    match built {
+        Ok(_) if valid_includes == 0 => {
+            warn!(
+                "indexing.include has no valid pattern; not purging excluded-but-present \
+                 files from the index this run"
+            );
+            None
+        }
+        Ok(f) => Some(f),
+        Err(e) => {
+            error!(
+                "Failed to build indexing path filter; not purging excluded-but-present \
+                 files from the index this run: {e:#}"
+            );
+            None
+        }
+    }
 }
 
 /// Partition `paths` into `(indexable, filtered_out)` using `indexing`'s
@@ -1579,7 +1623,8 @@ async fn flush_pending_batch<E: EmbedStore, Q: VectorStore + NeighborStore>(
     Ok(count)
 }
 
-/// Remove orphaned files (deleted from disk but still in the index).
+/// Remove orphaned files (deleted from disk, or now excluded by the indexing path
+/// filter — #266 — but still in the index).
 async fn remove_orphans<Q: VectorStore>(
     orphaned: &[String],
     store: &Q,
@@ -2715,7 +2760,15 @@ const SCAN_PAGE_SIZE: i64 = 1000;
 ///    positive here (mtime touched, bytes unchanged) costs one wasted hash comparison
 ///    downstream, not a wasted re-embed; a false negative would silently drop a real
 ///    change, which stat cannot produce short of the clock going backwards.
-/// 2. **Orphaned.** It has an `indexed_files` row but no longer exists on disk.
+/// 2. **Orphaned.** It has an `indexed_files` row but no longer exists on disk or is
+///    now excluded by `indexing.include`/`exclude`/`exclude_files` (#266) — either
+///    way it is absent from the filtered walk, and `index_paths` purges it. One
+///    guard: when the walk finds no indexable file at all, or more than half of the
+///    indexed rows are absent from it while their files are still on disk (an empty
+///    or partly unmounted `data_path`, an `include` that matches too little), those
+///    rows are withheld rather than reported, so a broken walk cannot turn into a
+///    purge of the index by exclusion. A row whose file is genuinely gone is always
+///    reported.
 /// 3. **Metadata-stale.** Content is unchanged (same `indexed_files.content_hash`),
 ///    but `documents` has no row for it, or a different hash — the case
 ///    `index_paths` resolves with a cheap parse-only refresh, no re-embedding.
@@ -2757,6 +2810,10 @@ pub async fn scan_for_dirty(
         .collect();
     let mut visited: HashSet<String> = HashSet::with_capacity(seen.len());
     let mut dirty: HashSet<PathBuf> = HashSet::new();
+    // Rows whose file is still on disk but absent from the filtered walk, i.e. "now
+    // excluded" (#266). Held back until the whole table is scanned so the bulk-purge
+    // guard below can see how many there are (see reason 2 in the doc comment).
+    let mut excluded_present: Vec<String> = Vec::new();
 
     INDEX_STATUS.set_phase(Phase::Scanning);
     let mut scanned = 0usize;
@@ -2783,8 +2840,18 @@ pub async fn scan_for_dirty(
             visited.insert(row.file_path.clone());
 
             if !seen.contains(&row.file_path) {
-                // Row survives, file does not: orphaned.
-                dirty.insert(PathBuf::from(&row.file_path));
+                // Row survives, but the filtered walk did not find the file: it was
+                // deleted, or it is now excluded (#266). Checked before the frozen
+                // scope test, so both are purged from frozen scopes too.
+                // A file that is really gone is reported at once; one still on disk is
+                // an exclusion purge, decided after the scan. An unknown stat result
+                // counts as present.
+                let abs = data_path.join(&row.file_path);
+                if tokio::fs::try_exists(&abs).await.unwrap_or(true) {
+                    excluded_present.push(row.file_path.clone());
+                } else {
+                    dirty.insert(PathBuf::from(&row.file_path));
+                }
                 continue;
             }
 
@@ -2878,6 +2945,27 @@ pub async fn scan_for_dirty(
         dirty.insert(PathBuf::from(rel_key));
     }
 
+    // Bulk-purge guard (#266): an empty walk, or one that would drop more than half of
+    // the indexed rows while their files are still on disk, says more about the walk
+    // (an unmounted subtree, an `include` typo) than about the files, so none of them
+    // are purged as excluded. Excluding a majority of the corpus on purpose needs the
+    // exclusion applied in steps (or a `--full` reindex, which rebuilds from the walk).
+    if !excluded_present.is_empty() {
+        if seen.is_empty() || excluded_present.len() * 2 > scanned {
+            error!(
+                withheld = excluded_present.len(),
+                indexed = scanned,
+                discovered = discovered.len(),
+                data_path = %data_path.display(),
+                "Reconcile scan would purge most indexed files as excluded although \
+                 they are still on disk; not purging them. Check data_path and \
+                 indexing.include/exclude/exclude_files"
+            );
+        } else {
+            dirty.extend(excluded_present.into_iter().map(PathBuf::from));
+        }
+    }
+
     info!(
         dirty = dirty.len(),
         discovered = discovered.len(),
@@ -2907,7 +2995,10 @@ pub async fn scan_for_dirty(
 /// or governing schema fingerprint actually changed (or `force` is set), it is
 /// chunked, embedded, and upserted. If unchanged but the metadata index is stale, only
 /// that (cheap, parse-only) metadata is refreshed — **no re-embedding**. If the file
-/// does not exist on disk, its points and rows are purged. This exactly mirrors
+/// does not exist on disk, or exists but is now excluded by `indexing.include`/
+/// `exclude`/`exclude_files` (#266; scoped runs only, and never when the path filter
+/// cannot be trusted — see [`PathFilter::for_exclusion_purge`]), its points and rows
+/// are purged. This exactly mirrors
 /// [`FileOutcome`] — see [`process_file`].
 ///
 /// `force = true` bypasses the skip-if-unchanged check and, before touching any path,
@@ -3262,6 +3353,15 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     // Once per run, not per file — compared against each row in `process_file`.
     let chunking_fp = chunking_fingerprint(&config.chunking);
 
+    // #266: once per run. `None` (fail closed — see `for_exclusion_purge`) means only
+    // files missing on disk are purged. A `force` run is fed `discover_files`'s
+    // already-filtered walk, so it never needs one.
+    let exclusion_filter = if force {
+        None
+    } else {
+        PathFilter::for_exclusion_purge(&config.indexing)
+    };
+
     // ── Per-path processing ──────────────────────────────────────────────────
     let mut pending: Vec<PendingFile> = Vec::new();
     let mut backfill_queue: Vec<(String, PathBuf)> = Vec::new();
@@ -3293,9 +3393,19 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
 
         let abs_path = data_path.join(rel_key);
 
-        // Missing on disk: treat as a delete, purged in a single batch below rather
-        // than one Qdrant round trip per path.
+        // Missing on disk, or present but now excluded by `indexing.include`/
+        // `exclude`/`exclude_files` (#266): treat as a delete, purged in a single
+        // batch below rather than one Qdrant round trip per path. Ahead of the
+        // frozen-scope check, so a frozen scope's deleted or excluded files are
+        // purged too. Only the paths this run was given are ever considered.
         if !abs_path.exists() {
+            missing.push(rel_key.clone());
+            continue;
+        }
+        if let Some(filter) = &exclusion_filter
+            && !filter.is_indexable(rel_key)
+        {
+            info!("Purging now-excluded file from index: {}", rel_key);
             missing.push(rel_key.clone());
             continue;
         }
@@ -4990,6 +5100,269 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dirty, vec![PathBuf::from("gone.md")]);
+    }
+
+    // -- #266: purging files that are now excluded by the indexing path filter ---
+
+    /// Write `rel` with `content` under `dir` and seed it as fully indexed: an
+    /// `indexed_files` row matching its real stat, schema and chunking fingerprint,
+    /// a `documents` row (projecting a `tags` field into `document_fields`) with the
+    /// same content hash, and one outgoing markdown link — so neither the scan nor
+    /// `index_paths_generic` sees any reason to touch it other than exclusion.
+    async fn seed_indexed_file(config: &ResolvedConfig, db: &StateDb, rel: &str, content: &str) {
+        let data_path = PathBuf::from(config.data_path());
+        let abs = data_path.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, content).unwrap();
+        let (mtime, size) = stat(&abs);
+        let schema_hash = SchemaCache::build(&data_path, &config.frontmatter)
+            .resolve_for(Path::new(rel))
+            .fingerprint();
+        let hash = compute_hash_from_bytes(content.as_bytes());
+        db.upsert(
+            rel,
+            &hash,
+            1,
+            &schema_hash,
+            &chunking_fingerprint(&config.chunking),
+            mtime,
+            size,
+        )
+        .await
+        .unwrap();
+        let mut fm = HashMap::new();
+        fm.insert("title".into(), serde_json::json!(rel));
+        fm.insert("tags".into(), serde_json::json!(["a", "b"]));
+        db.upsert_document_metadata(rel, &fm, mtime, &hash, 1)
+            .await
+            .unwrap();
+        db.replace_links(rel, "markdown", &[("elsewhere.md".to_string(), None)])
+            .await
+            .unwrap();
+    }
+
+    async fn field_row_count(db: &StateDb, rel: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM document_fields WHERE file_path = ?")
+            .bind(rel)
+            .fetch_one(db.pool_for_test())
+            .await
+            .unwrap()
+    }
+
+    async fn run_index_paths(config: &ResolvedConfig, paths: &[&str]) -> TrackingMockVectorStore {
+        let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        let store = TrackingMockVectorStore::all_ok();
+        let result = index_paths_generic(
+            config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &MockEmbedClient::ok(vec![]),
+            &store,
+        )
+        .await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        store
+    }
+
+    /// Asserts every trace of `rel` is gone from the state DB.
+    async fn assert_fully_purged(db: &StateDb, rel: &str) {
+        assert!(
+            db.get(rel).await.unwrap().is_none(),
+            "{rel}: indexed_files row"
+        );
+        assert!(
+            db.get_document_hashes_many(&[rel.to_string()])
+                .await
+                .unwrap()
+                .is_empty(),
+            "{rel}: documents row"
+        );
+        assert_eq!(
+            field_row_count(db, rel).await,
+            0,
+            "{rel}: document_fields rows"
+        );
+        assert!(
+            !db.all_links().await.unwrap().iter().any(|(s, ..)| s == rel),
+            "{rel}: outgoing document_links rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_flags_an_on_disk_row_now_in_exclude_files() {
+        let dir = TempDir::new().unwrap();
+        let mut config = scan_test_config(&dir);
+        config.indexing.exclude_files = vec!["secret.md".into()];
+        let db = open_scan_test_db(&config).await;
+        seed_indexed_file(&config, &db, "keep.md", "# Keep").await;
+        seed_indexed_file(&config, &db, "secret.md", "# Secret").await;
+
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
+        assert_eq!(dirty, vec![PathBuf::from("secret.md")]);
+    }
+
+    #[tokio::test]
+    async fn index_paths_generic_purges_a_now_excluded_file_and_nothing_else() {
+        let dir = TempDir::new().unwrap();
+        let mut config = scan_test_config(&dir);
+        config.indexing.exclude_files = vec!["secret.md".into()];
+        let db = open_scan_test_db(&config).await;
+        seed_indexed_file(&config, &db, "keep.md", "# Keep").await;
+        seed_indexed_file(&config, &db, "secret.md", "# Secret").await;
+        assert!(field_row_count(&db, "secret.md").await > 0);
+
+        // A targeted run on another path purges only what it was given.
+        let store = run_index_paths(&config, &["keep.md"]).await;
+        assert!(store.delete_by_files_calls.lock().unwrap().is_empty());
+        assert!(db.get("secret.md").await.unwrap().is_some());
+
+        let store = run_index_paths(&config, &["secret.md"]).await;
+        assert_eq!(
+            store.delete_by_files_calls.lock().unwrap().clone(),
+            vec![vec!["secret.md".to_string()]]
+        );
+        assert!(store.upserted_points.lock().unwrap().is_empty());
+        assert_fully_purged(&db, "secret.md").await;
+        assert!(
+            dir.path().join("secret.md").exists(),
+            "the file itself is left alone"
+        );
+
+        // The unrelated document is untouched.
+        assert!(db.get("keep.md").await.unwrap().is_some());
+        assert!(field_row_count(&db, "keep.md").await > 0);
+        assert!(
+            db.all_links()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(s, ..)| s == "keep.md")
+        );
+    }
+
+    #[test]
+    fn exclusion_purge_filter_fails_closed() {
+        let indexing = crate::config::IndexingConfig::default();
+        assert!(
+            exclusion_purge_filter(Err(anyhow::anyhow!("glob build failed")), 1).is_none(),
+            "a filter-build error must disable exclusion purges, not exclude everything"
+        );
+        assert!(
+            exclusion_purge_filter(PathFilter::from_config(&indexing), 0).is_none(),
+            "no valid include pattern must disable exclusion purges"
+        );
+        assert!(exclusion_purge_filter(PathFilter::from_config(&indexing), 1).is_some());
+    }
+
+    /// An `include` with no valid pattern matches nothing, so every file looks
+    /// excluded. Neither the scan nor the indexer may purge on that basis, while a
+    /// file that is really gone is still purged.
+    #[tokio::test]
+    async fn no_valid_include_pattern_purges_no_present_file() {
+        let dir = TempDir::new().unwrap();
+        let mut config = scan_test_config(&dir);
+        let db = open_scan_test_db(&config).await;
+        seed_indexed_file(&config, &db, "doc.md", "# Doc").await;
+        seed_indexed_file(&config, &db, "gone.md", "# Gone").await;
+        std::fs::remove_file(dir.path().join("gone.md")).unwrap();
+        // Unclosed character class: rejected by `Glob::new`, so zero patterns compile.
+        config.indexing.include = vec!["[unclosed".into()];
+
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
+        assert_eq!(
+            dirty,
+            vec![PathBuf::from("gone.md")],
+            "empty walk: only the really-deleted file may be reported"
+        );
+
+        let store = run_index_paths(&config, &["doc.md", "gone.md"]).await;
+        assert_eq!(
+            store.delete_by_files_calls.lock().unwrap().clone(),
+            vec![vec!["gone.md".to_string()]]
+        );
+        assert!(db.get("doc.md").await.unwrap().is_some());
+        assert_fully_purged(&db, "gone.md").await;
+    }
+
+    /// An empty walk with valid patterns (e.g. an unmounted, empty-looking tree
+    /// where the indexed files are simply not indexable any more) withholds rows
+    /// whose files are present, rather than reporting them for purge.
+    #[tokio::test]
+    async fn scan_for_dirty_empty_walk_withholds_present_rows() {
+        let dir = TempDir::new().unwrap();
+        let mut config = scan_test_config(&dir);
+        let db = open_scan_test_db(&config).await;
+        seed_indexed_file(&config, &db, "doc.md", "# Doc").await;
+        config.indexing.include = vec!["**/*.txt".into()];
+
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
+        assert!(dirty.is_empty(), "{dirty:?}");
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_withholds_a_majority_exclusion_but_not_a_deletion() {
+        let dir = TempDir::new().unwrap();
+        let mut config = scan_test_config(&dir);
+        let db = open_scan_test_db(&config).await;
+        for rel in ["a.md", "b.md", "c.md", "gone.md"] {
+            seed_indexed_file(&config, &db, rel, "# Doc").await;
+        }
+        std::fs::remove_file(dir.path().join("gone.md")).unwrap();
+        // 3 of 4 rows would be purged as excluded while still on disk: a partial
+        // walk, not an intentional exclusion, so only the deletion is reported.
+        config.indexing.include = vec!["nothing-matches/**/*.md".into()];
+
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
+        assert_eq!(dirty, vec![PathBuf::from("gone.md")]);
+
+        // Excluding fewer than half is applied.
+        config.indexing.include = vec!["**/*.md".into()];
+        config.indexing.exclude_files = vec!["a.md".into()];
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
+        let dirty: HashSet<PathBuf> = dirty.into_iter().collect();
+        assert_eq!(
+            dirty,
+            HashSet::from([PathBuf::from("a.md"), PathBuf::from("gone.md")])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_now_excluded_file_in_a_frozen_scope_is_still_purged() {
+        let dir = TempDir::new().unwrap();
+        let mut config = scan_test_config(&dir);
+        config.indexing.exclude_files = vec!["secret.md".into()];
+        let db = open_scan_test_db(&config).await;
+        seed_indexed_file(&config, &db, "keep.md", "# Keep").await;
+        seed_indexed_file(&config, &db, "broken/secret.md", "# Secret").await;
+        // Frozen only after seeding, as if the schema broke after the last index.
+        std::fs::write(
+            dir.path().join("broken/.kb-schema.yaml"),
+            "fields: [not, a, mapping]",
+        )
+        .unwrap();
+
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
+        assert_eq!(dirty, vec![PathBuf::from("broken/secret.md")]);
+
+        let store = run_index_paths(&config, &["broken/secret.md"]).await;
+        assert_eq!(
+            store.delete_by_files_calls.lock().unwrap().clone(),
+            vec![vec!["broken/secret.md".to_string()]]
+        );
+        assert_fully_purged(&db, "broken/secret.md").await;
     }
 
     #[tokio::test]

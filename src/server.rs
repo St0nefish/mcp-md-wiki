@@ -158,24 +158,20 @@ const MAX_DISTINCT_FOR_BREAKDOWN: i64 = 500;
 const MAX_BREAKDOWN_FIELDS: usize = 20;
 /// Cap on values reported per field.
 const MAX_VALUES_PER_BREAKDOWN: i64 = 50;
-/// Fields never broken down.
+/// Free-text frontmatter fields: unique per document by design (and promoted to
+/// columns, so they never reach `document_fields` anyway). Neither a metrics breakdown
+/// nor an `Available <field>:` instructions line can say anything useful about them —
+/// the latter would list one value per document (#333).
+const FREE_TEXT_FIELDS: [&str; 2] = ["title", "description"];
+/// Fields never broken down, in addition to [`FREE_TEXT_FIELDS`].
 ///
-/// - `title`/`description` are free text, unique per document by design (and promoted
-///   to columns, so they never reach `document_fields` anyway).
 /// - `domain` is *derived* from the top-level folder, making it identical to the
 ///   synthetic `area` breakdown by construction — reporting both prints the same
 ///   histogram twice.
 /// - `timestamp`/`date` are instants. Grouping documents by exact instant produces a
 ///   near-unique list that crowds out real vocabularies; recency is a range query, not
 ///   a category.
-const BREAKDOWN_EXCLUDED: [&str; 6] = [
-    "title",
-    "description",
-    "file_path",
-    "domain",
-    "timestamp",
-    "date",
-];
+const BREAKDOWN_EXCLUDED: [&str; 4] = ["file_path", "domain", "timestamp", "date"];
 /// Cap on a single reported value's length. Frontmatter values are uncapped at ingest.
 const MAX_VALUE_LEN: usize = 200;
 /// How long a collected status is reused. Short enough that `/status` still reads as
@@ -345,6 +341,11 @@ pub struct StatusResponse {
     /// full reindex, so an operator troubleshooting a deployed instance needs a way
     /// to ask it what it actually is without shelling in.
     pub version: String,
+    /// Git tree hash the binary was built from (`REVISION` at build time, the same
+    /// value as the image's `org.opencontainers.image.revision` label; `"unknown"`
+    /// for a plain `cargo build`) — #264. `version` alone cannot tell two `:dev`
+    /// builds of the same release apart.
+    pub revision: String,
     pub uptime_secs: f64,
     pub collection: String,
     pub data_path: String,
@@ -444,13 +445,17 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
 
             // Fetch a few extra rows so an excluded field cannot eat a slot that a
             // reportable one would have used.
-            let fetch = (MAX_BREAKDOWN_FIELDS + BREAKDOWN_EXCLUDED.len()) as i64;
+            let fetch =
+                (MAX_BREAKDOWN_FIELDS + BREAKDOWN_EXCLUDED.len() + FREE_TEXT_FIELDS.len()) as i64;
             match db.breakdown_fields(MAX_DISTINCT_FOR_BREAKDOWN, fetch).await {
                 Err(e) => store.errors.push(store_error("breakdown fields", &e)),
                 Ok(fields) => {
                     let selected: Vec<(String, i64)> = fields
                         .into_iter()
-                        .filter(|(name, _)| !BREAKDOWN_EXCLUDED.contains(&name.as_str()))
+                        .filter(|(name, _)| {
+                            !BREAKDOWN_EXCLUDED.contains(&name.as_str())
+                                && !FREE_TEXT_FIELDS.contains(&name.as_str())
+                        })
                         .take(MAX_BREAKDOWN_FIELDS)
                         .collect();
 
@@ -565,6 +570,10 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
 
     StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        revision: option_env!("REVISION")
+            .filter(|r| !r.is_empty())
+            .unwrap_or("unknown")
+            .to_string(),
         uptime_secs: crate::status::uptime_secs(),
         collection: config.qdrant.collection.clone(),
         data_path: config.data_path().to_string(),
@@ -739,16 +748,20 @@ pub fn render_prometheus(
     let plain = |v: f64| vec![(String::new(), v)];
 
     // Standard Prometheus "build info" convention: a gauge that is always 1, whose
-    // only purpose is to carry the version as a label so `kb_build_info` can be
+    // only purpose is to carry the version and build revision as labels so `kb_build_info` can be
     // joined against other series in a query (e.g. to annotate a dashboard with
-    // which version was running when a regression appeared) — see #183. The value
+    // which version was running when a regression appeared) — see #183, #264. The value
     // itself is meaningless; only the label is.
     metric(
         "kb_build_info",
-        "Always 1; carries the running binary's version as a label.",
+        "Always 1; carries the running binary's version and build revision as labels.",
         "gauge",
         &[(
-            format!("{{version=\"{}\"}}", escape_label(&status.version)),
+            format!(
+                "{{version=\"{}\",revision=\"{}\"}}",
+                escape_label(&status.version),
+                escape_label(&status.revision)
+            ),
             1.0,
         )],
     );
@@ -1502,7 +1515,7 @@ async fn build_instructions(
     // would grow without bound as schemas nest, and most of it is irrelevant to any
     // given call — get_schema is the targeted way to ask.
     for field in schemas.root().indexed_fields() {
-        if field == "file_path" {
+        if field == "file_path" || FREE_TEXT_FIELDS.contains(&field.as_str()) {
             continue;
         }
         // Field NAMES are attacker-influenceable too — they come from .kb-schema.yaml
@@ -2692,6 +2705,7 @@ mod tests {
 
         StatusResponse {
             version: "0.0.0-test".into(),
+            revision: "abc1234".into(),
             uptime_secs: 42.0,
             collection: "knowledge-base".into(),
             data_path: "/data".into(),
@@ -2753,7 +2767,7 @@ mod tests {
 
         // Build-info gauge (#183): version carried as a label, value always 1.
         assert!(
-            out.contains(r#"kb_build_info{version="0.0.0-test"} 1"#),
+            out.contains(r#"kb_build_info{version="0.0.0-test",revision="abc1234"} 1"#),
             "{out}"
         );
 
@@ -4060,6 +4074,49 @@ mod tests {
         assert!(
             !instructions.contains("Available tags"),
             "an undeclared field falls back to facets, which are unreachable here: {instructions}"
+        );
+    }
+
+    /// `title`/`description` are free text, so an `Available title:` line would be a
+    /// per-document list rather than a vocabulary (#333). Other fields are unaffected.
+    #[tokio::test]
+    async fn build_instructions_skips_free_text_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let frontmatter = FrontmatterConfig {
+            indexed_fields: vec!["title".into(), "description".into(), "status".into()],
+            allowed: std::collections::HashMap::from([(
+                "status".to_string(),
+                vec!["active".to_string(), "draft".to_string()],
+            )]),
+            ..Default::default()
+        };
+        let schemas = SchemaCache::build(dir.path(), &frontmatter);
+        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
+            url: "http://127.0.0.1:1".into(),
+            collection: "unused".into(),
+        })
+        .expect("client construction is lazy and must not require a live server");
+
+        let instructions = build_instructions(
+            "base",
+            &qdrant,
+            "unused",
+            dir.path(),
+            &schemas,
+            &frontmatter,
+            &config::Granularity::ALL,
+            &[],
+        )
+        .await;
+
+        assert!(!instructions.contains("Available title"), "{instructions}");
+        assert!(
+            !instructions.contains("Available description"),
+            "{instructions}"
+        );
+        assert!(
+            instructions.contains("Available status: active, draft"),
+            "other fields are unchanged: {instructions}"
         );
     }
 

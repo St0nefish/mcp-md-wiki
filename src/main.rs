@@ -706,6 +706,7 @@ fn write_status(
     status: &server::StatusResponse,
 ) -> std::io::Result<()> {
     writeln!(w, "Version:     {}", status.version)?;
+    writeln!(w, "Revision:    {}", status.revision)?;
     writeln!(w, "Collection:  {}", status.collection)?;
     writeln!(w, "Data path:   {}", status.data_path)?;
     writeln!(w)?;
@@ -1040,6 +1041,7 @@ mod tests {
     fn base_status() -> StatusResponse {
         StatusResponse {
             version: "0.0.0-test".into(),
+            revision: "abc1234".into(),
             uptime_secs: 1.0,
             collection: "knowledge-base".into(),
             data_path: "/data".into(),
@@ -1068,6 +1070,7 @@ mod tests {
     fn status_renders_the_three_store_counts() {
         let out = render(&base_status());
         assert!(out.contains("Version:     0.0.0-test"), "{out}");
+        assert!(out.contains("Revision:    abc1234"), "{out}");
         assert!(out.contains("Indexed files:  330"), "{out}");
         assert!(out.contains("Documents:      330"), "{out}");
         assert!(out.contains("Qdrant points:  2481"), "{out}");

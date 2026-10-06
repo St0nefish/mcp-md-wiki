@@ -48,6 +48,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY migrations/ migrations/
 COPY assets/ assets/
+# After the cook layer so a new revision does not bust the dependency cache (#264).
+# Read by option_env!("REVISION") in src/server.rs.
+ARG REVISION=unknown
+ENV REVISION=$REVISION
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release && \
     cp target/release/mcp-md-wiki /usr/local/bin/mcp-md-wiki

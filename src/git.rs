@@ -809,20 +809,36 @@ pub async fn document_history(
 /// already has a specific commit sha from this document's own history and
 /// wants to see what THAT commit changed, not construct an arbitrary range.
 ///
-/// Empty string if `commit` did not touch `rel_path` at all (a caller is
-/// expected to only ever pass a `commit` this document's own
-/// [`document_history`] reported, but this degrades to "no diff" rather than
-/// an error if it doesn't — same defensive posture [`is_git_repo`]'s callers
-/// get for a missing repo).
-pub async fn document_commit_diff(data_path: &str, commit: &str, rel_path: &str) -> Result<String> {
+/// `commit` is resolved first (`rev-parse --verify <commit>^{commit}`), so a
+/// revision that does not name a commit — nonexistent, malformed, a tree or
+/// blob, or a leading-dash string — is [`CommitDiffError::UnknownRevision`]
+/// (bad caller input, #265) while any other git failure is
+/// [`CommitDiffError::Git`]. A valid commit that never touched `rel_path`
+/// still yields an empty diff, not an error. Returns an empty string with no
+/// error when `data_path` is not a git repository.
+pub async fn document_commit_diff(
+    data_path: &str,
+    commit: &str,
+    rel_path: &str,
+) -> Result<String, CommitDiffError> {
     if !is_git_repo(data_path) {
         return Ok(String::new());
     }
     let safe_dir = format!("safe.directory={}", data_path);
+    let resolved = resolve_commit(data_path, &safe_dir, commit).await?;
     let out = timeout(
         GIT_TIMEOUT,
         Command::new("git")
-            .args(["-c", &safe_dir, "show", "--format=", commit, "--", rel_path])
+            .args([
+                "-c",
+                &safe_dir,
+                "show",
+                "--format=",
+                "--end-of-options",
+                &resolved,
+                "--",
+                rel_path,
+            ])
             .current_dir(data_path)
             .output(),
     )
@@ -832,10 +848,64 @@ pub async fn document_commit_diff(data_path: &str, commit: &str, rel_path: &str)
 
     if !out.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
-        anyhow::bail!("git show failed: {}", stderr);
+        return Err(anyhow::anyhow!("git show failed: {}", stderr).into());
     }
 
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Resolve `commit` to a full commit sha. Exit 1 is `rev-parse --verify`'s
+/// "does not name a commit" answer (a tree or blob sha exits 1 too, with a
+/// stderr note that `--quiet` does not suppress); git's own fatal errors exit
+/// 128, so every other outcome is a genuine git failure (#265).
+async fn resolve_commit(
+    data_path: &str,
+    safe_dir: &str,
+    commit: &str,
+) -> Result<String, CommitDiffError> {
+    let spec = format!("{commit}^{{commit}}");
+    let out = timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args([
+                "-c",
+                safe_dir,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &spec,
+            ])
+            .current_dir(data_path)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git rev-parse timed out after {:?}", GIT_TIMEOUT))?
+    .context("Failed to spawn git rev-parse")?;
+
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    if out.status.code() == Some(1) {
+        return Err(CommitDiffError::UnknownRevision(commit.to_string()));
+    }
+    let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+    Err(anyhow::anyhow!("git rev-parse failed ({}): {}", out.status, stderr).into())
+}
+
+/// Why [`document_commit_diff`] failed (#265): the caller named a revision
+/// that is not a commit (a client error), or git itself failed (a server
+/// error).
+#[derive(Debug, thiserror::Error)]
+pub enum CommitDiffError {
+    /// The revision does not resolve to a commit in this repository.
+    #[error("unknown revision '{0}'")]
+    UnknownRevision(String),
+
+    /// Any other git failure (timeout, spawn failure, corrupt repository).
+    /// `redact_url` has already been applied to any git stderr folded in.
+    #[error("{0:#}")]
+    Git(#[from] anyhow::Error),
 }
 
 /// The outcome of a failed [`commit_and_sync`] call, split by whether a commit landed.
@@ -2134,6 +2204,57 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(diff, "");
+    }
+
+    #[tokio::test]
+    async fn document_commit_diff_rejects_non_commit_revisions_as_unknown_revision() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+        commit_tool_authored(work_path, "a.md", "# A\n", "write_document");
+
+        // A tree and a blob sha: real objects, but not commits.
+        let tree = git_test_cmd(work_path)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        let tree = String::from_utf8(tree.stdout).unwrap().trim().to_string();
+        let blob = git_test_cmd(work_path)
+            .args(["rev-parse", "HEAD:a.md"])
+            .output()
+            .unwrap();
+        let blob = String::from_utf8(blob.stdout).unwrap().trim().to_string();
+
+        let nonexistent = "0123456789abcdef0123456789abcdef01234567".to_string();
+        for rev in [
+            nonexistent,
+            "not-a-rev".to_string(),
+            "--foo".to_string(),
+            tree,
+            blob,
+        ] {
+            match document_commit_diff(work_path, &rev, "a.md").await {
+                Err(CommitDiffError::UnknownRevision(got)) => assert_eq!(got, rev),
+                other => panic!("expected UnknownRevision for {rev:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn document_commit_diff_reports_a_corrupt_repo_as_git_error_not_unknown_revision() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+        commit_tool_authored(work_path, "a.md", "# A\n", "write_document");
+        let (history, _) = document_history(work_path, "a.md", 10).await.unwrap();
+        let sha = history[0].sha.clone();
+
+        std::fs::write(work.path().join(".git/HEAD"), "garbage\n").unwrap();
+
+        match document_commit_diff(work_path, &sha, "a.md").await {
+            Err(CommitDiffError::Git(_)) => {}
+            other => panic!("expected Git error for a corrupt repo, got {other:?}"),
+        }
     }
 
     // --- commit_and_sync tests ---
