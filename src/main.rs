@@ -159,7 +159,7 @@ enum Commands {
         /// Emit the BROKEN LINKS report as JSON on stdout
         ///
         /// Scoped deliberately to the broken-links report. Frontmatter results,
-        /// SCHEMA ERRORS and FROZEN still print as human-readable text on stderr
+        /// SCHEMA ERRORS still print as human-readable text on stderr
         /// regardless of this flag — same stdout/stderr split `status --json`
         /// uses, so the JSON on stdout is always parseable on its own.
         #[arg(long)]
@@ -318,41 +318,29 @@ async fn main() -> anyhow::Result<()> {
             let files = ingest::discover_files(data_path, &cfg.indexing)?;
             info!("Validating {} files", files.len());
 
-            let schemas = schema::SchemaCache::build(data_path, &cfg.frontmatter);
-            let broken: Vec<_> = schemas.broken_scopes().collect();
-            if !broken.is_empty() {
-                eprintln!("SCHEMA ERRORS ({}):", broken.len());
-                for (scope, reason) in &broken {
-                    eprintln!(
-                        "  {}/{}: {}",
-                        scope.display(),
-                        schema::SCHEMA_FILE_NAME,
-                        reason
-                    );
-                    eprintln!("    -> documents in this scope are frozen and will not be indexed");
-                }
-                eprintln!();
-            }
+            // Any invalid schema file fails the whole check, regardless of
+            // --strict: the server refuses to start on the same tree, and there are
+            // no rules to validate documents against that are known to be right.
+            let schemas =
+                match schema::SchemaCache::build(data_path, &cfg.frontmatter, &cfg.indexing) {
+                    Ok(schemas) => schemas,
+                    Err(e) => {
+                        eprintln!("SCHEMA ERRORS ({}):", e.invalid.len());
+                        for file in &e.invalid {
+                            eprintln!("  {}: {}", file.path.display(), file.reason);
+                        }
+                        eprintln!();
+                        anyhow::bail!(
+                            "{} {} file(s) are invalid; no document was validated, and the \
+                         server will refuse to start until they are fixed",
+                            e.invalid.len(),
+                            schema::SCHEMA_FILE_NAME
+                        );
+                    }
+                };
 
-            // Documents under a broken schema are frozen: the indexer will not touch
-            // them, so validating against the parent's rules would report a reassuring
-            // result for files that are not actually being indexed.
-            let (frozen, live): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
-                let rel = f.strip_prefix(data_path).unwrap_or(f);
-                schemas.is_frozen(rel).is_some()
-            });
-            if !frozen.is_empty() {
-                eprintln!(
-                    "FROZEN ({}): under an invalid schema, not indexed, not validated",
-                    frozen.len()
-                );
-                for f in &frozen {
-                    eprintln!("  {}", f.strip_prefix(data_path).unwrap_or(f).display());
-                }
-                eprintln!();
-            }
-
-            let results = validate::validate_all(&live, data_path, &schemas, &cfg.validation).await;
+            let results =
+                validate::validate_all(&files, data_path, &schemas, &cfg.validation).await;
 
             let mut valid_count = 0;
             let mut invalid_count = 0;
@@ -423,15 +411,9 @@ async fn main() -> anyhow::Result<()> {
 
             // Severity split from frontmatter failures, deliberately: a broken link
             // is fixable but does not mean the KB's content is wrong the way a
-            // missing/mistyped frontmatter field does, so it never joins `broken`
-            // (schema errors) or `invalid_count` in the exit-code decision below,
-            // regardless of --strict.
+            // missing/mistyped frontmatter field does, so it never joins
+            // `invalid_count` in the exit-code decision below, regardless of --strict.
             let strict = cfg.validation.strict || strict;
-            if strict && !broken.is_empty() {
-                // A broken schema silently loosens validation for a whole subtree,
-                // which is worse than any single invalid document.
-                anyhow::bail!("{} schema file(s) failed to parse", broken.len());
-            }
             if invalid_count > 0 && strict {
                 anyhow::bail!("{} file(s) failed validation in strict mode", invalid_count);
             }
@@ -782,7 +764,7 @@ fn write_status(
 /// the staleness caveat are both assertable in tests rather than only exercised
 /// by running the CLI against a real state DB. Writes nothing when the report is
 /// empty — same "no section when there's nothing to say" convention the SCHEMA
-/// ERRORS/FROZEN sections in `Commands::Validate` already follow.
+/// ERRORS section in `Commands::Validate` already follows.
 fn write_broken_links(
     w: &mut impl std::io::Write,
     report: &validate::BrokenLinksReport,
@@ -1192,8 +1174,8 @@ mod tests {
         };
         assert!(
             render_broken_links(&report).is_empty(),
-            "a clean report must print nothing, matching the SCHEMA ERRORS/FROZEN \
-             sections' convention of no section when there's nothing to say"
+            "a clean report must print nothing, matching the SCHEMA ERRORS \
+             section's convention of no section when there's nothing to say"
         );
     }
 

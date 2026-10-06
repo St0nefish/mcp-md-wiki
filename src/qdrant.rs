@@ -3528,7 +3528,7 @@ mod tests {
             indexed_fields: vec!["prep_minutes".to_string()],
             ..Default::default()
         };
-        let schemas = crate::schema::SchemaCache::build(tmp.path(), &config.frontmatter);
+        let schemas = crate::schema::SchemaCache::build_for_test(tmp.path(), &config.frontmatter);
 
         let fields = all_indexed_fields(&config, &schemas);
         let prep = fields

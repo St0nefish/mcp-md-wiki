@@ -164,11 +164,11 @@ Nested authoring (as above) and flat dot-paths (`planning.prep_minutes:`) are eq
 
 A field definition can't declare both a scalar `type` and nested `fields:` — a field is either a value or a container, not both. `type: object` is the exception, since `object` inherently means "has nested fields." `update_schema` rejects this the same way a hand-edited `.kb-schema.yaml` does.
 
-Declaring the same path twice in one file — once under a nested `fields:` and once as a flat dot-path key (`planning.method:` next to `planning: {fields: {method: ...}}`) — is an error that freezes the scope, because the two spellings are the same field and only one could win. `update_schema` addresses a nested field by its dot-path and edits it where it lives, nested or flat; `add_values`/`set_field` on a path whose parents don't exist yet create those parents as `type: object` fields.
+Declaring the same path twice in one file — once under a nested `fields:` and once as a flat dot-path key (`planning.method:` next to `planning: {fields: {method: ...}}`) — makes the file invalid (see [Invalid schema files](#invalid-schema-files)), because the two spellings are the same field and only one could win. `update_schema` addresses a nested field by its dot-path and edits it where it lives, nested or flat; `add_values`/`set_field` on a path whose parents don't exist yet create those parents as `type: object` fields.
 
 **`values:` without a `type:` is enforced leniently.** A field declaring `values:` *and* `type: enum` is checked strictly — any value outside the list fails, whatever its YAML type. A field declaring `values:` with **no** `type:` exempts non-string values from the check, so `status: 3` passes a `values: [active, draft]` list that `status: "retired"` would fail. That is deliberate: it preserves the behaviour of the pre-cascade global `frontmatter.allowed` map so existing deployments don't start failing, and it applies to any field authored that way — including in a `.kb-schema.yaml`, not just the legacy `config.yaml` block. If you want a closed set actually enforced, declare `type: enum`.
 
-`.kb-schema.yaml` files themselves are not indexed as documents.
+`.kb-schema.yaml` files themselves are not indexed as documents, and the document tools (`write_document`, `delete_document`, the web UI editor) refuse to write, move or delete one — edit them with `update_schema`, or in the knowledge base's git repository.
 
 ### Cascade and merge rules
 
@@ -176,6 +176,18 @@ Declaring the same path twice in one file — once under a nested `fields:` and 
 - **Merging is per attribute, not per field.** A field redefined at a deeper level overrides only the attributes it explicitly writes (`type`, `required`, `indexed`, `default`, `open`, `values`) — every attribute it leaves unwritten still inherits from the nearest ancestor that declared this same field. A `recipes/` scope that writes only `values: [recipe]` for `type` does not reset that field's `required`/`indexed`/`default` to nothing; it only changes `values`. This is deliberate: the previous rule (a redefinition replacing the whole definition wholesale) meant a deeper scope narrowing one attribute silently discarded every other attribute the root had set for that field, with nothing reported — a real footgun for a field like `tags` that nearly every domain redeclares just to set its own `values`.
 - **`values` is the one attribute with an in-band way to request a merge instead of a plain override**, via a `$values` placeholder inside the list — see below. Every other attribute either inherits wholesale (unwritten) or overrides wholesale (written); there is no partial merge for them.
 - Top-level folder names are the KB's areas (this is also what `domain` is derived from — see [Sample Document](#sample-document) above); the MCP server's dynamic instructions list them from a directory read, in addition to any `Available domain: ...` facet it advertises when `domain` is indexed at the root — either via `frontmatter.indexed_fields` (deprecated fallback) or an `indexed: true` entry for `domain` in a root `.kb-schema.yaml`. `domain` isn't author-written frontmatter (see the note above), so if you migrate off `config.yaml`, remember to declare it explicitly — it does not carry over automatically.
+
+#### Per-directory near-duplicate override (`dedup:`)
+
+Alongside `fields:`, a `.kb-schema.yaml` may set a `dedup:` block that overrides the global `write.dedup_enabled` / `write.dedup_threshold` for that directory and everything beneath it. This is for structurally templated folders (`food/plans/`, `food/recipes/`) whose documents are legitimately near-identical and would otherwise trip the [near-duplicate check](#the-tools) on every create:
+
+```yaml
+dedup:
+  enabled: false     # no near-duplicate check on create in this subtree, or
+  threshold: 0.95    # check, but refuse only at cosine >= 0.95 (range 0.0–1.0)
+```
+
+Both keys are optional and cascade independently, nearest scope winning; a key no schema in the chain sets falls back to the global `write.*` value. A threshold outside 0.0–1.0, a wrong-typed value, or an unknown key under `dedup:` makes the file invalid like any other schema error (see [Invalid schema files](#invalid-schema-files)). The block is hand-edited — `update_schema` has no operation for it, but it preserves an existing block when it rewrites the file — and `get_schema` reports the effective override when one is set. It applies to creates only (edits and moves never run the check) and, unlike `fields:`, does not affect the schema fingerprint, so changing it revalidates nothing.
 
 #### The `$values` placeholder
 
@@ -278,7 +290,6 @@ Calling `get_schema` for a document in that directory (e.g. `food/recipes/lasagn
 ```json
 {
   "path": "food/recipes/lasagna.md",
-  "frozen": false,
   "fields": [
     {
       "field": "type",
@@ -314,13 +325,14 @@ tags:
 
 `extend: true` is a shorthand for a leading `$values` — internally it becomes `values: [$values, dinner, quick]`, the same list spliced the same way — but using it logs a warning naming the schema file, since `$values` is the non-deprecated way to say the same thing. New schemas should write `$values` explicitly, as in the worked example above.
 
-### Freezing
+### Invalid schema files
 
-A malformed `.kb-schema.yaml` **freezes its subtree**: nothing under it is indexed or re-indexed, and existing index entries are left untouched — it never silently falls back to the parent's rules. `mcp-md-wiki validate` reports broken schema files in a `SCHEMA ERRORS` section, and they count as a failure under `validation.strict: true`.
+Every `.kb-schema.yaml` in the indexed tree that is present must be valid — a root one is optional. Hidden directories, and directories whose every document `indexing.exclude` rules out (for example `templates/**`), are not part of the schema tree: a schema file there is never read or validated, and changing it triggers nothing. A file is invalid when it can't be read, is larger than 256 KB (refused on its file size alone, never read or parsed), doesn't parse (unknown key, wrong type, a bad `dedup:` block), or contradicts itself. An invalid file is never loaded; it never silently falls back to the parent's rules, and there is no partial schema with one subtree switched off.
 
-A `.kb-schema.yaml` larger than 256 KB is rejected outright — it's never read or parsed, just refused on its file size — and freezes its subtree the same way any other invalid schema does.
+- **Startup:** the server refuses to start, with an error listing every invalid file and why. `mcp-md-wiki index` (incremental or `--full`) aborts the same way before touching the index, and `mcp-md-wiki validate` lists them under `SCHEMA ERRORS` and exits non-zero, `--strict` or not. Run `validate` before deploying a schema change by hand.
+- **Running server:** an invalid file arriving later — pushed to the git host and delivered by the webhook, or found by a reconcile — is refused. The server keeps enforcing the last schema that loaded cleanly, indexes nothing until the file is fixed (writes still commit, and are indexed by the reconcile the fix — or the first rebuild that succeeds afterwards — triggers), and logs the refusal at error level on every reconcile sweep, and each time a write's indexing run is dropped over it. Moving a directory that carries a schema file invalid on disk is refused, with nothing moved. `/status` shows it as `schema_error` (since when, plus every file's `path` and `reason`) and `/metrics` as `kb_schema_invalid` / `kb_schema_invalid_files`. `/health` stays healthy, since the server is still serving correctly under the previous schema.
 
-`mcp-md-wiki index --full` refuses to run at all while any scope is frozen, naming the offending directories: a full run drops and recreates the Qdrant collection, and a frozen scope's documents would be skipped during the rebuild — losing their vectors outright rather than merely leaving them stale. Fix the schema first, or keep making progress with an incremental `mcp-md-wiki index`, which is unaffected by scopes frozen elsewhere in the tree.
+`update_schema` cannot produce an invalid file: it re-parses, self-checks and size-checks what it is about to write. It also cannot edit a file that has already gone invalid on disk — fix that one in the git repository.
 
 ### Root schema (`.kb-schema.yaml` at the KB root)
 
@@ -370,7 +382,7 @@ Each tool returns a one-line summary with the commit SHA plus a unified diff of 
   - **Surgical** (`old_string` + `new_string`) — replaces a single unique occurrence instead of resending the whole file. Mutually exclusive with `content`.
   - **Move** (`new_path`) — relocates a document. Combines with either edit mode above (edit-then-move, one commit), or stands alone for a pure move — the server reads the current body itself and revalidates it against the destination schema. If `path` names a *directory* instead, `write_document` detects that and moves the whole subtree there in one commit, no `content`/`old_string`/`new_string` allowed — this replaces the old `move_directory` tool. Links pointing at whatever moved are rewritten either way.
 
-  On create, it runs a **near-duplicate check**: it embeds the content and searches the collection; if an existing document scores at or above `write.dedup_threshold`, the write is refused and the close match is named. The score is always a **dense cosine similarity** — this check is pinned to dense-only retrieval with reranking detached, regardless of `search.hybrid` and `reranking.enabled`, because hybrid RRF scores (~0.01–0.03) and cross-encoder relevance scores are not on the same scale as the threshold. Pass `force_new: true` to create anyway. Disable the check globally with `write.dedup_enabled: false` (useful during bulk migrations). The check fails open — if the embedder or Qdrant is unreachable, the write proceeds.
+  On create, it runs a **near-duplicate check**: it embeds the content and searches the collection; if an existing document scores at or above `write.dedup_threshold`, the write is refused and the close match is named. The score is always a **dense cosine similarity** — this check is pinned to dense-only retrieval with reranking detached, regardless of `search.hybrid` and `reranking.enabled`, because hybrid RRF scores (~0.01–0.03) and cross-encoder relevance scores are not on the same scale as the threshold. Pass `force_new: true` to create anyway. Disable the check globally with `write.dedup_enabled: false` (useful during bulk migrations), or per directory with a [`dedup:` block](#per-directory-near-duplicate-override-dedup) in its `.kb-schema.yaml`, which also overrides `write.dedup_threshold`. The check fails open — if the embedder or Qdrant is unreachable, the write proceeds.
 
   Pass `expected_hash` (a `content_hash` from a prior `get_document`) to reject an edit built on a stale read.
 - **`delete_document`** — removes the file, commits and pushes the deletion, then purges the document's vectors from Qdrant and its row from the state DB directly (no full reindex needed).

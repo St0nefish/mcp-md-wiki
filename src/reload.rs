@@ -282,7 +282,10 @@ const DIFF_TABLE: &[DiffField] = &[
                 setting: "indexing.exclude",
                 note: "read fresh per indexing run by ingest::discover_files (ingest.rs), \
                        and by index_paths_generic, which purges a newly excluded file (#266); \
-                       unlike indexing.include, no MCP path filter bakes this in.",
+                       unlike indexing.include, no MCP path filter bakes this in. It also \
+                       decides which directories' .kb-schema.yaml files are part of the \
+                       schema tree (schema::SchemaWalkFilter, #272); the shared schema \
+                       cache re-reads it on the full reconcile every reload queues.",
             },
             ConsumerEntry {
                 effect: ReloadEffect::Applied,
@@ -917,7 +920,8 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::Applied,
             setting: "write.dedup_enabled",
             note: "read fresh from the live config on every create_document call (mcp.rs \
-                   write_document).",
+                   write_document); the global fallback where no .kb-schema.yaml `dedup:` \
+                   block overrides it (write.rs effective_dedup, #272).",
         }],
     },
     DiffField {
@@ -927,7 +931,8 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::Applied,
             setting: "write.dedup_threshold",
             note: "read fresh from the live config on every create_document call (mcp.rs \
-                   write_document).",
+                   write_document); the global fallback where no .kb-schema.yaml `dedup:` \
+                   block overrides it (write.rs effective_dedup, #272).",
         }],
     },
     DiffField {

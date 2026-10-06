@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::Notify;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::config::{ResolvedConfig, SharedConfig};
 use crate::schema::SharedSchemaCache;
@@ -113,6 +113,45 @@ impl ReindexQueue {
             state.full = true;
         }
         self.notify.notify_one();
+    }
+
+    /// Queue a full reconcile when any of `changed` is a `.kb-schema.yaml`, and say
+    /// whether it did. Returns immediately, like every other producer call.
+    ///
+    /// For producers that learn about changed paths from git — the webhook's push
+    /// diff, a write's own rebase (`rebased_paths`), a `move_directory` carrying
+    /// schema files along. A schema file is never an indexable document, so the
+    /// include/exclude filter those producers apply before [`Self::mark_paths`]
+    /// drops it; without this the worker would never learn the schema changed. A
+    /// full reconcile (rather than just the path) because the worker rebuilds the
+    /// shared schema cache before every full reconcile (see
+    /// `unit_touches_schema`), and the scan that follows re-validates every
+    /// document whose governing schema fingerprint moved.
+    ///
+    /// Only a schema file that is part of the schema tree counts: one in a hidden
+    /// directory, or in a directory `indexing.exclude` rules out entirely, is
+    /// never read by the rebuild (`schema::SchemaWalkFilter`), so changing it
+    /// queues nothing (#272).
+    pub fn mark_schema_changes<P: AsRef<std::path::Path>>(
+        &self,
+        indexing: &crate::config::IndexingConfig,
+        changed: &[P],
+    ) -> bool {
+        // Cheap name test first: building the filter compiles the include/exclude
+        // globsets, and nearly every call (every write, every webhook) carries no
+        // schema file at all.
+        if !changed
+            .iter()
+            .any(|p| crate::schema::is_schema_file_path(p.as_ref()))
+        {
+            return false;
+        }
+        let walk = crate::schema::SchemaWalkFilter::from_config(indexing);
+        let schema_changed = changed.iter().any(|p| walk.governs(p.as_ref()));
+        if schema_changed {
+            self.mark_full();
+        }
+        schema_changed
     }
 
     /// Atomically take everything dirty and reset to empty/false.
@@ -209,8 +248,21 @@ fn backoff_for_attempt(attempt: u32) -> Duration {
 /// Whether a failed run should be dropped (permanent) rather than requeued
 /// (transient — the default).
 ///
-/// **Dead in practice as of #156/#159 — no current code path triggers this.** It used
-/// to exist for exactly one case: a `validation.strict` rejection, which
+/// An invalid `.kb-schema.yaml` is permanent: the run aborted because
+/// `SchemaCache::build` refused the tree (a [`crate::schema::SchemaBuildError`]
+/// anywhere in the error chain — typed, not a substring match), and retrying with
+/// backoff cannot fix a file on disk. The fix itself queues a full reconcile
+/// ([`ReindexQueue::mark_schema_changes`], or `update_schema`'s own `mark_full`),
+/// and the periodic sweep re-reports the refusal until then, so dropping loses
+/// nothing and does not hot-loop. [`run_with_retry`] handles this case itself
+/// before consulting this function — it records the schema error for `/status`
+/// and `/metrics` straight away (`report_dropped_for_invalid_schema`) — and the
+/// rebuild that finds the tree valid again queues the reconcile that indexes
+/// what was dropped (#272).
+///
+/// The substring arm below is **dead in practice as of #156/#159 — no current code
+/// path triggers it.** It used to exist for exactly one case: a `validation.strict`
+/// rejection, which
 /// `ingest::process_file` used to `bail!` with a message containing the literal
 /// substring `"(strict mode)"`. That rejection is no longer an `Err` at all —
 /// `process_file` now returns it as a typed `ingest::FileOutcome::Rejected` outcome
@@ -245,7 +297,43 @@ fn backoff_for_attempt(attempt: u32) -> Duration {
 /// with nothing left to fall back on but the reconcile sweep. Given the choice, this
 /// function is written to fail toward "retry too much" rather than "retry too little".
 fn is_permanent_failure(err: &anyhow::Error) -> bool {
-    format!("{err:#}").contains("(strict mode)")
+    schema_build_error(err).is_some() || format!("{err:#}").contains("(strict mode)")
+}
+
+/// The [`crate::schema::SchemaBuildError`] anywhere in `err`'s chain, if any.
+fn schema_build_error(err: &anyhow::Error) -> Option<&crate::schema::SchemaBuildError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<crate::schema::SchemaBuildError>())
+}
+
+/// A run aborted because a `.kb-schema.yaml` is invalid (#272): record it as the
+/// schema error at once — the same state a refused `schema::apply_rebuild` sets,
+/// keeping the streak's original `since` — rather than leaving `/status` and
+/// `/metrics` silent until the next sweep's rebuild notices, and log every invalid
+/// file plus what happened to the unit. The unit is dropped, not retried; its
+/// paths stay dirty on disk, and the full reconcile queued once the schema tree is
+/// valid again (see `drain_and_run_with`) indexes them.
+fn report_dropped_for_invalid_schema(
+    unit: &Unit,
+    err: &crate::schema::SchemaBuildError,
+    status: &crate::status::IndexStatus,
+) {
+    status.record_schema_error(err);
+    for file in &err.invalid {
+        error!(
+            path = %file.path.display(),
+            "invalid {}: {}",
+            crate::schema::SCHEMA_FILE_NAME,
+            file.reason
+        );
+    }
+    error!(
+        ?unit,
+        invalid_files = err.invalid.len(),
+        "Indexing run REFUSED: a .kb-schema.yaml is invalid. Dropped this unit without \
+         retrying; its paths stay dirty and are indexed by the full reconcile queued \
+         once every schema file is valid again"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -281,20 +369,26 @@ enum Unit {
 ///
 /// A `FullReconcile` always rebuilds: it already means "something the queue's own
 /// path-level tracking doesn't capture may have changed" (periodic sweep, startup
-/// catch-up, or `write_raw_file` after ANY schema write, via `mark_full`), and
-/// `scan_for_dirty` is about to do its own full walk regardless — a schema rebuild
-/// alongside it is a rounding error on that cost, not worth the precision of trying
-/// to detect "no, THIS particular full reconcile didn't touch a schema". A `Paths`
-/// unit rebuilds only when one of the changed paths is literally a
-/// `.kb-schema.yaml` — the case a webhook delivers when someone pushes straight to
-/// the KB's git host without going through `update_schema` (which already rebuilds
-/// synchronously on its own, before ever reaching this queue).
-fn unit_touches_schema(unit: &Unit) -> bool {
+/// catch-up, `write_raw_file` after ANY schema write, or a producer that saw a
+/// `.kb-schema.yaml` change — a webhook push, a write's rebase, a `move_directory`
+/// — via [`ReindexQueue::mark_schema_changes`]), and `scan_for_dirty` is about to do
+/// its own full walk regardless — a schema rebuild alongside it is a rounding error
+/// on that cost, not worth the precision of trying to detect "no, THIS particular
+/// full reconcile didn't touch a schema". A `Paths` unit rebuilds only when one of
+/// its paths is literally a `.kb-schema.yaml`; producers route those through
+/// `mark_schema_changes` instead (the include filter they apply before
+/// `mark_paths` drops schema files), so this arm is a backstop for a caller that
+/// marks one directly. As there, a schema file the rebuild would never read (in a
+/// hidden or wholly excluded directory, per `indexing`) does not count (#272).
+fn unit_touches_schema(unit: &Unit, indexing: &crate::config::IndexingConfig) -> bool {
     match unit {
         Unit::FullReconcile => true,
-        Unit::Paths(paths) => paths.iter().any(|p| {
-            p.file_name().and_then(|n| n.to_str()) == Some(crate::schema::SCHEMA_FILE_NAME)
-        }),
+        Unit::Paths(paths) => {
+            paths.iter().any(|p| crate::schema::is_schema_file_path(p)) && {
+                let walk = crate::schema::SchemaWalkFilter::from_config(indexing);
+                paths.iter().any(|p| walk.governs(p))
+            }
+        }
     }
 }
 
@@ -307,13 +401,17 @@ fn unit_touches_schema(unit: &Unit) -> bool {
 /// small `Unit` once per drained batch is not worth fighting that for.
 type RunFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
 
-/// Same shape as [`RunFuture`], for the schema-rebuild step. No `Result`: a failed
-/// rebuild (in practice only a panic inside the blocking walk — `SchemaCache::build`
-/// has no fallible return) is logged and swallowed by the real implementation rather
-/// than aborting the unit's indexing, for the same reason [`is_permanent_failure`]
-/// biases toward retrying too much rather than too little — a stale cache for one
-/// more cycle is a much smaller failure than skipping indexing entirely.
-type RebuildFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+/// Same shape as [`RunFuture`], for the schema-rebuild step. Resolves to whether
+/// the unit should still be indexed: `false` exactly when the rebuild was refused
+/// because a `.kb-schema.yaml` is invalid (see `schema::apply_rebuild`) — the
+/// unit's own indexing run would rebuild from the same files and fail the same
+/// way, so it is skipped rather than run into a certain, retried failure. Every
+/// path it carried is still on disk in its changed state and is picked up by the
+/// reconcile that the schema fix triggers (or by the periodic sweep). A panic
+/// inside the blocking walk resolves to `true`: it is logged and the unit indexes
+/// anyway, since a stale cache for one more cycle is a much smaller failure than
+/// skipping indexing over a bug unrelated to the schema files themselves.
+type RebuildFuture = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
 
 /// The real runner: calls into `ingest`, exactly as the module doc's diagram promises.
 /// This is the ONLY place in the worker that talks to `ingest::index_paths` /
@@ -332,10 +430,14 @@ fn ingest_runner(config: Arc<ResolvedConfig>, unit: Unit) -> RunFuture {
 }
 
 /// The real schema-rebuild step: walk the tree (off the executor — this is blocking
-/// filesystem work, same as every other `SchemaCache::build` call site) and swap the
-/// result into `schema_cache`. This is the ONLY place the worker itself rebuilds the
-/// shared cache; `update_schema` has its own synchronous rebuild, independent of this
-/// one, for the reasons documented on that call site.
+/// filesystem work, same as every other `SchemaCache::build` call site) and apply the
+/// result to `schema_cache` through `schema::apply_rebuild` — swapped in when every
+/// schema file is valid, refused (previous cache kept, logged at error level,
+/// recorded for `/status`) when any is not. Runs before every full reconcile, so a
+/// refusal is re-logged on every periodic sweep for as long as it persists. This is
+/// the ONLY place the worker itself rebuilds the shared cache; `update_schema` has
+/// its own synchronous rebuild, independent of this one, for the reasons documented
+/// on that call site.
 fn schema_rebuild_runner(
     config: Arc<ResolvedConfig>,
     schema_cache: SharedSchemaCache,
@@ -343,13 +445,22 @@ fn schema_rebuild_runner(
     Box::pin(async move {
         let data_path = config.canonical_data_path();
         let frontmatter = config.frontmatter.clone();
+        let indexing = config.indexing.clone();
         match tokio::task::spawn_blocking(move || {
-            crate::schema::SchemaCache::build(&data_path, &frontmatter)
+            crate::schema::SchemaCache::build(&data_path, &frontmatter, &indexing)
         })
         .await
         {
-            Ok(schemas) => crate::schema::store_shared(&schema_cache, schemas),
-            Err(e) => warn!("Schema rebuild panicked in the reindex worker: {e}"),
+            Ok(built) => crate::schema::apply_rebuild(
+                &schema_cache,
+                built,
+                &crate::status::INDEX_STATUS,
+                "reindex worker",
+            ),
+            Err(e) => {
+                warn!("Schema rebuild panicked in the reindex worker: {e}");
+                true
+            }
         }
     })
 }
@@ -395,7 +506,14 @@ pub async fn run_worker(
     };
     loop {
         queue.notify.notified().await;
-        drain_and_run_with(&queue, &shared_config, &ingest_runner, &rebuild).await;
+        drain_and_run_with(
+            &queue,
+            &shared_config,
+            &ingest_runner,
+            &rebuild,
+            &crate::status::INDEX_STATUS,
+        )
+        .await;
     }
 }
 
@@ -415,11 +533,19 @@ pub async fn run_worker(
 /// loop picks up. Reusing the wake's snapshot would run that reconcile with the
 /// pre-reload `chunking.*` fingerprint, find nothing dirty, and consume the
 /// reload's reconcile as a no-op until the next periodic sweep.
+///
+/// `status` is `crate::status::INDEX_STATUS` in production — the same instance
+/// `schema::apply_rebuild` records a refused rebuild on — and a private one in
+/// tests. It carries the schema error between the two halves of the invalid-schema
+/// handling: [`run_with_retry`] records one when a run aborts on an invalid
+/// `.kb-schema.yaml`, and a later rebuild that clears it queues the recovery
+/// reconcile below (#272).
 async fn drain_and_run_with(
     queue: &ReindexQueue,
     shared_config: &SharedConfig,
     run: &(dyn Fn(Arc<ResolvedConfig>, Unit) -> RunFuture + Sync),
     rebuild_schema: &(dyn Fn(Arc<ResolvedConfig>) -> RebuildFuture + Sync),
+    status: &crate::status::IndexStatus,
 ) {
     loop {
         let (paths, full) = queue.drain();
@@ -436,10 +562,31 @@ async fn drain_and_run_with(
         };
         // See `unit_touches_schema`'s doc comment for why this must happen BEFORE
         // `run_with_retry` below, not after or concurrently with it.
-        if unit_touches_schema(&unit) {
-            rebuild_schema(Arc::clone(config)).await;
+        if unit_touches_schema(&unit, &config.indexing) {
+            let was_invalid = status.schema_error().is_some();
+            if !rebuild_schema(Arc::clone(config)).await {
+                // See `RebuildFuture`'s doc comment: the run would fail on the same
+                // invalid schema file(s) the rebuild just reported.
+                error!(
+                    ?unit,
+                    "Skipping this indexing run: a .kb-schema.yaml is invalid, so nothing \
+                     is indexed until it is fixed (the fix itself queues a full reconcile)"
+                );
+                continue;
+            }
+            // The schema tree just became valid again. Every unit dropped while it
+            // was invalid is still dirty on disk, and only a full reconcile finds
+            // them: a `Paths` unit would index just its own paths. A `FullReconcile`
+            // unit is that reconcile already (#272).
+            if was_invalid && status.schema_error().is_none() && matches!(unit, Unit::Paths(_)) {
+                warn!(
+                    "Every .kb-schema.yaml is valid again; queueing a full reconcile to \
+                     index what was dropped while one was invalid"
+                );
+                queue.mark_full();
+            }
         }
-        run_with_retry(config, unit, run).await;
+        run_with_retry(config, unit, run, status).await;
     }
 }
 
@@ -447,54 +594,51 @@ async fn run_with_retry(
     config: &Arc<ResolvedConfig>,
     unit: Unit,
     run: &(dyn Fn(Arc<ResolvedConfig>, Unit) -> RunFuture + Sync),
+    status: &crate::status::IndexStatus,
 ) {
     let mut attempt = 0u32;
     loop {
-        match run(Arc::clone(config), unit.clone()).await {
-            Ok(()) => return,
-            Err(e) if is_permanent_failure(&e) => {
-                // As of #156/#159 this arm is dead in practice — see
-                // `is_permanent_failure`'s doc comment for why nothing on the indexing
-                // path produces a "(strict mode)"-matching error anymore. Kept as the
-                // hook for a future permanent-failure class. The claim this log line
-                // used to make — "the writer that caused this already saw the
-                // rejection" — was already false for a webhook-originated push even
-                // before that fix: a webhook has no synchronous caller waiting on this
-                // run's result to relay a rejection to, unlike an MCP `write_document`
-                // call. Dropped rather than repeated here.
-                warn!(
-                    ?unit,
-                    "Indexing run failed with a non-retryable error; dropping it \
-                     rather than retrying — the periodic reconcile sweep will pick up \
-                     any legitimately dirty paths on its own schedule: {:#}",
-                    e
-                );
-                return;
-            }
-            Err(e) => {
-                attempt += 1;
-                if attempt > MAX_RETRY_ATTEMPTS {
-                    warn!(
-                        ?unit,
-                        attempts = attempt - 1,
-                        "Indexing run kept failing after {} attempt(s); giving up for \
-                         now. The periodic reconcile sweep will retry: {:#}",
-                        MAX_RETRY_ATTEMPTS,
-                        e
-                    );
-                    return;
-                }
-                let backoff = backoff_for_attempt(attempt);
-                warn!(
-                    ?unit,
-                    attempt,
-                    ?backoff,
-                    "Indexing run failed; treating as transient and retrying: {:#}",
-                    e
-                );
-                tokio::time::sleep(backoff).await;
-            }
+        let Err(e) = run(Arc::clone(config), unit.clone()).await else {
+            return;
+        };
+        if let Some(schema_err) = schema_build_error(&e) {
+            report_dropped_for_invalid_schema(&unit, schema_err, status);
+            return;
         }
+        if is_permanent_failure(&e) {
+            // Only the vestigial "(strict mode)" wording reaches this branch — see
+            // `is_permanent_failure`'s doc comment; an invalid `.kb-schema.yaml` is
+            // handled just above.
+            error!(
+                ?unit,
+                "Indexing run failed with a non-retryable error; dropping it \
+                 rather than retrying — the periodic reconcile sweep will pick up \
+                 any legitimately dirty paths on its own schedule: {:#}",
+                e
+            );
+            return;
+        }
+        attempt += 1;
+        if attempt > MAX_RETRY_ATTEMPTS {
+            warn!(
+                ?unit,
+                attempts = attempt - 1,
+                "Indexing run kept failing after {} attempt(s); giving up for \
+                 now. The periodic reconcile sweep will retry: {:#}",
+                MAX_RETRY_ATTEMPTS,
+                e
+            );
+            return;
+        }
+        let backoff = backoff_for_attempt(attempt);
+        warn!(
+            ?unit,
+            attempt,
+            ?backoff,
+            "Indexing run failed; treating as transient and retrying: {:#}",
+            e
+        );
+        tokio::time::sleep(backoff).await;
     }
 }
 
@@ -705,7 +849,7 @@ mod tests {
     /// A rebuild step that does nothing — for tests exercising coalesce/retry
     /// mechanics that have no opinion on schema handling.
     fn noop_rebuild() -> impl Fn(Arc<ResolvedConfig>) -> RebuildFuture {
-        |_cfg| Box::pin(async {})
+        |_cfg| Box::pin(async { true })
     }
 
     #[tokio::test]
@@ -735,7 +879,14 @@ mod tests {
         let config = crate::config::shared_config(test_config());
         let runner_for_closure = Arc::clone(&runner);
         let run_fn = boxed_runner(move |unit| runner_for_closure.run_sync(unit));
-        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &noop_rebuild(),
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
 
         assert_eq!(
             runner.call_count(),
@@ -764,7 +915,14 @@ mod tests {
         let config = crate::config::shared_config(test_config());
         let runner_for_closure = Arc::clone(&runner);
         let run_fn = boxed_runner(move |unit| runner_for_closure.run_sync(unit));
-        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &noop_rebuild(),
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
 
         assert_eq!(runner.call_count(), 1);
         assert_eq!(runner.calls.lock().unwrap()[0], Unit::FullReconcile);
@@ -785,7 +943,14 @@ mod tests {
                 "Validation failed for 'bad.md' (strict mode): [\"bad\"]"
             ))
         });
-        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &noop_rebuild(),
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
 
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -809,7 +974,14 @@ mod tests {
             attempts_for_closure.fetch_add(1, Ordering::SeqCst);
             Err(anyhow::anyhow!("embeddings service unreachable"))
         });
-        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &noop_rebuild(),
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
 
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -835,7 +1007,14 @@ mod tests {
                 Ok(())
             }
         });
-        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &noop_rebuild(),
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
 
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -878,7 +1057,14 @@ mod tests {
             }
             Box::pin(async { Ok(()) })
         };
-        drain_and_run_with(&queue, &shared, &run_fn, &noop_rebuild()).await;
+        drain_and_run_with(
+            &queue,
+            &shared,
+            &run_fn,
+            &noop_rebuild(),
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
 
         assert_eq!(
             *seen_max.lock().unwrap(),
@@ -898,7 +1084,14 @@ mod tests {
             calls_for_closure.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
-        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &noop_rebuild(),
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
@@ -907,19 +1100,22 @@ mod tests {
 
     #[test]
     fn full_reconcile_always_touches_schema() {
-        assert!(unit_touches_schema(&Unit::FullReconcile));
+        assert!(unit_touches_schema(
+            &Unit::FullReconcile,
+            &Default::default()
+        ));
     }
 
     #[test]
     fn paths_without_a_schema_file_do_not_touch_schema() {
         let unit = Unit::Paths(vec![path("notes/a.md"), path("food/recipes/b.md")]);
-        assert!(!unit_touches_schema(&unit));
+        assert!(!unit_touches_schema(&unit, &Default::default()));
     }
 
     #[test]
     fn a_schema_file_among_the_paths_touches_schema() {
         let unit = Unit::Paths(vec![path("notes/a.md"), path("food/.kb-schema.yaml")]);
-        assert!(unit_touches_schema(&unit));
+        assert!(unit_touches_schema(&unit, &Default::default()));
     }
 
     /// The ordering this whole feature exists for: a dirtied `.kb-schema.yaml` must
@@ -939,6 +1135,7 @@ mod tests {
             let timeline = Arc::clone(&timeline_for_rebuild);
             Box::pin(async move {
                 timeline.lock().unwrap().push("rebuild");
+                true
             })
         };
 
@@ -952,7 +1149,14 @@ mod tests {
         };
 
         let config = crate::config::shared_config(test_config());
-        drain_and_run_with(&queue, &config, &run_fn, &rebuild).await;
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &rebuild,
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
 
         assert_eq!(
             *timeline.lock().unwrap(),
@@ -971,12 +1175,19 @@ mod tests {
         let rebuild_calls_for_closure = Arc::clone(&rebuild_calls);
         let rebuild = move |_cfg: Arc<ResolvedConfig>| -> RebuildFuture {
             rebuild_calls_for_closure.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
+            Box::pin(async { true })
         };
 
         let run_fn = boxed_runner(|_unit| Ok(()));
         let config = crate::config::shared_config(test_config());
-        drain_and_run_with(&queue, &config, &run_fn, &rebuild).await;
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &rebuild,
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
 
         assert_eq!(
             rebuild_calls.load(Ordering::SeqCst),
@@ -994,12 +1205,19 @@ mod tests {
         let rebuild_calls_for_closure = Arc::clone(&rebuild_calls);
         let rebuild = move |_cfg: Arc<ResolvedConfig>| -> RebuildFuture {
             rebuild_calls_for_closure.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
+            Box::pin(async { true })
         };
 
         let run_fn = boxed_runner(|_unit| Ok(()));
         let config = crate::config::shared_config(test_config());
-        drain_and_run_with(&queue, &config, &run_fn, &rebuild).await;
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &rebuild,
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
 
         assert_eq!(
             rebuild_calls.load(Ordering::SeqCst),
@@ -1007,5 +1225,241 @@ mod tests {
             "a full reconcile cannot cheaply prove it didn't touch a schema, so it \
              always rebuilds"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_schema_rebuild_skips_the_unit_without_retrying() {
+        let queue = ReindexQueue::new();
+        queue.mark_full();
+
+        let rebuild = |_cfg: Arc<ResolvedConfig>| -> RebuildFuture { Box::pin(async { false }) };
+        let runs = Arc::new(AtomicU32::new(0));
+        let runs_for_closure = Arc::clone(&runs);
+        let run_fn = boxed_runner(move |_unit| {
+            runs_for_closure.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let config = crate::config::shared_config(test_config());
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &rebuild,
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "nothing is indexed while the schema tree is invalid"
+        );
+        assert!(!queue.snapshot().full_pending, "no requeue, so no hot loop");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_schema_failure_is_permanent_and_not_retried() {
+        let queue = ReindexQueue::new();
+        queue.mark_paths([path("notes/a.md")]);
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_for_closure = Arc::clone(&attempts);
+        let run_fn = boxed_runner(move |_unit| {
+            attempts_for_closure.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::Error::new(crate::schema::SchemaBuildError {
+                invalid: vec![crate::schema::InvalidSchemaFile {
+                    path: path("notes/.kb-schema.yaml"),
+                    reason: "bad".into(),
+                }],
+            })
+            .context("Refusing to index"))
+        });
+        let config = crate::config::shared_config(test_config());
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &noop_rebuild(),
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_changed_schema_file_queues_a_full_reconcile() {
+        let q = ReindexQueue::new();
+        assert!(!q.mark_schema_changes(&Default::default(), &[path("notes/a.md")]));
+        assert!(!q.snapshot().full_pending);
+
+        assert!(q.mark_schema_changes(
+            &Default::default(),
+            &[path("notes/a.md"), path("food/.kb-schema.yaml")]
+        ));
+        assert!(q.snapshot().full_pending);
+    }
+
+    /// The real rebuild step against a real tree: a valid tree swaps in; an
+    /// invalid one keeps the previous cache and tells the worker to skip the unit.
+    /// (The status bookkeeping is `schema::apply_rebuild`'s own test, against a
+    /// private `IndexStatus` rather than the process-global one.)
+    #[tokio::test]
+    async fn the_real_rebuild_keeps_the_last_good_cache_on_an_invalid_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let schema_path = dir.path().join(crate::schema::SCHEMA_FILE_NAME);
+        std::fs::write(&schema_path, "fields:\n  title:\n    required: true\n").unwrap();
+        let config = crate::mcp::make_test_resolved_config(dir.path());
+        let shared: SharedSchemaCache = Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::schema::SchemaCache::from_config_only(&Default::default()),
+        )));
+
+        assert!(schema_rebuild_runner(Arc::clone(&config), Arc::clone(&shared)).await);
+        let good = crate::schema::load_shared(&shared);
+        assert!(good.root().fields["title"].required);
+
+        std::fs::write(&schema_path, "fields: [not a map\n").unwrap();
+        assert!(!schema_rebuild_runner(Arc::clone(&config), Arc::clone(&shared)).await);
+        assert!(
+            Arc::ptr_eq(&good, &crate::schema::load_shared(&shared)),
+            "the refused rebuild must not replace the last good cache"
+        );
+
+        std::fs::write(&schema_path, "fields:\n  title:\n    required: false\n").unwrap();
+        assert!(schema_rebuild_runner(Arc::clone(&config), Arc::clone(&shared)).await);
+        assert!(!crate::schema::load_shared(&shared).root().fields["title"].required);
+    }
+
+    fn invalid_schema_error(at: &str) -> crate::schema::SchemaBuildError {
+        crate::schema::SchemaBuildError {
+            invalid: vec![crate::schema::InvalidSchemaFile {
+                path: path(at),
+                reason: "bad".into(),
+            }],
+        }
+    }
+
+    /// #272: a run that aborts on an invalid `.kb-schema.yaml` is reported at once —
+    /// recorded as the schema error `/status` and `/metrics` show — rather than
+    /// only at the next sweep's rebuild, and a repeat keeps the streak's `since`.
+    #[tokio::test]
+    async fn an_invalid_schema_run_failure_records_the_schema_error_immediately() {
+        let status = crate::status::IndexStatus::new();
+        let config = crate::config::shared_config(test_config());
+
+        let queue = ReindexQueue::new();
+        queue.mark_paths([path("notes/a.md")]);
+        let run_fn = boxed_runner(|_unit| {
+            Err(
+                anyhow::Error::new(invalid_schema_error("notes/.kb-schema.yaml"))
+                    .context("Refusing to index"),
+            )
+        });
+        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild(), &status).await;
+
+        let first = status.schema_error().expect("the refusal must be recorded");
+        assert_eq!(first.files[0].path, path("notes/.kb-schema.yaml"));
+
+        queue.mark_paths([path("notes/b.md")]);
+        let run_fn = boxed_runner(|_unit| {
+            Err(anyhow::Error::new(invalid_schema_error(
+                "other/.kb-schema.yaml",
+            )))
+        });
+        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild(), &status).await;
+
+        let second = status.schema_error().unwrap();
+        assert_eq!(second.files[0].path, path("other/.kb-schema.yaml"));
+        assert_eq!(
+            second.since_unix, first.since_unix,
+            "the streak's start is kept"
+        );
+    }
+
+    /// #272: a `Paths` unit dropped while the schema tree was invalid is indexed
+    /// once it is valid again. The rebuild that clears the recorded error queues a
+    /// full reconcile, so the recovery does not wait for the periodic sweep.
+    #[tokio::test]
+    async fn a_rebuild_that_clears_a_schema_error_queues_a_full_reconcile() {
+        let status = Arc::new(crate::status::IndexStatus::new());
+        status.record_schema_error(&invalid_schema_error("food/.kb-schema.yaml"));
+
+        let queue = ReindexQueue::new();
+        queue.mark_paths([path("food/.kb-schema.yaml")]);
+
+        let status_for_rebuild = Arc::clone(&status);
+        let rebuild = move |_cfg: Arc<ResolvedConfig>| -> RebuildFuture {
+            // What `schema::apply_rebuild` does on a clean build.
+            status_for_rebuild.clear_schema_error();
+            Box::pin(async { true })
+        };
+        let runner = Arc::new(FakeRunner::new(vec![
+            Box::new(|| Ok(())),
+            Box::new(|| Ok(())),
+        ]));
+        let runner_for_closure = Arc::clone(&runner);
+        let run_fn = boxed_runner(move |unit| runner_for_closure.run_sync(unit));
+        let config = crate::config::shared_config(test_config());
+        drain_and_run_with(&queue, &config, &run_fn, &rebuild, &status).await;
+
+        assert_eq!(
+            *runner.calls.lock().unwrap(),
+            vec![
+                Unit::Paths(vec![path("food/.kb-schema.yaml")]),
+                Unit::FullReconcile
+            ],
+        );
+    }
+
+    /// With no schema error on record, a schema rebuild for a `Paths` unit queues
+    /// nothing extra.
+    #[tokio::test]
+    async fn a_clean_rebuild_with_no_prior_error_queues_no_reconcile() {
+        let queue = ReindexQueue::new();
+        queue.mark_paths([path("food/.kb-schema.yaml")]);
+        let runner = Arc::new(FakeRunner::new(vec![Box::new(|| Ok(()))]));
+        let runner_for_closure = Arc::clone(&runner);
+        let run_fn = boxed_runner(move |unit| runner_for_closure.run_sync(unit));
+        let config = crate::config::shared_config(test_config());
+        drain_and_run_with(
+            &queue,
+            &config,
+            &run_fn,
+            &noop_rebuild(),
+            &crate::status::IndexStatus::new(),
+        )
+        .await;
+        assert_eq!(runner.call_count(), 1);
+    }
+
+    /// #272: a schema file the rebuild never reads — under a hidden directory, or
+    /// one `indexing.exclude` rules out entirely — neither queues a full reconcile
+    /// nor makes a `Paths` unit rebuild the cache.
+    #[test]
+    fn schema_files_outside_the_schema_tree_are_ignored() {
+        let indexing = crate::config::IndexingConfig {
+            exclude: vec!["templates/**".into()],
+            ..Default::default()
+        };
+        let q = ReindexQueue::new();
+        for p in [
+            "templates/.kb-schema.yaml",
+            "templates/deep/.kb-schema.yaml",
+            ".obsidian/.kb-schema.yaml",
+            "notes/.hidden/.kb-schema.yaml",
+        ] {
+            assert!(!q.mark_schema_changes(&indexing, &[path(p)]), "{p}");
+            assert!(
+                !unit_touches_schema(&Unit::Paths(vec![path(p)]), &indexing),
+                "{p}"
+            );
+        }
+        assert!(!q.snapshot().full_pending);
+
+        assert!(q.mark_schema_changes(&indexing, &[path(".kb-schema.yaml")]));
+        assert!(unit_touches_schema(
+            &Unit::Paths(vec![path("notes/.kb-schema.yaml")]),
+            &indexing
+        ));
     }
 }

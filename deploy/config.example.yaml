@@ -69,7 +69,11 @@ indexing:
   include:
     - "**/*.md"
 
-  # Glob patterns for directories/files to skip entirely.
+  # Glob patterns for directories/files to skip entirely. A directory whose
+  # every document is excluded (e.g. "templates/**") is also left out of the
+  # schema tree: a .kb-schema.yaml there is never read or validated, so it
+  # cannot stop the server from starting. Hidden directories are always left
+  # out. `include` and `exclude_files` never remove a directory's schema.
   exclude:
     - ".git/**"
     - ".claude/**"
@@ -594,6 +598,10 @@ write:
   # structured error naming the duplicate file. The agent can override the
   # check by passing `force_new=true` in the tool call.
   # Set to false to disable the check entirely (e.g. during bulk migrations).
+  # A directory's .kb-schema.yaml can override this (and dedup_threshold) for
+  # its subtree with a `dedup: {enabled: ..., threshold: ...}` block; this
+  # value is the fallback wherever no schema sets it. A malformed block makes
+  # that schema file invalid, which stops the server from starting.
   dedup_enabled: true
 
   # Cosine similarity score at or above which a candidate is treated as a

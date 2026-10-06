@@ -446,7 +446,7 @@ pub async fn validate_all(
 /// One document's broken outbound links, grouped for `validate`'s BROKEN LINKS
 /// report — grouping by source rather than a flat list of pairs, because the
 /// source document is the thing a human actually has to go open and fix, same
-/// rationale `SCHEMA ERRORS`/`FROZEN` group by the file they apply to. Assumes
+/// rationale `SCHEMA ERRORS` groups by the file it applies to. Assumes
 /// its input pairs arrive pre-sorted by `source_path` (the raw query orders
 /// that way, see [`crate::state::StateDb::broken_markdown_links`]) so
 /// [`broken_links_report`] can group by run of equal keys instead of a hash-map

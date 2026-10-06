@@ -2449,7 +2449,10 @@ fn batch_write_success_to_result(success: write::BatchWriteSuccess) -> CallToolR
 /// into a generic fallback.
 fn batch_write_document_error_text(err: &WriteError) -> String {
     match err {
-        WriteError::Frozen { reason } => format!("schema is invalid: {reason}"),
+        WriteError::SchemaFile { .. } => format!(
+            "{} files are not documents; edit them with update_schema",
+            crate::schema::SCHEMA_FILE_NAME
+        ),
         WriteError::Validation { result } => result.errors.join("; "),
         WriteError::DedupHit {
             duplicate_of,
@@ -2601,6 +2604,21 @@ fn create_edit_success_to_result(
     }
 }
 
+/// The refusal for a document write, delete or move that names a
+/// `.kb-schema.yaml` (`WriteError::SchemaFile`), pointing at the one tool that
+/// edits schema files.
+fn schema_file_path_error(schema_path: &str) -> McpError {
+    McpError::invalid_params(
+        format!(
+            "'{schema_path}' is a {} file, not a document: schema files cannot be written, \
+             moved or deleted with the document tools. Use update_schema to change a \
+             directory's schema.",
+            crate::schema::SCHEMA_FILE_NAME
+        ),
+        None,
+    )
+}
+
 /// Map a `write::write_document` failure (create or edit) onto this tool
 /// surface's `McpError`, preserving the exact text/data shapes the existing
 /// create/edit tests pin down.
@@ -2624,16 +2642,9 @@ fn create_edit_error_to_mcp_error(
     dest_path: Option<&str>,
 ) -> McpError {
     match err {
-        WriteError::Frozen { reason } => McpError::invalid_params(
-            format!(
-                "Cannot write '{}': the schema governing this directory is invalid ({}). \
-                 Fix {} before writing here.",
-                rel_path,
-                reason,
-                crate::schema::SCHEMA_FILE_NAME
-            ),
-            None,
-        ),
+        WriteError::SchemaFile {
+            rel_path: schema_path,
+        } => schema_file_path_error(&schema_path),
         WriteError::Validation { result } => McpError::invalid_params(
             format!(
                 "frontmatter validation failed for '{}': {}",
@@ -2857,9 +2868,12 @@ fn delete_error_to_mcp_error(err: WriteError, rel_path: &str) -> McpError {
             outcome_data(WriteOutcome::FailedInconsistentState),
         ),
         WriteError::Io { msg } => McpError::internal_error(msg, None),
+        WriteError::SchemaFile {
+            rel_path: schema_path,
+        } => schema_file_path_error(&schema_path),
         // `write::delete_document` never produces these — they are create/edit-only
-        // failure modes (schema-frozen check, frontmatter validation, the dedup
-        // gate, and create-vs-exists) that the delete pipeline doesn't run.
+        // failure modes (frontmatter validation, the dedup gate, and
+        // create-vs-exists) that the delete pipeline doesn't run.
         other => McpError::internal_error(format!("unexpected write error: {:?}", other), None),
     }
 }
@@ -2982,30 +2996,6 @@ fn move_directory_error_to_mcp_error(
             ),
             None,
         ),
-        DirectoryMoveError::BrokenSchemaInSource { path, reason } => McpError::invalid_params(
-            format!(
-                "Cannot move '{}': the schema file '{}' under the source subtree is invalid \
-                 ({}). A {} that cannot be read cannot be verified safe to relocate — moving \
-                 documents governed by rules this process cannot parse is exactly the case \
-                 this refuses. Fix it (or remove it) before retrying the move.",
-                source_dir,
-                path,
-                reason,
-                crate::schema::SCHEMA_FILE_NAME
-            ),
-            None,
-        ),
-        DirectoryMoveError::Frozen { reason } => McpError::invalid_params(
-            format!(
-                "Cannot move '{}' to '{}': the schema governing one of the directories \
-                 involved is invalid ({}). Fix {} before moving.",
-                source_dir,
-                dest_dir,
-                reason,
-                crate::schema::SCHEMA_FILE_NAME
-            ),
-            None,
-        ),
         DirectoryMoveError::Validation {
             failures,
             moved_schema_files,
@@ -3030,8 +3020,8 @@ fn move_directory_error_to_mcp_error(
                      the source — a relocated schema file re-parents onto the destination's \
                      ancestors, not the source's, so a document that was valid moments ago \
                      can legitimately stop being valid. Either adjust the destination's \
-                     cascade to still admit these documents, fix the documents themselves, \
-                     or move the schema file separately first.",
+                     cascade to still admit these documents (update_schema), or fix the \
+                     documents themselves.",
                     crate::schema::SCHEMA_FILE_NAME,
                     relocated
                 )
@@ -3058,6 +3048,14 @@ fn move_directory_error_to_mcp_error(
                 })),
             )
         }
+        DirectoryMoveError::InvalidSchemaInSource { path, reason } => McpError::invalid_params(
+            format!(
+                "Cannot move '{source_dir}' to '{dest_dir}': the schema file '{path}' inside \
+                 it is invalid: {reason}. Fix it, or revert it in git, before moving the \
+                 directory — nothing was moved."
+            ),
+            Some(serde_json::json!({ "invalid_schema_file": path, "reason": reason })),
+        ),
         DirectoryMoveError::UnsafePath { msg } => McpError::invalid_params(msg, None),
         DirectoryMoveError::Internal { msg } => McpError::invalid_params(msg, None),
         DirectoryMoveError::InvalidCommitMessage { reason } => {
@@ -3357,7 +3355,7 @@ impl KbSearchServer {
     /// Used for `.kb-schema.yaml`, which is versioned and synced like a document but is
     /// not itself indexed. The write goes to a temp file and is renamed into place, so a
     /// failure part-way through the *filesystem* write cannot leave a half-written
-    /// schema that would freeze the scope.
+    /// schema that the next rebuild would refuse.
     ///
     /// `commit_and_sync` below has its own two-phase failure mode — see
     /// `git::CommitSyncError` — and is rolled back exactly like `write_document`'s: a
@@ -4294,25 +4292,48 @@ impl KbSearchServer {
             }));
         }
 
-        let frozen = schemas.is_frozen(&lookup);
-        let structured = serde_json::json!({
+        let mut structured = serde_json::json!({
             "path": rel.to_string_lossy(),
-            "frozen": frozen.is_some(),
-            "frozen_reason": frozen,
             "fields": reported,
             "omitted_fields": omitted,
         });
+        // The `dedup:` override cascade (#272), only when this scope sets a key —
+        // unset keys fall back to the server's global `write.dedup_*`, which a
+        // schema read has no business reporting.
+        let mut dedup = serde_json::Map::new();
+        let mut dedup_parts: Vec<String> = Vec::new();
+        if let Some(enabled) = schema.dedup_enabled {
+            dedup.insert("enabled".into(), serde_json::json!(enabled));
+            dedup_parts.push(format!("enabled: {enabled}"));
+        }
+        if let Some(threshold) = schema.dedup_threshold {
+            // `json!(f32)` widens to f64 and would emit 0.949999988079071 for a
+            // file that says 0.95; round-trip through the shortest f32 text instead.
+            let shown = threshold
+                .to_string()
+                .parse::<f64>()
+                .map_or(serde_json::json!(threshold), |v| serde_json::json!(v));
+            dedup.insert("threshold".into(), shown);
+            dedup_parts.push(format!("threshold: {threshold}"));
+        }
+        let dedup_line = (!dedup_parts.is_empty()).then(|| {
+            format!(
+                "Near-duplicate check override for this scope ({}); unset keys use the \
+                 server default.\n\n",
+                dedup_parts.join(", ")
+            )
+        });
+        if !dedup.is_empty() {
+            structured["dedup"] = serde_json::Value::Object(dedup);
+        }
 
         let mut text = format!(
             "Schema governing '{}' ({} field(s)):\n\n",
             rel.display(),
             reported.len()
         );
-        if let Some(reason) = frozen {
-            text.push_str(&format!(
-                "WARNING: this scope is frozen — its schema file is invalid ({reason}). \
-                 Documents here are not being indexed.\n\n"
-            ));
+        if let Some(line) = dedup_line {
+            text.push_str(&line);
         }
         if omitted > 0 {
             text.push_str(&format!(
@@ -4407,20 +4428,43 @@ impl KbSearchServer {
             ));
         }
 
-        let mut file = schemas
-            .raw_file_at(&rel_dir)
-            .map_err(|e| invalid(format!("Existing schema at '{}' is unreadable: {e}. Fix it by hand before editing through this tool.", rel_dir.display())))?;
+        // Read from disk, not the shared cache: the edit must apply to the file as it
+        // is now. A file that no longer parses got there outside this tool (a push to
+        // the knowledge base's git host); a running server refuses it and keeps
+        // serving the last valid schema, and only a fix to the file itself clears that.
+        let mut file = schemas.raw_file_at(&rel_dir).map_err(|e| {
+            invalid(format!(
+                "The {} at '{}' on disk is invalid: {e}. The server is still enforcing the \
+                 last valid schema (and would refuse to start on this one). Fix or revert \
+                 the file in the knowledge base's git repository; update_schema can only \
+                 edit a schema file that parses.",
+                crate::schema::SCHEMA_FILE_NAME,
+                rel_dir.display()
+            ))
+        })?;
         let summary = file.apply(&edit).map_err(invalid)?;
 
-        // A self-contradictory definition parses fine but freezes the whole subtree at
-        // the next index run — after this call has already reported success. Catch it
-        // here, where the caller can still act on it.
+        // A self-contradictory definition parses fine but would be refused by the next
+        // schema rebuild (and stop the server from starting) — after this call has
+        // already reported success. Catch it here, where the caller can still act on it.
         file.validate_self().map_err(invalid)?;
 
         let yaml = file.to_yaml().map_err(invalid)?;
 
+        // The same size cap `SchemaCache::build` enforces before parsing: a file over
+        // it would be refused at the next rebuild, so never write one.
+        if yaml.len() as u64 > crate::schema::MAX_SCHEMA_FILE_BYTES {
+            return Err(invalid(format!(
+                "Refusing to write a {} of {} bytes: the limit is {} bytes. Split the \
+                 rules across subdirectory schema files instead.",
+                crate::schema::SCHEMA_FILE_NAME,
+                yaml.len(),
+                crate::schema::MAX_SCHEMA_FILE_BYTES
+            )));
+        }
+
         // Re-parse what we are about to write. A schema that does not round-trip would
-        // freeze this whole subtree at the next index run.
+        // be refused by the next schema rebuild.
         serde_yaml_ng::from_str::<crate::schema::SchemaFile>(&yaml).map_err(|e| {
             McpError::internal_error(
                 format!("Refusing to write a schema that does not parse: {e}"),
@@ -4514,22 +4558,39 @@ impl KbSearchServer {
         // `CommittedPendingSync` write is still a real local commit — the new schema
         // is genuinely in effect for this clone regardless of whether the push to the
         // remote landed — so the cache must reflect it just the same.
+        //
+        // The file this call wrote was validated above, so a refused rebuild means a
+        // DIFFERENT schema file in the tree is invalid (it arrived through git).
+        // `apply_rebuild` keeps the last good cache, logs and records it; the call
+        // still succeeds — the write is committed — but says loudly that the change
+        // is not in effect yet.
         let rebuild_data_path = self.canonical_data_path.clone();
         let rebuild_frontmatter = self.config().frontmatter.clone();
+        let rebuild_indexing = self.config().indexing.clone();
+        let mut refused_rebuild: Option<crate::schema::SchemaBuildError> = None;
         match tokio::task::spawn_blocking(move || {
-            SchemaCache::build(&rebuild_data_path, &rebuild_frontmatter)
+            SchemaCache::build(&rebuild_data_path, &rebuild_frontmatter, &rebuild_indexing)
         })
         .await
         {
-            Ok(rebuilt) => crate::schema::store_shared(&self.schema_cache, rebuilt),
+            Ok(built) => {
+                let refusal = built.as_ref().err().cloned();
+                if !crate::schema::apply_rebuild(
+                    &self.schema_cache,
+                    built,
+                    &crate::status::INDEX_STATUS,
+                    "update_schema",
+                ) {
+                    refused_rebuild = refusal;
+                }
+            }
             Err(e) => {
-                // A panic in the walk itself (not a normal error — `SchemaCache::build`
-                // has no fallible return). Leave the previous cache in place rather than
-                // fail the whole call: the write already succeeded and is committed: an
-                // agent's NEXT read/write may briefly see the pre-edit schema, which is
-                // the same staleness window this call exists to close, not a new one —
-                // failing here would not close it either, just add a spurious error on
-                // top of a successful write.
+                // A panic in the walk itself. Leave the previous cache in place rather
+                // than fail the whole call: the write already succeeded and is
+                // committed: an agent's NEXT read/write may briefly see the pre-edit
+                // schema, which is the same staleness window this call exists to
+                // close, not a new one — failing here would not close it either, just
+                // add a spurious error on top of a successful write.
                 error!("Schema rebuild panicked after update_schema write: {e}");
             }
         }
@@ -4559,6 +4620,13 @@ impl KbSearchServer {
                  being re-indexed until fixed:\n{}",
                 casualties.len(),
                 render_casualties(&casualties)
+            ));
+        }
+        if let Some(refusal) = &refused_rebuild {
+            text.push_str(&format!(
+                "\n\nWARNING: this change is committed but NOT in effect yet — another schema \
+                 file in the knowledge base is invalid, so the server keeps enforcing the \
+                 previous schema until it is fixed. {refusal}"
             ));
         }
 
@@ -7485,7 +7553,7 @@ mod tests {
             indexed_fields: fields.iter().map(|f| f.to_string()).collect(),
             ..Default::default()
         };
-        let schemas = SchemaCache::build(tmp.path(), &config.frontmatter);
+        let schemas = SchemaCache::build_for_test(tmp.path(), &config.frontmatter);
         (config, schemas)
     }
 
@@ -7538,7 +7606,8 @@ mod tests {
         };
         // Built from an empty field list: nothing is `indexed: true` in any schema,
         // so the schema half of the union contributes nothing for this field.
-        let schemas = SchemaCache::build(tmp.path(), &crate::config::FrontmatterConfig::default());
+        let schemas =
+            SchemaCache::build_for_test(tmp.path(), &crate::config::FrontmatterConfig::default());
 
         let conditions = build_query_conditions(
             &filters_param(serde_json::json!({ "legacy_only": "x" })),
@@ -7568,7 +7637,7 @@ mod tests {
             indexed_fields: vec!["prep_minutes".to_string()],
             ..Default::default()
         };
-        let schemas = SchemaCache::build(tmp.path(), &config.frontmatter);
+        let schemas = SchemaCache::build_for_test(tmp.path(), &config.frontmatter);
 
         let conditions = build_query_conditions(
             &filters_param(serde_json::json!({ "prep_minutes": { "gte": 10 } })),
@@ -7933,7 +8002,7 @@ mod tests {
     #[test]
     fn schema_edits_round_trip_through_yaml() {
         // The property that matters: whatever update_schema writes must parse back,
-        // because an unparseable schema freezes its whole subtree.
+        // because an unparseable schema fails the whole schema build.
         let mut file = crate::schema::SchemaFile::default();
         file.apply(&crate::schema::SchemaEdit::AddValues {
             field: "tags".into(),
@@ -8062,7 +8131,10 @@ mod tests {
 
         assert!(names.contains(&"title"), "inherited from the root scope");
         assert!(names.contains(&"prep"), "declared in this scope");
-        assert_eq!(structured["frozen"], serde_json::json!(false));
+        assert!(
+            structured.get("frozen").is_none() && structured.get("frozen_reason").is_none(),
+            "there is no frozen state: an invalid schema never loads"
+        );
 
         let prep = fields.iter().find(|f| f["field"] == "prep").unwrap();
         assert_eq!(prep["type"], serde_json::json!("integer"));
@@ -8072,6 +8144,43 @@ mod tests {
                 .unwrap()
                 .contains("food/recipes"),
             "provenance points at the declaring file"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_schema_reports_dedup_override_only_when_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "", "fields:\n  title:\n    required: true\n");
+        write_schema_file(
+            &tmp,
+            "food/plans",
+            "dedup:\n  enabled: false\n  threshold: 0.95\n",
+        );
+        let server = schema_tool_server(&tmp);
+
+        let plans = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("food/plans".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let structured = plans.structured_content.clone().unwrap();
+        assert_eq!(structured["dedup"]["enabled"], serde_json::json!(false));
+        assert_eq!(structured["dedup"]["threshold"].as_f64(), Some(0.95));
+        let text = plans.content[0].as_text().unwrap().text.clone();
+        assert!(
+            text.contains("Near-duplicate check override"),
+            "got: {text}"
+        );
+
+        let root = server
+            .get_schema(Parameters(GetSchemaParams::default()))
+            .await
+            .unwrap();
+        assert!(
+            root.structured_content.unwrap().get("dedup").is_none(),
+            "no override set, no dedup key"
         );
     }
 
@@ -8235,22 +8344,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_schema_surfaces_a_frozen_scope() {
+    async fn update_schema_refuses_to_write_a_file_over_the_size_cap() {
+        // Flow style on disk (~12 bytes a value, under the cap) re-serializes in block
+        // style (~17 bytes a value, over it), so one added value crosses the limit.
         let tmp = tempfile::tempdir().unwrap();
-        write_schema_file(&tmp, "broken", "fields: [not a mapping\n");
+        let values: Vec<String> = (0..20_000).map(|i| format!("value{i:05}")).collect();
+        let on_disk = format!("fields:\n  tags:\n    values: [{}]\n", values.join(", "));
+        assert!((on_disk.len() as u64) < crate::schema::MAX_SCHEMA_FILE_BYTES);
+        write_schema_file(&tmp, "big", &on_disk);
         let server = schema_tool_server(&tmp);
 
-        let result = server
-            .get_schema(Parameters(GetSchemaParams {
-                path: Some("broken".into()),
-                ..Default::default()
+        let err = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("big".into()),
+                operation: "add_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["new".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+                acknowledge_root_change: None,
             }))
             .await
-            .unwrap();
+            .unwrap_err();
 
-        let structured = result.structured_content.unwrap();
-        assert_eq!(structured["frozen"], serde_json::json!(true));
-        assert!(structured["frozen_reason"].is_string());
+        assert!(err.message.contains("limit"), "got: {}", err.message);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("big").join(crate::schema::SCHEMA_FILE_NAME))
+                .unwrap(),
+            on_disk,
+            "nothing written"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_on_a_file_made_invalid_on_disk_says_how_to_recover() {
+        // The server built its cache while the file was valid; it then went bad on
+        // disk (as a git push would leave it) and the runtime rebuild was refused.
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "notes", "fields:\n  tags:\n    values: [a]\n");
+        let server = schema_tool_server(&tmp);
+        write_schema_file(&tmp, "notes", "fields: [not a mapping\n");
+
+        let err = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "add_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["b".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(err.message.contains("is invalid"), "got: {}", err.message);
+        assert!(
+            err.message.contains("last valid schema"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -8561,8 +8716,8 @@ mod tests {
 
     #[tokio::test]
     async fn update_schema_rejects_a_self_contradictory_definition() {
-        // Parses fine, but declaring a scalar type alongside nested children freezes
-        // the whole subtree at the next index run — long after this call reported
+        // Parses fine, but declaring a scalar type alongside nested children fails
+        // the next schema rebuild (and startup) — long after this call reported
         // success. It must be caught here instead.
         let tmp = tempfile::tempdir().unwrap();
         let server = schema_tool_server(&tmp);
@@ -9959,7 +10114,8 @@ mod tests {
                 let server = make_overlay_test_server_with_config(overlay, Arc::clone(&config));
                 let tool = server.get_tool("search").unwrap();
                 let tool_json = serde_json::to_string(&tool).unwrap();
-                let schemas = crate::schema::SchemaCache::build(data.path(), &config.frontmatter);
+                let schemas =
+                    crate::schema::SchemaCache::build_for_test(data.path(), &config.frontmatter);
                 let instructions = crate::server::compose_server_instructions(
                     &config,
                     &qdrant,
@@ -11721,7 +11877,7 @@ mod tests {
         // before calling this, exactly as they already do for `write_schema_file`.
         let canonical = tmp.path().canonicalize().unwrap();
         let schema_cache: crate::schema::SharedSchemaCache = Arc::new(RwLock::new(Arc::new(
-            crate::schema::SchemaCache::build(&canonical, &config.frontmatter),
+            crate::schema::SchemaCache::build_for_test(&canonical, &config.frontmatter),
         )));
         KbSearchServer::new(
             embed,
@@ -15625,6 +15781,24 @@ mod tests {
     }
 
     // -- move_directory_error_to_mcp_error: destination-cascade wording -----
+
+    #[test]
+    fn invalid_schema_in_source_names_the_file_reason_and_fix() {
+        let err = move_directory_error_to_mcp_error(
+            DirectoryMoveError::InvalidSchemaInSource {
+                path: "src/.kb-schema.yaml".to_string(),
+                reason: "fields: expected a map".to_string(),
+            },
+            "src",
+            "dest",
+        );
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        for needle in ["src/.kb-schema.yaml", "fields: expected a map", "git"] {
+            assert!(err.message.contains(needle), "{needle}: {}", err.message);
+        }
+        let data = err.data.expect("structured data");
+        assert_eq!(data["invalid_schema_file"], "src/.kb-schema.yaml");
+    }
 
     #[test]
     fn validation_error_names_the_destination_when_a_schema_file_relocated() {

@@ -888,7 +888,9 @@ fn default_mcp_port() -> u16 {
 #[serde(deny_unknown_fields)]
 pub struct WriteConfig {
     /// If true, creating a new document runs a similarity check against the
-    /// existing collection and refuses if a near-duplicate exists.
+    /// existing collection and refuses if a near-duplicate exists. A directory's
+    /// `.kb-schema.yaml` `dedup:` block overrides this (and `dedup_threshold`)
+    /// for its subtree; this is the fallback where none sets it (#272).
     #[serde(default = "default_dedup_enabled")]
     pub dedup_enabled: bool,
     /// Cosine similarity at or above which a new document is treated as a

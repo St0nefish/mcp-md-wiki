@@ -1,5 +1,7 @@
 Change a directory's frontmatter rules by editing its `.kb-schema.yaml`. Use this
 when a document warrants a new tag or field rather than working around the rules.
+It is the only tool that edits schema files — the document tools refuse
+`.kb-schema.yaml` paths.
 
 Operations: `add_values`, `remove_values`, `set_field`, `remove_field`.
 

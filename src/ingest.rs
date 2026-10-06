@@ -196,6 +196,32 @@ impl PathFilter {
         true
     }
 
+    /// Whether `exclude` rules out every document under the KB-relative directory
+    /// `rel_dir` — the question the schema walk asks before reading a
+    /// `.kb-schema.yaml` there (#272), since a schema governing only excluded
+    /// documents governs nothing.
+    ///
+    /// Globs match file paths, never directories, so this probes two synthetic
+    /// document paths, one directly in `rel_dir` and one a level below it: an
+    /// `exclude` like `templates/**` matches both, while one that leaves documents
+    /// at one of those depths indexed fails a probe and keeps the directory in —
+    /// `archive/*/*.md` still indexes `archive/x.md`, so `archive/` is read. (A
+    /// `*` crosses `/` in these globs, the same as for the indexer's own walk, so
+    /// `archive/*.md` excludes the whole subtree.) Only `exclude` is consulted: `exclude_files` names files,
+    /// never a directory, and `include` cannot rule a directory out — an `include`
+    /// of `docs/**/*.md` matches nothing directly in the root, yet the root's
+    /// schema still governs `docs/`.
+    pub(crate) fn excludes_dir(&self, rel_dir: &str) -> bool {
+        const PROBE: &str = "__kb_dir_probe__";
+        let Some(excl) = &self.exclude_set else {
+            return false;
+        };
+        let dir = Path::new(rel_dir);
+        let shallow = dir.join(format!("{PROBE}.md"));
+        let deep = dir.join(PROBE).join(format!("{PROBE}.md"));
+        excl.is_match(&shallow) && excl.is_match(&deep)
+    }
+
     /// The filter [`index_paths_generic`] uses to decide that a path still on disk
     /// but no longer indexable (newly added to `exclude_files`/`exclude`, or no
     /// longer matching `include`) must be purged from the index (#266), or `None`
@@ -2737,6 +2763,19 @@ async fn discover_relative(config: &ResolvedConfig) -> Result<(PathBuf, Vec<Path
 // The reconcile scan — read-only, produces a worklist
 // ---------------------------------------------------------------------------
 
+/// Build the schema cache one scan or indexing run validates against, from disk.
+///
+/// An invalid `.kb-schema.yaml` anywhere in the tree aborts the run: nothing is
+/// scanned or indexed under rules known to be wrong, and the
+/// [`crate::schema::SchemaBuildError`] stays in the error chain so the reindex
+/// worker classifies the failure as permanent (`reindex::is_permanent_failure`) —
+/// no retry can fix a file on disk, and the fix itself queues a full reconcile.
+fn build_run_schemas(data_path: &Path, config: &ResolvedConfig) -> Result<SchemaCache> {
+    SchemaCache::build(data_path, &config.frontmatter, &config.indexing).map_err(|e| {
+        anyhow::Error::new(e).context("Refusing to index while a .kb-schema.yaml is invalid")
+    })
+}
+
 /// How many `indexed_files` rows [`scan_for_dirty`] holds in memory at once. See
 /// [`StateDb::fetch_indexed_files_page`] for why this is paged rather than loaded in
 /// one query.
@@ -2778,14 +2817,14 @@ const SCAN_PAGE_SIZE: i64 = 1000;
 /// the sweep's cost; this function never does either.
 ///
 /// `scan` is the caller's [`crate::status::ReconcileScan`] guard: the first
-/// non-frozen file found with a stale chunking fingerprint marks it, which
+/// file found with a stale chunking fingerprint marks it, which
 /// makes `INDEX_STATUS.is_bulk_indexing()` true from that moment — and keeps
 /// it true past this function returning, through however long the indexing
 /// run that follows (and any retry of it) takes, until [`scan_and_index`]
-/// confirms nothing stale remains (#286; round-6 review L1). A frozen scope's
-/// stale files never mark this, by design: they are skipped before the
-/// fingerprint check below ever runs, since they are never re-chunked until
-/// the schema is fixed and must not pin the note on forever.
+/// confirms nothing stale remains (#286; round-6 review L1).
+///
+/// An invalid `.kb-schema.yaml` anywhere in the tree fails the scan before any
+/// row is read (see [`build_run_schemas`]).
 pub async fn scan_for_dirty(
     config: &ResolvedConfig,
     scan: &crate::status::ReconcileScan<'_>,
@@ -2797,7 +2836,7 @@ pub async fn scan_for_dirty(
     let (data_path, discovered) = discover_relative(config).await?;
     INDEX_STATUS.set_files_total(discovered.len() as u64);
 
-    let schemas = SchemaCache::build(&data_path, &config.frontmatter);
+    let schemas = build_run_schemas(&data_path, config)?;
     // Once per scan, not per row — see `chunking_fingerprint`'s doc comment.
     let chunking_fp = chunking_fingerprint(&config.chunking);
 
@@ -2841,8 +2880,7 @@ pub async fn scan_for_dirty(
 
             if !seen.contains(&row.file_path) {
                 // Row survives, but the filtered walk did not find the file: it was
-                // deleted, or it is now excluded (#266). Checked before the frozen
-                // scope test, so both are purged from frozen scopes too.
+                // deleted, or it is now excluded (#266).
                 // A file that is really gone is reported at once; one still on disk is
                 // an exclusion purge, decided after the scan. An unknown stat result
                 // counts as present.
@@ -2856,11 +2894,6 @@ pub async fn scan_for_dirty(
             }
 
             let rel = Path::new(&row.file_path);
-            if schemas.is_frozen(rel).is_some() {
-                // Frozen scopes are never touched by the scan or the indexer, exactly
-                // as a full walk-based run has always skipped them.
-                continue;
-            }
 
             // Reason 1a: the schema fingerprint moved. Cheap — no disk I/O, just a
             // lookup against the already-built schema tree — and it can flip a file
@@ -2932,16 +2965,8 @@ pub async fn scan_for_dirty(
         offset += SCAN_PAGE_SIZE;
     }
 
-    // Reason 2: files on disk with no `indexed_files` row at all — but still subject
-    // to the same frozen-scope exclusion as every other path here. Without this check
-    // a new file dropped into a frozen scope would be marked dirty on every sweep
-    // forever (it never gets an `indexed_files` row, since `index_paths` also skips
-    // frozen paths), for no benefit — it can never actually be indexed until the
-    // schema is fixed.
+    // Reason 1, new files: on disk with no `indexed_files` row at all.
     for rel_key in seen.difference(&visited) {
-        if schemas.is_frozen(Path::new(rel_key)).is_some() {
-            continue;
-        }
         dirty.insert(PathBuf::from(rel_key));
     }
 
@@ -3212,40 +3237,14 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
 
     // Discover and merge every .kb-schema.yaml once. Resolution afterwards is an
     // in-memory prefix lookup, so this stays O(schema files) rather than O(paths).
-    let schemas = SchemaCache::build(&data_path, &config.frontmatter);
-    for (scope, reason) in schemas.broken_scopes() {
-        error!(
-            "Invalid schema at {}/{}: {} — documents in this scope are frozen and will \
-             not be indexed until it is fixed",
-            scope.display(),
-            crate::schema::SCHEMA_FILE_NAME,
-            reason
-        );
-    }
+    // Before anything is touched — a full reindex included — so an invalid schema
+    // file aborts the run with nothing dropped, cleared or indexed.
+    let schemas = build_run_schemas(&data_path, config)?;
 
     // Union of every `indexed` dot-path across the whole schema tree. Payload indexes
     // are collection-wide, so a field declared only in a deep scope still has to be
     // registered here or filtering on it silently fails.
     let indexed_fields = crate::qdrant::all_indexed_fields(config, &schemas);
-
-    // A full reindex drops the collection and rebuilds it, but frozen documents are
-    // skipped during the rebuild — so their vectors would be deleted and never
-    // restored, leaving them invisible to search while still listed in the metadata
-    // index. Refuse rather than destroy data; scoped indexing is unaffected.
-    if force && schemas.broken_scopes().count() > 0 {
-        let scopes: Vec<String> = schemas
-            .broken_scopes()
-            .map(|(dir, _)| dir.display().to_string())
-            .collect();
-        anyhow::bail!(
-            "Refusing a full reindex while {} schema file(s) are invalid ({}). A full \
-             run rebuilds the collection from scratch and cannot reindex frozen scopes, \
-             so their vectors would be lost. Fix the schema(s), or run a scoped/incremental \
-             index instead.",
-            scopes.len(),
-            scopes.join(", ")
-        );
-    }
 
     // ── force: clear state, THEN drop/recreate the Qdrant collection ─────────
     //
@@ -3370,7 +3369,6 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     let mut invalid = 0usize;
     let mut empty = 0usize;
     let mut read_errors = 0usize;
-    let mut frozen = 0usize;
     let mut rejected = 0usize;
     // #160: running total across every `flush_pending_batch` call (mid-loop and the
     // trailing one), since `pending.len()` after the loop is no longer a meaningful
@@ -3395,9 +3393,8 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
 
         // Missing on disk, or present but now excluded by `indexing.include`/
         // `exclude`/`exclude_files` (#266): treat as a delete, purged in a single
-        // batch below rather than one Qdrant round trip per path. Ahead of the
-        // frozen-scope check, so a frozen scope's deleted or excluded files are
-        // purged too. Only the paths this run was given are ever considered.
+        // batch below rather than one Qdrant round trip per path. Only the paths
+        // this run was given are ever considered.
         if !abs_path.exists() {
             missing.push(rel_key.clone());
             continue;
@@ -3411,15 +3408,6 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         }
 
         let rel = Path::new(rel_key.as_str());
-        if let Some(reason) = schemas.is_frozen(rel) {
-            // The schema governing this document failed to parse. Applying the
-            // parent's rules instead would silently enforce rules we know are wrong
-            // across a whole subtree, so the scope is frozen: nothing here is indexed
-            // or re-indexed, and whatever is already in the index stays untouched.
-            debug!("Frozen scope, skipping {}: {}", rel_key, reason);
-            frozen += 1;
-            continue;
-        }
 
         // Read file once — used for hashing, validation, and chunking (fix TOCTOU #51)
         let content = match tokio::fs::read_to_string(&abs_path).await {
@@ -3568,8 +3556,6 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         empty: empty as u64,
         read_errors: read_errors as u64,
         metadata_backfilled: backfilled as u64,
-        frozen_by_broken_schema: frozen as u64,
-        broken_schemas: schemas.broken_scopes().count() as u64,
         orphans_removed: missing.len() as u64,
         strict_rejected: rejected as u64,
     };
@@ -3583,8 +3569,6 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         empty = counters.empty,
         read_errors = counters.read_errors,
         metadata_backfilled = counters.metadata_backfilled,
-        frozen_by_broken_schema = counters.frozen_by_broken_schema,
-        broken_schemas = counters.broken_schemas,
         orphans_removed = counters.orphans_removed,
         strict_rejected = counters.strict_rejected,
         elapsed_secs = run_start.elapsed().as_secs_f64(),
@@ -3698,20 +3682,18 @@ async fn detect_qdrant_wipe<Q: VectorStore>(
 /// on `index_paths` that nothing in the worker/queue path ever sets `force`; it is
 /// deliberately routed through this existing branch rather than spliced in
 /// elsewhere (e.g. after `ensure_collection` inside `index_paths_generic`) because
-/// this branch already carries the guard that refuses a full reindex while any
-/// schema scope is broken (frozen scopes would otherwise lose their vectors to the
-/// drop-and-rebuild with no way to restore them), the collection drop, and the
-/// `state.clear()` — all "for free," rather than needing to be re-derived at a second
+/// this branch already carries the schema build that refuses any run while a
+/// `.kb-schema.yaml` is invalid (before anything is dropped), the collection drop,
+/// and the `state.clear()` — all "for free," rather than needing to be re-derived at a second
 /// call site. Escalating here also means the check runs once per reconcile sweep
 /// rather than once per write, keeping the added Qdrant round trip cheap.
 pub async fn scan_and_index(config: &ResolvedConfig, force: bool, trigger: Trigger) -> Result<()> {
     if force {
         let (_data_path, all_paths) = discover_relative(config).await?;
         let result = index_paths(config, &all_paths, true, trigger).await;
-        // A full reindex re-chunks every non-frozen file under the current
-        // settings, so no non-frozen file can be stale afterward (#286 round-6
-        // L1) — frozen scopes are excluded from this concern by design, same
-        // as everywhere else: see `status::IndexStatus::clear_stale_chunking`.
+        // A full reindex re-chunks every file under the current settings, so no
+        // file can be stale afterward (#286 round-6 L1): see
+        // `status::IndexStatus::clear_stale_chunking`.
         if result.is_ok() {
             INDEX_STATUS.clear_stale_chunking();
         }
@@ -3763,7 +3745,7 @@ pub async fn scan_and_index(config: &ResolvedConfig, force: bool, trigger: Trigg
         .await
         .context("Reconcile scan failed")?;
     if !scan.rechunk_detected() {
-        // This scan found no non-frozen file chunked under a stale
+        // This scan found no file chunked under a stale
         // fingerprint. That is a fresh, authoritative read of the whole
         // corpus, independent of whatever the run below does next (which may
         // fail for an unrelated reason, e.g. a new file's embedding call).
@@ -4914,7 +4896,7 @@ mod tests {
         data_path: &std::path::Path,
         frontmatter: &crate::config::FrontmatterConfig,
     ) -> String {
-        let schemas = SchemaCache::build(data_path, frontmatter);
+        let schemas = SchemaCache::build_for_test(data_path, frontmatter);
         schemas
             .resolve_for(std::path::Path::new("doc.md"))
             .fingerprint()
@@ -5115,7 +5097,7 @@ mod tests {
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
         std::fs::write(&abs, content).unwrap();
         let (mtime, size) = stat(&abs);
-        let schema_hash = SchemaCache::build(&data_path, &config.frontmatter)
+        let schema_hash = SchemaCache::build_for_test(&data_path, &config.frontmatter)
             .resolve_for(Path::new(rel))
             .fingerprint();
         let hash = compute_hash_from_bytes(content.as_bytes());
@@ -5338,31 +5320,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_now_excluded_file_in_a_frozen_scope_is_still_purged() {
+    async fn an_invalid_schema_fails_the_scan_and_the_run_before_touching_anything() {
         let dir = TempDir::new().unwrap();
-        let mut config = scan_test_config(&dir);
-        config.indexing.exclude_files = vec!["secret.md".into()];
+        let config = scan_test_config(&dir);
         let db = open_scan_test_db(&config).await;
         seed_indexed_file(&config, &db, "keep.md", "# Keep").await;
-        seed_indexed_file(&config, &db, "broken/secret.md", "# Secret").await;
-        // Frozen only after seeding, as if the schema broke after the last index.
+        seed_indexed_file(&config, &db, "broken/doc.md", "# Doc").await;
+        // Invalid only after seeding, as if a bad schema arrived after the last index.
         std::fs::write(
             dir.path().join("broken/.kb-schema.yaml"),
             "fields: [not, a, mapping]",
         )
         .unwrap();
+        std::fs::remove_file(dir.path().join("keep.md")).unwrap();
 
-        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+        let err = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
             .await
-            .unwrap();
-        assert_eq!(dirty, vec![PathBuf::from("broken/secret.md")]);
-
-        let store = run_index_paths(&config, &["broken/secret.md"]).await;
-        assert_eq!(
-            store.delete_by_files_calls.lock().unwrap().clone(),
-            vec![vec!["broken/secret.md".to_string()]]
+            .unwrap_err();
+        assert!(
+            err.chain()
+                .any(|c| c.is::<crate::schema::SchemaBuildError>()),
+            "the typed error must survive for the worker's permanent classification: {err:#}"
         );
-        assert_fully_purged(&db, "broken/secret.md").await;
+        assert!(
+            format!("{err:#}").contains("broken/.kb-schema.yaml"),
+            "{err:#}"
+        );
+
+        // Not even a deletion is applied under an invalid schema tree.
+        let store = TrackingMockVectorStore::all_ok();
+        let result = index_paths_generic(
+            &config,
+            &[PathBuf::from("keep.md")],
+            false,
+            std::time::Instant::now(),
+            &MockEmbedClient::ok(vec![]),
+            &store,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(store.delete_by_files_calls.lock().unwrap().is_empty());
+        assert!(db.get("keep.md").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -5792,81 +5790,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_for_dirty_never_flags_a_file_under_a_frozen_scope() {
-        let dir = TempDir::new().unwrap();
-        let config = scan_test_config(&dir);
-        std::fs::create_dir_all(dir.path().join("broken")).unwrap();
-        // Deliberately invalid schema YAML — this scope is "frozen": the indexer
-        // refuses to touch anything under it until the file is fixed.
-        std::fs::write(
-            dir.path().join("broken/.kb-schema.yaml"),
-            "fields: [not, a, mapping]",
-        )
-        .unwrap();
-        // Neither a new file nor a previously-indexed one under the broken scope
-        // should ever be marked dirty.
-        std::fs::write(dir.path().join("broken/new.md"), "# New").unwrap();
-
-        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
-            .await
-            .unwrap();
-        assert!(
-            dirty.is_empty(),
-            "a frozen scope must never be marked dirty by the scan: {dirty:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn scan_for_dirty_never_marks_rechunk_for_a_frozen_scopes_stale_fingerprint() {
-        // #286 round-6 L1: a frozen scope's file is never re-chunked until the
-        // schema is fixed, so its stale chunking fingerprint must not pin the
-        // "results may be incomplete" note on forever the way a normal stale
-        // file does. `mark_rechunk` must simply never be called for it.
+    async fn scan_for_dirty_under_an_invalid_schema_never_marks_rechunk() {
+        // #286 round-6 L1: the scan aborts on the schema build, before any row's
+        // chunking fingerprint is compared, so a stale file cannot raise the
+        // "results may be incomplete" note while nothing can be re-chunked.
         let dir = TempDir::new().unwrap();
         let mut config = scan_test_config(&dir);
-        std::fs::create_dir_all(dir.path().join("broken")).unwrap();
-        std::fs::write(
-            dir.path().join("broken/.kb-schema.yaml"),
-            "fields: [not, a, mapping]",
-        )
-        .unwrap();
         let path = dir.path().join("broken/doc.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "# Doc").unwrap();
         let (mtime, size) = stat(&path);
-
-        // Indexed while the scope was still valid, under the config about to
-        // change — a stale chunking fingerprint, same as an ordinary file's.
         let db = open_scan_test_db(&config).await;
         db.upsert(
             "broken/doc.md",
             "some-hash",
             1,
-            "irrelevant-while-frozen",
+            &expected_schema_hash(dir.path(), &config.frontmatter),
             &chunking_fingerprint(&config.chunking),
             mtime,
             size,
         )
         .await
         .unwrap();
-
-        // Operator changes a chunking setting; the scope is (independently)
-        // now frozen too.
+        std::fs::write(
+            dir.path().join("broken/.kb-schema.yaml"),
+            "fields: [not, a, mapping]",
+        )
+        .unwrap();
         config.chunking.max_chunk_size += 500;
 
         let scan = INDEX_STATUS.begin_reconcile_scan();
-        let dirty = scan_for_dirty(&config, &scan).await.unwrap();
-        assert!(
-            dirty.is_empty(),
-            "a frozen scope's file must not be marked dirty even with a stale \
-             chunking fingerprint: {dirty:?}"
-        );
-        assert!(
-            !scan.rechunk_detected(),
-            "a frozen scope's stale fingerprint must never raise the \
-             incomplete-results note — it can never be fixed by re-chunking \
-             until the schema is fixed, so the note must not claim indexing \
-             will catch up on its own"
-        );
+        assert!(scan_for_dirty(&config, &scan).await.is_err());
+        assert!(!scan.rechunk_detected());
     }
 
     // -- detect_qdrant_wipe (#155 active self-heal) ---------------------------
@@ -6423,7 +6378,7 @@ mod tests {
             indexed_fields: vec!["tags".into(), "planning.prep_minutes".into()],
             ..Default::default()
         };
-        let schemas = SchemaCache::build(dir.path(), &config.frontmatter);
+        let schemas = SchemaCache::build_for_test(dir.path(), &config.frontmatter);
 
         let fields = crate::qdrant::all_indexed_fields(&config, &schemas);
         let named = |n: &str| fields.iter().find(|f| f.name == n);

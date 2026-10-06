@@ -102,6 +102,20 @@ pub(crate) fn build_dedup_query(
     assembled.chars().take(DEDUP_QUERY_CHAR_LIMIT).collect()
 }
 
+/// The dedup gate's effective `(enabled, threshold)` for a document governed by
+/// `schema`: the `.kb-schema.yaml` `dedup:` cascade where it sets a key, else the
+/// global `write.*` value in `deps` (#272). Resolved per key, so a scope that only
+/// sets `threshold` still inherits the global `enabled`.
+pub(crate) fn effective_dedup<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    schema: &schema::ResolvedSchema,
+) -> (bool, f32) {
+    (
+        schema.dedup_enabled.unwrap_or(deps.dedup_enabled),
+        schema.dedup_threshold.unwrap_or(deps.dedup_threshold),
+    )
+}
+
 /// Search options for the dedup gate.
 ///
 /// Deliberately pinned to dense-only rather than inheriting `search.hybrid`, so
@@ -265,15 +279,26 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     pub state: Option<&'a StateDb>,
 }
 
-/// Filter `paths` down to the ones `indexing`'s include/exclude/exclude_files
-/// predicate ([`crate::ingest::PathFilter`]) would actually index — applied to
-/// every path a write is about to mark dirty (its own target(s), rewritten
-/// referencing documents, and `commit_outcome.rebased_paths`) before they
-/// reach `queue.mark_paths` (#278). Fails open (returns `paths` unfiltered) on
-/// a glob-build error, logging loudly, rather than dropping otherwise-
-/// legitimate paths because of a config problem this write did not cause.
-fn filter_indexable(indexing: &crate::config::IndexingConfig, paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    crate::ingest::partition_indexable(indexing, paths).0
+/// Mark every path a write touched (its own target(s), rewritten referencing
+/// documents, and `commit_outcome.rebased_paths`) dirty on `queue`.
+///
+/// Paths are first filtered down to the ones `indexing`'s include/exclude/
+/// exclude_files predicate ([`crate::ingest::PathFilter`]) would actually index
+/// (#278). That filter fails open (marks `paths` unfiltered) on a glob-build
+/// error, logging loudly, rather than dropping otherwise-legitimate paths
+/// because of a config problem this write did not cause.
+///
+/// A `.kb-schema.yaml` among `paths` — carried by a `move_directory`, or pulled
+/// in by this write's own rebase — is never a document, so the filter drops it;
+/// it instead queues a full reconcile, which rebuilds the shared schema cache
+/// before scanning (see `reindex::ReindexQueue::mark_schema_changes`).
+fn mark_dirty(
+    queue: &crate::reindex::ReindexQueue,
+    indexing: &crate::config::IndexingConfig,
+    paths: Vec<PathBuf>,
+) {
+    queue.mark_schema_changes(indexing, &paths);
+    queue.mark_paths(crate::ingest::partition_indexable(indexing, paths).0);
 }
 
 /// A create or edit request against the write pipeline.
@@ -306,9 +331,9 @@ pub struct WriteRequest<'a> {
     /// `rel_path`'s content itself, move or not) — typically the source's current
     /// content, possibly transformed.
     ///
-    /// Both paths are subject to the same eligibility (include-pattern) and
-    /// path-safety checks the non-move path applies to `rel_path`, and either
-    /// directory being schema-frozen blocks the whole move. Frontmatter
+    /// Both paths are subject to the same schema-file, eligibility
+    /// (include-pattern) and path-safety checks the non-move path applies to
+    /// `rel_path`. Frontmatter
     /// validation, however, runs against the DESTINATION's resolved schema, not
     /// the source's — that is the whole point of a move: the destination
     /// directory may enforce different frontmatter than the source did. The
@@ -385,9 +410,12 @@ pub struct WriteSuccess {
 /// `PostCommitPending` is not among them.
 #[derive(Debug)]
 pub enum WriteError {
-    /// The schema governing `rel_path`'s directory failed to parse. `reason` is
-    /// the parse-failure message from `SchemaCache::is_frozen`.
-    Frozen { reason: String },
+    /// `rel_path` names a `.kb-schema.yaml`. Schema files are not documents: a
+    /// direct write, delete or single-document move of one is refused whatever
+    /// `indexing.include` says, because it would bypass the parse/validate/
+    /// round-trip/size checks `update_schema` applies — and a schema file that is
+    /// present must be valid. `rel_path` is the caller-supplied path, safe to echo.
+    SchemaFile { rel_path: String },
     /// Frontmatter validation failed. Carries the full structured result so a
     /// caller can report per-field errors, not just a flat message.
     Validation { result: ValidationResult },
@@ -1127,9 +1155,22 @@ pub fn apply_append(old_content: &str, text: &str) -> String {
 // create_document / edit_document core
 // ---------------------------------------------------------------------------
 
+/// Refuse `rel_path` when it names a `.kb-schema.yaml` — see
+/// [`WriteError::SchemaFile`]. Checked first by every document write, delete and
+/// single-document move, independently of `indexing.include` (a widened include
+/// must not turn schema files into writable documents).
+fn check_not_schema_file(rel_path: &str) -> Result<(), WriteError> {
+    if crate::schema::is_schema_file_path(Path::new(rel_path)) {
+        return Err(WriteError::SchemaFile {
+            rel_path: rel_path.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Shared pipeline for a create or edit write.
 ///
-/// Handles the stale-read guard, schema-frozen check, validation, optional dedup
+/// Handles the schema-file guard, stale-read guard, validation, optional dedup
 /// gating (create only), filesystem write, git commit, reindex queuing, and diff
 /// output. Callers are responsible for resolving `req.rel_path` and computing
 /// `req.new_content` (e.g. applying a surgical old_string/new_string replacement)
@@ -1144,7 +1185,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     req: WriteRequest<'_>,
 ) -> Result<WriteSuccess, WriteError> {
     // A move is a different enough shape at nearly every step (two paths through
-    // eligibility/safety/frozen checks, validation against the DESTINATION's
+    // schema-file/eligibility/safety checks, validation against the DESTINATION's
     // schema rather than `rel_path`'s, a write-then-remove filesystem sequence, a
     // two-path rollback) that folding it into the branches below would make both
     // harder to follow — see `write_document_move`'s doc comment.
@@ -1165,9 +1206,11 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
         dest_path: _,
     } = req;
 
-    // 0. Include-pattern eligibility guard: reject paths the indexer would not
-    //    pick up, before anything else runs. See `check_include_pattern`'s doc
-    //    comment for why this must live here rather than in each caller.
+    // 0. Schema-file guard, then include-pattern eligibility guard: reject paths
+    //    the indexer would not pick up, before anything else runs. See
+    //    `check_include_pattern`'s doc comment for why this must live here rather
+    //    than in each caller.
+    check_not_schema_file(rel_path)?;
     check_include_pattern(deps, rel_path)?;
 
     // 0.5. Early path-safety check: reject traversal (or any other
@@ -1197,19 +1240,17 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
         }
     }
 
-    // 2. Schema-frozen guard, then validate new_content.
+    // 2. Validate new_content.
     //
     // The schema is resolved from the TARGET path's directory, so writing into a
     // subdirectory is governed by that folder's rules regardless of where the
     // caller has been reading. This reads the shared, caller-owned cache rather
     // than rebuilding it — see `KbSearchServer::schema_cache`'s doc comment for
-    // why that is safe to read without staleness after `update_schema`.
+    // why that is safe to read without staleness after `update_schema`. That cache
+    // only ever holds a tree in which every schema file was valid: a runtime
+    // rebuild that hit an invalid one was refused and the last good cache kept
+    // (`schema::apply_rebuild`).
     let schemas = crate::schema::load_shared(deps.schema_cache);
-    if let Some(reason) = schemas.is_frozen(Path::new(rel_path)) {
-        return Err(WriteError::Frozen {
-            reason: reason.to_string(),
-        });
-    }
     let schema = schemas.resolve_for(Path::new(rel_path));
 
     let (validation_result, validated) =
@@ -1229,9 +1270,11 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     }
 
     // 3. Dedup gate: on create paths, check for near-duplicate existing documents.
-    //    Gate runs only when: this is a create (not edit), dedup is enabled in
-    //    config, and the caller has not set force_new = true.
-    if is_create && deps.dedup_enabled && !matches!(force_new, Some(true)) {
+    //    Gate runs only when: this is a create (not edit), dedup is enabled for
+    //    this path (schema `dedup:` override, else config), and the caller has
+    //    not set force_new = true.
+    let (dedup_enabled, dedup_threshold) = effective_dedup(deps, schema);
+    if is_create && dedup_enabled && !matches!(force_new, Some(true)) {
         // Reuse the body already parsed during validation above rather than
         // re-deriving it here: that keeps the dedup query on exactly the
         // frontmatter-stripped basis the indexer embeds.
@@ -1287,14 +1330,14 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                             rel_path,
                             path,
                             score,
-                            deps.dedup_threshold
+                            dedup_threshold
                         );
                     }
-                    if let Some(hit) = dedup_verdict(top, deps.dedup_threshold) {
+                    if let Some(hit) = dedup_verdict(top, dedup_threshold) {
                         return Err(WriteError::DedupHit {
                             duplicate_of: hit.file_path,
                             similarity: hit.score,
-                            threshold: deps.dedup_threshold,
+                            threshold: dedup_threshold,
                         });
                     }
                 }
@@ -1517,13 +1560,10 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
             // status, so the local index should too. `rebased_paths` is empty
             // here — the rebase never ran (fetch/rebase/push all happen after the
             // commit, so any of them failing means we never got as far as a
-            // trustworthy rebase diff). Still filtered through `filter_indexable`
+            // trustworthy rebase diff). Still filtered through `mark_dirty`
             // (#278): this write's own target can match `include` and still be
             // excluded, same as the success path below.
-            deps.queue.mark_paths(filter_indexable(
-                deps.indexing,
-                vec![PathBuf::from(rel_path)],
-            ));
+            mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
 
             return Ok(WriteSuccess {
                 outcome: WriteOutcome::CommittedPendingSync,
@@ -1544,12 +1584,13 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     // actual chunk/embed/upsert work out of band; this call never blocks on it,
     // which is the whole point — embedding is far slower than a caller's request
     // timeout on a large document.
-    deps.queue.mark_paths(filter_indexable(
+    mark_dirty(
+        deps.queue,
         deps.indexing,
         std::iter::once(PathBuf::from(rel_path))
             .chain(commit_outcome.rebased_paths.iter().cloned())
             .collect(),
-    ));
+    );
 
     Ok(WriteSuccess {
         outcome: WriteOutcome::Synced,
@@ -1570,7 +1611,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
 
 /// The MOVE branch of `write_document`, split out because a move touches TWO
 /// paths at every stage that the create/edit path only ever touches one:
-/// eligibility, path-safety, schema-frozen, the filesystem mutation itself, the
+/// schema-file guard, eligibility, path-safety, the filesystem mutation itself, the
 /// commit, and — the part most worth keeping legible on its own — the rollback.
 /// Interleaving that with the single-path create/edit logic above would have
 /// made both harder to reason about; keeping it here means the non-move path
@@ -1618,6 +1659,8 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     //    is touched. The resolved paths are discarded here, same as
     //    write_document's early check — each is re-resolved immediately before
     //    the filesystem action that uses it, below.
+    check_not_schema_file(source_rel)?;
+    check_not_schema_file(dest_rel)?;
     check_include_pattern(deps, source_rel)?;
     check_include_pattern(deps, dest_rel)?;
     safe_write_path(deps, source_rel)?;
@@ -1652,20 +1695,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
         return Err(WriteError::AlreadyExists);
     }
 
-    // 6. Schema-frozen guard against BOTH paths: removing a file from a frozen
-    //    directory mutates that directory's contents exactly as adding one does,
-    //    so either side being frozen blocks the whole move.
     let schemas = crate::schema::load_shared(deps.schema_cache);
-    if let Some(reason) = schemas.is_frozen(Path::new(source_rel)) {
-        return Err(WriteError::Frozen {
-            reason: reason.to_string(),
-        });
-    }
-    if let Some(reason) = schemas.is_frozen(Path::new(dest_rel)) {
-        return Err(WriteError::Frozen {
-            reason: reason.to_string(),
-        });
-    }
 
     // 6.5. Outbound-link re-relativization: EVERY relative link inside the
     //    document being moved was authored against wherever it used to live
@@ -1887,16 +1917,6 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     //    so a failure partway through can still be undone by hand (see the
     //    write failure branch below) rather than racing a rollback against a
     //    half-committed state.
-    //
-    //    Frozen directories: deliberately NOT checked here. `schemas.is_frozen`
-    //    guards frontmatter/content changes to a directory's document set — a
-    //    link-text rewrite touches neither; it edits prose inside the Markdown
-    //    body of a document that already exists and was already valid. Treating
-    //    "the referencing document happens to live under a frozen directory" as
-    //    a reason to fail the WHOLE MOVE would be surprising (the caller asked
-    //    to move one document, not to write into the frozen one) and gains
-    //    nothing safety-wise, so frozen referencing documents are rewritten
-    //    exactly like any other.
     //
     //    Best-effort against the reverse-link index itself: if there is no
     //    `StateDb` (`deps.state == None` — see that field's doc comment) or the
@@ -2156,16 +2176,17 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
             //     rolled back) and reported as sync-pending, same as every other
             //     post-commit failure in this pipeline. `rebased_paths` is empty
             //     for the same reason as elsewhere: the rebase never ran. Still
-            //     filtered through `filter_indexable` (#278): the source/dest
+            //     filtered through `mark_dirty` (#278): the source/dest
             //     path(s) can match `include` and still be excluded, same as the
             //     success path below.
-            deps.queue.mark_paths(filter_indexable(
+            mark_dirty(
+                deps.queue,
                 deps.indexing,
                 [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
                     .into_iter()
                     .chain(rewritten_paths.iter().map(PathBuf::from))
                     .collect(),
-            ));
+            );
 
             return Ok(WriteSuccess {
                 outcome: WriteOutcome::CommittedPendingSync,
@@ -2187,14 +2208,15 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     //     document (whose `document_links` rows self-heal from its new body in
     //     the same pass); all of them need to be in the same worklist for the
     //     worker to do that in one sweep.
-    deps.queue.mark_paths(filter_indexable(
+    mark_dirty(
+        deps.queue,
         deps.indexing,
         [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
             .into_iter()
             .chain(rewritten_paths.iter().map(PathBuf::from))
             .chain(commit_outcome.rebased_paths.iter().cloned())
             .collect(),
-    ));
+    );
 
     Ok(WriteSuccess {
         outcome: WriteOutcome::Synced,
@@ -2437,7 +2459,7 @@ pub enum BatchWriteError {
     /// whichever entry is processed last clobber the other.
     DuplicatePath { rel_path: String },
     /// One or more documents failed a pre-write check: path safety,
-    /// schema-frozen, frontmatter validation, the dedup gate, a stale
+    /// a schema-file path, frontmatter validation, the dedup gate, a stale
     /// `expected_hash`, or — discovered only under `GIT_LOCK`, at the same
     /// point `write_document` itself discovers it — create-on-existing or
     /// edit-on-missing. Carries EVERY failing document from this phase, not
@@ -2507,7 +2529,7 @@ async fn rollback_batch_filesystem_writes(
 /// ## Phases
 ///
 /// 1. **Pre-flight, no lock, no filesystem mutation.** Every document is
-///    checked — include-pattern eligibility, path safety, schema-frozen,
+///    checked — schema-file guard, include-pattern eligibility, path safety,
 ///    frontmatter validation, the create-path dedup gate (its embedding call
 ///    and Qdrant query, same as a single create's) — and EVERY failure
 ///    across the whole batch is collected before this function returns
@@ -2594,7 +2616,9 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
     let mut failures: Vec<(String, WriteError)> = Vec::new();
 
     for req in requests {
-        if let Err(e) = check_include_pattern(deps, req.rel_path) {
+        if let Err(e) = check_not_schema_file(req.rel_path)
+            .and_then(|()| check_include_pattern(deps, req.rel_path))
+        {
             failures.push((req.rel_path.to_string(), e));
             continue;
         }
@@ -2616,15 +2640,6 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
             }
         }
 
-        if let Some(reason) = schemas.is_frozen(Path::new(req.rel_path)) {
-            failures.push((
-                req.rel_path.to_string(),
-                WriteError::Frozen {
-                    reason: reason.to_string(),
-                },
-            ));
-            continue;
-        }
         let schema = schemas.resolve_for(Path::new(req.rel_path));
 
         let (validation_result, validated) = match validate::validate_content(
@@ -2657,7 +2672,8 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
             continue;
         }
 
-        if req.is_create && deps.dedup_enabled && !matches!(req.force_new, Some(true)) {
+        let (dedup_enabled, dedup_threshold) = effective_dedup(deps, schema);
+        if req.is_create && dedup_enabled && !matches!(req.force_new, Some(true)) {
             let query_text = validated
                 .as_ref()
                 .map(|v| {
@@ -2701,13 +2717,13 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                                 .unwrap_or_default();
                             (path, r.score)
                         });
-                        if let Some(hit) = dedup_verdict(top, deps.dedup_threshold) {
+                        if let Some(hit) = dedup_verdict(top, dedup_threshold) {
                             failures.push((
                                 req.rel_path.to_string(),
                                 WriteError::DedupHit {
                                     duplicate_of: hit.file_path,
                                     similarity: hit.score,
-                                    threshold: deps.dedup_threshold,
+                                    threshold: dedup_threshold,
                                 },
                             ));
                             continue;
@@ -2961,13 +2977,14 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                 written.len(),
                 source
             );
-            // Still filtered through `filter_indexable` (#278): a written path
+            // Still filtered through `mark_dirty` (#278): a written path
             // can match `include` and still be excluded, same as the success
             // path below.
-            deps.queue.mark_paths(filter_indexable(
+            mark_dirty(
+                deps.queue,
                 deps.indexing,
                 written.iter().map(|(p, _)| PathBuf::from(p)).collect(),
-            ));
+            );
             let documents = requests
                 .iter()
                 .map(|req| BatchDocumentResult {
@@ -2986,14 +3003,15 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
         }
     };
 
-    deps.queue.mark_paths(filter_indexable(
+    mark_dirty(
+        deps.queue,
         deps.indexing,
         written
             .iter()
             .map(|(p, _)| PathBuf::from(p))
             .chain(commit_outcome.rebased_paths.iter().cloned())
             .collect(),
-    ));
+    );
 
     let documents = requests
         .iter()
@@ -3025,8 +3043,8 @@ pub struct DirectoryMoveSuccess {
     pub rebased_paths: Vec<PathBuf>,
     /// `(old_rel, new_rel)` for every document AND schema file moved (a
     /// `.kb-schema.yaml` found under the source subtree moves along with the
-    /// documents it governs — see `DirectoryMoveError::BrokenSchemaInSource`'s
-    /// doc comment), sorted by `old_rel`.
+    /// documents it governs, and the move queues a full reconcile so the worker
+    /// rebuilds the shared schema cache), sorted by `old_rel`.
     pub moved: Vec<(String, String)>,
     /// Documents OUTSIDE the moved subtree whose inline links were rewritten to
     /// point at a moved document's new location, and which rode along in the same
@@ -3053,26 +3071,6 @@ pub enum DirectoryMoveError {
     /// At least one file already lives under `dest_dir` — a directory move never
     /// merges into, or overwrites, an existing prefix.
     AlreadyExists,
-    /// A `.kb-schema.yaml` somewhere under the source subtree, at `path`, failed
-    /// to parse — `reason` is `SchemaCache::is_frozen`'s message for its
-    /// governing directory.
-    ///
-    /// This mirrors `is_frozen`'s own "rules unreadable ⇒ don't touch" stance:
-    /// moving documents governed by rules this process cannot read is exactly
-    /// the situation where it cannot verify the move is safe, so it refuses
-    /// outright rather than silently carrying the parse failure through into
-    /// the destination. A schema file that DOES parse is not blocked — it moves
-    /// with the documents it governs, and they are validated against the
-    /// cascade that results (see [`SchemaCache::with_remapped_scopes`]).
-    BrokenSchemaInSource {
-        path: String,
-        reason: String,
-    },
-    /// The schema governing a source or destination document's directory failed
-    /// to parse (`SchemaCache::is_frozen`).
-    Frozen {
-        reason: String,
-    },
     /// Frontmatter validation against the DESTINATION's schema cascade failed
     /// for one or more documents. Carries every failure, not just the first —
     /// the whole move is all-or-nothing, so a caller needs to know everything
@@ -3089,6 +3087,16 @@ pub enum DirectoryMoveError {
         /// facing error name that explicitly instead of leaving a document
         /// that was valid moments ago looking like an unexplained failure.
         moved_schema_files: Vec<(String, String)>,
+    },
+    /// A `.kb-schema.yaml` under the source subtree is invalid on disk (#272).
+    /// The shared cache keeps the last good schema while a file on disk is
+    /// invalid, so it may still hold that directory's previous rules — the move
+    /// would validate against those, then carry the broken file to the
+    /// destination. Refused until the file is fixed or reverted in git. `path` is
+    /// the first such file (by path), KB-relative; `reason` is why it is invalid.
+    InvalidSchemaInSource {
+        path: String,
+        reason: String,
     },
     UnsafePath {
         msg: String,
@@ -3144,7 +3152,7 @@ impl From<WriteError> for DirectoryMoveError {
 ///
 /// Unfiltered: returns every file, not just indexable documents. `move_directory`
 /// uses this both for the source-subtree scan (filtered to indexable documents,
-/// and checked for a stray `.kb-schema.yaml`, by the caller) and the
+/// and scanned for `.kb-schema.yaml` files to carry along, by the caller) and the
 /// destination-prefix collision check (deliberately left UNFILTERED there, since
 /// ANY file under the destination — indexable or not — means the prefix is not
 /// free).
@@ -3326,22 +3334,26 @@ async fn rollback_directory_move_filesystem(
 ///    [`DirectoryMoveError::SourceEmpty`].
 /// 2. No file may already live anywhere under `dest_dir`
 ///    ([`DirectoryMoveError::AlreadyExists`]) — a directory move never merges.
-/// 3. Every `.kb-schema.yaml` under the source subtree must currently parse
-///    ([`DirectoryMoveError::BrokenSchemaInSource`] otherwise — see that
-///    variant's doc comment). One that does is not a blocker: it moves WITH the
-///    documents it governs (as a raw copy — schema files are never frontmatter-
-///    validated or link-rewritten), and every moved document is validated
-///    against a cascade rebuilt with that schema file's governing directory
-///    re-parented onto the destination (`SchemaCache::with_remapped_scopes`),
-///    not against the live cache, which still reflects the OLD parentage until
-///    the post-commit reindex rebuilds it. Relocating a schema file is a
-///    genuine semantic change — a document valid under the source's cascade can
-///    fail under the destination's — and that is exactly what guard 4 below
-///    (`DirectoryMoveError::Validation`) exists to catch before anything moves.
-/// 4. Neither the source nor destination subtree may be schema-frozen (checked
-///    per document, via `SchemaCache::is_frozen`), and every moved document's
-///    frontmatter must validate against the (possibly re-parented, per guard 3)
-///    destination cascade.
+/// 3. A `.kb-schema.yaml` under the source subtree is not a blocker: it moves
+///    WITH the documents it governs (as a raw copy — schema files are never
+///    frontmatter-validated or link-rewritten), and every moved document is
+///    validated against a cascade rebuilt with that schema file's governing
+///    directory re-parented onto the destination
+///    (`SchemaCache::with_remapped_scopes`), not against the live cache, which
+///    still reflects the OLD parentage until the post-commit full reconcile
+///    rebuilds it (`reindex::ReindexQueue::mark_schema_changes`). The shared
+///    cache only ever holds schema files that were valid when it was built, so
+///    the remapped cascade is built from validated content — but it may be the
+///    last good content of a file that is invalid on disk now, so every schema
+///    file under the source that is part of the schema tree is re-read, parsed
+///    and self-validated first, and an invalid one refuses the move
+///    ([`DirectoryMoveError::InvalidSchemaInSource`], #272). Relocating a schema
+///    file is a genuine semantic change — a document valid under the source's
+///    cascade can fail under the destination's — and that is exactly what guard
+///    4 below (`DirectoryMoveError::Validation`) exists to catch before anything
+///    moves.
+/// 4. Every moved document's frontmatter must validate against the (possibly
+///    re-parented, per guard 3) destination cascade.
 /// 5. Every source and destination document path passes the same path-safety
 ///    ([`safe_write_path`]) and include-pattern eligibility
 ///    ([`check_include_pattern`]) checks a single-document write applies.
@@ -3380,7 +3392,8 @@ async fn rollback_directory_move_filesystem(
 /// unstaged, every rewritten referencing document restored from HEAD — all
 /// steps run unconditionally, and `rolled_back` is `true` only if every single
 /// one of them succeeded. On success, every path is marked dirty in one
-/// `reindex::mark_paths` call.
+/// `reindex::mark_paths` call, and a full reconcile is queued when a schema file
+/// moved (see [`mark_dirty`]).
 ///
 /// How many documents' `validate::validate_content` calls run at once (see the
 /// body below): each may exec an external `lint_command` subprocess, so this
@@ -3425,17 +3438,19 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
 
     let schema_files_in_source: Vec<String> = source_files
         .iter()
-        .filter(|p| {
-            Path::new(p)
-                .file_name()
-                .is_some_and(|n| n == crate::schema::SCHEMA_FILE_NAME)
-        })
+        .filter(|p| crate::schema::is_schema_file_path(Path::new(p)))
         .cloned()
         .collect();
 
     let documents: Vec<String> = source_files
         .into_iter()
-        .filter(|p| deps.retrieval.include_patterns.is_match(p.as_str()))
+        .filter(|p| {
+            // A schema file is never a document, even under a widened `include`
+            // (`**/*`): it travels via `schema_moves` below, and listing it here too
+            // would validate it as markdown and rename it twice.
+            !crate::schema::is_schema_file_path(Path::new(p.as_str()))
+                && deps.retrieval.include_patterns.is_match(p.as_str())
+        })
         .collect();
     if documents.is_empty() {
         return Err(DirectoryMoveError::SourceEmpty {
@@ -3512,29 +3527,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
 
     let schemas = crate::schema::load_shared(deps.schema_cache);
 
-    // Guard 3: any `.kb-schema.yaml` under the source subtree must currently
-    // parse, or this move is refused outright — see
-    // `DirectoryMoveError::BrokenSchemaInSource`'s doc comment for why (mirrors
-    // `SchemaCache::is_frozen`'s "rules unreadable ⇒ don't touch" stance).
-    // Checked against the `schemas` snapshot just loaded above, the same
-    // staleness tolerance every other check in this function already accepts
-    // (`is_frozen` below, in particular).
-    for schema_path in &schema_files_in_source {
-        let governing_dir = Path::new(schema_path.as_str())
-            .parent()
-            .unwrap_or(Path::new(""));
-        if let Some((_, reason)) = schemas
-            .broken_scopes()
-            .find(|(broken_dir, _)| broken_dir.as_path() == governing_dir)
-        {
-            return Err(DirectoryMoveError::BrokenSchemaInSource {
-                path: schema_path.clone(),
-                reason: reason.to_string(),
-            });
-        }
-    }
-
-    // A NEW, detached cache with every schema file under `source_dir` re-parented
+    // Guard 3: a NEW, detached cache with every schema file under `source_dir` re-parented
     // onto `dest_dir` (see `SchemaCache::with_remapped_scopes`). Moved documents
     // are validated against THIS cache below, not the live one: if the subtree
     // carries its own schema file(s), the live cache still reflects the OLD
@@ -3557,13 +3550,12 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         }
     });
 
-    // Guard 4 (frozen, per document) + guard 5 (eligibility/safety, per
-    // document) + the outbound link rewrite. ALL before any mutation: every
-    // document is only ever READ here, and every failure path below returns
-    // before touching the filesystem. These checks are all cheap, in-memory or
-    // single-file-read work, so they stay a plain serial loop — same
-    // first-failure-wins behavior as before, e.g. `AlreadyExists`/`Frozen` on
-    // whichever document trips it first. Only `validate::validate_content`
+    // Guard 5 (eligibility/safety, per document) + the outbound link rewrite.
+    // ALL before any mutation: every document is only ever READ here, and every
+    // failure path below returns before touching the filesystem. These checks
+    // are all cheap, in-memory or single-file-read work, so they stay a plain
+    // serial loop — same first-failure-wins behavior as before, e.g.
+    // `AlreadyExists` on whichever document trips it first. Only `validate::validate_content`
     // below (which may exec a `lint_command` subprocess) is expensive enough,
     // and independent enough per document, to run concurrently.
     // (old_rel, new_rel, content_to_write)
@@ -3574,17 +3566,6 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         check_include_pattern(deps, new_rel)?;
         let abs_source_doc = safe_write_path(deps, old_rel)?;
         let abs_dest_doc = safe_write_path(deps, new_rel)?;
-
-        if let Some(reason) = schemas.is_frozen(Path::new(old_rel.as_str())) {
-            return Err(DirectoryMoveError::Frozen {
-                reason: reason.to_string(),
-            });
-        }
-        if let Some(reason) = schemas.is_frozen(Path::new(new_rel.as_str())) {
-            return Err(DirectoryMoveError::Frozen {
-                reason: reason.to_string(),
-            });
-        }
 
         if abs_dest_doc.exists() {
             // Guard 2 already checked the whole prefix; this is a defensive
@@ -3622,6 +3603,27 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 msg: format!("Failed to read '{}': {}", old_rel, e),
             })?;
         schema_contents.push((old_rel.clone(), new_rel.clone(), raw));
+    }
+
+    // Guard 3a (#272): every schema file being carried along must be valid ON
+    // DISK. A runtime rebuild that finds one invalid keeps the last good cache,
+    // so `schemas` (and `remapped_schemas`) may still hold that directory's old
+    // rules: validating against them and then relocating the broken file would
+    // move it out from under the very check that should have stopped it. Only
+    // files in the schema tree are checked — one in a hidden or wholly excluded
+    // directory is never read by a rebuild (`schema::SchemaWalkFilter`), so it
+    // does not govern anything and moves as an inert raw copy.
+    let walk = crate::schema::SchemaWalkFilter::from_config(deps.indexing);
+    for (old_rel, _, raw) in &schema_contents {
+        if !walk.governs(Path::new(old_rel)) {
+            continue;
+        }
+        if let Err(reason) = crate::schema::parse_schema_text(raw) {
+            return Err(DirectoryMoveError::InvalidSchemaInSource {
+                path: old_rel.clone(),
+                reason,
+            });
+        }
     }
 
     // Destination-schema validation, run concurrently across every document
@@ -4140,17 +4142,18 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 source_dir, dest_dir, sha, source_err
             );
 
-            // Still filtered through `filter_indexable` (#278): a moved path can
+            // Still filtered through `mark_dirty` (#278): a moved path can
             // match `include` and still be excluded, same as the success path
             // below.
-            deps.queue.mark_paths(filter_indexable(
+            mark_dirty(
+                deps.queue,
                 deps.indexing,
                 all_moves
                     .iter()
                     .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
                     .chain(rewritten_paths.iter().map(PathBuf::from))
                     .collect(),
-            ));
+            );
 
             return Ok(DirectoryMoveSuccess {
                 outcome: WriteOutcome::CommittedPendingSync,
@@ -4171,7 +4174,8 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // force the shared `SchemaCache` to rebuild before this unit is next
     // indexed — see that function's doc comment; nothing further is needed
     // here for the post-commit self-correction this move depends on.
-    deps.queue.mark_paths(filter_indexable(
+    mark_dirty(
+        deps.queue,
         deps.indexing,
         all_moves
             .iter()
@@ -4179,7 +4183,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             .chain(rewritten_paths.iter().map(PathBuf::from))
             .chain(commit_outcome.rebased_paths.iter().cloned())
             .collect(),
-    ));
+    );
 
     Ok(DirectoryMoveSuccess {
         outcome: WriteOutcome::Synced,
@@ -4206,9 +4210,10 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     rel_path: &str,
     message: Option<&str>,
 ) -> Result<WriteSuccess, WriteError> {
-    // Include-pattern eligibility guard, ahead of everything else — see
-    // `check_include_pattern`'s doc comment for why this must live here rather
-    // than in each caller.
+    // Schema-file guard, then include-pattern eligibility guard, ahead of
+    // everything else — see `check_include_pattern`'s doc comment for why this
+    // must live here rather than in each caller.
+    check_not_schema_file(rel_path)?;
     check_include_pattern(deps, rel_path)?;
 
     // Early path-safety check, ahead of everything else below — mirrors
@@ -4384,12 +4389,9 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
 
             // The file is already gone from local disk regardless of push status,
             // so the local index should reflect that regardless too. Still
-            // filtered through `filter_indexable` (#278): an excluded path was
+            // filtered through `mark_dirty` (#278): an excluded path was
             // never indexed, so there is nothing to purge for it either.
-            deps.queue.mark_paths(filter_indexable(
-                deps.indexing,
-                vec![PathBuf::from(rel_path)],
-            ));
+            mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
 
             return Ok(WriteSuccess {
                 outcome: WriteOutcome::CommittedPendingSync,
@@ -4413,12 +4415,13 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     // missing-file branch of `ingest::index_paths`), so there is no separate
     // purge to do here — this is "one reindex path" applied to deletes too, not a
     // special case.
-    deps.queue.mark_paths(filter_indexable(
+    mark_dirty(
+        deps.queue,
         deps.indexing,
         std::iter::once(PathBuf::from(rel_path))
             .chain(commit_outcome.rebased_paths.iter().cloned())
             .collect(),
-    ));
+    );
 
     Ok(WriteSuccess {
         outcome: WriteOutcome::Synced,
@@ -5145,7 +5148,11 @@ mod tests {
             let mut builder = globset::GlobSetBuilder::new();
             builder.add(globset::Glob::new("**/*.md").unwrap());
             let schema_cache: SharedSchemaCache = Arc::new(std::sync::RwLock::new(Arc::new(
-                crate::schema::SchemaCache::build(&canonical_data_path, &config.frontmatter),
+                crate::schema::SchemaCache::build_for_test_with(
+                    &canonical_data_path,
+                    &config.frontmatter,
+                    &config.indexing,
+                ),
             )));
             Harness {
                 embed,
@@ -5237,6 +5244,44 @@ mod tests {
         }
     }
 
+    /// A schema `dedup:` key overrides the global `write.*` value per key; an unset
+    /// key falls back to it (#272).
+    #[test]
+    fn effective_dedup_prefers_schema_override_per_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = (*crate::mcp::make_test_resolved_config(tmp.path())).clone();
+        config.write.dedup_enabled = true;
+        config.write.dedup_threshold = 0.8;
+        let harness = Harness::new(&tmp, Arc::new(config));
+        let deps = harness.deps();
+
+        let unset = schema::ResolvedSchema::default();
+        assert_eq!(effective_dedup(&deps, &unset), (true, 0.8));
+
+        let disabled = schema::ResolvedSchema {
+            dedup_enabled: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(effective_dedup(&deps, &disabled), (false, 0.8));
+
+        let stricter = schema::ResolvedSchema {
+            dedup_threshold: Some(0.97),
+            ..Default::default()
+        };
+        assert_eq!(effective_dedup(&deps, &stricter), (true, 0.97));
+
+        let enabled_when_global_off = {
+            let mut config = (*crate::mcp::make_test_resolved_config(tmp.path())).clone();
+            config.write.dedup_enabled = false;
+            Harness::new(&tmp, Arc::new(config))
+        };
+        let schema = schema::ResolvedSchema {
+            dedup_enabled: Some(true),
+            ..Default::default()
+        };
+        assert!(effective_dedup(&enabled_when_global_off.deps(), &schema).0);
+    }
+
     // -----------------------------------------------------------------------
     // write_document core tests (ported from mcp.rs's write/delete suite,
     // exercised directly against `write::write_document`/`write::delete_document`
@@ -5289,22 +5334,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frozen_schema_rejects_the_write() {
+    async fn a_schema_file_path_is_refused_by_every_document_write_even_with_a_widened_include() {
         let tmp = tempfile::tempdir().unwrap();
         let sub = tmp.path().join("notes");
         std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(
-            sub.join(crate::schema::SCHEMA_FILE_NAME),
-            "not: [valid: yaml",
-        )
-        .unwrap();
+        let schema_text = "fields:\n  title:\n    required: true\n";
+        std::fs::write(sub.join(crate::schema::SCHEMA_FILE_NAME), schema_text).unwrap();
+        std::fs::write(sub.join("doc.md"), "---\ntitle: T\n---\n# Body").unwrap();
 
         let config = crate::mcp::make_test_resolved_config(tmp.path());
-        let harness = Harness::new(&tmp, config);
+        let mut harness = Harness::new(&tmp, config);
+        // An include that would otherwise admit the schema file: the guard must
+        // not depend on `indexing.include`.
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/*").unwrap());
+        harness.include_patterns = builder.build().unwrap();
+        let schema_rel = "notes/.kb-schema.yaml";
+        let is_refused = |err: &WriteError| matches!(err, WriteError::SchemaFile { rel_path } if rel_path == schema_rel);
 
-        let req = make_req("notes/new.md", "---\ntitle: T\n---\n# Body", true);
-        let err = write_document(&harness.deps(), req).await.unwrap_err();
-        assert!(matches!(err, WriteError::Frozen { .. }), "got {err:?}");
+        let mut edit = make_req(schema_rel, "fields: {}\n", false);
+        edit.old_content = schema_text;
+        let err = write_document(&harness.deps(), edit).await.unwrap_err();
+        assert!(is_refused(&err), "edit: {err:?}");
+
+        let err = write_document(&harness.deps(), make_req(schema_rel, "fields: {}\n", true))
+            .await
+            .unwrap_err();
+        assert!(is_refused(&err), "create: {err:?}");
+
+        let err = delete_document(&harness.deps(), schema_rel, None)
+            .await
+            .unwrap_err();
+        assert!(is_refused(&err), "delete: {err:?}");
+
+        let err = write_document(
+            &harness.deps(),
+            make_move_req(schema_rel, "notes/moved.yaml", schema_text, schema_text),
+        )
+        .await
+        .unwrap_err();
+        assert!(is_refused(&err), "move from: {err:?}");
+
+        let doc = "---\ntitle: T\n---\n# Body";
+        let err = write_document(
+            &harness.deps(),
+            make_move_req("notes/doc.md", "other/.kb-schema.yaml", doc, doc),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, WriteError::SchemaFile { rel_path } if rel_path == "other/.kb-schema.yaml"),
+            "move onto: {err:?}"
+        );
+
+        let batch = [BatchWriteRequest {
+            rel_path: schema_rel,
+            old_content: schema_text,
+            new_content: "fields: {}\n",
+            is_create: false,
+            force_new: Some(true),
+            expected_hash: None,
+        }];
+        match write_documents_batch(&harness.deps(), &batch, None).await {
+            Err(BatchWriteError::Documents { failures }) => {
+                assert_eq!(failures.len(), 1);
+                assert!(is_refused(&failures[0].1), "batch: {:?}", failures[0].1);
+            }
+            other => panic!("expected a per-document batch failure, got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(sub.join(crate::schema::SCHEMA_FILE_NAME)).unwrap(),
+            schema_text,
+            "the schema file is untouched"
+        );
+    }
+
+    /// A `.kb-schema.yaml` among a write's touched paths (here, as if pulled in by
+    /// the write's own rebase) is not a document to index, but it must make the
+    /// worker rebuild the shared schema cache — a full reconcile does.
+    #[test]
+    fn mark_dirty_turns_a_changed_schema_file_into_a_full_reconcile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let queue = crate::reindex::ReindexQueue::new();
+
+        mark_dirty(&queue, &config.indexing, vec![PathBuf::from("notes/a.md")]);
+        assert!(!queue.snapshot().full_pending);
+
+        mark_dirty(
+            &queue,
+            &config.indexing,
+            vec![
+                PathBuf::from("notes/b.md"),
+                PathBuf::from("food/.kb-schema.yaml"),
+            ],
+        );
+        assert!(queue.snapshot().full_pending);
+        let pending = queue.snapshot_paths();
+        assert!(pending.contains(&PathBuf::from("notes/b.md")));
+        assert!(!pending.contains(&PathBuf::from("food/.kb-schema.yaml")));
     }
 
     #[tokio::test]
@@ -6731,61 +6860,6 @@ mod tests {
             !dest_dir.join("dest.md").exists(),
             "nothing should be written to the destination when validation fails"
         );
-    }
-
-    #[tokio::test]
-    async fn move_with_a_frozen_source_directory_is_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source_dir = tmp.path().join("frozen-src");
-        std::fs::create_dir_all(&source_dir).unwrap();
-        std::fs::write(
-            source_dir.join(crate::schema::SCHEMA_FILE_NAME),
-            "not: [valid: yaml",
-        )
-        .unwrap();
-        let content = "---\ntitle: T\n---\n# Body";
-        std::fs::write(source_dir.join("source.md"), content).unwrap();
-        let dest_dir = tmp.path().join("dest-ok");
-        std::fs::create_dir_all(&dest_dir).unwrap();
-
-        let config = crate::mcp::make_test_resolved_config(tmp.path());
-        let harness = Harness::new(&tmp, config);
-
-        let req = make_move_req("frozen-src/source.md", "dest-ok/dest.md", content, content);
-        let err = write_document(&harness.deps(), req).await.unwrap_err();
-        assert!(matches!(err, WriteError::Frozen { .. }), "got {err:?}");
-        assert!(source_dir.join("source.md").exists());
-        assert!(!dest_dir.join("dest.md").exists());
-    }
-
-    #[tokio::test]
-    async fn move_with_a_frozen_destination_directory_is_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source_dir = tmp.path().join("source-ok");
-        std::fs::create_dir_all(&source_dir).unwrap();
-        let content = "---\ntitle: T\n---\n# Body";
-        std::fs::write(source_dir.join("source.md"), content).unwrap();
-        let dest_dir = tmp.path().join("frozen-dest");
-        std::fs::create_dir_all(&dest_dir).unwrap();
-        std::fs::write(
-            dest_dir.join(crate::schema::SCHEMA_FILE_NAME),
-            "not: [valid: yaml",
-        )
-        .unwrap();
-
-        let config = crate::mcp::make_test_resolved_config(tmp.path());
-        let harness = Harness::new(&tmp, config);
-
-        let req = make_move_req(
-            "source-ok/source.md",
-            "frozen-dest/dest.md",
-            content,
-            content,
-        );
-        let err = write_document(&harness.deps(), req).await.unwrap_err();
-        assert!(matches!(err, WriteError::Frozen { .. }), "got {err:?}");
-        assert!(source_dir.join("source.md").exists());
-        assert!(!dest_dir.join("dest.md").exists());
     }
 
     #[tokio::test]
@@ -8679,7 +8753,7 @@ mod tests {
         // Post-move: rebuilding a real cache off disk must agree with what the
         // move validated against — proving the prediction was right, not merely
         // self-consistent.
-        let rebuilt = crate::schema::SchemaCache::build(
+        let rebuilt = crate::schema::SchemaCache::build_for_test(
             &work.path().canonicalize().unwrap(),
             &crate::config::FrontmatterConfig::default(),
         );
@@ -8807,6 +8881,107 @@ mod tests {
         assert_eq!(git_status(&work), "");
     }
 
+    /// #272: the shared cache keeps the last good schema while a file on disk is
+    /// invalid, so the move re-reads every schema file it would carry and refuses
+    /// on an invalid one — nothing moves. Once the file is valid on disk again the
+    /// same move goes through. A broken schema in a directory `indexing.exclude`
+    /// rules out entirely is not part of the schema tree and does not block.
+    #[tokio::test]
+    async fn move_directory_refuses_a_source_schema_file_that_is_invalid_on_disk() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let source = work.path().join("src10");
+        std::fs::create_dir_all(source.join("templates")).unwrap();
+        let schema_rel = format!("src10/{}", crate::schema::SCHEMA_FILE_NAME);
+        let valid = "fields:\n  status:\n    required: true\n";
+        std::fs::write(work.path().join(&schema_rel), valid).unwrap();
+        let ignored_rel = format!("src10/templates/{}", crate::schema::SCHEMA_FILE_NAME);
+        std::fs::write(work.path().join(&ignored_rel), "fields: [broken\n").unwrap();
+        std::fs::write(source.join("a.md"), "---\nstatus: draft\n---\n# A").unwrap();
+        git_commit_paths(
+            &work,
+            &[&schema_rel, &ignored_rel, "src10/a.md"],
+            "add src10",
+        );
+
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        {
+            let cfg = Arc::get_mut(&mut config).unwrap();
+            cfg.write.dedup_enabled = false;
+            cfg.indexing.exclude.push("**/templates/**".into());
+        }
+        // Built while the schema is valid — the last good cache from here on.
+        let harness = Harness::new(&work, config);
+
+        std::fs::write(
+            work.path().join(&schema_rel),
+            "fields: [this is not a map\n",
+        )
+        .unwrap();
+        let err = move_directory(&harness.deps(), "src10", "dest10", None)
+            .await
+            .expect_err("an invalid schema file on disk must block the move");
+        match err {
+            DirectoryMoveError::InvalidSchemaInSource { path, reason } => {
+                assert_eq!(path, schema_rel);
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected InvalidSchemaInSource, got {other:?}"),
+        }
+        assert!(source.join("a.md").exists());
+        assert!(!work.path().join("dest10").exists(), "nothing moved");
+
+        std::fs::write(work.path().join(&schema_rel), valid).unwrap();
+        let success = move_directory(&harness.deps(), "src10", "dest10", None)
+            .await
+            .unwrap();
+        assert_eq!(success.moved.len(), 3, "{:?}", success.moved);
+        assert!(work.path().join("dest10/a.md").exists());
+        assert_eq!(git_status(&work), "");
+    }
+
+    /// A widened `indexing.include` (`**/*`) admits `.kb-schema.yaml` as a path, but
+    /// the move carries it through `schema_moves` only: it is neither validated as a
+    /// document nor listed a second time.
+    #[tokio::test]
+    async fn move_directory_carries_a_schema_file_once_with_a_widened_include() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let source = work.path().join("src11");
+        std::fs::create_dir_all(&source).unwrap();
+        let schema_rel = format!("src11/{}", crate::schema::SCHEMA_FILE_NAME);
+        std::fs::write(
+            work.path().join(&schema_rel),
+            "fields:\n  status:\n    required: true\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("a.md"), "---\nstatus: draft\n---\n# A").unwrap();
+        git_commit_paths(&work, &[&schema_rel, "src11/a.md"], "add src11");
+
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
+        let mut harness = Harness::new(&work, config);
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/*").unwrap());
+        harness.include_patterns = builder.build().unwrap();
+
+        let success = move_directory(&harness.deps(), "src11", "dest11", None)
+            .await
+            .unwrap();
+        let dest_schema = format!("dest11/{}", crate::schema::SCHEMA_FILE_NAME);
+        let schema_arrivals = success
+            .moved
+            .iter()
+            .filter(|m| format!("{m:?}").contains(".kb-schema.yaml"))
+            .count();
+        assert_eq!(schema_arrivals, 1, "{:?}", success.moved);
+        assert_eq!(success.moved.len(), 2, "{:?}", success.moved);
+        assert!(work.path().join(&dest_schema).exists());
+        assert!(work.path().join("dest11/a.md").exists());
+        assert!(!source.exists(), "source is gone");
+        assert_eq!(git_status(&work), "");
+    }
+
     #[tokio::test]
     async fn move_directory_relocates_multiple_schema_files_at_different_depths() {
         let bare = crate::git::tests::create_bare_repo("master");
@@ -8867,7 +9042,7 @@ mod tests {
         assert!(work.path().join("dest9/mid/deep/doc.md").exists());
         assert_eq!(git_status(&work), "");
 
-        let rebuilt = crate::schema::SchemaCache::build(
+        let rebuilt = crate::schema::SchemaCache::build_for_test(
             &work.path().canonicalize().unwrap(),
             &crate::config::FrontmatterConfig::default(),
         );
@@ -8928,8 +9103,12 @@ mod tests {
             .unwrap();
         assert_eq!(success.moved.len(), 2);
         assert_eq!(git_status(&work), "");
+        assert!(
+            harness.reindex_queue.snapshot().full_pending,
+            "a moved schema file queues a full reconcile, which rebuilds the shared cache"
+        );
 
-        let rebuilt = crate::schema::SchemaCache::build(
+        let rebuilt = crate::schema::SchemaCache::build_for_test(
             &work.path().canonicalize().unwrap(),
             &crate::config::FrontmatterConfig::default(),
         );
@@ -8939,38 +9118,6 @@ mod tests {
             Some(vec!["dest_tag".to_string(), "own_tag".to_string()]),
             "the splice must resolve against the DESTINATION parent's set"
         );
-    }
-
-    #[tokio::test]
-    async fn move_directory_with_an_unparseable_schema_file_in_source_is_blocked() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source_dir = tmp.path().join("src11/sub");
-        std::fs::create_dir_all(&source_dir).unwrap();
-        std::fs::write(source_dir.join("a.md"), "---\ntitle: A\n---\n# A").unwrap();
-        std::fs::write(
-            source_dir.join(crate::schema::SCHEMA_FILE_NAME),
-            "fields:\n  tags:\n    values: [$oops]\n",
-        )
-        .unwrap();
-
-        let config = crate::mcp::make_test_resolved_config(tmp.path());
-        let harness = Harness::new(&tmp, config);
-
-        let err = move_directory(&harness.deps(), "src11", "dest11", None)
-            .await
-            .unwrap_err();
-        match err {
-            DirectoryMoveError::BrokenSchemaInSource { path, reason } => {
-                assert_eq!(
-                    path,
-                    format!("src11/sub/{}", crate::schema::SCHEMA_FILE_NAME)
-                );
-                assert!(!reason.is_empty());
-            }
-            other => panic!("expected BrokenSchemaInSource, got {other:?}"),
-        }
-        assert!(source_dir.join("a.md").exists());
-        assert!(!tmp.path().join("dest11").exists());
     }
 
     #[tokio::test]
