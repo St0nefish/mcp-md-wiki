@@ -615,9 +615,8 @@ write:
 # ----------------------------------------------------------------------------
 # rate_limit — per-IP rate limiting for all HTTP endpoints
 # ----------------------------------------------------------------------------
-# Uses the Governor algorithm (token bucket) with per-IP tracking. Behind a
-# reverse proxy, the real client IP is extracted from X-Forwarded-For,
-# X-Real-IP, or Forwarded headers (falling back to peer IP).
+# Uses the Governor algorithm (token bucket) with per-client tracking. Which
+# address identifies a client is set by client_ip_source below.
 #
 # Responses include standard rate limit headers:
 #   x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-after, retry-after
@@ -644,6 +643,25 @@ rate_limit:
   # kicks in. After the burst is exhausted, requests are limited to the
   # requests_per_second rate.
   burst_size: 50
+
+  # Which address keys a client's bucket. A forwarding header is only as trustworthy
+  # as the hop that wrote it — most proxies append to X-Forwarded-For rather than
+  # replace it, so its leftmost entry is whatever the caller sent, and trusting it
+  # lets a caller mint a fresh bucket per request. This key never reads that entry.
+  #
+  #   peer                       The socket peer address; headers ignored. Safe
+  #                              anywhere, but behind a reverse proxy every caller
+  #                              shares the proxy's single bucket.
+  #   cf_connecting_ip           CF-Connecting-IP, else the peer. Only safe when
+  #                              Cloudflare is the outermost hop (it overwrites the
+  #                              header); anywhere else a caller can set it.
+  #   x_forwarded_for_rightmost  The rightmost X-Forwarded-For entry, else the peer:
+  #                              the address the last proxy saw. That is the client
+  #                              only when exactly one proxy sits in front; with a
+  #                              chain it is the previous hop.
+  #
+  # Default: peer.
+  client_ip_source: peer
 
 
 # ----------------------------------------------------------------------------

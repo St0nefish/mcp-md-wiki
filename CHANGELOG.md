@@ -49,6 +49,20 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   removed. Previously one declaration was silently dropped. A schema already damaged by the
   old bug will show up this way.
 
+### Security
+
+- **The rate limiter no longer trusts a caller-supplied `X-Forwarded-For`** (fix #275).
+  It keyed on the *leftmost* forwarded address, which each proxy hop preserves, so a caller
+  could rotate the header for a fresh bucket per request (no volumetric protection in front
+  of the bearer compare, JWT verification and JWKS refetch) or forge a victim's address to
+  drain theirs. The new `rate_limit.client_ip_source` picks the key: `peer` (the default,
+  headers ignored), `cf_connecting_ip` (`CF-Connecting-IP`, for a Cloudflare-fronted
+  deployment) or `x_forwarded_for_rightmost`; each falls back to the socket peer.
+  **Upgrade note:** the default changed from forwarded-header keying to `peer`, so behind a
+  reverse proxy all callers now share one bucket until you set `cf_connecting_ip` or
+  `x_forwarded_for_rightmost`. `X-Real-IP` and `Forwarded` are no longer read. Restart
+  required; no reindex.
+
 ## [0.1.2] - 2026-10-05
 
 ### Deployment
