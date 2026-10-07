@@ -4,12 +4,12 @@ use anyhow::{Context, Result};
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     Condition, CountPointsBuilder, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
-    DeletePointsBuilder, Distance, FacetCountsBuilder, FacetHit, FieldCondition, FieldType, Filter,
-    Fusion, Match, Modifier, NamedVectors, PointStruct, PrefetchQuery, PrefetchQueryBuilder, Query,
-    QueryPointGroupsBuilder, QueryPointsBuilder, Range, SearchPointsBuilder,
-    SparseVectorParamsBuilder, SparseVectorsConfigBuilder, TextIndexParamsBuilder, TokenizerType,
-    UpsertPointsBuilder, Value as QdrantValue, Vector, VectorInput, VectorParamsBuilder,
-    VectorsConfigBuilder, facet_value, value::Kind, vectors_config::Config as VectorsConfigOneof,
+    DeletePointsBuilder, Distance, FieldCondition, FieldType, Filter, Fusion, Match, Modifier,
+    NamedVectors, PointStruct, PrefetchQuery, PrefetchQueryBuilder, Query, QueryPointGroupsBuilder,
+    QueryPointsBuilder, Range, SearchPointsBuilder, SparseVectorParamsBuilder,
+    SparseVectorsConfigBuilder, TextIndexParamsBuilder, TokenizerType, UpsertPointsBuilder,
+    Value as QdrantValue, Vector, VectorInput, VectorParamsBuilder, VectorsConfigBuilder,
+    value::Kind, vectors_config::Config as VectorsConfigOneof,
 };
 use tracing::{debug, error, info, warn};
 
@@ -208,7 +208,7 @@ impl IndexedField {
 }
 
 /// The full set of payload fields Qdrant actually has an index for: the union of
-/// [`crate::schema::SchemaCache::all_indexed_fields`] (per-scope `.kb-schema.yaml`
+/// [`crate::schema::SchemaCache::all_indexed_fields`] (per-scope schema file
 /// declarations) and `config.effective_indexed_fields()` (the legacy
 /// `frontmatter.indexed_fields` list, which also always contributes `file_path`).
 ///
@@ -251,6 +251,33 @@ pub fn all_indexed_fields(
 /// writer actually writes. Route every writer and reader through this constant
 /// so that class of drift can't happen again.
 pub const CHUNK_TEXT_KEY: &str = "text";
+
+/// The Qdrant payload key holding the byte offset in [`CHUNK_TEXT_KEY`] where
+/// the chunk's own body starts, past the breadcrumb/description prefix the
+/// chunker adds for embedding (`chunk::Chunk::body_offset`). Read only through
+/// [`chunk_body_text`].
+pub const CHUNK_BODY_OFFSET_KEY: &str = "text_body_offset";
+
+/// A chunk's text as a search snippet shows it: [`CHUNK_TEXT_KEY`] without the
+/// breadcrumb/description prefix, which repeats per chunk and would otherwise
+/// fill much of a short snippet. A payload written before the offset existed
+/// falls back to dropping a leading `description` paragraph when the payload
+/// carries one, else returns the text as stored.
+pub fn chunk_body_text(payload: &std::collections::HashMap<String, serde_json::Value>) -> &str {
+    let text = payload
+        .get(CHUNK_TEXT_KEY)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if let Some(offset) = payload.get(CHUNK_BODY_OFFSET_KEY).and_then(|v| v.as_u64()) {
+        return text.get(offset as usize..).unwrap_or(text);
+    }
+    payload
+        .get("description")
+        .and_then(|v| v.as_str())
+        .and_then(|d| text.strip_prefix(d))
+        .and_then(|rest| rest.strip_prefix("\n\n"))
+        .unwrap_or(text)
+}
 
 /// The Qdrant payload key under which a document's ancestor-directory keyword
 /// array is stored (#130) — for `sysadmin/nodes/ares/boot/efi.md`:
@@ -610,7 +637,8 @@ pub fn lower_field_filters(
                     return Err(format!(
                         "filter '{field}': a numeric range (gte/lte/gt/lt) was requested but \
                          the field is indexed as {kind:?}; declare it `type: integer` or \
-                         `type: number` in the governing .kb-schema.yaml to use a range filter"
+                         `type: number` in the governing directory's schema (update_schema) to use \
+                         a range filter"
                     ));
                 }
                 conditions.push(Condition::from(FieldCondition {
@@ -1290,18 +1318,6 @@ impl RetrievalStore for QdrantStore {
     }
 }
 
-/// Extract string values from facet hits, skipping non-string variants.
-fn extract_facet_strings(hits: Vec<FacetHit>) -> Vec<String> {
-    hits.into_iter()
-        .filter_map(|hit| {
-            hit.value.and_then(|v| match v.variant {
-                Some(facet_value::Variant::StringValue(s)) => Some(s),
-                _ => None,
-            })
-        })
-        .collect()
-}
-
 impl QdrantStore {
     pub async fn search(
         &self,
@@ -1690,30 +1706,6 @@ impl QdrantStore {
             .await
             .context("Qdrant health check failed")?;
         Ok(())
-    }
-
-    /// Fetch distinct values for a keyword-indexed payload field via Qdrant facets.
-    ///
-    /// Returns up to `limit` unique string values. Gracefully returns an empty
-    /// vec on errors (e.g. empty collection, unindexed field).
-    pub async fn fetch_facet_values(
-        &self,
-        collection: &str,
-        field: &str,
-        limit: u64,
-    ) -> Result<Vec<String>> {
-        let builder = FacetCountsBuilder::new(collection, field).limit(limit);
-        let response = match self.client.facet(builder).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                debug!(
-                    "Facet query for field '{}' failed (may be empty collection): {e}",
-                    field
-                );
-                return Ok(vec![]);
-            }
-        };
-        Ok(extract_facet_strings(response.hits))
     }
 
     pub async fn collection_info(&self, collection: &str) -> Result<Option<u64>> {
@@ -2460,181 +2452,13 @@ mod tests {
         );
     }
 
-    fn make_string_facet_hit(value: &str, count: u64) -> FacetHit {
-        use qdrant_client::qdrant::FacetValue;
-        FacetHit {
-            value: Some(FacetValue {
-                variant: Some(facet_value::Variant::StringValue(value.to_string())),
-            }),
-            count,
-        }
-    }
-
-    #[test]
-    fn extract_facet_strings_returns_string_values() {
-        let hits = vec![
-            make_string_facet_hit("networking", 5),
-            make_string_facet_hit("docker", 3),
-            make_string_facet_hit("storage", 1),
-        ];
-        let values = extract_facet_strings(hits);
-        assert_eq!(values, vec!["networking", "docker", "storage"]);
-    }
-
-    #[test]
-    fn extract_facet_strings_skips_non_string_variants() {
-        use qdrant_client::qdrant::FacetValue;
-        let hits = vec![
-            make_string_facet_hit("valid", 2),
-            FacetHit {
-                value: Some(FacetValue {
-                    variant: Some(facet_value::Variant::IntegerValue(42)),
-                }),
-                count: 1,
-            },
-            FacetHit {
-                value: Some(FacetValue {
-                    variant: Some(facet_value::Variant::BoolValue(true)),
-                }),
-                count: 1,
-            },
-            make_string_facet_hit("also-valid", 1),
-        ];
-        let values = extract_facet_strings(hits);
-        assert_eq!(values, vec!["valid", "also-valid"]);
-    }
-
-    #[test]
-    fn extract_facet_strings_handles_empty_hits() {
-        let values = extract_facet_strings(vec![]);
-        assert!(values.is_empty());
-    }
-
-    #[test]
-    fn extract_facet_strings_skips_none_value() {
-        let hits = vec![
-            make_string_facet_hit("present", 3),
-            FacetHit {
-                value: None,
-                count: 1,
-            },
-        ];
-        let values = extract_facet_strings(hits);
-        assert_eq!(values, vec!["present"]);
-    }
-
-    #[test]
-    fn extract_facet_strings_skips_none_variant() {
-        use qdrant_client::qdrant::FacetValue;
-        let hits = vec![
-            make_string_facet_hit("present", 3),
-            FacetHit {
-                value: Some(FacetValue { variant: None }),
-                count: 1,
-            },
-        ];
-        let values = extract_facet_strings(hits);
-        assert_eq!(values, vec!["present"]);
-    }
-
-    /// Integration test: upsert points with keyword fields, then fetch facet values.
-    ///
-    /// Stays live-only for the part that matters here: that Qdrant's facet
-    /// aggregation actually groups by distinct field value and that
-    /// `extract_facet_strings` (tested standalone above) is fed real `FacetHit`s
-    /// shaped the way the server actually returns them. The *other* half of what
-    /// this test used to check — that a failed facet query degrades to an empty
-    /// list instead of an error — needs no live server at all and is now covered
-    /// offline by `fetch_facet_values_degrades_to_empty_on_query_failure` below, so
-    /// it is no longer duplicated here.
-    ///
-    /// Requires a running Qdrant instance at localhost:6334.
-    /// Run with: cargo test facet_values_returns_distinct_strings -- --ignored
-    #[tokio::test]
-    #[ignore]
-    async fn facet_values_returns_distinct_strings() {
-        let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
-            collection: live_test_collection("facet_values_returns_distinct_strings"),
-        };
-        let store = QdrantStore::new(&config).unwrap();
-
-        let _ = store.client.delete_collection(&config.collection).await;
-
-        store
-            .ensure_collection(
-                &config.collection,
-                4,
-                &[IndexedField::keyword("domain")],
-                IndexFeatures::default(),
-            )
-            .await
-            .unwrap();
-
-        with_collection_cleanup(&store, &config.collection, || async {
-            let make_point = |id: &str, domain: &str, vec: Vec<f32>| {
-                let mut payload = HashMap::new();
-                payload.insert("domain".into(), serde_json::json!(domain));
-                QdrantPoint {
-                    id: id.into(),
-                    vector: vec,
-                    sparse: None,
-                    payload,
-                }
-            };
-
-            let points = vec![
-                make_point(
-                    "00000000-0000-0000-0000-000000000001",
-                    "networking",
-                    vec![1.0, 0.0, 0.0, 0.0],
-                ),
-                make_point(
-                    "00000000-0000-0000-0000-000000000002",
-                    "docker",
-                    vec![0.0, 1.0, 0.0, 0.0],
-                ),
-                make_point(
-                    "00000000-0000-0000-0000-000000000003",
-                    "networking",
-                    vec![0.0, 0.0, 1.0, 0.0],
-                ),
-            ];
-            store
-                .upsert_points(&config.collection, points)
-                .await
-                .unwrap();
-
-            // Poll instead of a single fixed sleep -- see retry_until's doc
-            // comment for why (#231).
-            let values = retry_until(
-                20,
-                std::time::Duration::from_millis(250),
-                || async {
-                    store
-                        .fetch_facet_values(&config.collection, "domain", 10)
-                        .await
-                        .unwrap()
-                },
-                |values| values.len() >= 2,
-            )
-            .await;
-
-            assert_eq!(values.len(), 2, "should have 2 distinct domains");
-            assert!(values.contains(&"networking".to_string()));
-            assert!(values.contains(&"docker".to_string()));
-        })
-        .await;
-    }
-
     /// Integration test (#286): upsert points carrying `section_key`, then
     /// confirm `search_grouped(group_by: SECTION_KEY)` collapses multiple chunk
     /// hits within the same section down to that section's single best-scoring
     /// hit — the mechanism `retrieval::search_sections` depends on Qdrant's
     /// server-side grouping to provide.
     ///
-    /// Stays live-only for the same reason `facet_values_returns_distinct_strings`
-    /// does just above: the thing under test is Qdrant's own server-side
+    /// Stays live-only: the thing under test is Qdrant's own server-side
     /// `group_by` collapsing behavior, which no fake `RetrievalStore` can stand
     /// in for without just re-asserting the grouping logic.
     ///
@@ -2751,33 +2575,6 @@ mod tests {
             );
         })
         .await;
-    }
-
-    /// `fetch_facet_values` treats ANY facet-query failure as "no values" rather
-    /// than propagating the error (see the `Err(e) => { ...; return Ok(vec![]) }`
-    /// arm above) — not just an unindexed/nonexistent field on an otherwise healthy
-    /// collection, which is all a live server can exercise. Pointing at an
-    /// unreachable Qdrant instead proves the degradation covers the failure mode
-    /// that matters most in production: a facet lookup (e.g. for `/status` or a
-    /// `list_documents` filter hint) landing during a brief Qdrant outage must not
-    /// itself become a hard error.
-    #[tokio::test]
-    async fn fetch_facet_values_degrades_to_empty_on_query_failure() {
-        let config = ResolvedQdrantConfig {
-            url: "http://127.0.0.1:1".into(),
-            collection: "unused".into(),
-        };
-        let store = QdrantStore::new(&config).unwrap();
-
-        let result = store
-            .fetch_facet_values(&config.collection, "domain", 10)
-            .await;
-
-        assert_eq!(
-            result.unwrap(),
-            Vec::<String>::new(),
-            "a facet query that can't reach Qdrant must degrade to empty, not error"
-        );
     }
 
     #[test]

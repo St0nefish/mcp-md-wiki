@@ -44,7 +44,7 @@ A complete sample file is available at [`docs/sample-document.md`](../docs/sampl
 | `domain` | **Not a frontmatter field.** Derived automatically from the document's top-level folder — see below. Still filterable in MCP search |
 | `tags` | List of tags; filterable in MCP search (match-any) |
 
-**`domain` is derived, not authored.** `domain` is computed from the document's top-level folder name (e.g. a file at `infrastructure/docker-compose.md` gets `domain: infrastructure`) and written into both the Qdrant payload and the SQLite metadata index — it is *not* read from a `domain:` key in frontmatter. If you write one anyway, it's overwritten on the next index run and the server logs a warning when the two disagree. Documents sitting directly at the knowledge-base root (no top-level folder) have no domain at all. This only changes where the value comes from: `search(filters={"domain": ...})` — whether ranking or enumerating — and the CLI's `--domain` flag all still work exactly as before.
+**`domain` is derived, not authored.** `domain` is computed from the document's top-level folder name (e.g. a file at `infrastructure/docker-compose.md` gets `domain: infrastructure`) and written into both the Qdrant payload and the SQLite metadata index — it is *not* read from a `domain:` key in frontmatter. If a document carries one anyway, it's overwritten on the next index run and the server logs a warning when the two disagree. Documents sitting directly at the knowledge-base root (no top-level folder) have no domain at all. This only changes where the value comes from: `search(filters={"domain": ...})` — whether ranking or enumerating — and the CLI's `--domain` flag all still work exactly as before. A write whose frontmatter carries `domain` is refused (`rule: "derived"`), while indexing and `validate` still accept existing documents that have one; a schema rule that makes `domain` `required`, or gives it a `default`, is ignored, so it is never demanded of an author nor filled in.
 
 You can add any other fields you like. Only fields listed in `frontmatter.indexed_fields` are stored as Qdrant payload for filtering by `search`. All frontmatter fields, however, are stored (as JSON, and projected into a filterable dot-path index) in the state DB, so any field — indexed or not — can be filtered, ranged, and sorted on via `search`'s enumeration mode (omit `query`).
 
@@ -62,7 +62,7 @@ Documents are split into chunks before embedding. The chunker is **section-aware
 
 4. **Force-split oversized sections** — If a single section exceeds `max_chunk_size` (default: 1500 characters), it is split further by a secondary markdown-aware text splitter. Small fragments (under 200 characters, e.g. a lone heading) are merged into adjacent chunks to avoid orphaned headings (with `chunking.heading_metadata` on, only into chunks of the same section).
 
-5. **Prepend description** — If `chunking.prepend_description` is enabled (default: `true`) and the document has a `description` frontmatter field, that description is prepended to every chunk. This gives the embedding model context about what the chunk relates to.
+5. **Prepend description** — If `chunking.prepend_description` is enabled (default: `true`) and the document has a `description` frontmatter field, that description is prepended to every chunk. This gives the embedding model context about what the chunk relates to. The prefix (and the heading breadcrumb `chunking.prepend_heading_path` adds) is for the embedding only: search snippets start at the chunk's own text.
 
 ### Example
 
@@ -89,7 +89,7 @@ chunking:
 
 Configure which frontmatter fields are required, which are indexed for filtering, and what defaults to apply.
 
-**This whole section describes the deprecated way to do it.** The `frontmatter` block below lives in `config.yaml`, which is deployment config on the container host — not part of the knowledge base's own git repo. Prefer a root `.kb-schema.yaml` (see [Directory Schemas](#directory-schemas-kb-schemayaml) below): it's the same mechanism every subdirectory already uses, it travels with the KB wherever it's cloned or served, and it's the one level `update_schema` can actually edit for you. `config.yaml`'s `frontmatter` block still works — it's consulted only when the knowledge base has no root `.kb-schema.yaml` at all — but every build logs a warning while it's in use, and once you add a root `.kb-schema.yaml`, this block stops applying (see [Backward compatibility and upgrade note](#backward-compatibility-and-upgrade-note)).
+**This whole section describes the deprecated way to do it.** The `frontmatter` block below lives in `config.yaml`, which is deployment config on the container host — not part of the knowledge base's own git repo. Prefer a root `.schema.yaml` (see [Directory Schemas](#directory-schemas-schemayaml) below): it's the same mechanism every subdirectory already uses, it travels with the KB wherever it's cloned or served, and it's the one level `update_schema` can actually edit for you. `config.yaml`'s `frontmatter` block still works — it's consulted only when the knowledge base has no root `.schema.yaml` at all — but every build logs a warning while it's in use, and once you add a root `.schema.yaml`, this block stops applying (see [Backward compatibility and upgrade note](#backward-compatibility-and-upgrade-note)).
 
 ### Sample Config
 
@@ -117,7 +117,8 @@ frontmatter:
   # allowed values; a present field whose value isn't in the list fails
   # validation. Absent fields are governed by `required`, not here. Leave a
   # field out of this map to keep it open-ended (e.g. tags). `domain` isn't
-  # author-set at all — it's derived from the folder — so it never belongs here.
+  # author-set at all — it's derived from the folder — so it never belongs here
+  # (nor in `required` or `defaults`, which are ignored for it).
   allowed:
     type: [guide, reference, research, config, troubleshooting, architecture, project, decision-record, migration]
     status: [active, draft, archived]
@@ -135,13 +136,13 @@ validation:
 
 With `validation.enabled: false`, frontmatter is still parsed — just not checked against `required`/`allowed`/lint rules — so Qdrant and the state DB's metadata index still reflect each file's actual frontmatter, rather than treating unvalidated files as fieldless.
 
-`frontmatter.allowed` is enforced by both `mcp-md-wiki validate` and the MCP write tools. When a write tool rejects a document, it returns a structured error (`field_errors`) naming the offending field, the rule it broke (`required` / `allowed_value` / `lint` / `type_mismatch` / `closed_object`), and — for closed-set fields — the value it `got` versus the values it `expected`, so an agent can fix and retry without guessing.
+`frontmatter.allowed` is enforced by both `mcp-md-wiki validate` and the MCP write tools. When a write tool rejects a document, it returns a structured error (`field_errors`) naming the offending field, the rule it broke (`required` / `allowed_value` / `lint` / `type_mismatch` / `closed_object`, or `derived` for an authored `domain`), and — for closed-set fields — the value it `got` versus the values it `expected`, so an agent can fix and retry without guessing.
 
 Run `mcp-md-wiki validate` to check all files without indexing — useful for CI or pre-commit hooks.
 
-## Directory Schemas (`.kb-schema.yaml`)
+## Directory Schemas (`.schema.yaml`)
 
-The `frontmatter` block above is the deprecated, single, global rule set. `.kb-schema.yaml` is the non-deprecated replacement, and it isn't limited to subdirectories — a `.kb-schema.yaml` at the knowledge-base root replaces `frontmatter` entirely (see [Root schema](#root-schema-kb-schemayaml-at-the-kb-root) below). For a knowledge base where different folders need different fields — recipes need `planning.prep_minutes`, runbooks need `severity` — drop a `.kb-schema.yaml` file into a directory. It governs that directory and everything beneath it, cascading like `CLAUDE.md`.
+The `frontmatter` block above is the deprecated, single, global rule set. `.schema.yaml` is the non-deprecated replacement, and it isn't limited to subdirectories — a `.schema.yaml` at the knowledge-base root replaces `frontmatter` entirely (see [Root schema](#root-schema-schemayaml-at-the-kb-root) below). For a knowledge base where different folders need different fields — recipes need `planning.prep_minutes`, runbooks need `severity` — drop a `.schema.yaml` file into a directory. It governs that directory and everything beneath it, cascading like `CLAUDE.md`.
 
 ### Authoring
 
@@ -162,24 +163,26 @@ Nested authoring (as above) and flat dot-paths (`planning.prep_minutes:`) are eq
 
 **Types:** `text`, `integer`, `number`, `boolean`, `enum`, `list`, `date` (`YYYY-MM-DD`), `timestamp` (RFC 3339), `object`. Types are strictly enforced with no coercion (`prep_minutes: "45"` fails against `type: integer`). Undeclared fields are never type-checked and remain legal.
 
-A field definition can't declare both a scalar `type` and nested `fields:` — a field is either a value or a container, not both. `type: object` is the exception, since `object` inherently means "has nested fields." `update_schema` rejects this the same way a hand-edited `.kb-schema.yaml` does.
+A field definition can't declare both a scalar `type` and nested `fields:` — a field is either a value or a container, not both. `type: object` is the exception, since `object` inherently means "has nested fields." `update_schema` rejects this the same way a hand-edited `.schema.yaml` does.
 
 Declaring the same path twice in one file — once under a nested `fields:` and once as a flat dot-path key (`planning.method:` next to `planning: {fields: {method: ...}}`) — makes the file invalid (see [Invalid schema files](#invalid-schema-files)), because the two spellings are the same field and only one could win. `update_schema` addresses a nested field by its dot-path and edits it where it lives, nested or flat; `add_values`/`set_field` on a path whose parents don't exist yet create those parents as `type: object` fields.
 
-**`values:` without a `type:` is enforced leniently.** A field declaring `values:` *and* `type: enum` is checked strictly — any value outside the list fails, whatever its YAML type. A field declaring `values:` with **no** `type:` exempts non-string values from the check, so `status: 3` passes a `values: [active, draft]` list that `status: "retired"` would fail. That is deliberate: it preserves the behaviour of the pre-cascade global `frontmatter.allowed` map so existing deployments don't start failing, and it applies to any field authored that way — including in a `.kb-schema.yaml`, not just the legacy `config.yaml` block. If you want a closed set actually enforced, declare `type: enum`.
+**`values:` without a `type:` is enforced leniently.** A field declaring `values:` *and* `type: enum` is checked strictly — any value outside the list fails, whatever its YAML type. A field declaring `values:` with **no** `type:` exempts non-string values from the check, so `status: 3` passes a `values: [active, draft]` list that `status: "retired"` would fail. That is deliberate: it preserves the behaviour of the pre-cascade global `frontmatter.allowed` map so existing deployments don't start failing, and it applies to any field authored that way — including in a `.schema.yaml`, not just the legacy `config.yaml` block. If you want a closed set actually enforced, declare `type: enum`.
 
-`.kb-schema.yaml` files themselves are not indexed as documents, and the document tools (`write_document`, `delete_document`, the web UI editor) refuse to write, move or delete one — edit them with `update_schema`, or in the knowledge base's git repository.
+`.schema.yaml` files themselves are not indexed as documents, and the document tools (`write_document`, `delete_document`, the web UI editor) refuse to write, move or delete one — edit them with `update_schema`, or in the knowledge base's git repository.
+
+**Legacy file name.** Schema files used to be named `.kb-schema.yaml`. That name is still read everywhere `.schema.yaml` is, so an existing knowledge base keeps working with no change. The next `update_schema` in a directory still on the old name writes `.schema.yaml` and removes `.kb-schema.yaml` in the same commit, so knowledge bases migrate one directory at a time as they are edited (or all at once, by renaming the files in git yourself). A directory holding **both** names is an invalid schema file — the server never picks one — until they are merged into `.schema.yaml`. A directory move carries whichever name it finds.
 
 ### Cascade and merge rules
 
 - The **set** of fields unions across levels.
 - **Merging is per attribute, not per field.** A field redefined at a deeper level overrides only the attributes it explicitly writes (`type`, `required`, `indexed`, `default`, `open`, `values`) — every attribute it leaves unwritten still inherits from the nearest ancestor that declared this same field. A `recipes/` scope that writes only `values: [recipe]` for `type` does not reset that field's `required`/`indexed`/`default` to nothing; it only changes `values`. This is deliberate: the previous rule (a redefinition replacing the whole definition wholesale) meant a deeper scope narrowing one attribute silently discarded every other attribute the root had set for that field, with nothing reported — a real footgun for a field like `tags` that nearly every domain redeclares just to set its own `values`.
 - **`values` is the one attribute with an in-band way to request a merge instead of a plain override**, via a `$values` placeholder inside the list — see below. Every other attribute either inherits wholesale (unwritten) or overrides wholesale (written); there is no partial merge for them.
-- Top-level folder names are the KB's areas (this is also what `domain` is derived from — see [Sample Document](#sample-document) above); the MCP server's dynamic instructions list them from a directory read, in addition to any `Available domain: ...` facet it advertises when `domain` is indexed at the root — either via `frontmatter.indexed_fields` (deprecated fallback) or an `indexed: true` entry for `domain` in a root `.kb-schema.yaml`. `domain` isn't author-written frontmatter (see the note above), so if you migrate off `config.yaml`, remember to declare it explicitly — it does not carry over automatically.
+- Top-level folder names are the KB's areas (this is also what `domain` is derived from — see [Sample Document](#sample-document) above); the MCP server's dynamic instructions list them from a directory read. Filtering on `domain` with a query needs it indexed — either via `frontmatter.indexed_fields` (deprecated fallback) or an `indexed: true` entry for `domain` in a root `.schema.yaml`. `domain` isn't author-written frontmatter (see the note above), so if you migrate off `config.yaml`, remember to declare it explicitly — it does not carry over automatically.
 
 #### Per-directory near-duplicate override (`dedup:`)
 
-Alongside `fields:`, a `.kb-schema.yaml` may set a `dedup:` block that overrides the global `write.dedup_enabled` / `write.dedup_threshold` for that directory and everything beneath it. This is for structurally templated folders (`food/plans/`, `food/recipes/`) whose documents are legitimately near-identical and would otherwise trip the [near-duplicate check](#the-tools) on every create:
+Alongside `fields:`, a `.schema.yaml` may set a `dedup:` block that overrides the global `write.dedup_enabled` / `write.dedup_threshold` for that directory and everything beneath it. This is for structurally templated folders (`food/plans/`, `food/recipes/`) whose documents are legitimately near-identical and would otherwise trip the [near-duplicate check](#the-tools) on every create:
 
 ```yaml
 dedup:
@@ -214,7 +217,7 @@ values: [one, two]             # replace outright
 
 The rules above are easiest to check against a real, end-to-end example. Take a knowledge base with a root schema, a `food/` schema that both adds a field and extends an inherited value list, and a `food/recipes/` schema that narrows one field's `values` without touching its other attributes.
 
-**Root `.kb-schema.yaml`** (at the knowledge-base root):
+**Root `.schema.yaml`** (at the knowledge-base root):
 
 ```yaml
 fields:
@@ -225,7 +228,7 @@ fields:
   tags:        { type: list, indexed: true, values: [reference, howto] }
 ```
 
-Resolved at the KB root — every field's `declared_in` is this file, since nothing has been inherited yet:
+Resolved at the KB root — every field's `declared_in` is `/` (the root), since nothing has been inherited yet:
 
 | Field | Type | Required | Indexed | Values | Default |
 |---|---|---|---|---|---|
@@ -235,7 +238,7 @@ Resolved at the KB root — every field's `declared_in` is this file, since noth
 | `status` | enum | false | true | `draft, active, archived` | `active` |
 | `tags` | list | false | true | `reference, howto` | — |
 
-**`food/.kb-schema.yaml`** — adds a new field (`cuisine`) and extends the inherited `tags` vocabulary rather than replacing it:
+**`food/.schema.yaml`** — adds a new field (`cuisine`) and extends the inherited `tags` vocabulary rather than replacing it:
 
 ```yaml
 fields:
@@ -247,16 +250,16 @@ Resolved for anything under `food/` (merged onto the root's resolved schema abov
 
 | Field | Type | Required | Indexed | Values | Default | Declared in |
 |---|---|---|---|---|---|---|
-| `title` | text | true | false | — | — | `.kb-schema.yaml` (root) |
-| `description` | text | true | false | — | — | `.kb-schema.yaml` (root) |
-| `type` | enum | true | true | `guide, reference, howto, recipe` | — | `.kb-schema.yaml` (root) |
-| `status` | enum | false | true | `draft, active, archived` | `active` | `.kb-schema.yaml` (root) |
-| `tags` | list | false | true | `reference, howto, dinner, quick` | — | `food/.kb-schema.yaml` |
-| `cuisine` | text | false | true | — | — | `food/.kb-schema.yaml` |
+| `title` | text | true | false | — | — | `/` (root) |
+| `description` | text | true | false | — | — | `/` (root) |
+| `type` | enum | true | true | `guide, reference, howto, recipe` | — | `/` (root) |
+| `status` | enum | false | true | `draft, active, archived` | `active` | `/` (root) |
+| `tags` | list | false | true | `reference, howto, dinner, quick` | — | `food/` |
+| `cuisine` | text | false | true | — | — | `food/` |
 
-`tags`' merged `values` list is `reference, howto, dinner, quick` — the inherited pair first (the position `$values` sits at in the list), then the two new literals, deduplicated. `type`/`status`/`title`/`description` pass through unchanged because `food/.kb-schema.yaml` never mentions them at all: per-attribute inheritance means a scope that redeclares one field has no effect on every *other* field.
+`tags`' merged `values` list is `reference, howto, dinner, quick` — the inherited pair first (the position `$values` sits at in the list), then the two new literals, deduplicated. `type`/`status`/`title`/`description` pass through unchanged because `food/.schema.yaml` never mentions them at all: per-attribute inheritance means a scope that redeclares one field has no effect on every *other* field.
 
-**`food/recipes/.kb-schema.yaml`** — redefines `type`'s `values` wholesale (no `$values`, so this **replaces** rather than extends) and declares a nested `planning` object, reusing the [Authoring](#authoring) example above:
+**`food/recipes/.schema.yaml`** — redefines `type`'s `values` wholesale (no `$values`, so this **replaces** rather than extends) and declares a nested `planning` object, reusing the [Authoring](#authoring) example above:
 
 ```yaml
 fields:
@@ -273,49 +276,42 @@ Resolved for anything under `food/recipes/` — the final, fully-merged schema a
 
 | Field | Type | Required | Indexed | Values | Default | Declared in |
 |---|---|---|---|---|---|---|
-| `title` | text | true | false | — | — | `.kb-schema.yaml` (root) |
-| `description` | text | true | false | — | — | `.kb-schema.yaml` (root) |
-| `type` | enum | **true** | **true** | **`recipe`** | — | `food/recipes/.kb-schema.yaml` |
-| `status` | enum | false | true | `draft, active, archived` | `active` | `.kb-schema.yaml` (root) |
-| `tags` | list | false | true | `reference, howto, dinner, quick` | — | `food/.kb-schema.yaml` |
-| `cuisine` | text | false | true | — | — | `food/.kb-schema.yaml` |
-| `planning` | object | false | false | — | — | `food/recipes/.kb-schema.yaml` |
-| `planning.prep_minutes` | integer | false | true | — | — | `food/recipes/.kb-schema.yaml` |
-| `planning.effort` | enum | false | true | `low, medium, high` | — | `food/recipes/.kb-schema.yaml` |
+| `title` | text | true | false | — | — | `/` (root) |
+| `description` | text | true | false | — | — | `/` (root) |
+| `type` | enum | **true** | **true** | **`recipe`** | — | `food/recipes/` |
+| `status` | enum | false | true | `draft, active, archived` | `active` | `/` (root) |
+| `tags` | list | false | true | `reference, howto, dinner, quick` | — | `food/` |
+| `cuisine` | text | false | true | — | — | `food/` |
+| `planning` | object | false | false | — | — | `food/recipes/` |
+| `planning.prep_minutes` | integer | false | true | — | — | `food/recipes/` |
+| `planning.effort` | enum | false | true | `low, medium, high` | — | `food/recipes/` |
 
-`type` is the wholesale-redefinition case the per-attribute merge rule exists for: `food/recipes/.kb-schema.yaml` writes *only* `values: [recipe]` — no `type:`, `required:`, or `indexed:` — and the resolved field still comes out `required: true, indexed: true`, inherited from the root's original declaration. Under the old whole-definition-replacement rule this narrowing would have silently reset `required`/`indexed` to their defaults (`false`); per-attribute merging is precisely what makes narrowing one attribute safe without restating every other one. `declared_in` still moves to `food/recipes/.kb-schema.yaml`, though, because that file is the one that most recently *mentioned* `type` — provenance tracks the nearest scope that touched a field, not which attributes it actually changed.
+`type` is the wholesale-redefinition case the per-attribute merge rule exists for: `food/recipes/.schema.yaml` writes *only* `values: [recipe]` — no `type:`, `required:`, or `indexed:` — and the resolved field still comes out `required: true, indexed: true`, inherited from the root's original declaration. Under the old whole-definition-replacement rule this narrowing would have silently reset `required`/`indexed` to their defaults (`false`); per-attribute merging is precisely what makes narrowing one attribute safe without restating every other one. `declared_in` still moves to `food/recipes/`, though, because that scope's schema is the one that most recently *mentioned* `type` — provenance tracks the nearest scope that touched a field, not which attributes it actually changed.
 
-Calling `get_schema` for a document in that directory (e.g. `food/recipes/lasagna.md`) returns exactly this merged view, with provenance per field — trimmed to two fields below for brevity, `fields` in the real response has one entry per row of the table above:
+Calling `get_schema` for a document in that directory (e.g. `food/recipes/lasagna.md`) returns exactly this merged view, with provenance per field. `fields` is an object keyed by dot-path with one entry per row of the table above (two are shown below), and an entry carries only what constrains a document: `type` and `values` when set, `required` and `indexed` when `true`, `default` when there is one, `open` only as `false` on an object that refuses undeclared keys, and `declared_in`:
 
 ```json
 {
   "path": "food/recipes/lasagna.md",
-  "fields": [
-    {
-      "field": "type",
+  "fields": {
+    "type": {
       "type": "enum",
       "required": true,
       "indexed": true,
       "values": ["recipe"],
-      "default": null,
-      "open": true,
-      "declared_in": "food/recipes/.kb-schema.yaml"
+      "declared_in": "food/recipes/"
     },
-    {
-      "field": "tags",
+    "tags": {
       "type": "list",
-      "required": false,
       "indexed": true,
       "values": ["reference", "howto", "dinner", "quick"],
-      "default": null,
-      "open": true,
-      "declared_in": "food/.kb-schema.yaml"
+      "declared_in": "food/"
     }
-  ]
+  }
 }
 ```
 
-**The deprecated equivalent.** `food/.kb-schema.yaml`'s `tags` redefinition above could also have been written with the deprecated `extend: true` flag instead of an explicit `$values` sentinel, with an identical result:
+**The deprecated equivalent.** `food/.schema.yaml`'s `tags` redefinition above could also have been written with the deprecated `extend: true` flag instead of an explicit `$values` sentinel, with an identical result:
 
 ```yaml
 tags:
@@ -327,25 +323,25 @@ tags:
 
 ### Invalid schema files
 
-Every `.kb-schema.yaml` in the indexed tree that is present must be valid — a root one is optional. Hidden directories, and directories whose every document `indexing.exclude` rules out (for example `templates/**`), are not part of the schema tree: a schema file there is never read or validated, and changing it triggers nothing. A file is invalid when it can't be read, is larger than 256 KB (refused on its file size alone, never read or parsed), doesn't parse (unknown key, wrong type, a bad `dedup:` block), or contradicts itself. An invalid file is never loaded; it never silently falls back to the parent's rules, and there is no partial schema with one subtree switched off.
+Every `.schema.yaml` in the indexed tree that is present must be valid — a root one is optional. Hidden directories, and directories whose every document `indexing.exclude` rules out (for example `templates/**`), are not part of the schema tree: a schema file there is never read or validated, and changing it triggers nothing (a directory move that would bring one into the schema tree checks it first, below). A file is invalid when it can't be read, is larger than 256 KB (refused on its file size alone, never read or parsed), doesn't parse (unknown key, wrong type, a bad `dedup:` block), or contradicts itself. An invalid file is never loaded; it never silently falls back to the parent's rules, and there is no partial schema with one subtree switched off.
 
 - **Startup:** the server refuses to start, with an error listing every invalid file and why. `mcp-md-wiki index` (incremental or `--full`) aborts the same way before touching the index, and `mcp-md-wiki validate` lists them under `SCHEMA ERRORS` and exits non-zero, `--strict` or not. Run `validate` before deploying a schema change by hand.
-- **Running server:** an invalid file arriving later — pushed to the git host and delivered by the webhook, or found by a reconcile — is refused. The server keeps enforcing the last schema that loaded cleanly, indexes nothing until the file is fixed (writes still commit, and are indexed by the reconcile the fix — or the first rebuild that succeeds afterwards — triggers), and logs the refusal at error level on every reconcile sweep, and each time a write's indexing run is dropped over it. Moving a directory that carries a schema file invalid on disk is refused, with nothing moved. `/status` shows it as `schema_error` (since when, plus every file's `path` and `reason`) and `/metrics` as `kb_schema_invalid` / `kb_schema_invalid_files`. `/health` stays healthy, since the server is still serving correctly under the previous schema.
+- **Running server:** an invalid file arriving later — pushed to the git host and delivered by the webhook, or found by a reconcile — is refused. The server keeps enforcing the last schema that loaded cleanly, indexes nothing until the file is fixed (writes still commit, and are indexed by the reconcile the fix — or the first rebuild that succeeds afterwards — triggers), and logs the refusal at error level on every reconcile sweep, and each time a write's indexing run is dropped over it. Moving a directory that carries an invalid schema file is refused, with nothing moved: the check covers a file the schema tree reads at the move's source or would read at its destination, one coming out of a hidden or excluded directory included. `/status` shows it as `schema_error` (since when, plus every file's `path` and `reason`) and `/metrics` as `kb_schema_invalid` / `kb_schema_invalid_files`. `/health` stays healthy, since the server is still serving correctly under the previous schema.
 
-`update_schema` cannot produce an invalid file: it re-parses, self-checks and size-checks what it is about to write. It also cannot edit a file that has already gone invalid on disk — fix that one in the git repository.
+`update_schema` cannot produce an invalid file: it re-parses, self-checks and size-checks what it is about to write. It also cannot edit a file that has already gone invalid on disk — fix that one in the git repository. A symlink or other non-regular entry named `.schema.yaml` is not a schema file: neither the schema walk nor `update_schema` follows it.
 
-### Root schema (`.kb-schema.yaml` at the KB root)
+### Root schema (`.schema.yaml` at the KB root)
 
-Every level of the cascade — including the root — is a `.kb-schema.yaml`. A root schema file is authored exactly like any other: drop one at the top of the knowledge base and it governs every document that no deeper scope claims, the same as a `.kb-schema.yaml` in any subdirectory.
+Every level of the cascade — including the root — is a `.schema.yaml`. A root schema file is authored exactly like any other: drop one at the top of the knowledge base and it governs every document that no deeper scope claims, the same as a `.schema.yaml` in any subdirectory.
 
-**A root `.kb-schema.yaml`, when present, REPLACES `config.yaml`'s `frontmatter` block outright — it does not merge with it.** This is deliberate, not an oversight: a schema describes the knowledge base's own content rules, and once the KB carries its own root rules, they must not be silently blended with whatever `frontmatter` block the current deploying host's `config.yaml` happens to declare — that would mean the same KB validates differently depending on where it's hosted. So:
+**A root `.schema.yaml`, when present, REPLACES `config.yaml`'s `frontmatter` block outright — it does not merge with it.** This is deliberate, not an oversight: a schema describes the knowledge base's own content rules, and once the KB carries its own root rules, they must not be silently blended with whatever `frontmatter` block the current deploying host's `config.yaml` happens to declare — that would mean the same KB validates differently depending on where it's hosted. So:
 
-- **No root `.kb-schema.yaml` anywhere** — `config.yaml`'s `frontmatter` block is used as the root schema, exactly as before. This is the deprecated fallback described above; it still fully works, but every index run logs a warning naming it.
-- **A root `.kb-schema.yaml` exists** — it is the entire root schema. Anything `config.yaml`'s `frontmatter` block still declares (`required`, `indexed_fields`, `defaults`, `allowed`) is ignored for root purposes unless the same field is *also* declared in the root `.kb-schema.yaml`. Every index run logs a warning naming this too, so the interaction is never silent.
+- **No root `.schema.yaml` anywhere** — `config.yaml`'s `frontmatter` block is used as the root schema, exactly as before. This is the deprecated fallback described above; it still fully works, but every index run logs a warning naming it.
+- **A root `.schema.yaml` exists** — it is the entire root schema. Anything `config.yaml`'s `frontmatter` block still declares (`required`, `indexed_fields`, `defaults`, `allowed`) is ignored for root purposes unless the same field is *also* declared in the root `.schema.yaml`. Every index run logs a warning naming this too, so the interaction is never silent.
 
-Either way, `get_schema` (omit `path` for the root) tells you exactly what's in effect and where each field came from — `.kb-schema.yaml` for a root schema file, `config.yaml` for the deprecated fallback.
+Either way, `get_schema` (omit `path` for the root) tells you exactly what's in effect and where each field came from — `/` for a root rule, whether it comes from a root schema file or from the deprecated `config.yaml` fallback.
 
-**Migrating an existing deployment:** translate `config.yaml`'s `frontmatter` block into `.kb-schema.yaml` field syntax (see [Authoring](#authoring) above) and commit it as `.kb-schema.yaml` at the knowledge-base root. Do this *before* or *at the same time as* removing anything from `config.yaml` — since the two don't merge, an incomplete root file written first (with the config block still present) can quietly narrow root's effective rules to only what the config block still contributes, until the root file catches up. `required` fields become `required: true`; `indexed_fields` become `indexed: true`; `defaults` become `default: <value>`; `allowed` becomes `values: [...]` **without** a `type:` — adding `type: enum` changes enforcement strictness (see [Authoring](#authoring) above) and is a separate decision, not a mechanical translation. If a subdirectory's own `.kb-schema.yaml` already redeclares a field the root also declares, double-check after migrating that the subdirectory's definition is still what you want — merging is per attribute (see [Cascade and merge rules](#cascade-and-merge-rules) above), so any attribute the subdirectory's redefinition never mentioned will start inheriting whatever the new root file says about it, even though it did not before the root file existed.
+**Migrating an existing deployment:** translate `config.yaml`'s `frontmatter` block into `.schema.yaml` field syntax (see [Authoring](#authoring) above) and commit it as `.schema.yaml` at the knowledge-base root. Do this *before* or *at the same time as* removing anything from `config.yaml` — since the two don't merge, an incomplete root file written first (with the config block still present) can quietly narrow root's effective rules to only what the config block still contributes, until the root file catches up. `required` fields become `required: true`; `indexed_fields` become `indexed: true`; `defaults` become `default: <value>`; `allowed` becomes `values: [...]` **without** a `type:` — adding `type: enum` changes enforcement strictness (see [Authoring](#authoring) above) and is a separate decision, not a mechanical translation. If a subdirectory's own `.schema.yaml` already redeclares a field the root also declares, double-check after migrating that the subdirectory's definition is still what you want — merging is per attribute (see [Cascade and merge rules](#cascade-and-merge-rules) above), so any attribute the subdirectory's redefinition never mentioned will start inheriting whatever the new root file says about it, even though it did not before the root file existed.
 
 ### Backward compatibility and upgrade note
 
@@ -366,14 +362,14 @@ Beyond read-only search, the MCP server lets a connected agent **author the know
 
 Both tools run the same pipeline server-side:
 
-1. **Resolve and guard the path** — relative to the KB root, or a unique basename. A leading `/` is also accepted, and means the KB root, not a filesystem path: a caller has no way to know where the KB actually lives inside the container, so `/food/chili.md` and `food/chili.md` resolve to the same file. `..` components and symlinked ancestors that escape the data root are still rejected — `/../x` is refused exactly like `../x` — as are paths that don't match `indexing.include` (a file the indexer would never pick up).
+1. **Resolve and guard the path** — taken literally, relative to the KB root: a bare basename names a file at the root, it is never searched for the way `get_document` does. A leading `/` is also accepted, and means the KB root, not a filesystem path: a caller has no way to know where the KB actually lives inside the container, so `/food/chili.md` and `food/chili.md` resolve to the same file. `..` components and symlinked ancestors that escape the data root are still rejected — `/../x` is refused exactly like `../x` — as are paths that don't match `indexing.include` (a file the indexer would never pick up).
 2. **Validate frontmatter** — required fields, `allowed` enums, and any `validation.lint_command`, against the *destination* directory's schema when the call also relocates the document. Failures come back as structured `field_errors` (see [Frontmatter Validation](#frontmatter-validation)) so the agent can self-correct.
 3. **Write to disk** — in the container-owned KB clone.
 4. **Commit with provenance** — the commit message gets `Tool: mcp-md-wiki` and `Operation: <tool>` trailers, authored under the `write.commit_author_*` identity. Tool-authored commits are trivially distinguishable from your own in `git log`.
-5. **Push to the remote** — `add → commit → fetch → rebase → push`, so the KB's git host stays the source of truth.
-6. **Reindex** — incrementally, holding the same internal lock the webhook uses, so a write and a webhook-triggered pull can never race.
+5. **Push to the remote** — `add → commit → fetch → rebase → push`, so the KB's git host stays the source of truth. The write already brought the clone up to date before reading the document, under the same lock. If the push loses a race or the rebase conflicts, the write's own commit is dropped, the clone re-synced with the remote and the change re-applied (up to three attempts in all); one that no longer fits the fresh document, or loses the race every time, is refused as edited by someone else. Any other failure (the remote unreachable, a push a hook refuses) keeps the local commit and still reports success; the next write rebases and pushes it (see [Concurrent writers](../README.md#write)).
+6. **Reindex** — queued, not run inline: the call returns once the push is done, and the single background worker that also serves the webhook indexes the path shortly after. Every git operation on the clone takes one lock, so a write and a webhook-triggered pull never touch it at the same time.
 
-Each tool returns a one-line summary with the commit SHA plus a unified diff of the change.
+Each tool returns one compact JSON object: `path`, `action`, the document's new `version` (not for a delete) and, for an edit or a move, the unified `diff`. It never carries a commit SHA or git state; the [README](../README.md#write) lists every field.
 
 ### The tools
 
@@ -382,19 +378,19 @@ Each tool returns a one-line summary with the commit SHA plus a unified diff of 
   - **Surgical** (`old_string` + `new_string`) — replaces a single unique occurrence instead of resending the whole file. Mutually exclusive with `content`.
   - **Move** (`new_path`) — relocates a document. Combines with either edit mode above (edit-then-move, one commit), or stands alone for a pure move — the server reads the current body itself and revalidates it against the destination schema. If `path` names a *directory* instead, `write_document` detects that and moves the whole subtree there in one commit, no `content`/`old_string`/`new_string` allowed — this replaces the old `move_directory` tool. Links pointing at whatever moved are rewritten either way.
 
-  On create, it runs a **near-duplicate check**: it embeds the content and searches the collection; if an existing document scores at or above `write.dedup_threshold`, the write is refused and the close match is named. The score is always a **dense cosine similarity** — this check is pinned to dense-only retrieval with reranking detached, regardless of `search.hybrid` and `reranking.enabled`, because hybrid RRF scores (~0.01–0.03) and cross-encoder relevance scores are not on the same scale as the threshold. Pass `force_new: true` to create anyway. Disable the check globally with `write.dedup_enabled: false` (useful during bulk migrations), or per directory with a [`dedup:` block](#per-directory-near-duplicate-override-dedup) in its `.kb-schema.yaml`, which also overrides `write.dedup_threshold`. The check fails open — if the embedder or Qdrant is unreachable, the write proceeds.
+  On create, it runs a **near-duplicate check**: it embeds the content and searches the collection; if an existing document scores at or above `write.dedup_threshold`, the write is refused and the close match is named. The score is always a **dense cosine similarity** — this check is pinned to dense-only retrieval with reranking detached, regardless of `search.hybrid` and `reranking.enabled`, because hybrid RRF scores (~0.01–0.03) and cross-encoder relevance scores are not on the same scale as the threshold. Pass `force_new: true` to create anyway. Disable the check globally with `write.dedup_enabled: false` (useful during bulk migrations), or per directory with a [`dedup:` block](#per-directory-near-duplicate-override-dedup) in its `.schema.yaml`, which also overrides `write.dedup_threshold`. The check fails open — if the embedder or Qdrant is unreachable, the write proceeds.
 
-  Pass `expected_hash` (a `content_hash` from a prior `get_document`) to reject an edit built on a stale read.
-- **`delete_document`** — removes the file, commits and pushes the deletion, then purges the document's vectors from Qdrant and its row from the state DB directly (no full reindex needed).
+  Replacing (`content`) or moving an existing document requires `expected_version` — the `version` from a prior `get_document`. A replace built on an older version is three-way merged with whatever changed since (a clean merge is saved and flagged `merged_with_other_changes`; overlapping changes are refused), and a stale move is refused. The relative edit modes (`old_string`/`new_string`, `frontmatter_patch`, `append`) don't need it: they apply to the document as it is when the write runs, so another writer's change elsewhere in it is kept; a stale `expected_version` passed to one does not refuse it, it only flags the result `merged_with_other_changes`. A create (a path with no document) given an `expected_version` is refused as not found. An edit that leaves the document exactly as it was commits nothing and succeeds with no `diff`, and a document is capped at 512 KiB, the result of a relative edit included. See [Concurrent writers](../README.md#write) in the README for the full rules.
+- **`delete_document`** — requires `expected_version` (a document changed since it was read is not deleted); removes the file, commits and pushes the deletion, then marks the path for the reindex worker, which purges the document's vectors from Qdrant and its row from the state DB (no full reindex needed). Links to it from other documents are left as they are; those documents are returned as `referencing_paths`.
 
 ### Schema tools
 
-Two more MCP tools let a connected agent inspect and evolve the [directory schema cascade](#directory-schemas-kb-schemayaml) itself, rather than working around it:
+Two more MCP tools let a connected agent inspect and evolve the [directory schema cascade](#directory-schemas-schemayaml) itself, rather than working around it:
 
-- **`get_schema`** — shows the fully merged rules governing a path (directory or document; omit `path` for the root), with per-field provenance naming which `.kb-schema.yaml` declared each field. Optional `fields` restricts the report to specific dot-paths; `values_only` limits it to fields with a closed value set.
-- **`update_schema`** — edits a directory's `.kb-schema.yaml` through constrained operations (`add_values`, `remove_values`, `set_field`, `remove_field`) rather than free-form text. Before writing anything, the change is validated against every document already indexed under that scope, using the frontmatter stored in the metadata index — no markdown re-read. If any document would fail the new rules, the change is refused and they're listed; pass `force` to apply anyway, or `dry_run` to see the effect without writing. The rendered YAML is re-parsed before writing, so an unparseable schema can never be committed. Like the document write tools, the file is written temp-then-rename, committed and pushed, and triggers an incremental reindex.
+- **`get_schema`** — shows the fully merged rules governing a path (directory or document; omit `path` for the root), with per-field provenance naming the directory whose schema declared each field (`food/recipes/`, the root as `/`) — schemas are named by directory, never by file, in everything a model reads. Optional `fields` restricts the report to specific dot-paths; `values_only` limits it to fields with a closed value set; `values_in_use` adds the 20 most-used values (with document counts) of each open field and the fields documents under the path carry that no scope declares — the on-demand replacement for the vocabulary lines the server instructions used to carry. A derived field (`domain`) is never listed, even when a scope declares it (to index it, say).
+- **`update_schema`** — edits a directory's `.schema.yaml` through constrained operations (`add_values`, `remove_values`, `set_field`, `remove_field`) rather than free-form text. `add_values` in a subdirectory whose schema has no `values` of its own for the field writes `[$values, ...new]`, so it extends the inherited set instead of replacing it, and keeps the inherited `type` (`enum` when no ancestor gives a type or values); a value the scope already inherits is not written again. A directory still on the legacy `.kb-schema.yaml` name is migrated by the same commit (see [Legacy file name](#directory-schemas-schemayaml)). Before writing anything, the change is validated against every document already indexed under that scope, using the frontmatter stored in the metadata index — no markdown re-read. If any document would fail the new rules, the change is refused and they're listed; pass `force` to apply anyway, or `dry_run` to see the effect without writing. The rendered YAML is re-parsed before writing, so an unparseable schema can never be committed. Like the document write tools, the file is written temp-then-rename and committed and pushed; a full reconcile is then queued, which re-validates the documents the schema governs. Changing the root schema with `add_values`, `set_field` or `remove_field` needs `acknowledge_root_change: true` (`remove_values` and `dry_run` are exempt).
 
-Both tools accept a partial directory for `path`, matching on trailing segments — e.g. `recipes` resolves to `lifestyle/kitchen/recipes` if that's the only scope ending in `recipes`. A unique match resolves silently; several matches are refused with the candidates listed rather than guessed at. `update_schema` alone treats zero matches as success rather than an error: it falls back to the literal path, since declaring a schema for a directory that doesn't have one yet is the normal way to introduce one.
+Both tools accept a partial directory for `path`, matching on trailing segments — e.g. `recipes` resolves to `lifestyle/kitchen/recipes` if that's the only scope ending in `recipes`. A unique match resolves silently; several matches are refused with the candidates listed rather than guessed at. Zero matches is not an error: the literal path is used, so `get_schema` reports whichever ancestor's rules govern it and `update_schema` introduces a schema for a directory that doesn't have one yet, which is the normal way to start one. Either tool takes `.` or `./` for the root and ignores a `.` segment or a doubled `/`.
 
 ### Configuration
 
@@ -415,7 +411,7 @@ For writes to push successfully, the container needs a writable, non-shallow clo
 Server and tool descriptions are assembled from three layers, appended in this order:
 
 1. **Compiled mechanics** — what's true of *every* deployment this binary could ever serve (how paths resolve, that there's no regex, what `write_document`'s parameters mean). Baked into the binary from `assets/mcp/`; you can't change this short of a fork.
-2. **Config-derived mechanics** — short sentences generated from your live config and corpus: whether search is hybrid and/or phrase-matching (`search.hybrid`/`search.phrase`), the distinct filter values (domains, types, tags) discovered in the live index, and a write-authoring section listing required frontmatter fields and any fixed `allowed` values.
+2. **Config-derived mechanics** — short sentences generated from your live config and corpus: on `search`, quoted-phrase syntax (when `search.phrase` is effective) and the enabled granularities; in the server instructions, the top-level areas and one pointer to `get_schema` for field values and per-folder rules. Field vocabularies, scoped folders and authoring rules are not listed up front: `get_schema` serves them on demand, and a `search` filter or write that gets one wrong is refused with the options listed.
 3. **Your knowledge base's own policy** — what this KB is for, what belongs in it, tagging conventions, writing style. This is yours to write, and it lives in the *served knowledge base itself*, not in `config.yaml`.
 
 **Nothing about what a knowledge base is for, or what belongs in it, is compiled in or config-derived — that's layer 3, and it's entirely up to you to write.** One binary may serve several knowledge bases with contradictory policies (a durable-reference KB and a scratch-space KB, say), so the compiled and config layers can only ever state what's true of *every* KB the binary might serve. If you want the connected agent to know this KB holds durable reference knowledge only, or that it should tag things a certain way, or anything else about *this* KB specifically — write it yourself, in `<mcp.extensions_path>/` (default `meta/mcp`, relative to the knowledge base root):
@@ -574,10 +570,10 @@ There is currently no way to get Posture B's diagnostic convenience — a `curl`
 
 Organize your markdown files in a git repository. Subdirectories are fine — the indexer walks recursively. Add YAML frontmatter to each file with at least the fields you mark as required.
 
-Commit a `.kb-schema.yaml` at the repository root declaring those rules — see [Root schema](#root-schema-kb-schemayaml-at-the-kb-root) above. This is the preferred place for root-level frontmatter rules: it's part of the knowledge base's own repo, so it travels with it wherever the KB is cloned or served, and `update_schema` can edit it for you later.
+Commit a `.schema.yaml` at the repository root declaring those rules — see [Root schema](#root-schema-schemayaml-at-the-kb-root) above. This is the preferred place for root-level frontmatter rules: it's part of the knowledge base's own repo, so it travels with it wherever the KB is cloned or served, and `update_schema` can edit it for you later.
 
 ```yaml
-# .kb-schema.yaml — at the knowledge-base root
+# .schema.yaml — at the knowledge-base root
 fields:
   title:       { type: text, required: true }
   description: { type: text, required: true }
@@ -607,7 +603,7 @@ chunking:
 
 Point `GIT_URL` (and optionally `GIT_BRANCH`) at your knowledge base repo via environment variables — see step 3. All other sections (`embedding`, `mcp`, `webhook`) use defaults that work with the Docker Compose stack. Override only if you need different values.
 
-`config.yaml` still has a `frontmatter` block (see [config.example.yaml](config.example.yaml)) for deployments that haven't moved to a root `.kb-schema.yaml` yet — it's the deprecated fallback described in [Frontmatter Validation](#frontmatter-validation) above, not something a new deployment should reach for.
+`config.yaml` still has a `frontmatter` block (see [config.example.yaml](config.example.yaml)) for deployments that haven't moved to a root `.schema.yaml` yet — it's the deprecated fallback described in [Frontmatter Validation](#frontmatter-validation) above, not something a new deployment should reach for.
 
 **Changing `config.yaml` later:** most settings in this file can be applied to a
 running server without a restart — edit the file and call:

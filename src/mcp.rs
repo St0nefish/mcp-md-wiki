@@ -22,7 +22,7 @@ use crate::{
     document_fields,
     embed::EmbedClient,
     git,
-    qdrant::{CHUNK_TEXT_KEY, IndexKind, QdrantStore},
+    qdrant::{IndexKind, QdrantStore},
     rerank::RerankClient,
     retrieval::{
         self, DocumentIndexDeps, GetDocumentError, RetrievalDeps, SearchFilters, SearchOptions,
@@ -32,7 +32,7 @@ use crate::{
     tool_schema, validate,
     write::{
         self, DirectoryMoveError, DirectoryMoveSuccess, FrontmatterEdit, WriteDeps, WriteError,
-        WriteOutcome as CoreWriteOutcome, WriteRequest, WriteSuccess,
+        WriteRequest, WriteSuccess,
     },
 };
 
@@ -41,7 +41,7 @@ const MAX_PATH_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
 /// Deepest dot-path `update_schema` will nest; see `build_schema_edit`.
 const MAX_SCHEMA_PATH_SEGMENTS: usize = 16;
-const MAX_CONTENT_LEN: usize = 512 * 1024; // 512 KB
+const MAX_CONTENT_LEN: usize = write::MAX_CONTENT_LEN;
 /// Cap on the number of operations a single `write_document` `frontmatter_patch`
 /// call may carry — a document write should rarely need more than a handful of
 /// field edits at once; this bounds the work `write::apply_frontmatter_patch`
@@ -99,12 +99,13 @@ const MAX_SCHEMA_DEFINITION_LEN: usize = 8 * 1024;
 const MAX_REPORTED_VALUES: usize = 200;
 /// Cap on fields echoed back per scope by `get_schema`.
 const MAX_REPORTED_FIELDS: usize = 500;
-/// Cap on the unified diff embedded in a write/delete tool's `structured_content`
-/// (fix #129). Mirrors `MAX_SCHEMA_DEFINITION_LEN`'s convention for bounding a
-/// single text blob: `WriteSuccess::diff` is unbounded by design (a full replace
-/// of a large document produces a large diff, and the text channel already
-/// carries it whole), but embedding it verbatim into `structured_content` too
-/// would let one write emit a multi-megabyte tool result. See
+/// Most-used values listed per open field by `get_schema`'s `values_in_use`.
+const MAX_VALUES_IN_USE: usize = 20;
+/// Cap on the unified diff an edit's result carries (fix #129). Mirrors
+/// `MAX_SCHEMA_DEFINITION_LEN`'s convention for bounding a single text blob:
+/// `WriteSuccess::diff` is unbounded by design (a full replace of a large
+/// document produces a large diff), but embedding it verbatim would let one
+/// write emit a multi-megabyte tool result. See
 /// [`capped_diff`] for the same unbounded-source/bounded-payload split
 /// [`capped_casualties`] already applies to `update_schema`'s casualty list.
 const MAX_STRUCTURED_DIFF_BYTES: usize = 8 * 1024;
@@ -113,10 +114,15 @@ const MAX_STRUCTURED_DIFF_BYTES: usize = 8 * 1024;
 ///
 /// Rejects absolute paths and any `..` component — a schema written outside the KB
 /// would govern nothing and could clobber unrelated files.
+///
+/// The result is rebuilt from the path's normal segments alone, so a `.` segment or a
+/// doubled separator (`food/./recipes`, `food//recipes`) never reaches a scope label, a
+/// commit message or the `LIKE` pattern `get_schema` counts values with: each is plain
+/// `food/recipes`. A lone `.` (or `./`) is the KB root, like an empty path.
 fn normalize_scope_path(raw: &str) -> Result<std::path::PathBuf, McpError> {
     use std::path::{Component, PathBuf};
 
-    let trimmed = raw.trim().trim_start_matches("./").trim_matches('/');
+    let trimmed = raw.trim().trim_matches('/');
     if trimmed.is_empty() {
         return Ok(PathBuf::new());
     }
@@ -138,27 +144,35 @@ fn normalize_scope_path(raw: &str) -> Result<std::path::PathBuf, McpError> {
             None,
         ));
     }
+    let mut normalized = PathBuf::new();
     for component in candidate.components() {
-        if !matches!(component, Component::Normal(_)) {
-            return Err(McpError::invalid_params(
-                format!("path must not contain '..' or absolute segments, got '{raw}'"),
-                None,
-            ));
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            // Only a leading `.` survives `components()`; it names no directory.
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(McpError::invalid_params(
+                    format!("path must not contain '..' or absolute segments, got '{raw}'"),
+                    None,
+                ));
+            }
         }
     }
 
-    Ok(candidate)
+    Ok(normalized)
 }
 
-/// Keys a `set_field` definition accepts, kept in one place so every error that names
-/// them — and the parameter's own doc comment — say exactly the same thing.
+/// Keys a `set_field` definition accepts, as the errors that reject a malformed one name
+/// them: `schema::RawFieldDef`'s advertised properties, kept in one place so those errors
+/// all say the same thing. The deprecated `extend` is still accepted but is not
+/// advertised, so it is not listed here either.
 const FIELD_DEFINITION_KEYS: &str =
-    "`type`, `required`, `indexed`, `values`, `extend`, `default`, `open`";
+    "`type`, `required`, `indexed`, `values`, `default`, `open`, `fields`";
 
 /// A `set_field` definition as delivered by an MCP client.
 ///
 /// The `update_schema` tool schema advertises this parameter as the plain JSON object
-/// described by [`crate::schema::RawFieldDef`] — the same shape a `.kb-schema.yaml`
+/// described by [`crate::schema::RawFieldDef`] — the same shape a schema file's
 /// entry uses. That's a deliberate fix: `serde_json::Value` (the old type here) produces
 /// no `type` constraint at all in the advertised schema, and at least one real MCP
 /// client responded to that ambiguity by sending the definition as a JSON-encoded
@@ -219,9 +233,8 @@ fn parse_field_definition(value: serde_json::Value) -> Result<crate::schema::Raw
             Err(e) => {
                 return Err(format!(
                     "field definition must be a JSON object with keys \
-                     {FIELD_DEFINITION_KEYS} (mirroring a .kb-schema.yaml entry). A JSON \
-                     string containing that object is also accepted, but this string is \
-                     not valid JSON: {e}"
+                     {FIELD_DEFINITION_KEYS}. A JSON string containing that object is \
+                     also accepted, but this string is not valid JSON: {e}"
                 ));
             }
         },
@@ -235,8 +248,7 @@ fn parse_field_definition(value: serde_json::Value) -> Result<crate::schema::Raw
 /// was actually received without echoing its (possibly large) content.
 fn definition_shape_error(value: &serde_json::Value) -> String {
     format!(
-        "field definition must be a JSON object with keys {FIELD_DEFINITION_KEYS} \
-         (mirroring a .kb-schema.yaml entry), got {}",
+        "field definition must be a JSON object with keys {FIELD_DEFINITION_KEYS}, got {}",
         json_value_kind(value)
     )
 }
@@ -338,16 +350,13 @@ impl schemars::JsonSchema for SearchFiltersInput {
     // `any_of`/`all_of`/`gte`/`lte`/`gt`/`lt` — exactly the shapes
     // `parse_field_filter` accepts. Kept tight and caller-facing (see #126): no
     // implementation rationale leaks into the emitted schema, only the shape a
-    // caller needs to construct a valid `filters` value.
+    // caller needs to construct a valid `filters` value. The prose lives once,
+    // on the `filters` property (`SearchParams::filters`); the structure here
+    // carries none of its own.
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "object",
-            "description": "Frontmatter criteria by field (dot-path keys). Each \
-                value is either a scalar (equality), an array of scalars (any-of), \
-                or an object with any_of/all_of (explicit set match) or \
-                gte/lte/gt/lt (numeric range).",
             "additionalProperties": {
-                "description": "One field's filter condition.",
                 "anyOf": [
                     { "type": ["string", "number", "boolean"] },
                     {
@@ -551,6 +560,71 @@ fn sanitize_reflected_value(value: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Render a casualty list for a human-readable message.
+/// Add an `update_schema` casualty list under `key` (`invalidated` after a
+/// forced change, `would_invalidate` on a dry run) — only when non-empty — with
+/// `casualties_total`/`casualties_truncated` only when the list was capped.
+fn insert_casualties(
+    response: &mut serde_json::Value,
+    key: &str,
+    capped: Vec<serde_json::Value>,
+    total: usize,
+    truncated: bool,
+) {
+    if capped.is_empty() {
+        return;
+    }
+    response[key] = serde_json::Value::Array(capped);
+    if truncated {
+        response["casualties_total"] = serde_json::json!(total);
+        response["casualties_truncated"] = serde_json::json!(true);
+    }
+}
+
+/// One resolved field definition as `get_schema` and an `update_schema` dry run
+/// report it. Only what constrains a document is sent: `type` and `values`
+/// when set, `required`/`indexed` when true, `default` when there is one,
+/// `open: false` on an object that refuses undeclared keys (`true` is the
+/// default), and `declared_in` — the scope directory that last set it (`/` for
+/// the root).
+fn field_def_json(def: &crate::schema::FieldDef, origin: Option<&str>) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    if let Some(ty) = def.ty {
+        entry.insert(
+            "type".into(),
+            serde_json::json!(format!("{ty:?}").to_lowercase()),
+        );
+    }
+    if def.required {
+        entry.insert("required".into(), serde_json::json!(true));
+    }
+    if def.indexed {
+        entry.insert("indexed".into(), serde_json::json!(true));
+    }
+    if let Some(values) = &def.values {
+        entry.insert(
+            "values".into(),
+            values
+                .iter()
+                .take(MAX_REPORTED_VALUES)
+                .map(|v| serde_json::json!(crate::server::sanitize_facet_value(v)))
+                .collect(),
+        );
+    }
+    if let Some(default) = &def.default {
+        entry.insert("default".into(), sanitize_reflected_value(default));
+    }
+    if def.ty == Some(crate::schema::FieldType::Object) && !def.open {
+        entry.insert("open".into(), serde_json::json!(false));
+    }
+    if let Some(origin) = origin {
+        entry.insert(
+            "declared_in".into(),
+            serde_json::json!(crate::server::sanitize_facet_value(origin)),
+        );
+    }
+    serde_json::Value::Object(entry)
+}
+
 fn render_casualties(casualties: &[serde_json::Value]) -> String {
     let mut out = String::new();
     for entry in casualties.iter().take(MAX_REPORTED_CASUALTIES) {
@@ -569,15 +643,13 @@ fn render_casualties(casualties: &[serde_json::Value]) -> String {
     out
 }
 
-/// Cap a casualty list for `structured_content`, mirroring the cap
-/// [`render_casualties`] already applies to the text half.
+/// Cap a casualty list for a tool result, mirroring the cap
+/// [`render_casualties`] applies to a refusal's message.
 ///
 /// `documents_broken_by` deliberately returns the *complete* casualty list — the
 /// force/refuse decision needs completeness, so that query stays unbounded — but
-/// embedding the full `Vec` verbatim into `structured_content` let a schema
-/// tightening that broke thousands of documents emit a multi-megabyte tool result
-/// while the text channel silently stayed capped at [`MAX_REPORTED_CASUALTIES`].
-/// Returns the capped list alongside the true total and whether it was truncated,
+/// embedding the full `Vec` verbatim let a schema tightening that broke thousands
+/// of documents emit a multi-megabyte tool result (#148). Returns the capped list alongside the true total and whether it was truncated,
 /// the same `total`/`has_more` shape `search` uses elsewhere in this file, so a
 /// client that only reads `structured_content` can still tell "empty" from
 /// "truncated" rather than only ever seeing the first page.
@@ -611,19 +683,6 @@ fn capped_diff(diff: &str) -> (String, bool, usize) {
         end -= 1;
     }
     (diff[..end].to_string(), true, total)
-}
-
-/// Render `WriteSuccess::rebased_paths`/`DirectoryMoveSuccess::rebased_paths`
-/// (a `Vec<PathBuf>`) as `Vec<String>` for `structured_content` — mirrors
-/// `web.rs`'s `write_success_response` doing the identical `to_string_lossy`
-/// conversion for its own fixed HTTP contract, rather than letting `json!`
-/// serialize `PathBuf` directly (which errors on a non-UTF-8 path instead of
-/// degrading gracefully).
-fn rebased_paths_json(rebased_paths: &[PathBuf]) -> Vec<String> {
-    rebased_paths
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect()
 }
 
 /// Default page size for `list_documents` — well above `search`'s cap, since
@@ -764,6 +823,40 @@ fn parse_field_filter(field: &str, raw: &serde_json::Value) -> Result<FieldFilte
             field
         )),
     }
+}
+
+/// Cap on the fields or values a refused `search` filter lists
+/// (`KbSearchServer::check_filter_vocabulary`).
+const MAX_FILTER_OPTIONS_LISTED: usize = 30;
+
+/// The first [`MAX_FILTER_OPTIONS_LISTED`] of `items`.
+fn capped_vec(items: &[String]) -> Vec<&String> {
+    items.iter().take(MAX_FILTER_OPTIONS_LISTED).collect()
+}
+
+/// `items` joined for an error message, capped at
+/// [`MAX_FILTER_OPTIONS_LISTED`] with a `(+N more)` tail.
+fn capped_list(items: &[String]) -> String {
+    let mut joined = items
+        .iter()
+        .take(MAX_FILTER_OPTIONS_LISTED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let overflow = items.len().saturating_sub(MAX_FILTER_OPTIONS_LISTED);
+    if overflow > 0 {
+        joined.push_str(&format!(" (+{overflow} more)"));
+    }
+    joined
+}
+
+/// Filter keys that need no schema declaration: the promoted `title` and
+/// `description`, the fields ingest derives (`ingest::DERIVED_FIELDS`), and
+/// the configured indexed fields.
+fn builtin_filter_field(field: &str, config: &ResolvedConfig) -> bool {
+    matches!(field, "title" | "description")
+        || crate::ingest::DERIVED_FIELDS.contains(&field)
+        || config.effective_indexed_fields().iter().any(|f| f == field)
 }
 
 /// Parse a `search` call's raw `filters` map into the typed representation shared by
@@ -915,7 +1008,8 @@ fn build_query_conditions(
         return Err(McpError::invalid_params(
             format!(
                 "filter '{field}' is not indexed for Qdrant queries; mark it `indexed: true` \
-                 in the governing .kb-schema.yaml to filter on it with a search query"
+                 in the governing directory's schema (update_schema) to filter on it \
+                 with a search query"
             ),
             None,
         ));
@@ -1017,22 +1111,12 @@ fn heading_results_indexing_note() -> Option<&'static str> {
     )
 }
 
-/// Attach [`heading_results_indexing_note`] (when one applies) to a finished
-/// `search` result: appended to the text block, and mirrored as
-/// `indexing_in_progress: true` in `structured_content`.
-fn annotate_heading_results(result: &mut CallToolResult, note: Option<&str>) {
-    let Some(note) = note else {
-        return;
-    };
-    if let Some(first) = result.content.first_mut()
-        && let Some(text) = first.as_text()
+/// Mark a finished `search` response `indexing_in_progress: true` when
+/// [`heading_results_indexing_note`] applies.
+fn annotate_heading_results(response: &mut serde_json::Value, note: Option<&str>) {
+    if note.is_some()
+        && let serde_json::Value::Object(map) = response
     {
-        let mut annotated = text.text.trim_end().to_string();
-        annotated.push_str("\n\n");
-        annotated.push_str(note);
-        *first = Content::text(annotated);
-    }
-    if let Some(serde_json::Value::Object(map)) = result.structured_content.as_mut() {
         map.insert(
             "indexing_in_progress".to_string(),
             serde_json::Value::Bool(true),
@@ -1245,258 +1329,109 @@ fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
 pub struct GetDocumentParams {
     /// Relative path, unique basename, or absolute path.
     pub path: String,
-    /// First line to return (1-based, inclusive). A range you name yourself is
-    /// served in full, however large — the size limit only applies to reads
-    /// you did not bound. Not combinable with `line`/`heading_path`/`outline`.
+    // Per-mode rules beyond these one-liners (ambiguous or unresolved
+    // selectors, oversized sections, capped outlines) are taught by the error
+    // or the response itself — `SectionError::data()`, `OutlineView::hint`.
+    /// First line (1-based, inclusive). An explicit range is never size-capped.
     #[serde(default)]
     pub start_line: Option<usize>,
-    /// Last line to return (1-based, inclusive). A range you name yourself is
-    /// served in full, however large — the size limit only applies to reads
-    /// you did not bound. Not combinable with `line`/`heading_path`/`outline`.
+    /// Last line (1-based, inclusive).
     #[serde(default)]
     pub end_line: Option<usize>,
-    /// Select a section by any 1-based line in it (must be 1 or greater): the
-    /// deepest heading whose range contains the line. A line on a heading, or
-    /// in the text before its first sub-heading, selects that heading's
-    /// section; a line inside a sub-heading's range selects the sub-heading.
-    /// Names the same section `heading_path` would — never a different read —
-    /// and an oversized section is handled as described there. Not combinable
-    /// with `heading_path` or `start_line`/`end_line`.
+    /// Select the section containing this 1-based line (its deepest enclosing
+    /// heading). Not combinable with `heading_path` or `start_line`/`end_line`.
     #[serde(default)]
     pub line: Option<usize>,
-    /// Select a section by heading path, e.g. `["Spells", "Fireball"]`. Each
-    /// segment is a complete heading name, in order; none may be empty or
-    /// blank. Resolves in tiers, each only when it names exactly one section:
-    /// the full path; then a trailing suffix (`["Fireball"]` alone is
-    /// enough); then an ordered match that may also skip a middle segment
-    /// (`["Feats", "Dual Wielding"]` matches `Feats > Combat > Dual
-    /// Wielding`). Order still matters: `["Dual Wielding", "Feats"]` does not
-    /// match that section. Matching ignores case, whitespace differences and
-    /// invisible characters such as soft hyphens, but not Unicode
-    /// normalization form — a precomposed `é` does not match `e` + a
-    /// combining accent. Heading text over 200 characters is cut to its first
-    /// 200 in outlines and paths (zero-width joiners, direction marks and
-    /// variation selectors don't count toward that); passing the full text
-    /// still matches.
-    ///
-    /// If it names more than one section (a duplicated exact path, common in
-    /// rulebook conversions, or segments matching several sections in order)
-    /// the error lists every candidate's line range: pick one with `line` when
-    /// their full paths are identical, or a longer or reordered
-    /// `heading_path` otherwise. If nothing resolves, the error may suggest
-    /// sections whose path the segments match in order by a looser
-    /// per-segment substring comparison (`["Dual Wield"]` surfaces `Dual
-    /// Wielding`) — suggestions only, never a resolved read.
-    ///
-    /// A selected section over the size limit that has sub-headings comes
-    /// back as `outline_only: true` — no text, just its sub-heading outline
-    /// (what `outline: true` with this selector returns) — plus, if it has
-    /// text of its own before its first sub-heading, that range as `intro`
-    /// (read it with `start_line`/`end_line`). One with no sub-headings comes
-    /// back flagged `oversized: true`, cut on a line boundary when it exceeds
-    /// the limit — then `truncated: true` and `end_line` (the last line you
-    /// got) say so; read on from `end_line + 1`. Not combinable with `line`
-    /// or `start_line`/`end_line`.
+    /// Select a section by heading path, e.g. `["Spells", "Fireball"]`:
+    /// complete heading names in order. A trailing part (`["Fireball"]`) or an
+    /// in-order subset that skips middle levels also resolves when it names
+    /// exactly one section. Ignores case and whitespace. Not combinable with
+    /// `line` or `start_line`/`end_line`.
     #[serde(default)]
     pub heading_path: Option<Vec<String>>,
-    /// Climb this many parent headings above the selected section (a heading's
-    /// parent is the nearest heading above it with a lower level, so `levels_up:
-    /// 1` from a `###` directly under a `#` reaches the `#`; clamped at the
-    /// top-most heading). Requires `line` or `heading_path`.
+    /// With `line`/`heading_path`: widen to the Nth parent heading (clamped at
+    /// the top).
     #[serde(default)]
     pub levels_up: Option<usize>,
-    /// Return a heading outline (with line ranges) instead of content: of the
-    /// whole document, or — with `line`/`heading_path` — of that section's
-    /// sub-headings. Outlines are capped to roughly the size limit's worth of
-    /// headings, keeping the shallowest levels first; a capped outline has
-    /// `truncated: true`, `total_entries` (the uncapped count) and a `hint`
-    /// saying how to reach the rest — usually by outlining one of the listed
-    /// sections. Not combinable with `start_line`/`end_line`.
+    /// Return the heading outline with line ranges instead of text — of the
+    /// document, or of the section chosen by `line`/`heading_path`.
     #[serde(default)]
     pub outline: Option<bool>,
-    /// Also return this document's own commit history, newest first, as many
-    /// commits as you name (at least 1, at most 100). Each commit has `sha`,
-    /// `author_name`, `author_email`, `timestamp` (Unix seconds), `subject`, and — for a commit
-    /// this server wrote — `tool` and `operation`; `tool_authored` is true when
-    /// both are present, false for a hand-made commit. Combinable with every
-    /// other parameter. Omit it and no history is read.
+    /// Also return the last N changes to this document (1-100), newest first.
     #[serde(default)]
     pub history: Option<usize>,
+    /// Link lists come with a whole-document read; `true` adds them to any
+    /// read, `false` drops them.
+    #[serde(default)]
+    pub links: Option<bool>,
 }
 
-/// One line per commit for `get_document`'s text block (the same data is in
-/// `structured_content.history`, for clients that render text only).
-fn render_history_text(history: &serde_json::Value) -> String {
-    if history["available"] != true {
-        return "\n\nHistory: unavailable (this knowledge base is not a git repository)."
-            .to_string();
-    }
-    let commits = history["commits"].as_array().map_or(&[][..], |c| &c[..]);
-    if commits.is_empty() {
-        return "\n\nHistory: no commits touch this document.".to_string();
-    }
-    let mut text = String::from("\n\nHistory (newest first):");
-    for c in commits {
-        let sha = c["sha"].as_str().unwrap_or("");
-        let when = chrono::DateTime::from_timestamp(c["timestamp"].as_i64().unwrap_or(0), 0)
-            .map_or_else(String::new, |d| d.format("%Y-%m-%d %H:%MZ").to_string());
-        let provenance = match (c["tool"].as_str(), c["operation"].as_str()) {
-            (Some(tool), Some(op)) => format!(" [{tool}/{op}]"),
-            _ => String::new(),
-        };
-        text.push_str(&format!(
-            "\n{} {} {}{} — {}",
-            sha.get(..8).unwrap_or(sha),
-            when,
-            c["author_name"].as_str().unwrap_or(""),
-            provenance,
-            c["subject"].as_str().unwrap_or(""),
-        ));
-    }
-    if history["truncated"] == true {
-        // At the cap, raising `history` cannot help — don't suggest it.
-        if history["limit"].as_u64() >= Some(retrieval::MAX_HISTORY_LIMIT as u64) {
-            text.push_str("\n(older commits not shown)");
+/// `get_document`'s link graph, in the compact shape a model reads: `links_out`
+/// (paths this document links to that exist), `broken_links` (link targets
+/// that do not), `links_in` (paths linking here), and `similar` (`{path,
+/// score}` inferred neighbors, either direction, only when semantic edges are
+/// on). Each key appears only when non-empty; `links_out_total`/`links_in_total`
+/// only when that direction was capped at `retrieval::MAX_LINKS_PER_DIRECTION`.
+fn insert_link_lists(
+    structured: &mut serde_json::Map<String, serde_json::Value>,
+    links_out: &crate::state::LinkPage<crate::state::OutboundLink>,
+    links_in: &crate::state::LinkPage<crate::state::InboundLink>,
+) {
+    let mut out: Vec<&str> = Vec::new();
+    let mut broken: Vec<&str> = Vec::new();
+    let mut incoming: Vec<&str> = Vec::new();
+    let mut similar: Vec<serde_json::Value> = Vec::new();
+    let mut seen_similar: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for l in &links_out.links {
+        if l.kind == "semantic" {
+            if seen_similar.insert(&l.target_path) {
+                similar.push(serde_json::json!({
+                    "path": l.target_path,
+                    "score": l.score.map_or(serde_json::Value::Null, round_score),
+                }));
+            }
+        } else if l.exists {
+            out.push(&l.target_path);
         } else {
-            text.push_str("\n(older commits not shown; raise `history`)");
+            broken.push(&l.target_path);
         }
     }
-    text
-}
-
-/// `get_document`'s `Content::text` block for a resolved view (#286).
-/// `structured_content` (`retrieval::document_view_json`) carries the same
-/// data; this is for clients that render text content only. A text read is
-/// the text itself; an outline is one line per heading plus the truncation
-/// hint, so the text block never repeats the JSON payload.
-fn render_document_view_text(view: retrieval::DocumentView, section_max_bytes: usize) -> String {
-    match view {
-        retrieval::DocumentView::Range(slice) => {
-            if !slice.truncated {
-                return slice.content;
+    for l in &links_in.links {
+        if l.kind == "semantic" {
+            if seen_similar.insert(&l.source_path) {
+                similar.push(serde_json::json!({
+                    "path": l.source_path,
+                    "score": l.score.map_or(serde_json::Value::Null, round_score),
+                }));
             }
-            let note = truncation_note(slice.end_line, slice.total_lines, section_max_bytes);
-            let mut text = slice.content;
-            text.push_str(&note);
-            text
+        } else {
+            incoming.push(&l.source_path);
         }
-        retrieval::DocumentView::Outline(outline) => {
-            let mut text = match &outline.section {
-                Some(section) => format!(
-                    "Headings under section \"{}\" (lines {}-{}):\n\n",
-                    section.heading_path.join(" > "),
-                    section.line_start,
-                    section.line_end
-                ),
-                // A whole-document read too large to serve as text (#290).
-                None if outline.document_oversized => format!(
-                    "This document is larger than this server's {section_max_bytes}-byte read \
-                     limit, so here is its outline instead of its text. Fetch a section by its \
-                     heading_path or line, or read raw lines with start_line/end_line.\n\n"
-                ),
-                None => String::new(),
-            };
-            text.push_str(&render_outline_body(&outline));
-            if let Some(intro) = &outline.intro {
-                text.push_str(&format!(
-                    "\n\nThe document also has text before its first heading (lines {}-{}); read \
-                     it with start_line: {}, end_line: {}.",
-                    intro.line_start, intro.line_end, intro.line_start, intro.line_end
-                ));
-            }
-            text
+    }
+    for (key, list) in [
+        ("links_out", out),
+        ("broken_links", broken),
+        ("links_in", incoming),
+    ] {
+        if !list.is_empty() {
+            structured.insert(key.to_string(), serde_json::json!(list));
         }
-        retrieval::DocumentView::Section(section) => match &section.outline {
-            None => {
-                let note = section.truncated.then(|| {
-                    truncation_note(section.end_line, section.entry.line_end, section_max_bytes)
-                });
-                let mut text = section.content.unwrap_or_default();
-                text.push_str(note.as_deref().unwrap_or_default());
-                text
-            }
-            Some(outline) => {
-                let mut text = format!(
-                    "Section \"{}\" (lines {}-{}) is larger than this server's {}-byte section \
-                     size limit, so here is its outline instead of its text. Fetch a sub-section by \
-                     its heading_path or line.\n\n{}",
-                    section.entry.heading_path.join(" > "),
-                    section.entry.line_start,
-                    section.entry.line_end,
-                    section_max_bytes,
-                    render_outline_body(outline),
-                );
-                if let Some(intro) = &section.intro {
-                    text.push_str(&format!(
-                        "\n\nThe section also has text of its own before its first sub-heading \
-                         (lines {}-{}); read it with start_line: {}, end_line: {}.",
-                        intro.line_start, intro.line_end, intro.line_start, intro.line_end
-                    ));
-                }
-                text
-            }
-        },
     }
-}
-
-/// The trailer appended to a text block the server cut at its size limit
-/// (#290), naming the last line served and how to read on. Text-only clients
-/// see nothing but the text itself, so without this a truncated read would
-/// look like a complete one; `structured_content` carries the same facts as
-/// `truncated`/`end_line`.
-fn truncation_note(end_line: usize, last_line: usize, section_max_bytes: usize) -> String {
-    format!(
-        "\n\n[Cut at this server's {section_max_bytes}-byte read limit: lines through {end_line} \
-         of {last_line}. Read on with start_line: {}.]",
-        end_line + 1
-    )
-}
-
-/// An outline's heading lines (relative to its scope) plus its truncation
-/// hint, if any.
-fn render_outline_body(outline: &retrieval::OutlineView) -> String {
-    let base_depth = outline.section.as_ref().map_or(0, |s| s.heading_path.len());
-    let mut text = render_outline_text(&outline.entries, base_depth);
-    if let Some(hint) = &outline.hint {
-        text.push_str("\n\n");
-        text.push_str(hint);
+    if !similar.is_empty() {
+        structured.insert("similar".to_string(), serde_json::Value::Array(similar));
     }
-    text
-}
-
-/// Plain-text rendering of outline entries: one line per entry, indented by
-/// ancestry depth below `base_depth` (the scope section's own depth, or 0
-/// for a whole document), e.g. `## Hardware (lines 12-40)`.
-fn render_outline_text(entries: &[retrieval::OutlineEntry], base_depth: usize) -> String {
-    if entries.is_empty() {
-        return "(no headings)".to_string();
+    if links_out.has_more() {
+        structured.insert(
+            "links_out_total".to_string(),
+            serde_json::json!(links_out.total),
+        );
     }
-    entries
-        .iter()
-        .map(|e| {
-            if e.level == 0 {
-                format!(
-                    "(text before the first heading) (lines {}-{})",
-                    e.line_start, e.line_end
-                )
-            } else {
-                let indent = "  ".repeat(
-                    e.heading_path
-                        .len()
-                        .saturating_sub(base_depth)
-                        .saturating_sub(1),
-                );
-                format!(
-                    "{indent}{} {} (lines {}-{})",
-                    "#".repeat(e.level as usize),
-                    e.heading,
-                    e.line_start,
-                    e.line_end
-                )
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    if links_in.has_more() {
+        structured.insert(
+            "links_in_total".to_string(),
+            serde_json::json!(links_in.total),
+        );
+    }
 }
 
 /// Map `retrieval::resolve_document_view`'s error into the `McpError` this
@@ -1529,6 +1464,11 @@ pub struct GetSchemaParams {
     /// Only fields with a closed value set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values_only: Option<bool>,
+
+    /// Also list the most-used values of each open field, with document
+    /// counts, and other fields documents here use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values_in_use: Option<bool>,
 }
 
 /// Parameters for `update_schema`.
@@ -1538,13 +1478,13 @@ pub struct UpdateSchemaParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
-    /// Which operation to perform.
+    // A string with an advertised `enum`, not a Rust enum, so parsing stays
+    // as tolerant as `build_schema_edit` already is.
+    #[schemars(extend("enum" = ["add_values", "remove_values", "set_field", "remove_field"]))]
     pub operation: String,
 
-    /// Field this operation targets, as a dot-path. A nested field such as
-    /// `planning.method` is edited in place under its parent; for add_values and
-    /// set_field, missing parents are created as object fields. Empty segments and
-    /// paths over 16 segments are refused.
+    /// Field to change, as a dot-path (`planning.method`); `add_values` and
+    /// `set_field` create missing parents.
     pub field: String,
 
     /// Values, for add_values/remove_values.
@@ -1563,7 +1503,7 @@ pub struct UpdateSchemaParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force: Option<bool>,
 
-    /// Required for root-scope changes; see schema-tag-policy.md.
+    /// Must be true to change the root schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acknowledge_root_change: Option<bool>,
 }
@@ -1581,23 +1521,14 @@ pub struct SearchParams {
     pub query: Option<String>,
 
     /// Frontmatter criteria keyed by field (dot-paths for nested fields): a
-    /// scalar means equals (`{"type": "guide"}`), an array means any-of, an
-    /// object means all-of or a numeric range
-    /// (`{"planning.prep_minutes": {"lt": 30}}`).
+    /// scalar means equals (`{"type": "guide"}`), an array any-of, an object
+    /// all-of or a numeric range (`{"planning.prep_minutes": {"lt": 30}}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<SearchFiltersInput>,
 
-    /// Restrict by location: a case-insensitive **substring** of the
-    /// document's path, not a prefix. It matches anywhere in the path, so it
-    /// also finds a document from a fragment of its name — `stir_fr` finds
-    /// `kitchen/recipes/stir_fry.md`, and `recipes/` finds everything under
-    /// any `recipes` folder. A trailing slash is optional: `sysadmin/` and
-    /// `sysadmin` behave identically. A short needle is correspondingly
-    /// broad — `sys` matches `sysadmin/` and `archive/old-sys/` alike — so
-    /// prefer the longest fragment you are sure of. A needle matching more
-    /// documents than the server will filter on at once sets
-    /// `path_prefix_truncated: true` on the response, rather than silently
-    /// returning fewer matches than exist.
+    /// Case-insensitive substring of the path, not just a prefix: `recipes/`
+    /// matches any recipes folder, `stir_fr` finds `stir_fry.md`. Prefer the
+    /// longest fragment you are sure of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
 
@@ -1610,15 +1541,10 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granularity: Option<String>,
 
-    /// Restrict results to everything under this run of consecutive headings,
-    /// starting at any level. Each segment is a complete heading name:
-    /// `["Conditions"]`, `["Chapter 10: Game Mastering", "Conditions"]` and
-    /// `["Conditions", "Blinded"]` all match text under `Chapter 10: Game
-    /// Mastering > Conditions > Blinded`; `["Chapter 10", "Conditions"]` does
-    /// not. Matched ignoring case, whitespace and invisible characters, but
-    /// not Unicode normalization form (a precomposed accented character does
-    /// not match a decomposed spelling of the same text). Requires a query;
-    /// must not be empty.
+    /// Restrict query results to text under this run of complete heading
+    /// names, starting at any level: `["Conditions", "Blinded"]` matches under
+    /// `Ch. 10 > Conditions > Blinded`. Ignores case and whitespace. Needs a
+    /// query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heading_prefix: Option<Vec<String>>,
 
@@ -1626,17 +1552,17 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
 
-    /// Number to skip, for paging. Exhaustive (no depth limit) in enumeration
-    /// mode. In query mode (any granularity), pages over the
-    /// already-ranked results, so `offset + limit` is capped at
-    /// reranking.candidate_limit when reranking is enabled, or a fixed depth
-    /// otherwise — a request past that bound gets `offset_truncated: true` in
-    /// the response instead of a silently short or empty page.
+    // Replaced at list time with effective-set-aware text
+    // (`descriptions::search_property_descriptions`).
+    /// Results to skip, for paging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
 
-    /// Sort key, enumeration only: path/title/mtime/indexed_at.
+    /// Sort key, enumeration only.
+    // A string with an advertised `enum`: `OrderBy::parse` also accepts the
+    // aliases `file_path`, `modified` and `indexed`, case-insensitively.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["path", "title", "mtime", "indexed_at"]))]
     pub order_by: Option<String>,
 
     /// Sort descending (enumeration only).
@@ -1647,112 +1573,75 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_score: Option<f32>,
 
-    /// Add a score-breakdown line per result (query + chunk granularity only;
-    /// rejected at document granularity, since a grouped result collapses to
-    /// one row per document with no per-arm chunk score to report).
+    /// Add a score breakdown per result (`chunk` granularity only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain: Option<bool>,
 
-    /// Frontmatter fields to include per result (dot-paths; document
-    /// granularity only, enumeration or query — rejected at any other
-    /// granularity, whose results carry no frontmatter).
+    /// Frontmatter fields to include per result, as dot-paths (`document`
+    /// only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<Vec<String>>,
 
-    /// Exclude docs modified before this date.
+    /// Only documents modified after this date (YYYY-MM-DD).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_after: Option<String>,
 
-    /// Exclude docs modified after this date.
+    /// Only documents modified before this date (YYYY-MM-DD).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_before: Option<String>,
 }
 
 /// Parameters for `write_document`.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct WriteDocumentParams {
-    /// Document or directory path, relative to the KB root. Required unless
-    /// `documents` is set for a batch write.
+    // Each edit mode states what it combines with once, here; a bad
+    // combination is refused by `parse_edit_mode` with the rule spelled out.
+    /// Document or directory path, relative to the KB root. Not with
+    /// `documents`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// The whole file, including YAML frontmatter. Creates `path` if it is
-    /// new, replaces it if it exists. Not combinable with any other edit mode.
+    /// The whole file, including YAML frontmatter: creates `path`, or
+    /// replaces it. Not combinable with another edit mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Exact text to replace with `new_string`, instead of resending the
-    /// whole file. Must occur exactly once in the document. Not combinable
-    /// with `content`, `frontmatter_patch` or `append`.
+    /// Exact text to replace with `new_string`; must occur exactly once. Not
+    /// combinable with another edit mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_string: Option<String>,
     /// Replacement for `old_string`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_string: Option<String>,
-    /// Structured edits to just the frontmatter, leaving the body untouched —
-    /// the usual small edit (flipping `status: draft` to `active`, adding a
-    /// tag) needs no `content` at all. Applied in order, each
-    /// `{operation, field, value}` or `{operation, field, values}` with
-    /// `field` a dot-path: `set_field` sets or replaces a value (`value`);
-    /// `remove_field` deletes a field (errors if it is not set);
-    /// `add_values` appends to a list field, creating it if absent,
-    /// de-duplicated (`values`); `remove_values` removes from a list field
-    /// (errors if it is absent). Fields the patch does not change keep their
-    /// exact formatting, order and comments; a changed field is re-rendered
-    /// (a dot-path re-renders its whole top-level field, and comments on a
-    /// changed field are dropped). Combines with `append` (the patch applies
-    /// first), not with `content` or `old_string`/`new_string`.
-    /// `expected_hash` still guards the whole file.
+    /// Frontmatter edits applied in order, body untouched: `set_field`
+    /// (`value`), `remove_field`, `add_values`/`remove_values` on a list
+    /// (`values`; add creates the list). Unchanged fields keep their
+    /// formatting. Combines with `append` (patch first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontmatter_patch: Option<Vec<FrontmatterPatchOp>>,
-    /// Text to add to the end of the document body, with no need to read or
-    /// resend existing content. Exactly one newline separates it from what
-    /// was already there; include your own blank line in `append` for one.
-    /// Never lands inside the frontmatter block, even for a document with no
-    /// body yet. Combines with `frontmatter_patch` (applied after it), not
-    /// with `content` or `old_string`/`new_string`.
+    /// Text to add to the end of the body, after one newline (start it with a
+    /// blank line for a paragraph break).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append: Option<String>,
-    /// Relocate to this path. Combines with any edit mode, or stands alone
-    /// for a pure move (the server reads the current body itself). Links
-    /// pointing at the document are rewritten for you. If `path` is a
-    /// directory, its whole subtree moves.
+    /// Move to this path, with any edit mode or alone; links to it are
+    /// rewritten. A directory `path` moves its whole subtree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_path: Option<String>,
-    /// Commit message; a default is generated if omitted.
+    /// Optional one-line summary of the change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// Stale-read guard: the `content_hash` from a prior `get_document` read.
-    /// The edit is rejected if the file has changed since. It covers the
-    /// whole file, even for a `frontmatter_patch` that touches only a few
-    /// fields.
+    /// The `version` from your last `get_document` read; required to replace
+    /// an existing document with `content` or to move one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_hash: Option<String>,
+    pub expected_version: Option<String>,
     /// Skip the near-duplicate check when creating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_new: Option<bool>,
     // The cap below is `write::MAX_BATCH_DOCUMENTS`; doc comments cannot
     // interpolate it, so `batch_documents_description_states_the_real_cap`
     // pins the number. Moves are excluded per `write::BatchWriteRequest`.
-    /// Batch write: several documents written as ONE commit instead of one
-    /// commit per document — for restructuring related pages, or the same
-    /// kind of change (e.g. a status flip) across a set. A batch call passes
-    /// ONLY this (plus, optionally, `message` as the batch's commit subject);
-    /// `path` and every other top-level field are rejected alongside it.
-    /// Each entry takes the single-document edit modes (`content`,
-    /// `old_string`+`new_string`, `frontmatter_patch`, `append`) with the
-    /// same exclusivity rules, but not `new_path`: a batch can create or
-    /// replace documents, not move them. Every `path` must be unique; at most
-    /// 25 documents per call.
-    ///
-    /// Atomic: every document lands in the one commit, or (if git fails
-    /// before committing) none do and everything this call wrote is rolled
-    /// back — there is no partial success. Frontmatter validation, and the
-    /// near-duplicate check for creates, run for every entry before anything
-    /// is written; a failure lists every offending document in
-    /// `data.failures`. A successful batch's `structured_content` has one
-    /// `outcome`, `sha`, `rebased_paths` and `sync_failure_cause` (one
-    /// commit), plus `documents`: one `{path, is_create, diff,
-    /// diff_truncated, diff_total_bytes}` per document. The text summary has
-    /// every diff in full.
+    /// Batch: several documents as one atomic change — all are saved or none.
+    /// Pass ONLY this (plus optional `message`). Each entry takes `path` and
+    /// the single-document edit modes with the same rules, but no
+    /// `new_path`. Paths unique; at most 25.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub documents: Option<Vec<BatchDocumentInput>>,
 }
@@ -1760,57 +1649,43 @@ pub struct WriteDocumentParams {
 // One document within a `write_document` batch call
 // (`WriteDocumentParams::documents`): the single-document content-edit
 // vocabulary minus `new_path` (no per-entry moves) and `message` (the batch
-// has one commit message, supplied once at the top level). A `//` comment,
-// not `///`, so none of this reaches the served schema.
-/// One document in a batch write.
+// has one commit message, supplied once at the top level). Every property
+// means what its top-level twin does, which `documents` says once, so none
+// carries a description of its own — the item schema is pure structure apart
+// from the one field description `FrontmatterPatchOp` brings along.
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct BatchDocumentInput {
-    /// Document path, relative to the KB root. Must be unique within the batch.
     pub path: String,
-    /// The whole file, including YAML frontmatter. Creates `path` if it is
-    /// new, replaces it if it exists. Not combinable with any other edit mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Exact text to replace with `new_string`; must occur exactly once.
-    /// Not combinable with `content`, `frontmatter_patch` or `append`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_string: Option<String>,
-    /// Replacement for `old_string`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_string: Option<String>,
-    /// Structured frontmatter edits, same operations as the top-level
-    /// `frontmatter_patch`; combines with `append`, not with `content` or
-    /// `old_string`/`new_string`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontmatter_patch: Option<Vec<FrontmatterPatchOp>>,
-    /// Append this text to the end of the document body; combines with
-    /// `frontmatter_patch`, not with `content` or `old_string`/`new_string`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append: Option<String>,
-    /// Stale-read guard: the `content_hash` from a prior `get_document` read,
-    /// checked against this document specifically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_hash: Option<String>,
-    /// Skip the near-duplicate check when creating this document.
+    pub expected_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_new: Option<bool>,
 }
 
 // Mirrors `update_schema`'s `operation`/`field`/`values`/`definition` shape
 // (`UpdateSchemaParams`, `build_schema_edit`), applied to a document's own
-// frontmatter values; parsed into `write::FrontmatterEdit`. A `//` comment,
-// not `///`, so none of this reaches the served schema.
-/// One structured frontmatter edit.
+// frontmatter values; parsed into `write::FrontmatterEdit`. `operation` stays
+// a string with an advertised `enum`, so `build_frontmatter_edit` keeps
+// parsing it case-insensitively. The operations themselves are described
+// once, on `WriteDocumentParams::frontmatter_patch`.
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct FrontmatterPatchOp {
-    /// "set_field" | "remove_field" | "add_values" | "remove_values".
+    #[schemars(extend("enum" = ["set_field", "remove_field", "add_values", "remove_values"]))]
     pub operation: String,
-    /// Frontmatter field this operation targets (dot-path).
+    /// Dot-path.
     pub field: String,
-    /// New value, for set_field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<serde_json::Value>,
-    /// Values to add/remove, for add_values/remove_values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<serde_json::Value>>,
 }
@@ -1818,11 +1693,14 @@ pub struct FrontmatterPatchOp {
 /// Parameters for `delete_document`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DeleteDocumentParams {
-    /// Relative path, unique basename, or absolute path.
+    /// Path relative to the KB root.
     pub path: String,
-    /// Optional commit message; defaults to "docs: delete {path}".
+    /// Optional one-line summary of the change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The `version` from your last `get_document` read; required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
 }
 
 /// Validated edit mode, produced by `parse_edit_mode`.
@@ -1842,6 +1720,70 @@ pub enum EditMode {
         edits: Vec<FrontmatterEdit>,
         text: String,
     },
+}
+
+/// An owned `write::DocChange`: what a parsed edit mode does to a document,
+/// handed to the write pipeline, which applies it to the document as read under
+/// the lock (so a relative edit always lands on current content).
+pub(crate) enum OwnedChange {
+    Create(String),
+    Replace(String),
+    Relative(Box<write::RelativeEdit<'static>>),
+}
+
+impl OwnedChange {
+    /// `display_path` names the document in an anchor-not-found message.
+    pub(crate) fn from_mode(mode: EditMode, display_path: String) -> Self {
+        match mode {
+            EditMode::Full { content } => OwnedChange::Replace(content),
+            EditMode::Surgical { old, new } => OwnedChange::Relative(Box::new(move |c: &str| {
+                apply_surgical(c, &old, &new, &display_path)
+            })),
+            EditMode::Patch { edits } => OwnedChange::Relative(Box::new(move |c: &str| {
+                write::apply_frontmatter_patch(c, &edits)
+            })),
+            EditMode::Append { text } => {
+                OwnedChange::Relative(Box::new(move |c: &str| Ok(write::apply_append(c, &text))))
+            }
+            // Patch first, then append — the patch only ever touches the
+            // frontmatter block, so the two compose with no ordering ambiguity.
+            EditMode::PatchAppend { edits, text } => {
+                OwnedChange::Relative(Box::new(move |c: &str| {
+                    write::apply_frontmatter_patch(c, &edits)
+                        .map(|patched| write::apply_append(&patched, &text))
+                }))
+            }
+        }
+    }
+
+    pub(crate) fn as_change(&self) -> write::DocChange<'_> {
+        match self {
+            OwnedChange::Create(c) => write::DocChange::Create(c),
+            OwnedChange::Replace(c) => write::DocChange::Replace(c),
+            OwnedChange::Relative(edit) => write::DocChange::Relative(edit.as_ref()),
+        }
+    }
+}
+
+/// The `Operation:` trailer label for an edit (`None` = a pure move).
+fn edit_operation_label(mode: Option<&EditMode>, is_move: bool) -> &'static str {
+    match (mode, is_move) {
+        (None, _) => "write_document (move)",
+        (Some(EditMode::Full { .. }), false) => "write_document (full replace)",
+        (Some(EditMode::Full { .. }), true) => "write_document (full replace + move)",
+        (Some(EditMode::Surgical { .. }), false) => "write_document (surgical replace)",
+        (Some(EditMode::Surgical { .. }), true) => "write_document (surgical replace + move)",
+        (Some(EditMode::Patch { .. }), false) => "write_document (frontmatter patch)",
+        (Some(EditMode::Patch { .. }), true) => "write_document (frontmatter patch + move)",
+        (Some(EditMode::Append { .. }), false) => "write_document (append)",
+        (Some(EditMode::Append { .. }), true) => "write_document (append + move)",
+        (Some(EditMode::PatchAppend { .. }), false) => {
+            "write_document (frontmatter patch + append)"
+        }
+        (Some(EditMode::PatchAppend { .. }), true) => {
+            "write_document (frontmatter patch + append + move)"
+        }
+    }
 }
 
 /// Build a single `write::FrontmatterEdit` from the wire shape a caller sent,
@@ -2071,7 +2013,7 @@ fn batch_input_as_write_params(input: &BatchDocumentInput) -> WriteDocumentParam
         append: input.append.clone(),
         new_path: None,
         message: None,
-        expected_hash: input.expected_hash.clone(),
+        expected_version: input.expected_version.clone(),
         force_new: input.force_new,
         documents: None,
     }
@@ -2090,11 +2032,12 @@ const NOT_FOUND_ANCHOR_CHARS: usize = 40;
 const NOT_FOUND_CONTEXT_CHARS: usize = 80;
 
 /// Above this size, skip the near-match/anchor diagnostics below and fall back to the
-/// plain not-found message. `old_content` is the on-disk document and, unlike
-/// `new_content`, is not itself bounded by `MAX_CONTENT_LEN` — it could predate that
-/// cap or have been written outside these tools entirely — so this is a second,
-/// independent bound rather than an assumption that the write-path cap already covers
-/// it.
+/// plain not-found message. `old_content` is the on-disk document, which the write
+/// path's `MAX_CONTENT_LEN` does not bound: it could predate that cap, have been
+/// written outside these tools entirely, or be an over-cap document an edit is
+/// shrinking (an edit is refused only for growing a document past the cap) — so
+/// this is a second, independent bound rather than an assumption that the
+/// write-path cap already covers it.
 const NOT_FOUND_DIAGNOSTIC_MAX_BYTES: usize = MAX_CONTENT_LEN;
 
 /// Collapse every run of whitespace (including newlines) to a single space and trim
@@ -2207,236 +2150,166 @@ pub fn apply_surgical(
     }
 }
 
-/// The definitive, machine-readable outcome of a write tool call
-/// (`write_document`/`delete_document`), exposed via
-/// `CallToolResult::structured_content` under the `"outcome"` key so a caller can
-/// branch on `result.structured_content["outcome"]` instead of pattern-matching the
-/// human-readable summary text.
-///
-/// The last three variants map directly onto `git::CommitSyncError`'s pre-commit /
-/// post-commit split (see that type's docs for why the two need opposite recovery):
-/// `FailedNoChange` and `FailedInconsistentState` both come from a `PreCommit`
-/// failure (the former rolled back cleanly, the latter's rollback itself failed);
-/// `CommittedPendingSync` comes from a `PostCommit` failure, which is deliberately
-/// left uncorrected. `NotFound` and validation failures never reach `write_document`/
-/// `delete_document` at all — they are rejected earlier via `McpError::invalid_params`
-/// — so they are not modeled here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WriteOutcome {
-    /// Committed and pushed. The tool's happy path.
-    Synced,
-    /// Committed locally, but the remote push failed. NOT rolled back — the commit is
-    /// real. Will sync on the next successful write, or on manual intervention.
-    CommittedPendingSync,
-    /// Nothing was committed and the pre-commit rollback succeeded: filesystem and
-    /// git state are back to exactly how they were before this call. Safe to retry.
-    FailedNoChange,
-    /// Nothing was committed AND the pre-commit rollback itself failed. Filesystem
-    /// and git are now inconsistent with each other and with HEAD. This needs
-    /// operator attention, not a blind retry — logged at `error!` for that reason.
-    FailedInconsistentState,
+/// Add `merged_with_other_changes: true` to a `structured_content` map — only
+/// when it applies, so the usual result carries no field about it at all.
+fn insert_merged(fields: &mut serde_json::Map<String, serde_json::Value>, merged: bool) {
+    if merged {
+        fields.insert(
+            "merged_with_other_changes".to_string(),
+            serde_json::json!(true),
+        );
+    }
 }
 
-impl WriteOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            WriteOutcome::Synced => "synced",
-            WriteOutcome::CommittedPendingSync => "committed_pending_sync",
-            WriteOutcome::FailedNoChange => "failed_no_change",
-            WriteOutcome::FailedInconsistentState => "failed_inconsistent_state",
+/// The refusal for a change that no longer fits the document
+/// (`WriteError::EditedElsewhere`).
+fn edited_elsewhere_error(rel_path: &str) -> McpError {
+    McpError::invalid_params(format!("'{rel_path}': {}", write::EDITED_ELSEWHERE), None)
+}
+
+/// The instruction every refusal for an absolute change sent without
+/// `expected_version` (`WriteError::VersionRequired`) gives, `action` being the
+/// operation-specific rest of the sentence.
+fn pass_expected_version(action: &str) -> String {
+    format!("pass expected_version (the version from get_document) to {action}")
+}
+
+/// The refusal for an absolute change sent without `expected_version`
+/// (`WriteError::VersionRequired`).
+fn version_required_error(rel_path: &str) -> McpError {
+    McpError::invalid_params(
+        format!(
+            "'{rel_path}' already exists: {}",
+            pass_expected_version("replace, move or delete it")
+        ),
+        None,
+    )
+}
+
+/// How `KbSearchServer::write_raw_file` ended when it did not fail outright.
+enum RawWrite {
+    /// The commit landed (synced, or pending sync).
+    Committed,
+    /// The remote changed underneath it. Its commit was dropped (the branch is
+    /// back at its pre-commit HEAD) and nothing was written; the caller syncs
+    /// again, then re-applies its edit or refuses.
+    Conflict,
+}
+
+/// The message a write tool returns when its change could not be saved and has
+/// been fully undone. The underlying cause is a server-side detail — it was
+/// already logged where it happened — so it is deliberately not relayed: the
+/// caller cannot act on it, and the only useful instruction is to retry.
+fn not_saved_error(what: &str) -> McpError {
+    McpError::internal_error(
+        format!("{what} could not be saved. Nothing was changed; try again."),
+        None,
+    )
+}
+
+/// The message a write tool returns when its change could not be saved AND
+/// undoing the partial write failed too. That is an operator problem (logged at
+/// `error!` where it happened), not something the caller can fix or retry its way
+/// out of, so the caller is only told not to trust the current state.
+fn not_saved_unverified_error(what: &str) -> McpError {
+    McpError::internal_error(
+        format!(
+            "{what} could not be saved, and the server could not confirm it was left \
+             unchanged. Do not retry; re-read it with get_document, and report the \
+             problem to the operator."
+        ),
+        None,
+    )
+}
+
+/// A failure to resolve the server's own sync credential. Configuration, not a
+/// caller error: logged, and reported as a plain save failure.
+fn credential_error(e: impl std::fmt::Display) -> McpError {
+    error!("write refused: could not resolve the sync credential: {e:#}");
+    McpError::internal_error(
+        "The change could not be saved: the server is misconfigured. Nothing was \
+         changed; report the problem to the operator."
+            .to_string(),
+        None,
+    )
+}
+
+/// `write.rs`'s message-length/newline rejections name the field by its internal
+/// purpose; the tool parameter is just `message`.
+fn message_param_reason(reason: &str) -> String {
+    reason.replace("commit message", "message")
+}
+
+/// A `write::validate_commit_message` rejection, worded for the `message` parameter.
+fn invalid_message_error(reason: String) -> McpError {
+    McpError::invalid_params(message_param_reason(&reason), None)
+}
+
+/// The response every successful single-document write or delete shares:
+/// `path` (where the document is now), `action` (`created`, `updated`,
+/// `moved` — with `from` — or `deleted`), `version` when there is a document to
+/// version, and `merged_with_other_changes: true` when that applies. `diff`
+/// rides only on an edit: a create would echo the content the caller just
+/// sent, and a delete the document it just removed. It is capped (see
+/// [`capped_diff`]), with `diff_truncated: true`/`diff_total_bytes` only when
+/// cut.
+fn write_response(
+    path: &str,
+    action: &str,
+    diff: &str,
+    version: Option<&str>,
+    merged: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert("path".to_string(), serde_json::json!(path));
+    fields.insert("action".to_string(), serde_json::json!(action));
+    if matches!(action, "updated" | "moved") && !diff.is_empty() {
+        let (diff, diff_truncated, diff_total_bytes) = capped_diff(diff);
+        fields.insert("diff".to_string(), serde_json::json!(diff));
+        if diff_truncated {
+            fields.insert("diff_truncated".to_string(), serde_json::json!(true));
+            fields.insert(
+                "diff_total_bytes".to_string(),
+                serde_json::json!(diff_total_bytes),
+            );
         }
     }
-}
-
-/// Build the fields every write/delete `structured_content` payload shares
-/// (fix #129): `sha` and `diff` (capped — see [`capped_diff`] — with
-/// `diff_truncated`/`diff_total_bytes` alongside it) and `rebased_paths`, plus
-/// `sync_failure_cause` when the write landed as `committed_pending_sync`.
-/// Before this, `structured_content` carried only `{"outcome", ...}` — a
-/// client that prefers structured content over prose (Claude Code does) had
-/// no programmatic way to learn the commit SHA or see the diff at all, the
-/// same class of bug as #124 (`search`'s `structured_content` once regressed
-/// to a bare `{"path_prefix_truncated": ...}`).
-///
-/// Returns a `serde_json::Map` rather than a full `Value` so
-/// [`with_outcome_and_rewrites`]/[`with_outcome_and_referencing`] can merge in
-/// their own move/delete-specific field on top.
-fn write_success_structured_fields(
-    outcome: WriteOutcome,
-    success: &WriteSuccess,
-) -> serde_json::Map<String, serde_json::Value> {
-    let (diff, diff_truncated, diff_total_bytes) = capped_diff(&success.diff);
-    let mut fields = serde_json::Map::new();
-    fields.insert("outcome".to_string(), serde_json::json!(outcome.as_str()));
-    fields.insert("sha".to_string(), serde_json::json!(success.sha));
-    fields.insert("diff".to_string(), serde_json::json!(diff));
-    fields.insert(
-        "diff_truncated".to_string(),
-        serde_json::json!(diff_truncated),
-    );
-    fields.insert(
-        "diff_total_bytes".to_string(),
-        serde_json::json!(diff_total_bytes),
-    );
-    fields.insert(
-        "rebased_paths".to_string(),
-        serde_json::json!(rebased_paths_json(&success.rebased_paths)),
-    );
-    if let Some(cause) = &success.sync_failure_cause {
-        fields.insert("sync_failure_cause".to_string(), serde_json::json!(cause));
+    if let Some(version) = version {
+        fields.insert("version".to_string(), serde_json::json!(version));
     }
+    insert_merged(&mut fields, merged);
     fields
 }
 
-/// Attach a machine-readable `{"outcome": ...}` discriminant to a successful
-/// `CallToolResult`, alongside its human-readable text content — for
-/// `write_document`'s create/edit path specifically: also attaches `sha`,
-/// `diff`/`diff_truncated`/`diff_total_bytes`, `rebased_paths`, and
-/// `sync_failure_cause` (see [`write_success_structured_fields`], fix #129),
-/// plus `rewritten_paths`, the repo-relative paths of OTHER documents a MOVE
-/// rewrote incoming links in (always `[]` for a non-move write, or a move
-/// with nothing to rewrite). A move that silently edits other documents
-/// without surfacing which ones is not acceptable, so this rides in
-/// `structured_content` on every create/edit result, not just moves. See
-/// [`with_outcome_and_referencing`] for `delete_document`'s equivalent.
-fn with_outcome_and_rewrites(
-    mut result: CallToolResult,
-    outcome: WriteOutcome,
-    success: &WriteSuccess,
-) -> CallToolResult {
-    let mut fields = write_success_structured_fields(outcome, success);
-    fields.insert(
-        "rewritten_paths".to_string(),
-        serde_json::json!(success.rewritten_paths),
-    );
-    result.structured_content = Some(serde_json::Value::Object(fields));
-    result
-}
-
-/// (#229) Like [`with_outcome_and_rewrites`], but for `delete_document`
-/// specifically: attaches `referencing_paths`, the repo-relative paths of
-/// OTHER documents that still link to the just-deleted document (always `[]`
-/// when none exist, or when no `StateDb` was available to check — see
-/// `write::WriteSuccess::referencing_paths`'s doc comment), alongside the same
-/// `sha`/`diff`/`rebased_paths`/`sync_failure_cause` fields
-/// [`write_success_structured_fields`] attaches for create/edit (fix #129).
-/// The `referencing_paths` half is the caller-visible counterpart of the
-/// reverse-link check #181 already logs server-side — an agent has no access
-/// to that log, so the same information must reach it through the tool result
-/// too.
-fn with_outcome_and_referencing(
-    mut result: CallToolResult,
-    outcome: WriteOutcome,
-    success: &WriteSuccess,
-) -> CallToolResult {
-    let mut fields = write_success_structured_fields(outcome, success);
-    fields.insert(
-        "referencing_paths".to_string(),
-        serde_json::json!(success.referencing_paths),
-    );
-    result.structured_content = Some(serde_json::Value::Object(fields));
-    result
-}
-
-/// Build the `data` payload for an `McpError` reporting a failed write-tool outcome,
-/// so the same `{"outcome": ...}` discriminant is available on the error path too
-/// (`ErrorData::data`), not just on success.
-fn outcome_data(outcome: WriteOutcome) -> Option<serde_json::Value> {
-    Some(serde_json::json!({ "outcome": outcome.as_str() }))
+/// Insert `key: paths` only when `paths` is non-empty.
+fn insert_paths(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    paths: &[String],
+) {
+    if !paths.is_empty() {
+        fields.insert(key.to_string(), serde_json::json!(paths));
+    }
 }
 
 /// Map a successful `write::write_documents_batch` result (#180) onto this
-/// tool surface's `CallToolResult`. Mirrors `create_edit_success_to_result`'s
-/// shape (`outcome`/`sha`/`rebased_paths`/`sync_failure_cause`), but a batch
-/// has no single `rel_path` or single `diff` — every per-document detail
-/// (path, whether it was a create, its own diff) lives in a `documents`
-/// array instead of at the top level, since the ONE commit covers several
-/// otherwise-unrelated documents at once.
+/// tool surface's `CallToolResult`: a `documents` array of per-document
+/// [`write_response`]s (`created` or `updated`), saved as one change.
 fn batch_write_success_to_result(success: write::BatchWriteSuccess) -> CallToolResult {
-    let verb_list: String = success
+    let documents: Vec<serde_json::Value> = success
         .documents
         .iter()
         .map(|d| {
-            format!(
-                "- {} {}",
-                if d.is_create { "create" } else { "update" },
-                d.rel_path
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let (summary, outcome) = match success.outcome {
-        CoreWriteOutcome::Synced => (
-            format!(
-                "Batch write: {} document(s) synced (commit {}). Indexing has been queued \
-                 and will complete shortly.\n{}",
-                success.documents.len(),
-                success.sha,
-                verb_list
-            ),
-            WriteOutcome::Synced,
-        ),
-        CoreWriteOutcome::CommittedPendingSync => {
-            let cause = success
-                .sync_failure_cause
-                .as_deref()
-                .unwrap_or("unknown error");
-            (
-                format!(
-                    "Batch write: {} document(s) committed locally (commit {}), but the push \
-                     to the remote failed: {}. It will sync on the next successful write or \
-                     manual intervention. Indexing has been queued from the local copy.\n{}",
-                    success.documents.len(),
-                    success.sha,
-                    cause,
-                    verb_list
-                ),
-                WriteOutcome::CommittedPendingSync,
-            )
-        }
-    };
-
-    // Every document's diff, in full — same "text channel is never truncated"
-    // contract `create_edit_success_to_result` upholds for a single write;
-    // `structured_content` below carries the per-document CAPPED copies.
-    let mut text = summary;
-    for doc in &success.documents {
-        if !doc.diff.is_empty() {
-            text = format!("{text}\n\n{}", doc.diff);
-        }
-    }
-
-    let documents_json: Vec<serde_json::Value> = success
-        .documents
-        .iter()
-        .map(|d| {
-            let (diff, diff_truncated, diff_total_bytes) = capped_diff(&d.diff);
-            serde_json::json!({
-                "path": d.rel_path,
-                "is_create": d.is_create,
-                "diff": diff,
-                "diff_truncated": diff_truncated,
-                "diff_total_bytes": diff_total_bytes,
-            })
+            serde_json::Value::Object(write_response(
+                &d.rel_path,
+                if d.is_create { "created" } else { "updated" },
+                &d.diff,
+                d.version.as_deref(),
+                d.merged,
+            ))
         })
         .collect();
-
-    let mut fields = serde_json::Map::new();
-    fields.insert("outcome".to_string(), serde_json::json!(outcome.as_str()));
-    fields.insert("sha".to_string(), serde_json::json!(success.sha));
-    fields.insert(
-        "rebased_paths".to_string(),
-        serde_json::json!(rebased_paths_json(&success.rebased_paths)),
-    );
-    fields.insert("documents".to_string(), serde_json::json!(documents_json));
-    if let Some(cause) = &success.sync_failure_cause {
-        fields.insert("sync_failure_cause".to_string(), serde_json::json!(cause));
-    }
-
-    let mut result = CallToolResult::success(vec![Content::text(text)]);
-    result.structured_content = Some(serde_json::Value::Object(fields));
-    result
+    CallToolResult::structured(serde_json::json!({ "documents": documents }))
 }
 
 /// Short, human-readable text for one document's `WriteError` inside a batch
@@ -2449,10 +2322,9 @@ fn batch_write_success_to_result(success: write::BatchWriteSuccess) -> CallToolR
 /// into a generic fallback.
 fn batch_write_document_error_text(err: &WriteError) -> String {
     match err {
-        WriteError::SchemaFile { .. } => format!(
-            "{} files are not documents; edit them with update_schema",
-            crate::schema::SCHEMA_FILE_NAME
-        ),
+        WriteError::SchemaFile { rel_path } => {
+            format!("'{rel_path}' is a schema file; change schemas with update_schema")
+        }
         WriteError::Validation { result } => result.errors.join("; "),
         WriteError::DedupHit {
             duplicate_of,
@@ -2462,16 +2334,21 @@ fn batch_write_document_error_text(err: &WriteError) -> String {
             "a similar document already exists: '{duplicate_of}' (similarity {similarity:.2} \
              >= threshold {threshold:.2})"
         ),
-        WriteError::InvalidCommitMessage { reason } => reason.clone(),
+        WriteError::InvalidCommitMessage { reason } => message_param_reason(reason),
         WriteError::UnsafePath { msg } => msg.clone(),
         WriteError::Internal { msg } => msg.clone(),
         WriteError::AlreadyExists => "document already exists".to_string(),
-        WriteError::NotFound => "document does not exist".to_string(),
-        WriteError::StaleHash { expected, actual } => format!(
-            "content has changed since it was read (expected content_hash '{expected}', \
-             actual is '{actual}')"
-        ),
-        WriteError::PreCommitFailed { msg, .. } => msg.clone(),
+        WriteError::NotFound => "document does not exist (deleted or moved?): find it with search \
+                                 or get_document, or give content and no expected_version to \
+                                 create it"
+            .to_string(),
+        WriteError::EditedElsewhere => write::EDITED_ELSEWHERE.to_string(),
+        WriteError::VersionRequired => {
+            format!("already exists: {}", pass_expected_version("replace it"))
+        }
+        WriteError::InvalidEdit { msg } => msg.clone(),
+        // The cause is logged where it happened; see `not_saved_error`.
+        WriteError::PreCommitFailed { .. } => "could not be saved".to_string(),
         WriteError::Io { msg } => msg.clone(),
     }
 }
@@ -2491,9 +2368,7 @@ fn batch_write_error_to_mcp_error(err: write::BatchWriteError) -> McpError {
             format!("documents contains '{rel_path}' more than once"),
             None,
         ),
-        write::BatchWriteError::InvalidCommitMessage { reason } => {
-            McpError::invalid_params(reason, None)
-        }
+        write::BatchWriteError::InvalidCommitMessage { reason } => invalid_message_error(reason),
         write::BatchWriteError::Documents { failures } => {
             let detail: Vec<serde_json::Value> = failures
                 .iter()
@@ -2517,103 +2392,67 @@ fn batch_write_error_to_mcp_error(err: write::BatchWriteError) -> McpError {
                 Some(serde_json::json!({ "failures": detail })),
             )
         }
+        // `msg` was logged by `write::write_documents_batch` and stays server-side.
         write::BatchWriteError::PreCommitFailed {
-            rolled_back: true,
-            msg,
-        } => McpError::internal_error(
-            format!(
-                "batch write failed: git commit failed and every document has been rolled \
-                 back — nothing changed, safe to retry. Cause: {msg}"
-            ),
-            outcome_data(WriteOutcome::FailedNoChange),
-        ),
+            rolled_back: true, ..
+        } => not_saved_error("The batch"),
         write::BatchWriteError::PreCommitFailed {
-            rolled_back: false,
-            msg,
-        } => McpError::internal_error(
-            format!(
-                "batch write is in an INCONSISTENT state: git commit failed AND the \
-                 rollback attempt itself failed for at least one document. The working \
-                 tree may not match git history — do not assume this operation did or did \
-                 not take effect. Manual inspection is required. {msg}"
-            ),
-            outcome_data(WriteOutcome::FailedInconsistentState),
+            rolled_back: false, ..
+        } => not_saved_unverified_error("The batch"),
+        write::BatchWriteError::EditedElsewhere => McpError::invalid_params(
+            format!("batch write failed: {}", write::EDITED_ELSEWHERE),
+            None,
         ),
     }
 }
 
-/// Map a successful `write::write_document` result (create or edit) onto this
-/// tool surface's `CallToolResult`, preserving the exact text and
-/// `structured_content` shape the existing create/edit tests pin down.
+/// Map a successful `write::write_document` result (create, edit or move) onto
+/// this tool surface's `CallToolResult`: [`write_response`] plus
+/// `rewritten_paths`, the OTHER documents a move rewrote incoming links in —
+/// a move that silently edits other documents must say which ones.
 fn create_edit_success_to_result(
     success: WriteSuccess,
     rel_path: &str,
     is_create: bool,
+    dest_path: Option<&str>,
 ) -> CallToolResult {
-    let action = if is_create { "Created" } else { "Edited" };
-    // Shared by both outcomes below: a one-line addendum naming exactly which
-    // OTHER documents a move rewrote incoming links in, so an agent moving a
-    // document is told about the side effect rather than discovering it later.
-    // Empty for every non-move write and for a move with nothing to rewrite.
-    let rewrite_note = if success.rewritten_paths.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nUpdated links in {} document(s): {}.",
-            success.rewritten_paths.len(),
-            success.rewritten_paths.join(", ")
-        )
+    let (path, action) = match dest_path {
+        Some(dest) => (dest, "moved"),
+        None if is_create => (rel_path, "created"),
+        None => (rel_path, "updated"),
     };
-    match success.outcome {
-        CoreWriteOutcome::Synced => {
-            let summary = format!(
-                "{} '{}' (commit {}). Indexing has been queued and will complete shortly.{}",
-                action, rel_path, success.sha, rewrite_note
-            );
-            let mut result_text = summary;
-            if !success.diff.is_empty() {
-                result_text = format!("{}\n\n{}", result_text, success.diff);
-            }
-            with_outcome_and_rewrites(
-                CallToolResult::success(vec![Content::text(result_text)]),
-                WriteOutcome::Synced,
-                &success,
-            )
-        }
-        CoreWriteOutcome::CommittedPendingSync => {
-            let cause = success
-                .sync_failure_cause
-                .as_deref()
-                .unwrap_or("unknown error");
-            let summary = format!(
-                "{} '{}' (commit {}) — committed locally, but the push to the remote \
-                 failed: {}. It will sync on the next successful write or manual \
-                 intervention. Indexing has been queued from the local copy.{}",
-                action, rel_path, success.sha, cause, rewrite_note
-            );
-            let mut result_text = summary;
-            if !success.diff.is_empty() {
-                result_text = format!("{}\n\n{}", result_text, success.diff);
-            }
-            with_outcome_and_rewrites(
-                CallToolResult::success(vec![Content::text(result_text)]),
-                WriteOutcome::CommittedPendingSync,
-                &success,
-            )
-        }
+    let mut fields = write_response(
+        path,
+        action,
+        &success.diff,
+        success.version.as_deref(),
+        success.merged,
+    );
+    if dest_path.is_some() {
+        fields.insert("from".to_string(), serde_json::json!(rel_path));
     }
+    insert_paths(&mut fields, "rewritten_paths", &success.rewritten_paths);
+    CallToolResult::structured(serde_json::Value::Object(fields))
 }
 
-/// The refusal for a document write, delete or move that names a
-/// `.kb-schema.yaml` (`WriteError::SchemaFile`), pointing at the one tool that
-/// edits schema files.
+/// The scope directory ([`crate::schema::scope_label`]) of a KB-relative schema file
+/// path — how model-facing text names a schema file the server itself found.
+fn schema_file_scope(schema_file: &str) -> String {
+    crate::schema::scope_label(
+        std::path::Path::new(schema_file)
+            .parent()
+            .unwrap_or(std::path::Path::new("")),
+    )
+}
+
+/// The refusal for a document write, delete or move that names a schema file
+/// (`WriteError::SchemaFile`), pointing at the one tool that edits schemas. Echoes
+/// only the caller's own path, never the schema file name convention.
 fn schema_file_path_error(schema_path: &str) -> McpError {
     McpError::invalid_params(
         format!(
-            "'{schema_path}' is a {} file, not a document: schema files cannot be written, \
-             moved or deleted with the document tools. Use update_schema to change a \
-             directory's schema.",
-            crate::schema::SCHEMA_FILE_NAME
+            "'{schema_path}' is a schema file; change schemas with update_schema. The \
+             document tools cannot write, move or delete it."
         ),
         None,
     )
@@ -2667,11 +2506,11 @@ fn create_edit_error_to_mcp_error(
             ),
             Some(serde_json::json!({
                 "duplicate_of": duplicate_of,
-                "similarity": similarity,
-                "threshold": threshold,
+                "similarity": round_score(f64::from(similarity)),
+                "threshold": round_score(f64::from(threshold)),
             })),
         ),
-        WriteError::InvalidCommitMessage { reason } => McpError::invalid_params(reason, None),
+        WriteError::InvalidCommitMessage { reason } => invalid_message_error(reason),
         WriteError::UnsafePath { msg } => McpError::invalid_params(msg, None),
         // Same text MCP callers already saw for this failure before
         // `WriteError::Internal` existed to split it out of `UnsafePath` — see
@@ -2728,112 +2567,54 @@ fn create_edit_error_to_mcp_error(
                 )
             }
         }
-        WriteError::NotFound => {
-            McpError::invalid_params(format!("File '{}' does not exist", rel_path), None)
-        }
-        WriteError::StaleHash { expected, actual } => McpError::invalid_params(
+        // A create only ends here when it carried `expected_version`: the caller
+        // meant a document it read, which is no longer at this path.
+        WriteError::NotFound if is_create => McpError::invalid_params(
             format!(
-                "'{}' has changed since you read it: expected content_hash '{}' \
-                 but the current document hash is '{}'. Re-read it with \
-                 get_document and reapply your edit against the current content.",
-                rel_path, expected, actual
+                "File '{rel_path}' does not exist: the document you read was deleted or moved. \
+                 Find it with search or get_document, or omit expected_version to create a \
+                 new document."
             ),
             None,
         ),
-        WriteError::PreCommitFailed {
-            rolled_back: true,
-            msg,
-        } => McpError::internal_error(
-            format!(
-                "'{}' was not {}: git commit failed and the attempted change has \
-                 been rolled back — nothing changed, safe to retry. Cause: {}",
-                rel_path,
-                if is_create { "created" } else { "edited" },
-                msg
-            ),
-            outcome_data(WriteOutcome::FailedNoChange),
-        ),
-        WriteError::PreCommitFailed {
-            rolled_back: false,
-            msg,
-        } => McpError::internal_error(
-            format!(
-                "'{}' is in an INCONSISTENT state: git commit failed AND the \
-                 rollback attempt itself failed. The working tree may not \
-                 match git history for this path — do not assume this \
-                 operation did or did not take effect. Manual inspection is \
-                 required. {}",
-                rel_path, msg
-            ),
-            outcome_data(WriteOutcome::FailedInconsistentState),
-        ),
+        WriteError::NotFound => {
+            McpError::invalid_params(format!("File '{}' does not exist", rel_path), None)
+        }
+        WriteError::EditedElsewhere => edited_elsewhere_error(rel_path),
+        WriteError::VersionRequired => version_required_error(rel_path),
+        WriteError::InvalidEdit { msg } => McpError::invalid_params(msg, None),
+        // `msg` was logged by `write::write_document` and stays server-side.
+        WriteError::PreCommitFailed { rolled_back, .. } => {
+            let what = if is_create {
+                format!("New document '{rel_path}'")
+            } else {
+                format!("The change to '{rel_path}'")
+            };
+            if rolled_back {
+                not_saved_error(&what)
+            } else {
+                not_saved_unverified_error(&what)
+            }
+        }
         WriteError::Io { msg } => McpError::internal_error(msg, None),
     }
 }
 
 /// Map a successful `write::delete_document` result onto this tool surface's
-/// `CallToolResult`, preserving the exact text/`structured_content` shape the
-/// existing delete tests pin down.
+/// `CallToolResult`: [`write_response`] plus (#229) `referencing_paths`, the
+/// OTHER documents that still link to the deleted one — the caller-visible
+/// counterpart of the reverse-link check #181 logs server-side.
 fn delete_success_to_result(success: WriteSuccess, rel_path: &str) -> CallToolResult {
-    // (#229) Named here so it can be included in both outcomes' text below —
-    // empty for every delete with nothing (or nothing known) still linking to
-    // the removed document.
-    let referencing_note = if success.referencing_paths.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nStill linked from {} other document(s): {}. This delete did not rewrite \
-             or remove those links — they will dangle until each referencing document's own \
-             next reindex drops the now-stale edge.",
-            success.referencing_paths.len(),
-            success.referencing_paths.join(", ")
-        )
-    };
-    match success.outcome {
-        CoreWriteOutcome::Synced => {
-            let summary = format!(
-                "Deleted '{}' (commit {}). Index cleanup has been queued and will complete shortly.{}",
-                rel_path, success.sha, referencing_note
-            );
-            let mut result_text = summary;
-            if !success.diff.is_empty() {
-                result_text = format!("{}\n\n{}", result_text, success.diff);
-            }
-            with_outcome_and_referencing(
-                CallToolResult::success(vec![Content::text(result_text)]),
-                WriteOutcome::Synced,
-                &success,
-            )
-        }
-        CoreWriteOutcome::CommittedPendingSync => {
-            let cause = success
-                .sync_failure_cause
-                .as_deref()
-                .unwrap_or("unknown error");
-            let summary = format!(
-                "Deleted '{}' (commit {}) — committed locally, but the push to the remote \
-                 failed: {}. It will sync on the next successful write or manual \
-                 intervention. Index cleanup has been queued from the local copy.{}",
-                rel_path, success.sha, cause, referencing_note
-            );
-            let mut result_text = summary;
-            if !success.diff.is_empty() {
-                result_text = format!("{}\n\n{}", result_text, success.diff);
-            }
-            with_outcome_and_referencing(
-                CallToolResult::success(vec![Content::text(result_text)]),
-                WriteOutcome::CommittedPendingSync,
-                &success,
-            )
-        }
-    }
+    let mut fields = write_response(rel_path, "deleted", "", None, success.merged);
+    insert_paths(&mut fields, "referencing_paths", &success.referencing_paths);
+    CallToolResult::structured(serde_json::Value::Object(fields))
 }
 
 /// Map a `write::delete_document` failure onto this tool surface's `McpError`,
 /// preserving the exact text/data shapes the existing delete tests pin down.
 fn delete_error_to_mcp_error(err: WriteError, rel_path: &str) -> McpError {
     match err {
-        WriteError::InvalidCommitMessage { reason } => McpError::invalid_params(reason, None),
+        WriteError::InvalidCommitMessage { reason } => invalid_message_error(reason),
         WriteError::UnsafePath { msg } => McpError::invalid_params(msg, None),
         // See `create_edit_error_to_mcp_error`'s identical arm: same text MCP
         // callers already saw before `WriteError::Internal` existed.
@@ -2841,36 +2622,21 @@ fn delete_error_to_mcp_error(err: WriteError, rel_path: &str) -> McpError {
         WriteError::NotFound => {
             McpError::invalid_params(format!("document does not exist: '{}'", rel_path), None)
         }
+        // `msg` was logged by `write::delete_document` and stays server-side.
         WriteError::PreCommitFailed {
-            rolled_back: true,
-            msg,
-        } => McpError::internal_error(
-            format!(
-                "'{}' was NOT deleted: git commit failed and the file has been \
-                 restored from HEAD — nothing changed, safe to retry. \
-                 Cause: {}",
-                rel_path, msg
-            ),
-            outcome_data(WriteOutcome::FailedNoChange),
-        ),
+            rolled_back: true, ..
+        } => not_saved_error(&format!("Deleting '{rel_path}'")),
         WriteError::PreCommitFailed {
-            rolled_back: false,
-            msg,
-        } => McpError::internal_error(
-            format!(
-                "'{}' is in an INCONSISTENT state: git commit failed AND the \
-                 attempt to restore the file from HEAD also failed. The file is \
-                 gone from disk but was never committed as deleted — do not \
-                 assume it exists or that the deletion is durable. Manual \
-                 inspection is required. {}",
-                rel_path, msg
-            ),
-            outcome_data(WriteOutcome::FailedInconsistentState),
-        ),
+            rolled_back: false, ..
+        } => not_saved_unverified_error(&format!("Deleting '{rel_path}'")),
         WriteError::Io { msg } => McpError::internal_error(msg, None),
         WriteError::SchemaFile {
             rel_path: schema_path,
         } => schema_file_path_error(&schema_path),
+        WriteError::EditedElsewhere => edited_elsewhere_error(rel_path),
+        WriteError::VersionRequired => {
+            McpError::invalid_params(pass_expected_version(&format!("delete '{rel_path}'")), None)
+        }
         // `write::delete_document` never produces these — they are create/edit-only
         // failure modes (frontmatter validation, the dedup gate, and
         // create-vs-exists) that the delete pipeline doesn't run.
@@ -2879,100 +2645,48 @@ fn delete_error_to_mcp_error(err: WriteError, rel_path: &str) -> McpError {
 }
 
 /// Map a successful `write::move_directory` result onto this tool surface's
-/// `CallToolResult`. Mirrors `create_edit_success_to_result`'s two-outcome shape
-/// (`Synced` / `CommittedPendingSync`), scaled to a whole batch of documents: the
-/// summary line names how many documents moved and lists every `old -> new` pair,
-/// plus the same rewrite-note addendum `create_edit_success_to_result` uses for a
-/// single-document move's incoming-link rewrites.
+/// `CallToolResult`: `action: "moved"`, `from`/`path` (the directories),
+/// `moved` (every document's `{from, to}`), `moved_schema_dirs` when the
+/// subtree carried directory schemas (named by directory, never by file — see
+/// `schema_file_scope`), and `rewritten_paths` when documents outside the
+/// subtree had links rewritten.
 fn move_directory_success_to_result(
     success: DirectoryMoveSuccess,
     source_dir: &str,
     dest_dir: &str,
 ) -> CallToolResult {
-    let rewrite_note = if success.rewritten_paths.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nUpdated links in {} document(s) outside the moved subtree: {}.",
-            success.rewritten_paths.len(),
-            success.rewritten_paths.join(", ")
-        )
-    };
-    let moved_lines = success
+    let (schema_moves, doc_moves): (Vec<_>, Vec<_>) = success
         .moved
         .iter()
-        .map(|(old, new)| format!("  {} -> {}", old, new))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let moved_json = success
-        .moved
-        .iter()
-        .map(|(old, new)| serde_json::json!({ "from": old, "to": new }))
-        .collect::<Vec<_>>();
-
-    let (outcome, summary) = match success.outcome {
-        CoreWriteOutcome::Synced => (
-            WriteOutcome::Synced,
-            format!(
-                "Moved {} document(s) from '{}' to '{}' (commit {}). Indexing has been \
-                 queued and will complete shortly.\n\n{}{}",
-                success.moved.len(),
-                source_dir,
-                dest_dir,
-                success.sha,
-                moved_lines,
-                rewrite_note
-            ),
-        ),
-        CoreWriteOutcome::CommittedPendingSync => {
-            let cause = success
-                .sync_failure_cause
-                .as_deref()
-                .unwrap_or("unknown error");
-            (
-                WriteOutcome::CommittedPendingSync,
-                format!(
-                    "Moved {} document(s) from '{}' to '{}' (commit {}) — committed \
-                     locally, but the push to the remote failed: {}. It will sync on the \
-                     next successful write or manual intervention. Indexing has been \
-                     queued from the local copy.\n\n{}{}",
-                    success.moved.len(),
-                    source_dir,
-                    dest_dir,
-                    success.sha,
-                    cause,
-                    moved_lines,
-                    rewrite_note
-                ),
-            )
-        }
-    };
-
-    let mut result = CallToolResult::success(vec![Content::text(summary)]);
-    // (fix #129) Same sha/rebased_paths/sync_failure_cause parity
-    // `write_success_structured_fields` gives the single-document create/edit/delete
-    // path — this tool surface is still `write_document`, just dispatched to a
-    // directory move, so a caller reading only `structured_content` deserves the
-    // same commit-identifying fields here too. No `diff`: `DirectoryMoveSuccess`
-    // carries no unified diff (a directory move's text summary has none either —
-    // see `moved_lines`/`moved_json` above for its equivalent).
+        .partition(|(old, _)| crate::schema::is_schema_file_path(std::path::Path::new(old)));
     let mut structured = serde_json::Map::new();
-    structured.insert("outcome".to_string(), serde_json::json!(outcome.as_str()));
-    structured.insert("sha".to_string(), serde_json::json!(success.sha));
+    structured.insert("path".to_string(), serde_json::json!(dest_dir));
+    structured.insert("action".to_string(), serde_json::json!("moved"));
+    structured.insert("from".to_string(), serde_json::json!(source_dir));
     structured.insert(
-        "rebased_paths".to_string(),
-        serde_json::json!(rebased_paths_json(&success.rebased_paths)),
+        "moved".to_string(),
+        doc_moves
+            .iter()
+            .map(|(old, new)| serde_json::json!({ "from": old, "to": new }))
+            .collect(),
     );
-    structured.insert("moved".to_string(), serde_json::json!(moved_json));
-    structured.insert(
-        "rewritten_paths".to_string(),
-        serde_json::json!(success.rewritten_paths),
-    );
-    if let Some(cause) = &success.sync_failure_cause {
-        structured.insert("sync_failure_cause".to_string(), serde_json::json!(cause));
+    if !schema_moves.is_empty() {
+        structured.insert(
+            "moved_schema_dirs".to_string(),
+            schema_moves
+                .iter()
+                .map(|(old, new)| {
+                    serde_json::json!({
+                        "from": schema_file_scope(old),
+                        "to": schema_file_scope(new),
+                    })
+                })
+                .collect(),
+        );
     }
-    result.structured_content = Some(serde_json::Value::Object(structured));
-    result
+    insert_paths(&mut structured, "rewritten_paths", &success.rewritten_paths);
+    insert_merged(&mut structured, success.merged);
+    CallToolResult::structured(serde_json::Value::Object(structured))
 }
 
 /// Map a `write::move_directory` failure onto this tool surface's `McpError`.
@@ -3010,19 +2724,20 @@ fn move_directory_error_to_mcp_error(
             } else {
                 let relocated = moved_schema_files
                     .iter()
-                    .map(|(old, new)| format!("{} -> {}", old, new))
+                    .map(|(old, new)| {
+                        format!("{} -> {}", schema_file_scope(old), schema_file_scope(new))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!(
-                    "\n\nThis subtree carries its own {}, which is relocating along with it \
-                     ({}). That means these documents are being checked against a \
+                    "\n\nThis subtree carries its own directory schema(s), which relocate \
+                     along with it ({}). That means these documents are being checked against a \
                      GENUINELY DIFFERENT schema cascade than the one that governed them at \
                      the source — a relocated schema file re-parents onto the destination's \
                      ancestors, not the source's, so a document that was valid moments ago \
                      can legitimately stop being valid. Either adjust the destination's \
                      cascade to still admit these documents (update_schema), or fix the \
                      documents themselves.",
-                    crate::schema::SCHEMA_FILE_NAME,
                     relocated
                 )
             };
@@ -3041,75 +2756,44 @@ fn move_directory_error_to_mcp_error(
                         "path": path,
                         "field_errors": result.field_errors,
                     })).collect::<Vec<_>>(),
-                    "moved_schema_files": moved_schema_files.iter().map(|(old, new)| serde_json::json!({
-                        "from": old,
-                        "to": new,
+                    "moved_schema_dirs": moved_schema_files.iter().map(|(old, new)| serde_json::json!({
+                        "from": schema_file_scope(old),
+                        "to": schema_file_scope(new),
                     })).collect::<Vec<_>>(),
                 })),
             )
         }
-        DirectoryMoveError::InvalidSchemaInSource { path, reason } => McpError::invalid_params(
-            format!(
-                "Cannot move '{source_dir}' to '{dest_dir}': the schema file '{path}' inside \
-                 it is invalid: {reason}. Fix it, or revert it in git, before moving the \
-                 directory — nothing was moved."
-            ),
-            Some(serde_json::json!({ "invalid_schema_file": path, "reason": reason })),
-        ),
+        DirectoryMoveError::InvalidSchemaInSource { path, reason } => {
+            let dir = schema_file_scope(&path);
+            let reason = crate::schema::model_facing_reason(&reason);
+            McpError::invalid_params(
+                format!(
+                    "Cannot move '{source_dir}' to '{dest_dir}': the schema for '{dir}' inside \
+                     it is invalid: {reason}. The operator must repair that schema before \
+                     the directory can move — nothing was moved."
+                ),
+                Some(serde_json::json!({ "invalid_schema_dir": dir, "reason": reason })),
+            )
+        }
         DirectoryMoveError::UnsafePath { msg } => McpError::invalid_params(msg, None),
         DirectoryMoveError::Internal { msg } => McpError::invalid_params(msg, None),
-        DirectoryMoveError::InvalidCommitMessage { reason } => {
-            McpError::invalid_params(reason, None)
-        }
+        DirectoryMoveError::InvalidCommitMessage { reason } => invalid_message_error(reason),
+        // `msg` was logged by `write::move_directory` and stays server-side.
         DirectoryMoveError::PreCommitFailed {
-            rolled_back: true,
-            msg,
-        } => McpError::internal_error(
-            format!(
-                "Directory move from '{}' to '{}' was NOT applied: git commit failed and \
-                 every document has been rolled back — nothing changed, safe to retry. \
-                 Cause: {}",
-                source_dir, dest_dir, msg
-            ),
-            outcome_data(WriteOutcome::FailedNoChange),
-        ),
+            rolled_back: true, ..
+        } => not_saved_error(&format!("Moving '{source_dir}' to '{dest_dir}'")),
         DirectoryMoveError::PreCommitFailed {
-            rolled_back: false,
-            msg,
-        } => McpError::internal_error(
-            format!(
-                "Directory move from '{}' to '{}' is in an INCONSISTENT state: git commit \
-                 failed AND the rollback attempt itself failed. Filesystem and git state \
-                 may not match each other — do not assume this move did or did not take \
-                 effect. Manual inspection is required. {}",
-                source_dir, dest_dir, msg
-            ),
-            outcome_data(WriteOutcome::FailedInconsistentState),
-        ),
+            rolled_back: false, ..
+        } => not_saved_unverified_error(&format!("Moving '{source_dir}' to '{dest_dir}'")),
         DirectoryMoveError::Io { msg } => McpError::internal_error(msg, None),
+        DirectoryMoveError::EditedElsewhere => McpError::invalid_params(
+            format!(
+                "Cannot move '{source_dir}' to '{dest_dir}': a document in it was edited by \
+                 someone else while the move was prepared; nothing was moved. Try again."
+            ),
+            None,
+        ),
     }
-}
-
-/// Outcome of a `write_raw_file` call whose commit actually landed in local
-/// history. The two `WriteOutcome` *failure* variants (`FailedNoChange`,
-/// `FailedInconsistentState`) are deliberately NOT modeled here — `write_raw_file`
-/// reports those directly as `Err(McpError)` (via `outcome_data`), exactly like
-/// `write_document`/`delete_document` do, rather than folding every case into one
-/// return type.
-///
-/// `update_schema` (the only caller) matches on this to decide the `WriteOutcome`
-/// discriminant and message text to hand back to its own caller. The schema-cache
-/// rebuild and `reindex::mark_full` queuing happen identically for both variants
-/// inside `write_raw_file` itself — the commit is durable in local history either
-/// way, only the remote push status differs — so `update_schema` does not need to
-/// (and must not) branch on this to decide whether to do those.
-enum RawFileOutcome {
-    /// Committed and pushed.
-    Synced { sha: String },
-    /// Committed locally; the remote push failed. `cause` is the redacted,
-    /// already-`{:#}`-formatted `CommitSyncError` source, ready to interpolate
-    /// into a user-facing message.
-    CommittedPendingSync { sha: String, cause: String },
 }
 
 #[derive(Clone)]
@@ -3140,7 +2824,7 @@ pub struct KbSearchServer {
     config: crate::config::SharedConfig,
     /// The shared, cached schema tree — built once at server startup and kept
     /// current by the reindex worker (which rebuilds it before indexing any
-    /// dirty `.kb-schema.yaml`) and by `update_schema`'s own synchronous rebuild.
+    /// dirty schema file) and by `update_schema`'s own synchronous rebuild.
     /// `get_schema`, `update_schema`, and the write path all read this instead of
     /// re-walking the knowledge base on every call; see `schema::SharedSchemaCache`.
     schema_cache: crate::schema::SharedSchemaCache,
@@ -3306,14 +2990,14 @@ impl KbSearchServer {
                 .get_mut("granularity")
                 .and_then(|v| v.as_object_mut())
             {
-                // `type` stays `["string", "null"]` (granularity is an
-                // `Option<String>`) — `null` is included in the enum so an
-                // omitted/null granularity remains valid against it.
-                let mut values: Vec<serde_json::Value> = effective
+                // Strings only: an omitted granularity is expressed by leaving
+                // the optional property out (`tool_schema::compact` drops its
+                // `null` type arm too); the server still accepts an explicit
+                // `null`, since the field is an `Option<String>`.
+                let values: Vec<serde_json::Value> = effective
                     .iter()
                     .map(|g| serde_json::Value::String(g.as_str().to_string()))
                     .collect();
-                values.push(serde_json::Value::Null);
                 granularity.insert("enum".to_string(), serde_json::Value::Array(values));
                 granularity.insert(
                     "description".to_string(),
@@ -3352,8 +3036,8 @@ impl KbSearchServer {
 
     /// Write a non-document file into the KB, commit it, and queue a full reconcile.
     ///
-    /// Used for `.kb-schema.yaml`, which is versioned and synced like a document but is
-    /// not itself indexed. The write goes to a temp file and is renamed into place, so a
+    /// Used for a directory's schema file, which is versioned and synced like a
+    /// document but is not itself indexed. The write goes to a temp file and is renamed into place, so a
     /// failure part-way through the *filesystem* write cannot leave a half-written
     /// schema that the next rebuild would refuse.
     ///
@@ -3362,31 +3046,46 @@ impl KbSearchServer {
     /// `PreCommit` failure undoes the filesystem write (remove + `unstage` for a
     /// brand-new schema file that has no HEAD content to fall back to;
     /// `restore_from_head` for an overwrite of an existing, already-tracked one) and
-    /// reports `FailedNoChange`, or `FailedInconsistentState` if that rollback itself
-    /// fails. A `PostCommit` failure leaves the local commit in place — it is real —
-    /// and reports `CommittedPendingSync`.
+    /// reports [`not_saved_error`], or [`not_saved_unverified_error`] if that rollback
+    /// itself fails. A `PostCommit` failure leaves the local commit in place — it is
+    /// real — is logged, and is reported to the caller as a plain success: the
+    /// pending sync is a server-side concern, never part of the tool result.
     ///
     /// `reindex::mark_full` fires only once the commit has actually landed locally
-    /// (`Synced` or `CommittedPendingSync`), never on a rolled-back write: queuing a
+    /// (synced or not), never on a rolled-back write: queuing a
     /// full reconcile against a schema change that was never actually committed (or,
     /// worse, against a filesystem/git state a failed rollback left inconsistent)
     /// would be pointless at best and actively misleading at worst — the reconcile
     /// would revalidate every document under the scope against content that is not,
     /// in fact, what's in git history.
+    ///
+    /// `replaces`, when set, is a sibling file this write supersedes — the legacy
+    /// `.kb-schema.yaml` that `update_schema` migrates to `.schema.yaml`. It is
+    /// removed from disk after `rel_path` is installed and staged in the SAME commit
+    /// (`git add` of a deleted tracked path records the removal), so the directory is
+    /// never left with both names or with neither. A pre-commit failure restores it
+    /// alongside `rel_path`'s own rollback. An untracked `replaces` (one git never
+    /// knew about) is removed from disk without being named in the commit, and
+    /// rewritten from memory on rollback.
+    ///
+    /// Every message names the scope directory (`schema::scope_label`), never the
+    /// file: this text reaches the model.
     async fn write_raw_file(
         &self,
+        git_lock: &git::GitLock,
         rel_path: &str,
         content: &str,
         commit_message: &str,
-    ) -> Result<RawFileOutcome, McpError> {
+        replaces: Option<&str>,
+    ) -> Result<RawWrite, McpError> {
         let config = self.config();
+        let scope = schema_file_scope(rel_path);
 
         // Resolved before anything touches the filesystem: a bad `<NAME>_FILE`
         // (both forms set, empty or unreadable file) must fail the call with nothing
         // written, since an early return after the rename below would leave an
         // uncommitted schema file in the working tree with no rollback.
-        let token = crate::secrets::git_token(&config)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let token = crate::secrets::git_token(&config).map_err(credential_error)?;
 
         // Same resolver the document write tools use. Joining the data root with a
         // caller-supplied path is NOT sufficient on its own: the knowledge base is a
@@ -3396,6 +3095,15 @@ impl KbSearchServer {
             .map_err(|e| {
             McpError::invalid_params(format!("Invalid schema path: {}", e), None)
         })?;
+        let abs_replaced = replaces
+            .map(|p| {
+                crate::write::resolve_safe_write_path(&self.canonical_data_path, p)
+                    .map(|abs| (p, abs))
+                    .map_err(|e| {
+                        McpError::invalid_params(format!("Invalid schema path: {}", e), None)
+                    })
+            })
+            .transpose()?;
 
         if let Some(parent) = abs_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -3443,28 +3151,80 @@ impl KbSearchServer {
         // filesystem write above is rolled back and reported as "nothing changed". A
         // `PostCommit` failure means the commit is a real, durable part of local
         // history — rolling it back here would silently undo a schema change that
-        // genuinely happened, so it is left alone and reported as "committed, sync
-        // pending" instead.
+        // genuinely happened, so it is left alone, logged, and reported to the caller
+        // as an ordinary success.
         let data_path_str = self.canonical_data_path.to_str().unwrap_or_default();
 
-        // Held across the commit AND any rollback below — see `write::write_document`.
-        // A schema write races document writes and the webhook for the same index.
-        let git_lock = git::lock_git().await;
+        // The superseded file goes under the same lock as the commit that records its
+        // removal. Its content is kept for the rollback of an untracked one, which
+        // has no HEAD copy to restore from.
+        let mut commit_paths: Vec<&str> = vec![rel_path];
+        let mut removed: Option<(&str, std::path::PathBuf, String, bool)> = None;
+        if let Some((replaced_rel, abs_replaced)) = abs_replaced {
+            // Read, classify and remove as one step, so every failure unwinds the same
+            // way: nothing is committed yet, and leaving the install of the new file
+            // in place would leave the directory holding both names.
+            let superseded: anyhow::Result<Option<(String, bool)>> = async {
+                let previous = match tokio::fs::read_to_string(&abs_replaced).await {
+                    Ok(previous) => previous,
+                    // Already gone: nothing left to supersede.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => {
+                        return Err(
+                            anyhow::Error::new(e).context("could not read the superseded file")
+                        );
+                    }
+                };
+                let tracked = git::is_tracked(git_lock, data_path_str, replaced_rel).await?;
+                tokio::fs::remove_file(&abs_replaced)
+                    .await
+                    .context("could not remove the superseded file")?;
+                Ok(Some((previous, tracked)))
+            }
+            .await;
+            match superseded {
+                Ok(Some((previous, tracked))) => {
+                    if tracked {
+                        commit_paths.push(replaced_rel);
+                    }
+                    removed = Some((replaced_rel, abs_replaced, previous, tracked));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!("Failed to retire the superseded schema file for {scope}: {e:#}");
+                    let undo = if is_new {
+                        tokio::fs::remove_file(&abs_path)
+                            .await
+                            .map_err(anyhow::Error::new)
+                    } else {
+                        git::restore_from_head(git_lock, data_path_str, rel_path).await
+                    };
+                    return Err(match undo {
+                        Ok(()) => not_saved_error(&format!("The schema change for '{scope}'")),
+                        Err(undo) => {
+                            error!("Failed to undo schema write for {scope}: {undo:#}");
+                            not_saved_unverified_error(&format!("The schema change for '{scope}'"))
+                        }
+                    });
+                }
+            }
+        }
 
-        let commit_outcome = match git::commit_and_sync(
-            &git_lock,
+        match git::commit_and_sync(
+            git_lock,
             config.source.git_url.as_deref(),
             &config.source.branch,
             data_path_str,
             token.as_deref(),
-            &[rel_path],
+            &commit_paths,
             commit_message,
             &config.write.commit_author_name,
             &config.write.commit_author_email,
         )
         .await
         {
-            Ok(outcome) => outcome,
+            // `rebased_paths` needs no handling: `mark_full` below covers every path.
+            Ok(_) => {}
 
             Err(git::CommitSyncError::PreCommit(source)) => {
                 error!(
@@ -3477,26 +3237,39 @@ impl KbSearchServer {
                 // staged. For an overwrite of an existing schema, HEAD already has
                 // the previous content, so restore it (this also un-stages any
                 // partial `git add`, in one step).
-                let rollback = if is_new {
+                let mut rollback = if is_new {
                     match tokio::fs::remove_file(&abs_path).await {
-                        Ok(()) => git::unstage(&git_lock, data_path_str, rel_path).await,
+                        Ok(()) => git::unstage(git_lock, data_path_str, rel_path).await,
                         Err(e) => Err(anyhow::Error::new(e)
                             .context("Failed to remove newly-written schema file during rollback")),
                     }
                 } else {
-                    git::restore_from_head(&git_lock, data_path_str, rel_path).await
+                    git::restore_from_head(git_lock, data_path_str, rel_path).await
                 };
+                // Put the superseded file back too: from HEAD when git tracks it
+                // (which also unstages its removal), from memory otherwise.
+                if let Some((replaced_rel, abs_replaced, previous, tracked)) = &removed {
+                    let restored = if *tracked {
+                        git::restore_from_head(git_lock, data_path_str, replaced_rel).await
+                    } else {
+                        tokio::fs::write(abs_replaced, previous.as_bytes())
+                            .await
+                            .map_err(|e| {
+                                anyhow::Error::new(e)
+                                    .context("Failed to rewrite superseded schema file")
+                            })
+                    };
+                    if let Err(e) = restored {
+                        rollback = Err(match rollback {
+                            Ok(()) => e,
+                            Err(first) => first.context(format!("{e:#}")),
+                        });
+                    }
+                }
 
+                // The cause was logged above and stays server-side.
                 return match rollback {
-                    Ok(()) => Err(McpError::internal_error(
-                        format!(
-                            "Schema at '{}' was NOT changed: git commit failed and the write \
-                             has been rolled back — nothing changed, safe to retry. \
-                             Cause: {:#}",
-                            rel_path, source
-                        ),
-                        outcome_data(WriteOutcome::FailedNoChange),
-                    )),
+                    Ok(()) => Err(not_saved_error(&format!("The schema change for '{scope}'"))),
                     // The rollback ITSELF failed — a third, worse state than either of
                     // the above. The schema file may now be gone/changed on disk with
                     // no corresponding commit, or the index may not match HEAD.
@@ -3509,18 +3282,9 @@ impl KbSearchServer {
                              now be inconsistent.",
                             rel_path, rollback_err, source
                         );
-                        Err(McpError::internal_error(
-                            format!(
-                                "Schema at '{}' is in an INCONSISTENT state: git commit \
-                                 failed AND the rollback attempt itself failed. The working \
-                                 tree may not match git history for this path — do not \
-                                 assume the schema change did or did not take effect. Manual \
-                                 inspection is required. Commit cause: {:#}. \
-                                 Rollback cause: {:#}",
-                                rel_path, source, rollback_err
-                            ),
-                            outcome_data(WriteOutcome::FailedInconsistentState),
-                        ))
+                        Err(not_saved_unverified_error(&format!(
+                            "The schema change for '{scope}'"
+                        )))
                     }
                 };
             }
@@ -3539,10 +3303,21 @@ impl KbSearchServer {
                 // on the rolled-back (PreCommit) branch above but must here.
                 self.reindex_queue.mark_full();
 
-                return Ok(RawFileOutcome::CommittedPendingSync {
-                    sha,
-                    cause: format!("{:#}", source),
-                });
+                return Ok(RawWrite::Committed);
+            }
+
+            // This commit is dropped: the branch is back at its pre-commit HEAD, and
+            // that reset restored every tracked file. An untracked superseded file
+            // never was in git, so it is rewritten from memory. The caller syncs
+            // again and re-applies.
+            Err(git::CommitSyncError::Conflict { source }) => {
+                warn!("Remote changed underneath the schema write for {scope}: {source:#}");
+                if let Some((_, abs_replaced, previous, false)) = &removed
+                    && let Err(e) = tokio::fs::write(abs_replaced, previous.as_bytes()).await
+                {
+                    error!("Failed to rewrite superseded schema file for {scope}: {e}");
+                }
+                return Ok(RawWrite::Conflict);
             }
         };
 
@@ -3555,9 +3330,7 @@ impl KbSearchServer {
         // actually catches the affected documents once it re-reads them.
         self.reindex_queue.mark_full();
 
-        Ok(RawFileOutcome::Synced {
-            sha: commit_outcome.sha,
-        })
+        Ok(RawWrite::Committed)
     }
 
     /// Documents already under `rel_dir` that a candidate schema would reject.
@@ -3647,6 +3420,129 @@ impl KbSearchServer {
             .await
     }
 
+    /// Refuse a `search` filter that can only ever match nothing, listing what
+    /// would match instead — the teach-on-error replacement for enumerating
+    /// every vocabulary in the server instructions. Applies to every
+    /// granularity, so the metadata-index (no query) and Qdrant (query)
+    /// backends share it.
+    ///
+    /// - A field is unknown when no schema scope declares it
+    ///   (`SchemaCache::declared_field_paths`), it is not a built-in filter key
+    ///   ([`builtin_filter_field`]), and no document carries it.
+    /// - A value is refused when the field has a closed value set across the
+    ///   governing scopes (`SchemaCache::filter_closed_values`, narrowed by
+    ///   `path_prefix` as [`retrieval::normalize_path_needle`] reads it, the
+    ///   needle `search` itself matches on), the value is outside it, and no
+    ///   document uses it either — so a refusal never hides a match, whichever
+    ///   scope the matching document sits in.
+    /// - A filter is refused only when no document could match it: an `all_of`
+    ///   as soon as one of its values is refused (no document can carry it),
+    ///   but a scalar or array filter is an any-of and still matches through
+    ///   its other values, so it is refused only when every value is.
+    ///
+    /// Fails open: when the metadata index cannot be opened or queried, the
+    /// filter runs as given.
+    async fn check_filter_vocabulary(&self, params: &SearchParams) -> Result<(), McpError> {
+        if params.filters.as_ref().is_none_or(|f| f.0.is_empty()) {
+            return Ok(());
+        }
+        let filters = parse_filters(&params.filters)?;
+        let Ok(index) = self.state_db().await else {
+            return Ok(());
+        };
+        let schemas = crate::schema::load_shared(&self.schema_cache);
+        let config = self.config();
+        let declared = schemas.declared_field_paths();
+        let path_needle = retrieval::normalize_path_needle(params.path_prefix.as_deref());
+
+        for (field, filter) in &filters {
+            let known = declared.contains(field)
+                || builtin_filter_field(field, &config)
+                || index.field_in_use(field).await.unwrap_or(true);
+            if !known {
+                let mut names: std::collections::BTreeSet<String> = declared.clone();
+                names.extend(
+                    config
+                        .effective_indexed_fields()
+                        .into_iter()
+                        .chain(crate::ingest::DERIVED_FIELDS.iter().map(|f| f.to_string())),
+                );
+                if let Ok(in_use) = index.fields_in_use(None, 500).await {
+                    names.extend(in_use.into_iter().map(|(name, _)| name));
+                }
+                names.remove("file_path");
+                let names: Vec<String> = names
+                    .iter()
+                    .map(|n| crate::server::sanitize_facet_value(n))
+                    .collect();
+                return Err(McpError::invalid_params(
+                    format!(
+                        "unknown filter field '{}'; filterable fields: {}",
+                        crate::server::sanitize_facet_value(field),
+                        capped_list(&names)
+                    ),
+                    Some(serde_json::json!({ "filterable_fields": capped_vec(&names) })),
+                ));
+            }
+
+            let (values, needs_every_value) = match filter {
+                FieldFilter::AnyOf(values) => (values, false),
+                FieldFilter::AllOf(values) => (values, true),
+                FieldFilter::Range { .. } => continue,
+            };
+            let Some(allowed) = schemas.filter_closed_values(field, path_needle) else {
+                continue;
+            };
+            let outside: Vec<String> = values
+                .iter()
+                .filter(|v| !allowed.contains(*v))
+                .cloned()
+                .collect();
+            if outside.is_empty() {
+                continue;
+            }
+            let Ok(present) = index.values_present(field, &outside).await else {
+                continue;
+            };
+            let refused: Vec<&String> = outside.iter().filter(|v| !present.contains(*v)).collect();
+            // `all_of` needs a document to carry every value, so one that nothing can
+            // match sinks the filter; an any-of still matches through the rest of its
+            // values and is empty only when none of them could match.
+            let matches_nothing = if needs_every_value {
+                !refused.is_empty()
+            } else {
+                !refused.is_empty() && refused.len() == values.len()
+            };
+            if matches_nothing {
+                let mut seen = std::collections::HashSet::new();
+                let refused: Vec<String> = refused
+                    .iter()
+                    .map(|v| format!("'{}'", crate::server::sanitize_facet_value(v)))
+                    .filter(|v| seen.insert(v.clone()))
+                    .collect();
+                let allowed: Vec<String> = allowed
+                    .iter()
+                    .map(|v| crate::server::sanitize_facet_value(v))
+                    .collect();
+                let verb = if refused.len() == 1 {
+                    "is not an allowed value"
+                } else {
+                    "are not allowed values"
+                };
+                return Err(McpError::invalid_params(
+                    format!(
+                        "filter '{}': {} {verb}; allowed: {}",
+                        crate::server::sanitize_facet_value(field),
+                        capped_list(&refused),
+                        capped_list(&allowed)
+                    ),
+                    Some(serde_json::json!({ "field": field, "allowed": capped_vec(&allowed) })),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve a `path_prefix` needle to the documents it actually matches (#182).
     ///
     /// The metadata index is the single authority for that question, so both query
@@ -3689,12 +3585,13 @@ impl KbSearchServer {
         }
     }
 
-    #[tool]
+    #[tool(annotations(read_only_hint = true))]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
         validate_search_params(&params)?;
+        self.check_filter_vocabulary(&params).await?;
 
         let query_present = query_is_present(&params.query);
         // This gate reads its own config snapshot; each downstream handler
@@ -3855,23 +3752,18 @@ impl KbSearchServer {
             (false, false) => "dense cosine",
         };
 
-        let (text, structured) = build_chunk_search_payload(
+        let mut response = build_chunk_search_payload(
             &results,
             &self.canonical_data_path,
             explain,
             mode,
             path_prefix_truncated,
             offset_truncated,
-            offset,
-            opts.rerank_candidate_limit,
         );
-
-        let mut call_result = CallToolResult::success(vec![Content::text(text)]);
-        call_result.structured_content = Some(structured);
         if params.heading_prefix.is_some() {
-            annotate_heading_results(&mut call_result, heading_results_indexing_note());
+            annotate_heading_results(&mut response, heading_results_indexing_note());
         }
-        Ok(call_result)
+        Ok(CallToolResult::structured(response))
     }
 
     /// query+document: Qdrant grouped by `file_path`, collapsed to each document's
@@ -4000,19 +3892,16 @@ impl KbSearchServer {
         let offset_truncated = outcome.offset_truncated;
         let documents = outcome.documents;
 
-        let (text, structured) = build_grouped_search_payload(
+        let mut response = build_grouped_search_payload(
             &documents,
+            params.fields.as_deref(),
             path_prefix_truncated,
             offset_truncated,
-            offset,
         );
-
-        let mut call_result = CallToolResult::success(vec![Content::text(text)]);
-        call_result.structured_content = Some(structured);
         if params.heading_prefix.is_some() {
-            annotate_heading_results(&mut call_result, heading_results_indexing_note());
+            annotate_heading_results(&mut response, heading_results_indexing_note());
         }
-        Ok(call_result)
+        Ok(CallToolResult::structured(response))
     }
 
     /// query+section: Qdrant grouped by `section_key` (#286), collapsed to
@@ -4108,17 +3997,10 @@ impl KbSearchServer {
         let offset_truncated = outcome.offset_truncated;
         let sections = outcome.sections;
 
-        let (text, structured) = build_section_search_payload(
-            &sections,
-            path_prefix_truncated,
-            offset_truncated,
-            offset,
-        );
-
-        let mut call_result = CallToolResult::success(vec![Content::text(text)]);
-        call_result.structured_content = Some(structured);
-        annotate_heading_results(&mut call_result, heading_results_indexing_note());
-        Ok(call_result)
+        let mut response =
+            build_section_search_payload(&sections, path_prefix_truncated, offset_truncated);
+        annotate_heading_results(&mut response, heading_results_indexing_note());
+        Ok(CallToolResult::structured(response))
     }
 
     /// document, no query: the former `list_documents` tool's behavior, unchanged
@@ -4155,70 +4037,32 @@ impl KbSearchServer {
                 McpError::internal_error(format!("Failed to list documents: {}", e), None)
             })?;
 
-        let has_more = result.has_more(query.offset);
-        let returned = result.documents.len();
-
-        let structured = serde_json::json!({
+        // `total` always; `has_more` only when another page exists. A row
+        // carries `mtime` only when the listing is ordered by it.
+        let fields = params.fields.as_deref();
+        let with_mtime = query.order_by == crate::state::OrderBy::Mtime;
+        let mut response = serde_json::json!({
             "total": result.total,
-            "returned": returned,
-            "offset": query.offset,
-            "has_more": has_more,
+            "returned": result.documents.len(),
             "documents": result
                 .documents
                 .iter()
-                .map(|d| serde_json::json!({
-                    "file_path": d.file_path,
-                    "title": d.title,
-                    "description": d.description,
-                    "mtime": d.mtime,
-                    "frontmatter": d.frontmatter,
-                }))
+                .map(|d| {
+                    let mut row = document_row(d, fields);
+                    if with_mtime {
+                        row.insert("mtime".into(), serde_json::json!(d.mtime));
+                    }
+                    serde_json::Value::Object(row)
+                })
                 .collect::<Vec<_>>(),
         });
-
-        let mut text = if result.total == 0 {
-            "No documents match those criteria.".to_string()
-        } else if returned == 0 {
-            format!(
-                "{} document(s) match, but offset {} is past the end.",
-                result.total, query.offset
-            )
-        } else {
-            format!(
-                "{} document(s) match; showing {}–{}.\n\n",
-                result.total,
-                query.offset + 1,
-                query.offset + returned as u64
-            )
-        };
-
-        for doc in &result.documents {
-            text.push_str(&format!("- {}", doc.file_path));
-            if let Some(title) = &doc.title {
-                text.push_str(&format!(" — {}", title));
-            }
-            text.push('\n');
-            if let Some(description) = &doc.description {
-                text.push_str(&format!("  {}\n", description.trim()));
-            }
+        if result.has_more(query.offset) {
+            response["has_more"] = serde_json::json!(true);
         }
-
-        if has_more {
-            text.push_str(&format!(
-                "\n{} more document(s) match. Page with offset={} to continue.",
-                result.total - query.offset - returned as u64,
-                query.offset + returned as u64
-            ));
-        }
-
-        // Plain text keeps parity with the other tools; the structured half is what a
-        // consuming skill checks to detect truncation without parsing prose.
-        let mut call_result = CallToolResult::success(vec![Content::text(text.trim_end())]);
-        call_result.structured_content = Some(structured);
-        Ok(call_result)
+        Ok(CallToolResult::structured(response))
     }
 
-    #[tool]
+    #[tool(annotations(read_only_hint = true))]
     async fn get_schema(
         &self,
         Parameters(params): Parameters<GetSchemaParams>,
@@ -4247,9 +4091,18 @@ impl KbSearchServer {
         let schema = schemas.resolve_for(&lookup);
 
         let values_only = params.values_only.unwrap_or(false);
-        let mut reported: Vec<serde_json::Value> = Vec::new();
+        let values_in_use = params.values_in_use.unwrap_or(false);
+        // (reported key, field path) of each open field `values_in_use` fills in.
+        let mut open_fields: Vec<(String, String)> = Vec::new();
+        let mut reported = serde_json::Map::new();
         let mut omitted = 0usize;
         for (field, def) in &schema.fields {
+            // A derived field (`domain`) can be declared — a deployment lists it in
+            // `indexed_fields` to filter on it — but ingest sets it from the folder and
+            // a write that authors it is refused, so it is never offered as one to write.
+            if crate::ingest::DERIVED_FIELDS.contains(&field.as_str()) {
+                continue;
+            }
             if let Some(wanted) = &params.fields
                 && !wanted.contains(field)
             {
@@ -4266,45 +4119,102 @@ impl KbSearchServer {
                 omitted += 1;
                 continue;
             }
-            // Field names, permitted values, and provenance paths all originate in
-            // .kb-schema.yaml files from a synced repo. The instructions actively steer
+            // Field names, permitted values, and provenance directories all originate
+            // in schema files from a synced repo. The instructions actively steer
             // agents to call this tool before every write, so it is a reliably-triggered
             // reflection point — strip control characters and cap length on everything
             // that came from the knowledge base.
-            let clean_values = def.values.as_ref().map(|vs| {
-                vs.iter()
-                    .take(MAX_REPORTED_VALUES)
-                    .map(|v| crate::server::sanitize_facet_value(v))
-                    .collect::<Vec<_>>()
-            });
-            reported.push(serde_json::json!({
-                "field": crate::server::sanitize_facet_value(field),
-                "type": def.ty.map(|t| format!("{t:?}").to_lowercase()),
-                "required": def.required,
-                "indexed": def.indexed,
-                "values": clean_values,
-                "default": def.default.as_ref().map(sanitize_reflected_value),
-                "open": def.open,
-                "declared_in": schema
-                    .origin
-                    .get(field)
-                    .map(|o| crate::server::sanitize_facet_value(o)),
-            }));
+            let key = crate::server::sanitize_facet_value(field);
+            // Free text, timestamps and object containers have no vocabulary
+            // worth listing.
+            if values_in_use
+                && def.values.is_none()
+                && !matches!(
+                    def.ty,
+                    Some(
+                        crate::schema::FieldType::Text
+                            | crate::schema::FieldType::Timestamp
+                            | crate::schema::FieldType::Object
+                    )
+                )
+            {
+                open_fields.push((key.clone(), field.clone()));
+            }
+            reported.insert(
+                key,
+                field_def_json(def, schema.origin.get(field).map(String::as_str)),
+            );
+        }
+
+        // `values_in_use`: what documents under this path actually use, so a
+        // caller can list filter fields and values on demand. Best effort — an
+        // unavailable metadata index just leaves these out.
+        let mut other_fields_in_use: Vec<String> = Vec::new();
+        if values_in_use && let Ok(index) = self.state_db().await {
+            let dir = if raw.ends_with(".md") {
+                rel.parent().map(Path::to_path_buf).unwrap_or_default()
+            } else {
+                rel.clone()
+            };
+            let dir = dir.to_string_lossy().trim_matches('/').to_string();
+            let dir = (!dir.is_empty()).then_some(dir.as_str());
+            for (key, field) in &open_fields {
+                let Ok(top) = index.top_values(field, dir, MAX_VALUES_IN_USE as i64).await else {
+                    continue;
+                };
+                if top.is_empty() {
+                    continue;
+                }
+                let in_use: serde_json::Map<String, serde_json::Value> = top
+                    .into_iter()
+                    .map(|(value, n)| (crate::server::sanitize_facet_value(&value), n.into()))
+                    .collect();
+                if let Some(entry) = reported.get_mut(key).and_then(|v| v.as_object_mut()) {
+                    entry.insert("in_use".into(), serde_json::Value::Object(in_use));
+                }
+            }
+            // "Undeclared" means declared by no scope — the set `search`'s filter check
+            // uses — not just absent from this one: a field a deeper scope declares
+            // would otherwise be offered here as one nothing governs.
+            let declared = schemas.declared_field_paths();
+            let excluded = declared.len() + crate::ingest::DERIVED_FIELDS.len();
+            if let Ok(fields) = index
+                .fields_in_use(dir, (excluded + MAX_FILTER_OPTIONS_LISTED) as i64)
+                .await
+            {
+                other_fields_in_use = fields
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .filter(|name| {
+                        !declared.contains(name)
+                            && !crate::ingest::DERIVED_FIELDS.contains(&name.as_str())
+                    })
+                    .take(MAX_FILTER_OPTIONS_LISTED)
+                    .map(|name| crate::server::sanitize_facet_value(&name))
+                    .collect();
+            }
         }
 
         let mut structured = serde_json::json!({
-            "path": rel.to_string_lossy(),
+            "path": if rel.as_os_str().is_empty() {
+                "/".to_string()
+            } else {
+                rel.to_string_lossy().into_owned()
+            },
             "fields": reported,
-            "omitted_fields": omitted,
         });
+        if omitted > 0 {
+            structured["omitted_fields"] = serde_json::json!(omitted);
+        }
+        if !other_fields_in_use.is_empty() {
+            structured["other_fields_in_use"] = serde_json::json!(other_fields_in_use);
+        }
         // The `dedup:` override cascade (#272), only when this scope sets a key —
         // unset keys fall back to the server's global `write.dedup_*`, which a
         // schema read has no business reporting.
         let mut dedup = serde_json::Map::new();
-        let mut dedup_parts: Vec<String> = Vec::new();
         if let Some(enabled) = schema.dedup_enabled {
             dedup.insert("enabled".into(), serde_json::json!(enabled));
-            dedup_parts.push(format!("enabled: {enabled}"));
         }
         if let Some(threshold) = schema.dedup_threshold {
             // `json!(f32)` widens to f64 and would emit 0.949999988079071 for a
@@ -4314,59 +4224,15 @@ impl KbSearchServer {
                 .parse::<f64>()
                 .map_or(serde_json::json!(threshold), |v| serde_json::json!(v));
             dedup.insert("threshold".into(), shown);
-            dedup_parts.push(format!("threshold: {threshold}"));
         }
-        let dedup_line = (!dedup_parts.is_empty()).then(|| {
-            format!(
-                "Near-duplicate check override for this scope ({}); unset keys use the \
-                 server default.\n\n",
-                dedup_parts.join(", ")
-            )
-        });
         if !dedup.is_empty() {
             structured["dedup"] = serde_json::Value::Object(dedup);
         }
 
-        let mut text = format!(
-            "Schema governing '{}' ({} field(s)):\n\n",
-            rel.display(),
-            reported.len()
-        );
-        if let Some(line) = dedup_line {
-            text.push_str(&line);
-        }
-        if omitted > 0 {
-            text.push_str(&format!(
-                "({omitted} further field(s) omitted; narrow with the fields parameter.)\n\n"
-            ));
-        }
-        for entry in &reported {
-            text.push_str(&format!("- {}", entry["field"].as_str().unwrap_or("?")));
-            if let Some(ty) = entry["type"].as_str() {
-                text.push_str(&format!(" ({ty})"));
-            }
-            if entry["required"] == serde_json::json!(true) {
-                text.push_str(" [required]");
-            }
-            if let Some(values) = entry["values"].as_array() {
-                let rendered: Vec<String> = values
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect();
-                text.push_str(&format!(" — one of: {}", rendered.join(", ")));
-            }
-            if let Some(origin) = entry["declared_in"].as_str() {
-                text.push_str(&format!("  (from {origin})"));
-            }
-            text.push('\n');
-        }
-
-        let mut result = CallToolResult::success(vec![Content::text(text.trim_end())]);
-        result.structured_content = Some(structured);
-        Ok(result)
+        Ok(CallToolResult::structured(structured))
     }
 
-    #[tool]
+    #[tool(annotations(destructive_hint = true, idempotent_hint = false))]
     async fn update_schema(
         &self,
         Parameters(params): Parameters<UpdateSchemaParams>,
@@ -4428,118 +4294,205 @@ impl KbSearchServer {
             ));
         }
 
-        // Read from disk, not the shared cache: the edit must apply to the file as it
-        // is now. A file that no longer parses got there outside this tool (a push to
-        // the knowledge base's git host); a running server refuses it and keeps
-        // serving the last valid schema, and only a fix to the file itself clears that.
-        let mut file = schemas.raw_file_at(&rel_dir).map_err(|e| {
-            invalid(format!(
-                "The {} at '{}' on disk is invalid: {e}. The server is still enforcing the \
-                 last valid schema (and would refuse to start on this one). Fix or revert \
-                 the file in the knowledge base's git repository; update_schema can only \
-                 edit a schema file that parses.",
-                crate::schema::SCHEMA_FILE_NAME,
-                rel_dir.display()
-            ))
-        })?;
-        let summary = file.apply(&edit).map_err(invalid)?;
+        // What this scope's ancestors alone resolve the field to, so `add_values` in a
+        // child scope extends the inherited set instead of replacing it. Read from the
+        // ancestors' files on disk, the same way the edit itself reads its own file:
+        // under the lock below for the real edit, so a concurrent change to a parent
+        // scope cannot leave the edit extending a stale inherited set. The root has no
+        // ancestors: a root schema file replaces the config-derived root outright.
+        let scope = crate::schema::scope_label(&rel_dir);
+        let inherited_field = |schemas: &SchemaCache| -> Option<crate::schema::FieldDef> {
+            if rel_dir.as_os_str().is_empty() {
+                return None;
+            }
+            match schemas.resolve_from_disk(&rel_dir, None) {
+                Ok(resolved) => resolved.fields.get(edit.field()).cloned(),
+                // An ancestor's file no longer parses (it arrived through git): the
+                // server still enforces its last valid rules, so extend those rather
+                // than nothing, which would narrow the inherited set.
+                Err(_) => {
+                    let parent = rel_dir.parent().unwrap_or(std::path::Path::new(""));
+                    schemas
+                        .resolve_for(&parent.join("_"))
+                        .fields
+                        .get(edit.field())
+                        .cloned()
+                }
+            }
+        };
 
-        // A self-contradictory definition parses fine but would be refused by the next
-        // schema rebuild (and stop the server from starting) — after this call has
-        // already reported success. Catch it here, where the caller can still act on it.
-        file.validate_self().map_err(invalid)?;
-
-        let yaml = file.to_yaml().map_err(invalid)?;
-
-        // The same size cap `SchemaCache::build` enforces before parsing: a file over
-        // it would be refused at the next rebuild, so never write one.
-        if yaml.len() as u64 > crate::schema::MAX_SCHEMA_FILE_BYTES {
-            return Err(invalid(format!(
-                "Refusing to write a {} of {} bytes: the limit is {} bytes. Split the \
-                 rules across subdirectory schema files instead.",
-                crate::schema::SCHEMA_FILE_NAME,
-                yaml.len(),
-                crate::schema::MAX_SCHEMA_FILE_BYTES
-            )));
-        }
-
-        // Re-parse what we are about to write. A schema that does not round-trip would
-        // be refused by the next schema rebuild.
-        serde_yaml_ng::from_str::<crate::schema::SchemaFile>(&yaml).map_err(|e| {
-            McpError::internal_error(
-                format!("Refusing to write a schema that does not parse: {e}"),
-                None,
-            )
-        })?;
-
-        // Dry-run the change against documents that already exist under this scope.
-        let casualties = self.documents_broken_by(&rel_dir, &schemas, &file).await?;
+        // Whether the edit applies to the file as it is before the lock — only to
+        // tell an edit that a concurrent change made inapplicable from one that never
+        // applied, should it fail under the lock.
+        let applied_before_lock = schemas.raw_file_at(&rel_dir).is_ok_and(|(mut file, _)| {
+            file.apply_inheriting(&edit, inherited_field(&schemas).as_ref())
+                .is_ok()
+        });
 
         let dry_run = params.dry_run.unwrap_or(false);
         let force = params.force.unwrap_or(false);
 
-        if !casualties.is_empty() && !force && !dry_run {
-            let (would_invalidate, casualties_total, casualties_truncated) =
-                capped_casualties(&casualties);
-            return Err(McpError::invalid_params(
-                format!(
-                    "Refusing to apply: {} existing document(s) would fail the new rules. \
-                     Fix them first, or pass force to apply anyway.\n{}",
-                    casualties.len(),
-                    render_casualties(&casualties)
-                ),
-                Some(serde_json::json!({
-                    "would_invalidate": would_invalidate,
-                    "casualties_total": casualties_total,
-                    "casualties_truncated": casualties_truncated,
-                })),
-            ));
-        }
+        let config = self.config();
+        let token = crate::secrets::git_token(&config).map_err(credential_error)?;
+        let deps = self.write_deps(&config, token.as_deref(), None);
 
-        if dry_run {
-            let text = format!(
-                "Dry run — nothing written.\n{}\nWould affect {} existing document(s).{}\n\nResulting {}:\n{}",
-                summary,
-                casualties.len(),
-                if casualties.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n{}", render_casualties(&casualties))
-                },
-                crate::schema::SCHEMA_FILE_NAME,
-                yaml
-            );
-            let (would_invalidate, casualties_total, casualties_truncated) =
-                capped_casualties(&casualties);
-            let mut result = CallToolResult::success(vec![Content::text(text)]);
-            result.structured_content = Some(serde_json::json!({
-                "dry_run": true,
-                "summary": summary,
-                "would_invalidate": would_invalidate,
-                "casualties_total": casualties_total,
-                "casualties_truncated": casualties_truncated,
-                "yaml": yaml,
-            }));
-            return Ok(result);
-        }
+        // The whole read / edit / install runs under one `GIT_LOCK` acquisition that
+        // starts by syncing with the remote, so the edit applies to the schema as it
+        // is now — two concurrent edits both land, neither overwriting the other.
+        let (git_lock, mut head) = write::lock_and_sync(&deps).await;
+        let mut attempt = 0;
+        let (summary, casualties) = loop {
+            attempt += 1;
 
-        let rel_file = rel_dir.join(crate::schema::SCHEMA_FILE_NAME);
-        let rel_file_str = rel_file.to_string_lossy().to_string();
-        let commit_message = format!("schema: {summary} in {}", rel_dir.display());
+            // Read from disk, not the shared cache: the edit must apply to the file as
+            // it is now. A file that no longer parses got there outside this tool (a
+            // push to the knowledge base's git host); a running server refuses it and
+            // keeps serving the last valid schema, and only a fix to the file itself
+            // clears that.
+            let (mut file, on_disk_name) = schemas.raw_file_at(&rel_dir).map_err(|e| {
+                let e = crate::schema::model_facing_reason(&e);
+                invalid(format!(
+                    "The schema for '{scope}' on disk is invalid: {e}. The server is still \
+                     enforcing the last valid schema (and would refuse to start on this one). \
+                     The operator must repair it; update_schema can only edit a schema that \
+                     parses."
+                ))
+            })?;
+            let inherited = inherited_field(&schemas);
+            let summary = match file.apply_inheriting(&edit, inherited.as_ref()) {
+                Ok(summary) => summary,
+                Err(_) if applied_before_lock || attempt > 1 => {
+                    return Err(invalid(format!(
+                        "The schema for '{scope}' was edited by someone else; re-read it with \
+                         get_schema and try again."
+                    )));
+                }
+                Err(e) => return Err(invalid(e)),
+            };
 
-        // `write_raw_file` rolls itself back on a pre-commit `commit_and_sync`
-        // failure and returns `Err` in that case (see its doc comment) — this `?`
-        // propagates that `Err` (with its `FailedNoChange`/`FailedInconsistentState`
-        // outcome data already attached) WITHOUT reaching the cache rebuild below.
-        // That is exactly what must happen: a rolled-back write means the schema on
-        // disk is unchanged (or, in the inconsistent-state case, of unknown
-        // trustworthiness), so rebuilding the shared cache from it here would either
-        // be a no-op at best or propagate bad state at worst. Only a call that
-        // actually landed a local commit — `Synced` or `CommittedPendingSync` —
-        // reaches the code below.
-        let write_outcome = self
-            .write_raw_file(&rel_file_str, &yaml, &commit_message)
-            .await?;
+            // A self-contradictory definition parses fine but would be refused by the
+            // next schema rebuild (and stop the server from starting) — after this call
+            // has already reported success. Catch it here, where the caller can act.
+            file.validate_self().map_err(invalid)?;
+
+            let yaml = file.to_yaml().map_err(invalid)?;
+
+            // The same size cap `SchemaCache::build` enforces before parsing: a file
+            // over it would be refused at the next rebuild, so never write one.
+            if yaml.len() as u64 > crate::schema::MAX_SCHEMA_FILE_BYTES {
+                return Err(invalid(format!(
+                    "Refusing to write a schema for '{scope}' of {} bytes: the limit is {} \
+                     bytes. Split the rules across subdirectory schemas instead.",
+                    yaml.len(),
+                    crate::schema::MAX_SCHEMA_FILE_BYTES
+                )));
+            }
+
+            // Re-parse what we are about to write. A schema that does not round-trip
+            // would be refused by the next schema rebuild.
+            serde_yaml_ng::from_str::<crate::schema::SchemaFile>(&yaml).map_err(|e| {
+                McpError::internal_error(
+                    format!("Refusing to write a schema that does not parse: {e}"),
+                    None,
+                )
+            })?;
+
+            // Dry-run the change against documents that already exist under this scope.
+            let casualties = self.documents_broken_by(&rel_dir, &schemas, &file).await?;
+
+            if !casualties.is_empty() && !force && !dry_run {
+                let (would_invalidate, casualties_total, casualties_truncated) =
+                    capped_casualties(&casualties);
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Refusing to apply: {} existing document(s) would fail the new rules. \
+                         Fix them first, or pass force to apply anyway.\n{}",
+                        casualties.len(),
+                        render_casualties(&casualties)
+                    ),
+                    Some(serde_json::json!({
+                        "would_invalidate": would_invalidate,
+                        "casualties_total": casualties_total,
+                        "casualties_truncated": casualties_truncated,
+                    })),
+                ));
+            }
+
+            if dry_run {
+                // The edited field as the scope would resolve it, not the file: the
+                // file format is the server's business, and `get_schema` serves the
+                // rest of the scope.
+                let resolved = schemas.resolve_from_disk(&rel_dir, Some(&file)).ok();
+                let field = edit.field();
+                let definition = resolved.as_ref().and_then(|r| {
+                    r.fields
+                        .get(field)
+                        .map(|def| field_def_json(def, r.origin.get(field).map(String::as_str)))
+                });
+                let (would_invalidate, casualties_total, casualties_truncated) =
+                    capped_casualties(&casualties);
+                let mut response = serde_json::json!({
+                    "dry_run": true,
+                    "path": scope,
+                    "summary": summary,
+                    "field": field,
+                });
+                if let Some(definition) = definition {
+                    response["definition"] = definition;
+                }
+                insert_casualties(
+                    &mut response,
+                    "would_invalidate",
+                    would_invalidate,
+                    casualties_total,
+                    casualties_truncated,
+                );
+                return Ok(CallToolResult::structured(response));
+            }
+
+            // Always the canonical name. A directory still on the legacy name is
+            // migrated by this write: the legacy file is removed in the same commit.
+            let rel_file = rel_dir.join(crate::schema::SCHEMA_FILE_NAME);
+            let rel_file_str = rel_file.to_string_lossy().to_string();
+            let replaced = on_disk_name
+                .filter(|name| *name != crate::schema::SCHEMA_FILE_NAME)
+                .map(|name| rel_dir.join(name).to_string_lossy().to_string());
+            let commit_message = format!("schema: {summary} in {scope}");
+
+            // `write_raw_file` rolls itself back on a pre-commit failure and returns
+            // `Err` (see its doc comment) — this `?` propagates that WITHOUT reaching
+            // the cache rebuild below: a rolled-back write leaves the schema on disk
+            // unchanged. A conflict with the remote drops this write's commit, so
+            // nothing is left written; the clone syncs again and the edit is applied
+            // once more to the fresh file.
+            match self
+                .write_raw_file(
+                    &git_lock,
+                    &rel_file_str,
+                    &yaml,
+                    &commit_message,
+                    replaced.as_deref(),
+                )
+                .await?
+            {
+                RawWrite::Committed => break (summary, casualties),
+                // Every conflict syncs, the last one included: the reset that dropped
+                // this commit went back to `head`, so this sync is what brings the
+                // clone onto whatever reached the remote since and marks those paths
+                // dirty — the webhook those commits trigger would then find the clone
+                // already up to date and mark nothing.
+                RawWrite::Conflict => {
+                    head = write::sync_clone(&deps, &git_lock, head).await;
+                    if attempt >= write::MAX_WRITE_ATTEMPTS {
+                        return Err(invalid(format!(
+                            "The schema for '{scope}' was edited by someone else; re-read it \
+                             with get_schema and try again."
+                        )));
+                    }
+                }
+            }
+        };
+        drop(git_lock);
 
         // Rebuild the shared schema cache and swap it in SYNCHRONOUSLY — before this
         // call returns, not merely "soon". `write_raw_file` already called
@@ -4554,10 +4507,10 @@ impl KbSearchServer {
         // because anything here needs to run off-thread for its own sake — `.await`ing
         // it still makes this call return only once the rebuild has completed.
         //
-        // This runs for BOTH `RawFileOutcome` variants, not just `Synced`: a
-        // `CommittedPendingSync` write is still a real local commit — the new schema
-        // is genuinely in effect for this clone regardless of whether the push to the
-        // remote landed — so the cache must reflect it just the same.
+        // This runs whether or not the commit has synced yet: an unsynced write is
+        // still a real local commit — the new schema is genuinely in effect for this
+        // clone regardless of whether the push to the remote landed — so the cache
+        // must reflect it just the same.
         //
         // The file this call wrote was validated above, so a refused rebuild means a
         // DIFFERENT schema file in the tree is invalid (it arrived through git).
@@ -4595,56 +4548,29 @@ impl KbSearchServer {
             }
         }
 
-        // Same `WriteOutcome` discriminant `write_document`/`delete_document` attach
-        // via `with_outcome` — not called directly here because this response also
-        // carries schema-specific fields (`summary`, `path`, `invalidated`) that
-        // `with_outcome` would clobber, but the discriminant string itself comes from
-        // the same enum, not a parallel literal.
-        let (outcome, mut text) = match write_outcome {
-            RawFileOutcome::Synced { sha } => (
-                WriteOutcome::Synced,
-                format!("{summary}\nWrote {rel_file_str} (commit {sha})."),
-            ),
-            RawFileOutcome::CommittedPendingSync { sha, cause } => (
-                WriteOutcome::CommittedPendingSync,
-                format!(
-                    "{summary}\nWrote {rel_file_str} (commit {sha}) — committed locally, but \
-                     the push to the remote failed: {cause}. It will sync on the next \
-                     successful write or manual intervention.",
-                ),
-            ),
-        };
-        if !casualties.is_empty() {
-            text.push_str(&format!(
-                "\n\nWARNING: {} existing document(s) now fail validation and will stop \
-                 being re-indexed until fixed:\n{}",
-                casualties.len(),
-                render_casualties(&casualties)
-            ));
-        }
-        if let Some(refusal) = &refused_rebuild {
-            text.push_str(&format!(
-                "\n\nWARNING: this change is committed but NOT in effect yet — another schema \
-                 file in the knowledge base is invalid, so the server keeps enforcing the \
-                 previous schema until it is fixed. {refusal}"
-            ));
-        }
-
         let (invalidated, casualties_total, casualties_truncated) = capped_casualties(&casualties);
-        let mut result = CallToolResult::success(vec![Content::text(text)]);
-        result.structured_content = Some(serde_json::json!({
-            "outcome": outcome.as_str(),
-            "dry_run": false,
+        let mut response = serde_json::json!({
+            "path": scope,
             "summary": summary,
-            "path": rel_file_str,
-            "invalidated": invalidated,
-            "casualties_total": casualties_total,
-            "casualties_truncated": casualties_truncated,
-        }));
-        Ok(result)
+        });
+        insert_casualties(
+            &mut response,
+            "invalidated",
+            invalidated,
+            casualties_total,
+            casualties_truncated,
+        );
+        if let Some(refusal) = &refused_rebuild {
+            response["warning"] = serde_json::json!(format!(
+                "Saved but NOT in effect yet: another directory's schema is invalid, so \
+                 the previous rules stay enforced until it is fixed. {}",
+                refusal.model_facing()
+            ));
+        }
+        Ok(CallToolResult::structured(response))
     }
 
-    #[tool]
+    #[tool(annotations(read_only_hint = true))]
     async fn get_document(
         &self,
         Parameters(params): Parameters<GetDocumentParams>,
@@ -4693,53 +4619,11 @@ impl KbSearchServer {
         match retrieval::get_document(&self.deps(), index, raw).await {
             Ok(doc) => {
                 debug!(path = %raw, "get_document served");
-                // Same hash indexed_files.content_hash already stores for this exact
-                // content, so a caller can round-trip it straight into write_document's
-                // expected_hash without this project introducing a second hash scheme.
-                // Hence hashing here, before any slicing, and always over the whole
-                // file: that expected_hash guards the document on disk, so hashing a
-                // slice would hand back a token that can never match — turning every
-                // partial read into a dead end for the edit that motivated it.
-                let content_hash = crate::ingest::compute_hash_from_bytes(doc.content.as_bytes());
-                // Snapshot the link-graph neighborhood before `doc.content` is moved
-                // into `slice_or_whole` below — `doc.links_out`/`doc.links_in` are
-                // untouched by that move (distinct fields), so this ordering is not
-                // load-bearing, just where it reads most naturally alongside the hash.
-                //
-                // `has_more` mirrors `search`'s truncation contract: a hub document
-                // can have far more inbound links than `retrieval::MAX_LINKS_PER_DIRECTION`
-                // allows through, and silently dropping the tail would misrepresent
-                // the graph rather than just page it. `score` is `null` for every
-                // `markdown` edge (only `semantic` neighbors carry one) and `exists`
-                // appears only on `links_out`: an inbound edge's source cannot dangle
-                // by construction (`delete_document` removes a deleted file's own
-                // outgoing rows), but an outbound edge's target can point at a file
-                // that was never indexed or was renamed out from under it — see
-                // `OutboundLink`'s doc comment. Both kinds (`markdown`, author-written;
-                // `semantic`, a machine-inferred kNN neighbor, only populated when
-                // `ui.semantic_edges.enabled` is on) ride the same list, tagged by
-                // `kind`, rather than being split into separate fields — mirroring how
-                // `/api/graph` already exposes them, just without that endpoint's
-                // dangling-edge drop.
-                let links_out = serde_json::json!({
-                    "total": doc.links_out.total,
-                    "has_more": doc.links_out.has_more(),
-                    "links": doc.links_out.links.iter().map(|l| serde_json::json!({
-                        "target_path": l.target_path,
-                        "kind": l.kind,
-                        "score": l.score,
-                        "exists": l.exists,
-                    })).collect::<Vec<_>>(),
-                });
-                let links_in = serde_json::json!({
-                    "total": doc.links_in.total,
-                    "has_more": doc.links_in.has_more(),
-                    "links": doc.links_in.links.iter().map(|l| serde_json::json!({
-                        "source_path": l.source_path,
-                        "kind": l.kind,
-                        "score": l.score,
-                    })).collect::<Vec<_>>(),
-                });
+                // The caller round-trips this into write_document/delete_document as
+                // `expected_version`. Computed before any slicing and always over the
+                // whole file: it names the document on disk, so a slice's version
+                // could never match.
+                let version = write::document_version(doc.content.as_bytes());
                 let rel_path = retrieval::relative_to_data(
                     &doc.path.to_string_lossy(),
                     &self.canonical_data_path,
@@ -4749,36 +4633,43 @@ impl KbSearchServer {
                     retrieval::resolve_document_view(&doc.content, &request, section_max_bytes)
                         .map_err(document_view_error_to_mcp)?;
 
-                // structured_content must mirror the text block: MCP clients that
-                // prefer structuredContent render ONLY it, so a hash-only payload
-                // makes the document invisible to them (observed in practice).
                 // The view-specific fields come from `retrieval::document_view_json`,
                 // shared with `/api/doc`; only the envelope is added here.
                 let mut structured = retrieval::document_view_json(&view);
                 structured.insert("path".to_string(), serde_json::json!(rel_path));
-                structured.insert("content_hash".to_string(), serde_json::json!(content_hash));
-                structured.insert("links_out".to_string(), links_out);
-                structured.insert("links_in".to_string(), links_in);
-                let mut text = render_document_view_text(view, section_max_bytes);
-                // Opt-in (#257): a caller that did not ask pays no git
-                // subprocess and sees a byte-identical response.
+                structured.insert("version".to_string(), serde_json::json!(version));
+                // The link graph rides on a whole-document read (the one a caller
+                // makes to understand a document) unless asked for or declined
+                // explicitly: on a targeted read it would outweigh the text itself.
+                // An oversized document read whole is still that read when it comes
+                // back cut short (`truncated`, #290), as the outline an oversized
+                // document with headings degrades to is; only a range the caller
+                // named is targeted.
+                let whole_read = match &view {
+                    retrieval::DocumentView::Range(slice) => !slice.partial() || slice.truncated,
+                    retrieval::DocumentView::Outline(outline) => outline.document_oversized,
+                    retrieval::DocumentView::Section(_) => false,
+                };
+                if params.links.unwrap_or(whole_read) {
+                    insert_link_lists(&mut structured, &doc.links_out, &doc.links_in);
+                }
+                // Opt-in (#257): a caller that did not ask pays no subprocess.
                 if let Some(limit) = params.history {
                     let data_path = self.canonical_data_path.to_string_lossy().into_owned();
-                    let history = retrieval::history_json(&data_path, Some(&rel_path), limit)
+                    let history = retrieval::document_changes_json(&data_path, &rel_path, limit)
                         .await
                         .map_err(|e| {
                             error!("get_document history failed for '{rel_path}': {e:#}");
                             McpError::internal_error(
-                                "failed to read this document's git history".to_string(),
+                                "this document's change history is unavailable".to_string(),
                                 None,
                             )
                         })?;
-                    text.push_str(&render_history_text(&history));
                     structured.insert("history".to_string(), history);
                 }
-                let mut result = CallToolResult::success(vec![Content::text(text)]);
-                result.structured_content = Some(serde_json::Value::Object(structured));
-                Ok(result)
+                Ok(CallToolResult::structured(serde_json::Value::Object(
+                    structured,
+                )))
             }
             Err(GetDocumentError::Outside) => {
                 warn!(path = %raw, "get_document: path outside data directory");
@@ -4824,83 +4715,15 @@ impl KbSearchServer {
         }
     }
 
-    /// Shared pipeline for `write_document`'s create and edit paths.
-    ///
-    /// Thin adapter over `write::write_document`: builds `WriteDeps`/`WriteRequest`
-    /// from this server's fields and the current config snapshot, then maps the
-    /// structured `WriteSuccess`/`WriteError` back onto this tool surface's exact
-    /// `CallToolResult`/`McpError` shapes (see `create_edit_success_to_result` /
-    /// `create_edit_error_to_mcp_error`).
-    ///
-    /// Callers are responsible for resolving paths and computing old/new content
-    /// before calling this — see `write::WriteRequest`'s doc comment.
-    ///
-    /// * `old_content` – empty string for create; existing file bytes for edit.
-    /// * `new_content` – the content to write (already computed by caller).
-    /// * `rel_path`    – repo-relative path (used for git add/commit and messages).
-    /// * `is_create`   – `true` for create (dedup gate active), `false` for edit.
-    /// * `message`     – optional custom commit message.
-    /// * `default_verb`– verb for the default commit message, e.g. `"add"` or `"update"`.
-    /// * `force_new`   – when `Some(true)`, bypasses the dedup gate on create paths.
-    /// * `operation`   – label for the `Operation:` git trailer, e.g. `"write_document"`.
-    /// * `dest_path`   – when `Some`, turns this into a document MOVE: `rel_path` is
-    ///   the source, this is the destination. `None` (the default for a plain
-    ///   create, and for an edit call with no `new_path`) is the existing
-    ///   create/edit behavior. See `write::WriteRequest::dest_path`.
-    /// * `expected_hash` – the caller's `content_hash` from a prior read, threaded
-    ///   straight into `WriteRequest::expected_hash`. See that field's doc comment
-    ///   for why this is not redundant with `write_document_edit`'s own up-front
-    ///   check: this one is `write::write_document`'s live-disk re-check,
-    ///   immediately before the overwrite under `GIT_LOCK`, which catches a
-    ///   modification that landed during this call's own awaits (e.g. a slow
-    ///   `validation.lint_command`) — a window the up-front check cannot see.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_document_write(
-        &self,
-        old_content: &str,
-        new_content: &str,
-        rel_path: &str,
-        is_create: bool,
-        message: Option<&str>,
-        default_verb: &str,
-        force_new: Option<bool>,
-        operation: &str,
-        dest_path: Option<&str>,
-        expected_hash: Option<&str>,
-    ) -> Result<CallToolResult, McpError> {
-        // One snapshot for the whole call, so a concurrent `POST /admin/reload`
-        // cannot mix old and new values across this method's several config reads.
-        let config = self.config();
-
-        if new_content.len() > MAX_CONTENT_LEN {
-            return Err(McpError::invalid_params(
-                format!(
-                    "content is too large ({} bytes); maximum is {} bytes",
-                    new_content.len(),
-                    MAX_CONTENT_LEN
-                ),
-                None,
-            ));
-        }
-
-        let token = crate::secrets::git_token(&config)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        // Only opened for a MOVE (`dest_path.is_some()`) — `write::write_document`
-        // itself never reads `deps.state` outside `write_document_move`, so a
-        // plain create/edit has no use for it, and opening the state DB lazily
-        // here (rather than unconditionally on every write) avoids materializing
-        // `state.db` on disk for calls that will never touch it. Best-effort: a
-        // state DB that fails to open degrades a move to "without link
-        // rewriting" (see `WriteDeps::state`'s doc comment) rather than failing
-        // the write.
-        let state_db = if dest_path.is_some() {
-            self.state_db().await.ok()
-        } else {
-            None
-        };
-
-        let deps = WriteDeps {
+    /// The `WriteDeps` every write tool hands the shared pipeline, from this
+    /// server's fields and one config snapshot.
+    fn write_deps<'a>(
+        &'a self,
+        config: &'a ResolvedConfig,
+        token: Option<&'a str>,
+        state: Option<&'a crate::state::StateDb>,
+    ) -> WriteDeps<'a, EmbedClient, QdrantStore> {
+        WriteDeps {
             retrieval: self.deps(),
             canonical_data_path: &self.canonical_data_path,
             schema_cache: &self.schema_cache,
@@ -4911,42 +4734,84 @@ impl KbSearchServer {
             dedup_threshold: config.write.dedup_threshold,
             git_url: config.source.git_url.as_deref(),
             branch: &config.source.branch,
-            token: token.as_deref(),
+            token,
             commit_author_name: &config.write.commit_author_name,
             commit_author_email: &config.write.commit_author_email,
             queue: &self.reindex_queue,
-            state: state_db,
-        };
+            state,
+        }
+    }
 
+    /// Shared pipeline for `write_document`'s create, edit and single-document
+    /// move paths: a thin adapter over `write::write_document` that maps the
+    /// structured `WriteSuccess`/`WriteError` back onto this tool surface's
+    /// `CallToolResult`/`McpError` shapes (see `create_edit_success_to_result` /
+    /// `create_edit_error_to_mcp_error`).
+    ///
+    /// `change` describes the edit; the new content is computed by the pipeline
+    /// from the document as it is under the lock — see `write::DocChange`.
+    /// `expected_version` is the caller's `version` from a prior read: required
+    /// for a full replace or a move of an existing document.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_document_write(
+        &self,
+        change: write::DocChange<'_>,
+        rel_path: &str,
+        message: Option<&str>,
+        default_verb: &str,
+        force_new: Option<bool>,
+        operation: &str,
+        dest_path: Option<&str>,
+        expected_version: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
+        // One snapshot for the whole call, so a concurrent `POST /admin/reload`
+        // cannot mix old and new values across this method's several config reads.
+        let config = self.config();
+
+        // Content sent whole is capped here; a relative edit's result is capped by
+        // the pipeline that computes it (`write::apply_change`).
+        if let write::DocChange::Create(content) | write::DocChange::Replace(content) = change
+            && content.len() > MAX_CONTENT_LEN
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "content is too large ({} bytes); maximum is {} bytes",
+                    content.len(),
+                    MAX_CONTENT_LEN
+                ),
+                None,
+            ));
+        }
+
+        let token = crate::secrets::git_token(&config).map_err(credential_error)?;
+
+        // Only opened for a MOVE — nothing else reads `deps.state` — so a plain
+        // create/edit never materializes `state.db`. Best-effort: a state DB that
+        // fails to open degrades a move to "without link rewriting" (see
+        // `WriteDeps::state`'s doc comment) rather than failing the write.
+        let state_db = if dest_path.is_some() {
+            self.state_db().await.ok()
+        } else {
+            None
+        };
+        let deps = self.write_deps(&config, token.as_deref(), state_db);
+
+        let is_create = change.is_create();
         let req = WriteRequest {
             rel_path,
-            old_content,
-            new_content,
-            is_create,
+            change,
             message,
             default_verb,
             force_new,
             operation,
-            // Threaded straight from this method's own `expected_hash` parameter.
-            // `write_document_edit`'s up-front check (above) and this one check
-            // different things: the up-front check compares against the
-            // in-memory `old_content` this call already read, catching a stale
-            // caller read; this one is `write::write_document`'s live-disk
-            // re-check immediately before the overwrite under `GIT_LOCK`, which
-            // catches a concurrent modification that lands *during* this call —
-            // e.g. while awaiting `validate::validate_content`, which can exec an
-            // arbitrarily slow `validation.lint_command`. Passing `None` here
-            // would leave that second window unguarded, silently dropping #142's
-            // protection for every MCP write (see #243).
-            expected_hash,
-            // Threaded straight from this method's own `dest_path` parameter —
-            // `Some` turns this call into a move. See
-            // `write::WriteRequest::dest_path`.
+            expected_version,
             dest_path,
         };
 
         match crate::write::write_document(&deps, req).await {
-            Ok(success) => Ok(create_edit_success_to_result(success, rel_path, is_create)),
+            Ok(success) => Ok(create_edit_success_to_result(
+                success, rel_path, is_create, dest_path,
+            )),
             Err(err) => Err(create_edit_error_to_mcp_error(
                 err,
                 rel_path,
@@ -4963,8 +4828,9 @@ impl KbSearchServer {
     /// old standalone `move_directory` tool.
     ///
     /// Every field that only makes sense for a single document (`content`,
-    /// `old_string`/`new_string`, `expected_hash`, `force_new`) is rejected here —
-    /// a directory move has no body to replace and no dedup gate to bypass.
+    /// `old_string`/`new_string`, `expected_version`, `force_new`) is rejected
+    /// here — a directory move has no body to replace and no dedup gate to
+    /// bypass; it re-checks every document under the lock itself instead.
     /// `new_path` is required: it is the destination prefix.
     async fn write_document_move_dir(
         &self,
@@ -4987,7 +4853,7 @@ impl KbSearchServer {
             ("new_string", params.new_string.is_some()),
             ("frontmatter_patch", params.frontmatter_patch.is_some()),
             ("append", params.append.is_some()),
-            ("expected_hash", params.expected_hash.is_some()),
+            ("expected_version", params.expected_version.is_some()),
             ("force_new", params.force_new.is_some()),
         ] {
             if is_set {
@@ -5003,32 +4869,12 @@ impl KbSearchServer {
         }
 
         let config = self.config();
-        let token = crate::secrets::git_token(&config)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let token = crate::secrets::git_token(&config).map_err(credential_error)?;
 
         // Best-effort, same as `run_document_write`'s own lazy state-DB open for a
-        // single-document MOVE: a state DB that fails to open degrades the
-        // incoming-link rewrite to "skip it", not a failed move — see
-        // `WriteDeps::state`'s doc comment.
+        // single-document MOVE — see `WriteDeps::state`'s doc comment.
         let state_db = self.state_db().await.ok();
-
-        let deps = WriteDeps {
-            retrieval: self.deps(),
-            canonical_data_path: &self.canonical_data_path,
-            schema_cache: &self.schema_cache,
-            validation: &config.validation,
-            indexing: &config.indexing,
-            prepend_description: config.chunking.prepend_description,
-            dedup_enabled: config.write.dedup_enabled,
-            dedup_threshold: config.write.dedup_threshold,
-            git_url: config.source.git_url.as_deref(),
-            branch: &config.source.branch,
-            token: token.as_deref(),
-            commit_author_name: &config.write.commit_author_name,
-            commit_author_email: &config.write.commit_author_email,
-            queue: &self.reindex_queue,
-            state: state_db,
-        };
+        let deps = self.write_deps(&config, token.as_deref(), state_db);
 
         match crate::write::move_directory(&deps, source_dir, dest_dir, params.message.as_deref())
             .await
@@ -5088,21 +4934,10 @@ impl KbSearchServer {
         let abs_path = crate::write::resolve_safe_write_path(&data_root, raw)
             .map_err(|e| McpError::invalid_params(e, None))?;
 
-        // The include-pattern eligibility guard is enforced inside
-        // `write::write_document` itself too — see that module's
-        // `check_include_pattern` — so every caller of the shared write pipeline
-        // (this tool, the HTTP UI in `web.rs`) gets it for free instead of each
-        // transport maintaining its own copy that a future caller could forget. It
-        // is ALSO run here, explicitly, ahead of the `exists()` pre-check just
-        // below: a path that both exists on disk and fails this check must be
-        // reported with the include-pattern message, not "already exists" — which,
-        // for such a path, is misleading circular guidance, since a retry would
-        // reject the same path as not permitted right back. Running
-        // `write::write_document`'s check later is not sufficient to restore that
-        // priority on its own, since the `exists()` check below returns before
-        // ever reaching it. Same message text as `write::write_document`'s own
-        // check (see `create_edit_error_to_mcp_error`'s `UnsafePath` arm), so
-        // existing callers see the exact same wording.
+        // The include-pattern guard runs inside `write::write_document` too; it
+        // runs here as well, ahead of the `exists()` pre-check below, so a path
+        // that both exists and fails it gets the include-pattern message rather
+        // than a misleading "already exists".
         crate::write::check_include_pattern_against(&self.include_patterns, raw).map_err(|e| {
             create_edit_error_to_mcp_error(e, raw, true, &self.canonical_data_path, None)
         })?;
@@ -5120,22 +4955,22 @@ impl KbSearchServer {
         }
 
         self.run_document_write(
-            "", // old_content: empty for new files
-            content,
+            write::DocChange::Create(content),
             raw,
-            true, // is_create
             params.message.as_deref(),
             "add",
             params.force_new,
             "write_document",
             None, // a create never moves a document
-            params.expected_hash.as_deref(),
+            params.expected_version.as_deref(),
         )
         .await
     }
 
     /// `write_document`'s edit path: `path` resolved to an existing, permitted
-    /// file. Mirrors the old standalone `edit_document` tool.
+    /// file. Mirrors the old standalone `edit_document` tool. Nothing is read
+    /// here: the pipeline applies the edit to the document as it is under the
+    /// lock.
     async fn write_document_edit(
         &self,
         params: WriteDocumentParams,
@@ -5154,114 +4989,20 @@ impl KbSearchServer {
             .to_string_lossy()
             .into_owned();
 
-        // Read the existing file content.
-        let old_content = tokio::fs::read_to_string(&canonical).await.map_err(|e| {
-            error!("Failed to read '{}': {}", canonical.display(), e);
-            McpError::internal_error(format!("Failed to read existing file: {}", e), None)
-        })?;
-
-        // Optional stale-read guard: if the caller tells us what content it based this
-        // edit on, refuse up front when the file has since changed, rather than let a
-        // shifted `old_string` fail with a confusing (and, for a full replace, silent)
-        // mismatch. Same hash `get_document` reports back as `content_hash` and
-        // `indexed_files.content_hash` already uses — see `WriteDocumentParams::expected_hash`.
-        if let Some(expected) = params.expected_hash.as_deref() {
-            let actual = crate::ingest::compute_hash_from_bytes(old_content.as_bytes());
-            if !expected.trim().eq_ignore_ascii_case(&actual) {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "'{}' has changed since you read it: expected content_hash '{}' \
-                         but the current document hash is '{}'. Re-read it with \
-                         get_document and reapply your edit against the current content.",
-                        rel_path,
-                        expected.trim(),
-                        actual
-                    ),
-                    None,
-                ));
-            }
-        }
-
-        // Compute new_content and operation label based on mode. `None` is a pure
-        // move (guaranteed by `parse_edit_mode` to only occur when `dest_path` is
-        // `Some` — see its doc comment): the destination gets the source's current
-        // content, byte-for-byte, since `write::write_document` never reads
-        // `rel_path`'s content itself, move or not.
-        let (new_content, operation) = match mode {
-            None => (old_content.clone(), "write_document (move)"),
-            Some(EditMode::Full { content }) => (
-                content,
-                if dest_path.is_some() {
-                    "write_document (full replace + move)"
-                } else {
-                    "write_document (full replace)"
-                },
-            ),
-            Some(EditMode::Surgical { old, new }) => {
-                let result = apply_surgical(&old_content, &old, &new, &rel_path)
-                    .map_err(|e| McpError::invalid_params(e, None))?;
-                (
-                    result,
-                    if dest_path.is_some() {
-                        "write_document (surgical replace + move)"
-                    } else {
-                        "write_document (surgical replace)"
-                    },
-                )
-            }
-            Some(EditMode::Patch { edits }) => {
-                let result = write::apply_frontmatter_patch(&old_content, &edits)
-                    .map_err(|e| McpError::invalid_params(e, None))?;
-                (
-                    result,
-                    if dest_path.is_some() {
-                        "write_document (frontmatter patch + move)"
-                    } else {
-                        "write_document (frontmatter patch)"
-                    },
-                )
-            }
-            Some(EditMode::Append { text }) => {
-                let result = write::apply_append(&old_content, &text);
-                (
-                    result,
-                    if dest_path.is_some() {
-                        "write_document (append + move)"
-                    } else {
-                        "write_document (append)"
-                    },
-                )
-            }
-            Some(EditMode::PatchAppend { edits, text }) => {
-                // Patch first, then append — the patch only ever touches the
-                // frontmatter block, so applying it first and re-deriving the
-                // frontmatter/body split for the append (see `apply_append`'s
-                // own doc comment) composes cleanly with no ordering ambiguity.
-                let patched = write::apply_frontmatter_patch(&old_content, &edits)
-                    .map_err(|e| McpError::invalid_params(e, None))?;
-                let result = write::apply_append(&patched, &text);
-                (
-                    result,
-                    if dest_path.is_some() {
-                        "write_document (frontmatter patch + append + move)"
-                    } else {
-                        "write_document (frontmatter patch + append)"
-                    },
-                )
-            }
-        };
+        let operation = edit_operation_label(mode.as_ref(), dest_path.is_some());
+        let owned = mode.map(|m| OwnedChange::from_mode(m, rel_path.clone()));
 
         self.run_document_write(
-            &old_content,
-            &new_content,
+            owned
+                .as_ref()
+                .map_or(write::DocChange::Keep, OwnedChange::as_change),
             &rel_path,
-            false, // is_create
             params.message.as_deref(),
             "update",
             None, // no dedup gate for edit
             operation,
             dest_path,
-            params.expected_hash.as_deref(),
+            params.expected_version.as_deref(),
         )
         .await
     }
@@ -5270,25 +5011,17 @@ impl KbSearchServer {
     ///
     /// Rejects every single-document field (`path`, `content`,
     /// `old_string`/`new_string`, `frontmatter_patch`, `append`, `new_path`,
-    /// `expected_hash`, `force_new`) if set alongside `documents` at the top
-    /// level — a batch entry carries its own copies of the content-edit
-    /// fields inside `documents` instead, and mixing the two shapes in one
-    /// call has no well-defined meaning worth guessing at.
+    /// `expected_version`, `force_new`) if set alongside `documents` at the top
+    /// level — a batch entry carries its own copies of the content-edit fields
+    /// inside `documents` instead.
     ///
-    /// Resolves each entry's create-vs-edit status and computes its
-    /// `new_content` up front (reusing `parse_edit_mode` via
-    /// `batch_input_as_write_params`, so a batch entry's content-edit rules
-    /// are byte-for-byte the same as a single-document call's — see that
-    /// adapter's doc comment), collecting EVERY entry's problem rather than
-    /// stopping at the first one — this is pure request-shape parsing
-    /// (bad field combinations, a missing `content` on a create, a path
-    /// that resolves outside the KB), done entirely before
-    /// `write::write_documents_batch` is ever called, so it cannot itself
-    /// leave any repo state behind to roll back. `write_documents_batch`
-    /// then owns the atomic, single-commit part: its own further validation
-    /// (schema, frontmatter, dedup) and the filesystem/git work — see that
-    /// function's doc comment for the full phase breakdown and rollback
-    /// contract.
+    /// Resolves each entry's create-vs-edit status and parses its edit mode up
+    /// front (reusing `parse_edit_mode` via `batch_input_as_write_params`, so a
+    /// batch entry's content-edit rules are byte-for-byte the same as a
+    /// single-document call's), collecting EVERY entry's problem rather than
+    /// stopping at the first one. `write::write_documents_batch` then owns the
+    /// atomic, single-commit part, including applying each change to the
+    /// document as it is under the lock.
     async fn write_document_batch(
         &self,
         params: WriteDocumentParams,
@@ -5301,15 +5034,15 @@ impl KbSearchServer {
             ("frontmatter_patch", params.frontmatter_patch.is_some()),
             ("append", params.append.is_some()),
             ("new_path", params.new_path.is_some()),
-            ("expected_hash", params.expected_hash.is_some()),
+            ("expected_version", params.expected_version.is_some()),
             ("force_new", params.force_new.is_some()),
         ] {
             if is_set {
                 return Err(McpError::invalid_params(
                     format!(
                         "{field} is not valid alongside documents: a batch write supplies \
-                         ONLY documents (and, optionally, message for the whole batch's \
-                         commit subject) — each document's own path/content/edit fields \
+                         ONLY documents (and, optionally, one message describing the whole \
+                         batch) — each document's own path/content/edit fields \
                          belong inside its entry in documents"
                     ),
                     None,
@@ -5339,12 +5072,10 @@ impl KbSearchServer {
         }
 
         let mut parse_errors: Vec<String> = Vec::new();
-        let mut rel_paths: Vec<String> = Vec::with_capacity(documents.len());
-        let mut old_contents: Vec<String> = Vec::with_capacity(documents.len());
-        let mut new_contents: Vec<String> = Vec::with_capacity(documents.len());
-        let mut is_creates: Vec<bool> = Vec::with_capacity(documents.len());
+        // (rel_path, change, index into `documents`)
+        let mut entries: Vec<(String, OwnedChange, usize)> = Vec::with_capacity(documents.len());
 
-        for entry in &documents {
+        for (index, entry) in documents.iter().enumerate() {
             let raw = entry.path.trim().to_string();
             if raw.is_empty() {
                 parse_errors.push("documents: an entry's path is empty".to_string());
@@ -5379,13 +5110,9 @@ impl KbSearchServer {
                     let mode = match parse_edit_mode(&fake_params) {
                         Ok(Some(m)) => m,
                         Ok(None) => {
-                            // `parse_edit_mode` only returns `None` for a pure move
-                            // (`new_path.is_some()` with no edit mode) — a batch
-                            // entry never has `new_path`, so this is unreachable in
-                            // practice; treated as "no edit mode" defensively rather
-                            // than with `unreachable!()`, since it costs nothing to
-                            // fail soft here instead of panicking on a future
-                            // `parse_edit_mode` change this call site fails to track.
+                            // `parse_edit_mode` only returns `None` for a pure move,
+                            // and a batch entry never has `new_path` — failed soft
+                            // rather than `unreachable!()`.
                             parse_errors.push(format!(
                                 "documents: '{raw}' provides no edit mode (content, \
                                  old_string+new_string, frontmatter_patch, or append)"
@@ -5397,57 +5124,13 @@ impl KbSearchServer {
                             continue;
                         }
                     };
-
                     let rel_path = canonical
                         .strip_prefix(&self.canonical_data_path)
                         .unwrap_or(&canonical)
                         .to_string_lossy()
                         .into_owned();
-                    let old_content = match tokio::fs::read_to_string(&canonical).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            parse_errors.push(format!(
-                                "documents: failed to read existing file '{rel_path}': {e}"
-                            ));
-                            continue;
-                        }
-                    };
-                    let new_content = match mode {
-                        EditMode::Full { content } => content,
-                        EditMode::Surgical { old, new } => {
-                            match apply_surgical(&old_content, &old, &new, &rel_path) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    parse_errors.push(format!("documents: '{rel_path}': {e}"));
-                                    continue;
-                                }
-                            }
-                        }
-                        EditMode::Patch { edits } => {
-                            match write::apply_frontmatter_patch(&old_content, &edits) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    parse_errors.push(format!("documents: '{rel_path}': {e}"));
-                                    continue;
-                                }
-                            }
-                        }
-                        EditMode::Append { text } => write::apply_append(&old_content, &text),
-                        EditMode::PatchAppend { edits, text } => {
-                            match write::apply_frontmatter_patch(&old_content, &edits) {
-                                Ok(patched) => write::apply_append(&patched, &text),
-                                Err(e) => {
-                                    parse_errors.push(format!("documents: '{rel_path}': {e}"));
-                                    continue;
-                                }
-                            }
-                        }
-                    };
-
-                    rel_paths.push(rel_path);
-                    old_contents.push(old_content);
-                    new_contents.push(new_content);
-                    is_creates.push(false);
+                    let change = OwnedChange::from_mode(mode, rel_path.clone());
+                    entries.push((rel_path, change, index));
                 }
                 Err(retrieval::ResolveErr::NotFound) | Err(retrieval::ResolveErr::NotPermitted) => {
                     // Create path — mirrors `write_document_create`'s own field
@@ -5490,10 +5173,7 @@ impl KbSearchServer {
                         ));
                         continue;
                     }
-                    rel_paths.push(raw);
-                    old_contents.push(String::new());
-                    new_contents.push(content);
-                    is_creates.push(true);
+                    entries.push((raw, OwnedChange::Create(content), index));
                 }
                 Err(retrieval::ResolveErr::Outside) => {
                     parse_errors.push(format!("documents: '{raw}' is outside the data directory"));
@@ -5509,41 +5189,18 @@ impl KbSearchServer {
         }
 
         let config = self.config();
-        let token = crate::secrets::git_token(&config)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let token = crate::secrets::git_token(&config).map_err(credential_error)?;
+        // Batch writes never move or delete a document, so nothing in
+        // `write::write_documents_batch` reads `WriteDeps::state`.
+        let deps = self.write_deps(&config, token.as_deref(), None);
 
-        let deps = WriteDeps {
-            retrieval: self.deps(),
-            canonical_data_path: &self.canonical_data_path,
-            schema_cache: &self.schema_cache,
-            validation: &config.validation,
-            indexing: &config.indexing,
-            prepend_description: config.chunking.prepend_description,
-            dedup_enabled: config.write.dedup_enabled,
-            dedup_threshold: config.write.dedup_threshold,
-            git_url: config.source.git_url.as_deref(),
-            branch: &config.source.branch,
-            token: token.as_deref(),
-            commit_author_name: &config.write.commit_author_name,
-            commit_author_email: &config.write.commit_author_email,
-            queue: &self.reindex_queue,
-            // Batch writes never move a document or delete one, so nothing in
-            // `write::write_documents_batch` ever reads `WriteDeps::state` —
-            // unlike a single-document move, `None` here skips no real
-            // behavior (see that field's own doc comment), so there is no
-            // reason to pay for opening `state.db` on a call that will never
-            // touch it.
-            state: None,
-        };
-
-        let requests: Vec<write::BatchWriteRequest<'_>> = (0..documents.len())
-            .map(|i| write::BatchWriteRequest {
-                rel_path: &rel_paths[i],
-                old_content: &old_contents[i],
-                new_content: &new_contents[i],
-                is_create: is_creates[i],
-                force_new: documents[i].force_new,
-                expected_hash: documents[i].expected_hash.as_deref(),
+        let requests: Vec<write::BatchWriteRequest<'_>> = entries
+            .iter()
+            .map(|(rel_path, change, index)| write::BatchWriteRequest {
+                rel_path,
+                change: change.as_change(),
+                force_new: documents[*index].force_new,
+                expected_version: documents[*index].expected_version.as_deref(),
             })
             .collect();
 
@@ -5553,7 +5210,7 @@ impl KbSearchServer {
         }
     }
 
-    #[tool]
+    #[tool(annotations(destructive_hint = true, idempotent_hint = false))]
     async fn write_document(
         &self,
         Parameters(params): Parameters<WriteDocumentParams>,
@@ -5643,7 +5300,7 @@ impl KbSearchServer {
         }
     }
 
-    #[tool]
+    #[tool(annotations(destructive_hint = true, idempotent_hint = false))]
     async fn delete_document(
         &self,
         Parameters(params): Parameters<DeleteDocumentParams>,
@@ -5658,7 +5315,7 @@ impl KbSearchServer {
             ));
         }
         // Mirrors `get_document`'s length guard (see its comment) and
-        // `write_document`'s identical check: reject before the fuzzy resolver, the
+        // `write_document`'s identical check: reject before the resolver, the
         // metadata index, or git ever see an input that was never going to resolve.
         if raw.len() > MAX_PATH_LEN {
             return Err(McpError::invalid_params(
@@ -5667,12 +5324,15 @@ impl KbSearchServer {
             ));
         }
 
-        // Resolve the path (must already exist on disk). This is the same fuzzy
-        // resolver `get_document`/`write_document` use — relative to the KB root, a
-        // unique basename, or absolute — and produces this tool's richer NotFound
-        // text. It stays here rather than in `write::delete_document`, which does
-        // its own plain existence check as a defense-in-depth fallback for callers
-        // (like the HTTP UI) that address a document by exact path instead.
+        // Resolve the path (must already exist on disk) with `resolve_within_data`,
+        // the literal resolver `write_document` also tries first: relative to the KB
+        // root (a leading `/` means the root), and bounded by the traversal and
+        // `indexing.include` checks. Unlike `get_document`'s resolution it has no
+        // basename fallback, so a bare basename is "does not exist". It produces
+        // this tool's richer NotFound text, and stays here rather than in
+        // `write::delete_document`, which does its own plain existence check as a
+        // defense-in-depth fallback for callers (like the HTTP UI) that address a
+        // document by exact path instead.
         let canonical = match retrieval::resolve_within_data(
             raw,
             &self.canonical_data_path,
@@ -5709,8 +5369,7 @@ impl KbSearchServer {
             .to_string_lossy()
             .into_owned();
 
-        let token = crate::secrets::git_token(&config)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let token = crate::secrets::git_token(&config).map_err(credential_error)?;
 
         // (#229) Best-effort, same as `run_document_write`'s and
         // `write_document_move_dir`'s own lazy state-DB opens: a state DB that
@@ -5721,48 +5380,108 @@ impl KbSearchServer {
         // `referencing_paths` would always come back empty regardless of what
         // actually links to the document being deleted.
         let state_db = self.state_db().await.ok();
+        let deps = self.write_deps(&config, token.as_deref(), state_db);
 
-        let deps = WriteDeps {
-            retrieval: self.deps(),
-            canonical_data_path: &self.canonical_data_path,
-            schema_cache: &self.schema_cache,
-            validation: &config.validation,
-            indexing: &config.indexing,
-            prepend_description: config.chunking.prepend_description,
-            dedup_enabled: config.write.dedup_enabled,
-            dedup_threshold: config.write.dedup_threshold,
-            git_url: config.source.git_url.as_deref(),
-            branch: &config.source.branch,
-            token: token.as_deref(),
-            commit_author_name: &config.write.commit_author_name,
-            commit_author_email: &config.write.commit_author_email,
-            queue: &self.reindex_queue,
-            state: state_db,
-        };
-
-        match crate::write::delete_document(&deps, &rel_path, params.message.as_deref()).await {
+        match crate::write::delete_document(
+            &deps,
+            &rel_path,
+            params.message.as_deref(),
+            params.expected_version.as_deref(),
+        )
+        .await
+        {
             Ok(success) => Ok(delete_success_to_result(success, &rel_path)),
             Err(err) => Err(delete_error_to_mcp_error(err, &rel_path)),
         }
     }
 }
 
-/// Builds `search_chunks`' text and structured payload from already-fetched
-/// results. Pulled out of the tool handler as its own pure function so the
-/// "results -> CallToolResult content" seam — the exact spot where
-/// `structured_content` once regressed to a bare `{"path_prefix_truncated": ...}"`
-/// while the text content still carried full results — is reachable by a plain
-/// unit test: no network, no mocked `KbSearchServer`, none of `EmbedClient`'s
-/// retry/backoff to defeat.
+/// A relevance score as reported to a caller: four significant digits. The
+/// full `f32`/`f64` precision is noise to a reader and costs bytes on every row
+/// (and a widened `f32` such as 0.93 would print as 0.9300000071525574). Also
+/// how a dedup refusal reports its `similarity` and `threshold`, here and in
+/// `web.rs`.
+pub(crate) fn round_score(score: f64) -> serde_json::Value {
+    if !score.is_finite() || score == 0.0 {
+        return serde_json::json!(score);
+    }
+    let magnitude = score.abs().log10().floor() as i32;
+    let decimals = (3 - magnitude).max(0) as usize;
+    let rounded = format!("{score:.decimals$}")
+        .parse::<f64>()
+        .unwrap_or(score);
+    serde_json::json!(rounded)
+}
+
+/// The longest search snippet, in characters, before it is cut with `…`.
+const SNIPPET_CHARS: usize = 800;
+
+/// A row's frontmatter as `search` reports it: without the keys already promoted
+/// to the row itself (`title`, `description`) or derived from the path
+/// (`domain`, unless the caller named it in `fields`). `None` when nothing is
+/// left.
+fn row_frontmatter(
+    frontmatter: &serde_json::Value,
+    fields: Option<&[String]>,
+) -> Option<serde_json::Value> {
+    let mut map = frontmatter.as_object()?.clone();
+    map.remove("title");
+    map.remove("description");
+    if !fields.is_some_and(|f| f.iter().any(|k| k == "domain")) {
+        map.remove("domain");
+    }
+    (!map.is_empty()).then_some(serde_json::Value::Object(map))
+}
+
+/// The `search_grouped`/`search_enumerate` row for one document: `file_path`,
+/// plus `title`, `description` and the remaining `frontmatter` when present.
+fn document_row(
+    summary: &crate::state::DocumentSummary,
+    fields: Option<&[String]>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut row = serde_json::Map::new();
+    row.insert("file_path".into(), serde_json::json!(summary.file_path));
+    if let Some(title) = &summary.title {
+        row.insert("title".into(), serde_json::json!(title));
+    }
+    if let Some(description) = &summary.description {
+        row.insert("description".into(), serde_json::json!(description));
+    }
+    if let Some(frontmatter) = row_frontmatter(&summary.frontmatter, fields) {
+        row.insert("frontmatter".into(), frontmatter);
+    }
+    row
+}
+
+/// The envelope keys every query-mode `search` response shares: `returned`, and
+/// `path_prefix_truncated`/`offset_truncated` only when set.
+fn search_envelope(
+    returned: usize,
+    path_prefix_truncated: bool,
+    offset_truncated: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("returned".into(), serde_json::json!(returned));
+    if path_prefix_truncated {
+        map.insert("path_prefix_truncated".into(), serde_json::json!(true));
+    }
+    if offset_truncated {
+        map.insert("offset_truncated".into(), serde_json::json!(true));
+    }
+    map
+}
+
+/// Builds `search_chunks`' response from already-fetched results. A pure
+/// function so the "results -> response" seam is reachable by a plain unit
+/// test: no network, no mocked `KbSearchServer`.
 ///
-/// `mode` is the caller-computed `explain` label (see `search_chunks`'s
-/// `phrase_arm_ran` derivation) — constant across the whole result set, never
-/// per-result. The empty-results branch lives here too, so one seam covers both.
-///
-/// `offset` and `rerank_candidate_limit` (#240) exist purely to hand to
-/// [`offset_truncated_note`] when `offset_truncated` is set — see that
-/// function's doc comment for why the note needs both to give accurate advice.
-#[allow(clippy::too_many_arguments)]
+/// Each row is `file_path`, `title`, `score` (four significant digits), `text`
+/// (the chunk body without its breadcrumb/description prefix — see
+/// `qdrant::chunk_body_text` — cut at [`SNIPPET_CHARS`] with `…`), plus
+/// `heading_path`, `line_start`/`line_end`, `type` and `tags` when the payload
+/// has them. With `explain`, the response carries `mode` (constant across the
+/// result set) and each row its per-arm scores and `phrase_matched: true` when
+/// they apply.
 fn build_chunk_search_payload(
     results: &[crate::qdrant::SearchResult],
     data_root: &Path,
@@ -5770,406 +5489,144 @@ fn build_chunk_search_payload(
     mode: &str,
     path_prefix_truncated: bool,
     offset_truncated: bool,
-    offset: u64,
-    rerank_candidate_limit: Option<u64>,
-) -> (String, serde_json::Value) {
-    if results.is_empty() {
-        let mut text = "No results found.".to_string();
-        if path_prefix_truncated {
-            text.push_str(
-                "\n\nNote: path_prefix matched more documents than could be filtered on at \
-                 once, so this may not be exhaustive — use a longer, more specific \
-                 path_prefix to be sure.",
-            );
-        }
-        if offset_truncated {
-            text.push_str(&offset_truncated_note(offset, rerank_candidate_limit));
-        }
-        let structured = serde_json::json!({
-            "returned": 0,
-            "results": [],
-            "path_prefix_truncated": path_prefix_truncated,
-            "offset_truncated": offset_truncated,
-        });
-        return (text, structured);
-    }
-
-    // Format results as text content, and mirror them into `structured_content`.
-    //
-    // Both, not either: `search` historically returned text only, so a client
-    // that prefers structured content had nothing to render but the truncation
-    // flag — which reads as "no results" even when the text body is full. The
-    // other two granularities (`search_enumerate`, `search_grouped`) already
-    // return a full structured payload, so chunk mode returning a bare flag was
-    // the odd one out.
-    let mut output = String::new();
-    let mut structured_results: Vec<serde_json::Value> = Vec::with_capacity(results.len());
-    for (i, result) in results.iter().enumerate() {
-        let title = result
-            .payload
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(untitled)");
-
-        let (text_snippet, needs_ellipsis) = {
-            let full_text = result
-                .payload
-                .get(CHUNK_TEXT_KEY)
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let chars: Vec<char> = full_text.chars().take(801).collect();
-            if chars.len() > 800 {
-                (chars[..800].iter().collect::<String>(), true)
-            } else {
-                (chars.into_iter().collect::<String>(), false)
-            }
-        };
-
-        let file_path_raw = result
-            .payload
+) -> serde_json::Value {
+    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(results.len());
+    for result in results {
+        let payload = &result.payload;
+        let mut row = serde_json::Map::new();
+        let file_path_raw = payload
             .get("file_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let file_path = retrieval::relative_to_data(file_path_raw, data_root);
-
-        let domain = result
-            .payload
-            .get("domain")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        let doc_type = result
-            .payload
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        let tags = result
-            .payload
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-
-        let lines = match (
-            result.payload.get("line_start").and_then(|v| v.as_i64()),
-            result.payload.get("line_end").and_then(|v| v.as_i64()),
-        ) {
-            (Some(s), Some(e)) => format!(" (lines {s}–{e})"),
-            _ => String::new(),
-        };
-
-        output.push_str(&format!(
-            "## Result {rank}\n\
-            **Title**: {title}\n\
-            **Score**: {score:.4}\n\
-            **File**: {file_path}{lines}\n",
-            rank = i + 1,
-            title = title,
-            score = result.score,
-            file_path = file_path,
-            lines = lines,
-        ));
-
-        if explain {
-            let mut breakdown = if let Some(pre) = result.pre_rerank_score {
-                format!(
-                    "**Score breakdown**: mode={mode}, rerank={:.4}, pre-rerank={:.4}",
-                    result.score, pre,
-                )
-            } else {
-                format!(
-                    "**Score breakdown**: mode={mode}, score={:.4}",
-                    result.score,
-                )
-            };
-            if let Some(d) = result.dense_score {
-                breakdown.push_str(&format!(", dense={d:.4}"));
+        row.insert(
+            "file_path".into(),
+            serde_json::json!(retrieval::relative_to_data(file_path_raw, data_root)),
+        );
+        row.insert(
+            "title".into(),
+            serde_json::json!(
+                payload
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(untitled)")
+            ),
+        );
+        // Only when `chunking.heading_metadata` was on at index time (#286).
+        if let Some(heading_path) = payload.get(crate::qdrant::HEADING_PATH_KEY) {
+            row.insert("heading_path".into(), heading_path.clone());
+        }
+        for key in ["line_start", "line_end"] {
+            if let Some(v) = payload.get(key).filter(|v| !v.is_null()) {
+                row.insert(key.into(), v.clone());
             }
-            if let Some(s) = result.sparse_score {
-                breakdown.push_str(&format!(", sparse={s:.4}"));
+        }
+        row.insert("score".into(), round_score(f64::from(result.score)));
+        let body = crate::qdrant::chunk_body_text(payload);
+        let mut chars = body.chars();
+        let mut snippet: String = chars.by_ref().take(SNIPPET_CHARS).collect();
+        if chars.next().is_some() {
+            snippet.push('…');
+        }
+        row.insert("text".into(), serde_json::json!(snippet));
+        if let Some(t) = payload
+            .get("type")
+            .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        {
+            row.insert("type".into(), t.clone());
+        }
+        if let Some(tags) = payload
+            .get("tags")
+            .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+        {
+            row.insert("tags".into(), tags.clone());
+        }
+        if explain {
+            for (key, value) in [
+                ("dense_score", result.dense_score),
+                ("sparse_score", result.sparse_score),
+                ("pre_rerank_score", result.pre_rerank_score),
+            ] {
+                if let Some(v) = value {
+                    row.insert(key.into(), round_score(f64::from(v)));
+                }
             }
             // Presence, not magnitude, is the signal: the phrase arm's "score" is
-            // just the dense-ranked query re-run under a phrase filter, so its
-            // value carries no information beyond dense=. What a caller actually
-            // wants to know is whether this result matched every requested
-            // phrase at all.
+            // just the dense-ranked query re-run under a phrase filter.
             if result.phrase_score.is_some() {
-                breakdown.push_str(", phrase=matched");
+                row.insert("phrase_matched".into(), serde_json::json!(true));
             }
-            breakdown.push('\n');
-            output.push_str(&breakdown);
         }
-
-        if !domain.is_empty() {
-            output.push_str(&format!("**Domain**: {domain}\n"));
-        }
-        if !doc_type.is_empty() {
-            output.push_str(&format!("**Type**: {doc_type}\n"));
-        }
-        if !tags.is_empty() {
-            output.push_str(&format!("**Tags**: {tags}\n"));
-        }
-
-        if !text_snippet.is_empty() {
-            let ellipsis = if needs_ellipsis { "..." } else { "" };
-            output.push_str(&format!("\n{text_snippet}{ellipsis}\n"));
-        }
-
-        let null = serde_json::Value::Null;
-        let mut row = serde_json::json!({
-            "file_path": file_path,
-            "title": title,
-            "score": result.score,
-            "text": text_snippet,
-            "text_truncated": needs_ellipsis,
-            "domain": domain,
-            "type": doc_type,
-            "tags": result.payload.get("tags").cloned().unwrap_or(null.clone()),
-            "line_start": result.payload.get("line_start").cloned().unwrap_or(null.clone()),
-            "line_end": result.payload.get("line_end").cloned().unwrap_or(null.clone()),
-            "dense_score": result.dense_score,
-            "sparse_score": result.sparse_score,
-            "pre_rerank_score": result.pre_rerank_score,
-            "phrase_matched": result.phrase_score.is_some(),
-            // Always present (the payload always carries it — see
-            // `ingest::upsert_pending`).
-            "chunk_index": result.payload.get("chunk_index").cloned().unwrap_or(null),
-        });
-        // Only when `chunking.heading_metadata` was on at index time (#286):
-        // omitted rather than `null` otherwise, the same as `/api/search`.
-        if let Some(heading_path) = result.payload.get(crate::qdrant::HEADING_PATH_KEY)
-            && let Some(map) = row.as_object_mut()
-        {
-            map.insert("heading_path".to_string(), heading_path.clone());
-        }
-        structured_results.push(row);
-
-        output.push('\n');
+        rows.push(serde_json::Value::Object(row));
     }
 
-    if path_prefix_truncated {
-        output.push_str(
-            "\nNote: path_prefix matched more documents than could be filtered on at once, \
-             so fewer results than `limit` were returned and more may exist — use a \
-             longer, more specific path_prefix to be sure this is exhaustive.\n",
-        );
+    let mut out = search_envelope(rows.len(), path_prefix_truncated, offset_truncated);
+    if explain {
+        out.insert("mode".into(), serde_json::json!(mode));
     }
-    if offset_truncated {
-        output.push_str(&offset_truncated_note(offset, rerank_candidate_limit));
-    }
-
-    let structured = serde_json::json!({
-        "returned": structured_results.len(),
-        "results": structured_results,
-        "path_prefix_truncated": path_prefix_truncated,
-        "offset_truncated": offset_truncated,
-    });
-
-    (output.trim().to_string(), structured)
+    out.insert("results".into(), serde_json::Value::Array(rows));
+    serde_json::Value::Object(out)
 }
 
-/// Shared prose for both `build_chunk_search_payload` and
-/// `build_grouped_search_payload`'s `offset_truncated` note (#224 / #240).
-///
-/// The bound this note explains can be tripped two different ways, and they
-/// need different advice:
-///
-/// - `offset == 0`: `limit` alone already exceeds the ranked-candidate depth
-///   bound — the whole first page is inside the untouched region, so there is
-///   no offset to lower (it's already zero). The actionable fix is raising the
-///   bound (`reranking.candidate_limit`, when a reranker sized it — passed as
-///   `rerank_candidate_limit`) or lowering `limit`. Telling a caller with
-///   `offset: 0` to "lower offset" is nonsensical advice pointing at a knob
-///   they never touched — that was #240.
-/// - `offset > 0`: the usual paging-too-deep case the original #224 note
-///   described — lowering `offset` (or narrowing the query so fewer pages are
-///   needed) is the real fix here.
-fn offset_truncated_note(offset: u64, rerank_candidate_limit: Option<u64>) -> String {
-    if offset == 0 {
-        match rerank_candidate_limit {
-            Some(limit) => format!(
-                "\nNote: limit alone already reached past this query's ranked-candidate depth \
-                 bound — reranking.candidate_limit is currently {limit}. This page may be short \
-                 or empty not because there are no more matches, but because paging that deep \
-                 was never attempted. Raise reranking.candidate_limit or lower limit to be sure \
-                 this is exhaustive.\n"
-            ),
-            None => "\nNote: limit alone already reached past this query's ranked-candidate \
-                 depth bound (a fixed ceiling; no reranker is configured to size a larger one) \
-                 — this page may be short or empty not because there are no more matches, but \
-                 because paging that deep was never attempted. Lower limit to be sure this is \
-                 exhaustive.\n"
-                .to_string(),
-        }
-    } else {
-        "\nNote: offset + limit reached past this query's ranked-candidate depth bound \
-         (reranking.candidate_limit when reranking is active, otherwise a fixed ceiling) — \
-         this page may be short or empty not because there are no more matches, but because \
-         paging that deep was never attempted. Narrow the query or lower offset to be sure \
-         this is exhaustive.\n"
-            .to_string()
-    }
-}
-
-/// Builds `search_grouped`'s text and structured payload from already-fetched
-/// grouped documents. Same untested-adapter shape and risk as
-/// `build_chunk_search_payload` (wrong JSON key, an accidentally-included
-/// `total`/`has_more` — grouped must claim neither — or a dropped `score`) —
-/// pulled out so a hand-built `Vec<GroupedDocument>` can drive it directly, with
-/// no network involved.
+/// Builds `search_grouped`'s response from already-fetched grouped documents:
+/// one [`document_row`] plus a rounded `score` per document, and deliberately no
+/// `total`/`has_more` (grouped vector search cannot back either).
 fn build_grouped_search_payload(
     documents: &[retrieval::GroupedDocument],
+    fields: Option<&[String]>,
     path_prefix_truncated: bool,
     offset_truncated: bool,
-    offset: u64,
-) -> (String, serde_json::Value) {
-    let returned = documents.len();
-
-    let structured = serde_json::json!({
-        "returned": returned,
-        "path_prefix_truncated": path_prefix_truncated,
-        "offset_truncated": offset_truncated,
-        "documents": documents
+) -> serde_json::Value {
+    let mut out = search_envelope(documents.len(), path_prefix_truncated, offset_truncated);
+    out.insert(
+        "documents".into(),
+        documents
             .iter()
-            .map(|d| serde_json::json!({
-                "file_path": d.summary.file_path,
-                "title": d.summary.title,
-                "description": d.summary.description,
-                "mtime": d.summary.mtime,
-                "frontmatter": d.summary.frontmatter,
-                "score": d.score,
-            }))
-            .collect::<Vec<_>>(),
-    });
-
-    let mut text = if returned == 0 {
-        "No documents matched.".to_string()
-    } else {
-        format!("{returned} document(s) matched, ranked by relevance.\n\n")
-    };
-
-    for doc in documents {
-        text.push_str(&format!(
-            "- {} (score {:.4})",
-            doc.summary.file_path, doc.score
-        ));
-        if let Some(title) = &doc.summary.title {
-            text.push_str(&format!(" — {}", title));
-        }
-        text.push('\n');
-        if let Some(description) = &doc.summary.description {
-            text.push_str(&format!("  {}\n", description.trim()));
-        }
-    }
-
-    if path_prefix_truncated {
-        text.push_str(
-            "\nNote: path_prefix matched more documents than could be filtered on at once, \
-             so fewer results than `limit` were returned and more may exist — use a \
-             longer, more specific path_prefix to be sure this is exhaustive.\n",
-        );
-    }
-    if offset_truncated {
-        // Grouped search never runs a reranker (see `search_grouped`'s doc
-        // comment / `retrieval::GroupedSearchOutcome::offset_truncated`), so
-        // there is no `reranking.candidate_limit` to name here — the bound is
-        // always the fixed absolute ceiling.
-        text.push_str(&offset_truncated_note(offset, None));
-    }
-
-    (text.trim_end().to_string(), structured)
+            .map(|d| {
+                let mut row = document_row(&d.summary, fields);
+                row.insert("score".into(), round_score(f64::from(d.score)));
+                serde_json::Value::Object(row)
+            })
+            .collect(),
+    );
+    serde_json::Value::Object(out)
 }
 
-/// Builds `search`'s `section` granularity text and structured payload from
-/// already-fetched section hits (#286) — mirrors
-/// `build_grouped_search_payload`'s shape (same `returned`/
-/// `path_prefix_truncated`/`offset_truncated` envelope, same text +
-/// structured_content parity), but with `heading_path`/`line_start`/
-/// `line_end` (the section) and `hit_line_start`/`hit_line_end` (the matched
-/// chunk within it) in place of document metadata and, deliberately, **no
-/// `text` field at all** — that omission is the whole point of this
-/// granularity.
+/// Builds `search`'s `section` granularity response from already-fetched
+/// section hits (#286): `file_path`, `heading_path` (omitted for the two
+/// heading-less kinds), the section's `line_start`/`line_end`, the matched
+/// chunk's `hit_line_start`/`hit_line_end`, a rounded `score`, and `scope` only
+/// when it is not an ordinary `section`. Deliberately **no** text: that
+/// omission is the whole point of this granularity.
 fn build_section_search_payload(
     sections: &[retrieval::SectionHit],
     path_prefix_truncated: bool,
     offset_truncated: bool,
-    offset: u64,
-) -> (String, serde_json::Value) {
-    let returned = sections.len();
-
-    let structured = serde_json::json!({
-        "returned": returned,
-        "path_prefix_truncated": path_prefix_truncated,
-        "offset_truncated": offset_truncated,
-        "results": sections
+) -> serde_json::Value {
+    let mut out = search_envelope(sections.len(), path_prefix_truncated, offset_truncated);
+    out.insert(
+        "results".into(),
+        sections
             .iter()
-            .map(|s| serde_json::json!({
-                "file_path": s.file_path,
-                "heading_path": s.heading_path,
-                "line_start": s.line_start,
-                "line_end": s.line_end,
-                "hit_line_start": s.hit_line_start,
-                "hit_line_end": s.hit_line_end,
-                "score": s.score,
-                "scope": s.scope.as_str(),
-            }))
-            .collect::<Vec<_>>(),
-    });
-
-    let mut text = if returned == 0 {
-        "No sections matched.".to_string()
-    } else {
-        format!("{returned} section(s) matched, ranked by relevance.\n\n")
-    };
-
-    for section in sections {
-        // Each label says what the row is and, for the two heading-less
-        // kinds, how to fetch it — a `heading_path` fetch can't reach them.
-        let heading = match section.scope {
-            retrieval::SectionScope::Section => section.heading_path.join(" > "),
-            retrieval::SectionScope::Preamble => {
-                "(text before the first heading; fetch with line)".to_string()
-            }
-            retrieval::SectionScope::WholeDocument => {
-                "(whole document: no headings to select by, or changed since indexing; read it \
-                 whole)"
-                    .to_string()
-            }
-        };
-        text.push_str(&format!(
-            "- {} — {} (lines {}-{}, match at lines {}-{}, score {:.4})\n",
-            section.file_path,
-            heading,
-            section.line_start,
-            section.line_end,
-            section.hit_line_start,
-            section.hit_line_end,
-            section.score,
-        ));
-    }
-
-    if path_prefix_truncated {
-        text.push_str(
-            "\nNote: path_prefix matched more documents than could be filtered on at once, \
-             so fewer results than `limit` were returned and more may exist — use a \
-             longer, more specific path_prefix to be sure this is exhaustive.\n",
-        );
-    }
-    if offset_truncated {
-        // Same posture as `build_grouped_search_payload`: no reranker on this
-        // path, so the bound is always the fixed absolute ceiling.
-        text.push_str(&offset_truncated_note(offset, None));
-    }
-
-    (text.trim_end().to_string(), structured)
+            .map(|s| {
+                let mut row = serde_json::Map::new();
+                row.insert("file_path".into(), serde_json::json!(s.file_path));
+                if !s.heading_path.is_empty() {
+                    row.insert("heading_path".into(), serde_json::json!(s.heading_path));
+                }
+                row.insert("line_start".into(), serde_json::json!(s.line_start));
+                row.insert("line_end".into(), serde_json::json!(s.line_end));
+                row.insert("hit_line_start".into(), serde_json::json!(s.hit_line_start));
+                row.insert("hit_line_end".into(), serde_json::json!(s.hit_line_end));
+                row.insert("score".into(), round_score(f64::from(s.score)));
+                if !matches!(s.scope, retrieval::SectionScope::Section) {
+                    row.insert("scope".into(), serde_json::json!(s.scope.as_str()));
+                }
+                serde_json::Value::Object(row)
+            })
+            .collect(),
+    );
+    serde_json::Value::Object(out)
 }
-
 #[tool_handler]
 impl ServerHandler for KbSearchServer {
     fn get_info(&self) -> ServerInfo {
@@ -6291,7 +5748,7 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
 
 /// An empty `SharedSchemaCache`, for tests that exercise a `KbSearchServer` but do
 /// not care about schema content (e.g. instructions plumbing, path validation).
-/// Tests that DO care build a real one from a temp dir's `.kb-schema.yaml` files —
+/// Tests that DO care build a real one from a temp dir's schema files —
 /// see `make_write_test_server` below.
 #[cfg(test)]
 pub(crate) fn empty_test_schema_cache() -> crate::schema::SharedSchemaCache {
@@ -7173,6 +6630,13 @@ mod tests {
         // that path, before ever reaching Qdrant.
         let tmp = tempfile::tempdir().unwrap();
         let server = schema_tool_server_with_granularities(&tmp, &[Granularity::Document]);
+        // In use, so the filter vocabulary check lets it through to routing.
+        seed_document(
+            &server,
+            "notes/a.md",
+            serde_json::json!({ "title": "A", "random_field": "x" }),
+        )
+        .await;
 
         let mut filters = serde_json::Map::new();
         filters.insert("random_field".into(), serde_json::json!("x"));
@@ -7478,7 +6942,7 @@ mod tests {
             score: 0.5,
             scope,
         };
-        let (text, structured) = build_section_search_payload(
+        let structured = build_section_search_payload(
             &[
                 hit(&["A", "B"], retrieval::SectionScope::Section),
                 hit(&[], retrieval::SectionScope::Preamble),
@@ -7486,56 +6950,37 @@ mod tests {
             ],
             false,
             false,
-            0,
         );
-        let scopes: Vec<&str> = structured["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r["scope"].as_str().unwrap())
-            .collect();
-        assert_eq!(scopes, vec!["section", "preamble", "whole_document"]);
-        assert!(
-            text.contains("A > B (lines 4-7, match at lines 5-6"),
-            "{text}"
-        );
-        let first = &structured["results"][0];
+        let rows = structured["results"].as_array().unwrap();
+        // An ordinary section is the default and carries no `scope`; the two
+        // heading-less kinds say what they are and carry no empty heading_path.
+        let scopes: Vec<Option<&str>> = rows.iter().map(|r| r["scope"].as_str()).collect();
+        assert_eq!(scopes, vec![None, Some("preamble"), Some("whole_document")]);
+        assert_eq!(rows[0]["heading_path"], serde_json::json!(["A", "B"]));
+        assert!(rows[1].get("heading_path").is_none(), "{}", rows[1]);
         assert_eq!(
             (
-                first["hit_line_start"].as_u64(),
-                first["hit_line_end"].as_u64()
+                rows[0]["hit_line_start"].as_u64(),
+                rows[0]["hit_line_end"].as_u64()
             ),
             (Some(5), Some(6))
         );
-        assert!(text.contains("text before the first heading"), "{text}");
-        assert!(text.contains("whole document"), "{text}");
-        assert!(!text.contains("untitled preamble"), "{text}");
+        assert!(structured.get("path_prefix_truncated").is_none());
     }
 
     #[test]
-    fn annotate_heading_results_appends_the_note_to_text_and_structured_content() {
-        let mut result = CallToolResult::success(vec![Content::text("1 section(s) matched.\n")]);
-        result.structured_content = Some(serde_json::json!({ "returned": 1 }));
-
-        annotate_heading_results(&mut result, None);
+    fn annotate_heading_results_marks_the_response_only_when_a_note_applies() {
+        let mut response = serde_json::json!({ "returned": 1 });
+        annotate_heading_results(&mut response, None);
         assert_eq!(
-            result.content[0].as_text().unwrap().text,
-            "1 section(s) matched.\n",
+            response,
+            serde_json::json!({ "returned": 1 }),
             "no note → untouched"
         );
-        assert!(result.structured_content.as_ref().unwrap()["indexing_in_progress"].is_null());
 
-        annotate_heading_results(&mut result, Some("Note: indexing."));
-        assert_eq!(
-            result.content[0].as_text().unwrap().text,
-            "1 section(s) matched.\n\nNote: indexing."
-        );
-        assert_eq!(
-            result.structured_content.as_ref().unwrap()["indexing_in_progress"],
-            serde_json::json!(true)
-        );
+        annotate_heading_results(&mut response, Some("Note: indexing."));
+        assert_eq!(response["indexing_in_progress"], serde_json::json!(true));
     }
-
     // --- search: query-mode filter lowering ---
 
     /// A `ResolvedConfig` (with `frontmatter.indexed_fields` set to `fields`) paired
@@ -7722,6 +7167,36 @@ mod tests {
         assert!(normalize_scope_path(&"a".repeat(MAX_PATH_LEN + 1)).is_err());
     }
 
+    #[test]
+    fn scope_paths_drop_dot_segments_and_doubled_separators() {
+        // `PathBuf` equality compares components, so it would hide a leftover `.`;
+        // the text is what reaches a scope label, a commit message and a `LIKE`.
+        for raw in [
+            "food/./recipes",
+            "food//recipes",
+            "./food/./recipes/.",
+            "/./food//recipes//",
+            " food/recipes ",
+        ] {
+            let normalized = normalize_scope_path(raw).unwrap();
+            assert_eq!(normalized.to_str(), Some("food/recipes"), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_lone_dot_scope_path_is_the_root() {
+        for raw in [".", "./", "/.", " . ", "././"] {
+            let normalized = normalize_scope_path(raw)
+                .unwrap_or_else(|e| panic!("{raw:?} must name the root, got: {}", e.message));
+            assert_eq!(normalized.to_str(), Some(""), "{raw:?}");
+        }
+        // `..` is still refused wherever it sits, with the traversal message.
+        for raw in ["..", "./..", "food/./../x"] {
+            let err = normalize_scope_path(raw).unwrap_err();
+            assert!(err.message.contains("'..'"), "{raw:?}: {}", err.message);
+        }
+    }
+
     fn update_params(operation: &str, field: &str) -> UpdateSchemaParams {
         UpdateSchemaParams {
             path: None,
@@ -7803,9 +7278,7 @@ mod tests {
             "an unknown key must be rejected by a conforming client's own schema \
              validation too, not just our runtime check, got: {resolved}"
         );
-        for key in [
-            "type", "required", "indexed", "values", "extend", "default", "open",
-        ] {
+        for key in ["type", "required", "indexed", "values", "default", "open"] {
             assert!(
                 !resolved["properties"][key].is_null(),
                 "definition schema is missing documented key '{key}': {resolved}"
@@ -7851,7 +7324,7 @@ mod tests {
                 .as_str()
                 .unwrap_or_else(|| panic!("property '{key}' lost its description: {prop}"));
             assert!(
-                desc.len() <= 80,
+                desc.len() <= 120,
                 "property '{key}' description should be a short override, not the full \
                  doc comment ({} chars): {desc:?}",
                 desc.len()
@@ -7965,6 +7438,40 @@ mod tests {
             !msg.contains("RawFieldDef"),
             "a Rust type name is meaningless to an MCP client, got: {msg}"
         );
+    }
+
+    #[test]
+    fn set_field_shape_errors_name_exactly_the_advertised_definition_keys() {
+        // The keys a malformed definition's error lists are the properties the
+        // `definition` schema advertises: `fields` is one, the deprecated `extend`
+        // (accepted, never advertised) is not.
+        let schema = schemars::schema_for!(crate::schema::RawFieldDef);
+        let root = schema.as_value();
+        let resolved = match root["$ref"].as_str() {
+            Some(reference) => &root["$defs"][reference.rsplit('/').next().unwrap()],
+            None => root,
+        };
+        let mut advertised: Vec<&str> = resolved["properties"]
+            .as_object()
+            .expect("the definition schema advertises named properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        advertised.sort_unstable();
+        let mut listed: Vec<&str> = FIELD_DEFINITION_KEYS
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(listed, advertised);
+
+        for bad in [serde_json::json!(["type"]), serde_json::json!("[1]")] {
+            let msg = serde_json::from_value::<FieldDefinitionInput>(bad)
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains(FIELD_DEFINITION_KEYS), "{msg}");
+        }
     }
 
     #[test]
@@ -8122,29 +7629,43 @@ mod tests {
             .await
             .unwrap();
 
-        let structured = result.structured_content.unwrap();
-        let fields = structured["fields"].as_array().unwrap();
-        let names: Vec<&str> = fields
-            .iter()
-            .map(|f| f["field"].as_str().unwrap())
-            .collect();
+        let structured = single_representation(&result);
+        let fields = structured["fields"].as_object().unwrap();
 
-        assert!(names.contains(&"title"), "inherited from the root scope");
-        assert!(names.contains(&"prep"), "declared in this scope");
+        // Keyed by field name; only what constrains a document is listed.
+        assert_eq!(
+            fields["title"],
+            serde_json::json!({"required": true, "declared_in": "/"}),
+            "inherited from the root scope, with nothing false, null or default"
+        );
+        assert_eq!(
+            fields["prep"],
+            serde_json::json!({"type": "integer", "indexed": true, "declared_in": "food/recipes/"}),
+            "declared in this scope"
+        );
         assert!(
             structured.get("frozen").is_none() && structured.get("frozen_reason").is_none(),
             "there is no frozen state: an invalid schema never loads"
         );
+        assert!(structured.get("omitted_fields").is_none(), "{structured}");
+    }
 
-        let prep = fields.iter().find(|f| f["field"] == "prep").unwrap();
-        assert_eq!(prep["type"], serde_json::json!("integer"));
-        assert!(
-            prep["declared_in"]
-                .as_str()
-                .unwrap()
-                .contains("food/recipes"),
-            "provenance points at the declaring file"
-        );
+    #[tokio::test]
+    async fn get_schema_reports_the_config_derived_root_as_slash() {
+        // No root schema file: the root rules come from the server's config,
+        // which is deployment detail — the caller sees the root scope, `/`.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = (*make_test_resolved_config(tmp.path())).clone();
+        config.frontmatter.required = vec!["legacy_field".into()];
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], Arc::new(config));
+        let result = server
+            .get_schema(Parameters(GetSchemaParams::default()))
+            .await
+            .unwrap();
+        let structured = single_representation(&result);
+        assert_eq!(structured["path"], "/");
+        assert_eq!(structured["fields"]["legacy_field"]["declared_in"], "/");
+        assert!(!structured.to_string().contains("config"), "{structured}");
     }
 
     #[tokio::test]
@@ -8165,14 +7686,9 @@ mod tests {
             }))
             .await
             .unwrap();
-        let structured = plans.structured_content.clone().unwrap();
+        let structured = single_representation(&plans);
         assert_eq!(structured["dedup"]["enabled"], serde_json::json!(false));
         assert_eq!(structured["dedup"]["threshold"].as_f64(), Some(0.95));
-        let text = plans.content[0].as_text().unwrap().text.clone();
-        assert!(
-            text.contains("Near-duplicate check override"),
-            "got: {text}"
-        );
 
         let root = server
             .get_schema(Parameters(GetSchemaParams::default()))
@@ -8205,25 +7721,21 @@ mod tests {
             .unwrap();
 
         let structured = result.structured_content.unwrap();
-        let fields = structured["fields"].as_array().unwrap();
-        let names: Vec<&str> = fields
-            .iter()
-            .map(|f| f["field"].as_str().unwrap())
-            .collect();
+        let fields = structured["fields"].as_object().unwrap();
 
         assert!(
-            names.contains(&"title"),
+            fields.contains_key("title"),
             "the root file's own field is reported"
         );
         assert!(
-            !names.contains(&"legacy_field"),
+            !fields.contains_key("legacy_field"),
             "a config-only field must not leak into the root once a root schema file exists"
         );
-        for field in fields {
+        for field in fields.values() {
             assert_eq!(
                 field["declared_in"],
-                serde_json::json!(".kb-schema.yaml"),
-                "every reported root field must be attributed to the root schema file, \
+                serde_json::json!("/"),
+                "every reported root field must be attributed to the root schema, \
                  not to config.yaml, once one exists"
             );
         }
@@ -8279,11 +7791,11 @@ mod tests {
             .expect("a unique trailing match resolves");
 
         let fields = result.structured_content.unwrap()["fields"]
-            .as_array()
+            .as_object()
             .unwrap()
             .clone();
         assert!(
-            fields.iter().any(|f| f["field"] == "prep"),
+            fields.contains_key("prep"),
             "should have resolved to food/recipes, got: {fields:?}"
         );
     }
@@ -8369,6 +7881,7 @@ mod tests {
             .unwrap_err();
 
         assert!(err.message.contains("limit"), "got: {}", err.message);
+        assert_no_schema_file_name(&err.message);
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("big").join(crate::schema::SCHEMA_FILE_NAME))
                 .unwrap(),
@@ -8406,6 +7919,121 @@ mod tests {
             "got: {}",
             err.message
         );
+        assert!(err.message.contains("'notes/'"), "got: {}", err.message);
+        assert_no_schema_file_name(&err.message);
+    }
+
+    #[tokio::test]
+    async fn update_schema_refuses_a_directory_holding_both_schema_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "notes", "fields:\n  tags:\n    values: [a]\n");
+        let server = schema_tool_server(&tmp);
+        std::fs::write(
+            tmp.path()
+                .join("notes")
+                .join(crate::schema::LEGACY_SCHEMA_FILE_NAME),
+            "fields:\n  tags:\n    values: [z]\n",
+        )
+        .unwrap();
+
+        let err = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "add_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["b".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.message.contains("two schema files"),
+            "got: {}",
+            err.message
+        );
+        assert_no_schema_file_name(&err.message);
+        assert!(
+            tmp.path()
+                .join("notes")
+                .join(crate::schema::LEGACY_SCHEMA_FILE_NAME)
+                .exists(),
+            "nothing is resolved by deleting either file"
+        );
+    }
+
+    /// Model-facing text names a schema by its directory, never by file name.
+    fn assert_no_schema_file_name(text: &str) {
+        for name in ["kb-schema", ".schema.yaml"] {
+            assert!(!text.contains(name), "'{name}' leaked into: {text}");
+        }
+    }
+
+    #[test]
+    fn no_model_facing_surface_names_the_schema_file() {
+        // Every tool description and input schema, as `tools/list` serves them.
+        let config = overlay_test_config(
+            &[
+                Granularity::Chunk,
+                Granularity::Document,
+                Granularity::Section,
+            ],
+            true,
+        );
+        let server = make_overlay_test_server_with_config(HashMap::new(), config);
+        for tool in KbSearchServer::tool_router().list_all() {
+            let tool = server.get_tool(tool.name.as_ref()).unwrap();
+            assert_no_schema_file_name(tool.description.as_deref().unwrap_or(""));
+            assert_no_schema_file_name(
+                &serde_json::Value::Object((*tool.input_schema).clone()).to_string(),
+            );
+        }
+        assert_no_schema_file_name(&crate::descriptions::compose_server_mechanics());
+
+        // Refusals that echo a caller-supplied path add nothing beyond it.
+        for path in ["notes/.schema.yaml", "notes/.kb-schema.yaml"] {
+            let err = schema_file_path_error(path);
+            assert_no_schema_file_name(&err.message.replace(path, ""));
+            let text = batch_write_document_error_text(&WriteError::SchemaFile {
+                rel_path: path.to_string(),
+            });
+            assert_no_schema_file_name(&text.replace(path, ""));
+        }
+
+        // A refused rebuild, as `update_schema` reports it.
+        let refusal = crate::schema::SchemaBuildError {
+            invalid: vec![
+                crate::schema::InvalidSchemaFile {
+                    path: "a/.kb-schema.yaml".into(),
+                    reason: crate::schema::BOTH_NAMES_REASON.to_string(),
+                },
+                crate::schema::InvalidSchemaFile {
+                    path: ".schema.yaml".into(),
+                    reason: "fields: expected a map".to_string(),
+                },
+            ],
+        };
+        let shown = refusal.model_facing();
+        assert!(shown.contains("a/: two schema files"), "{shown}");
+        assert!(shown.contains("/: fields: expected a map"), "{shown}");
+        assert_no_schema_file_name(&shown);
+        // The operator-facing Display keeps the real paths.
+        assert!(refusal.to_string().contains("a/.kb-schema.yaml"));
+
+        // A move refusal over both names in one source directory.
+        let err = move_directory_error_to_mcp_error(
+            DirectoryMoveError::InvalidSchemaInSource {
+                path: "src/.schema.yaml".to_string(),
+                reason: crate::schema::BOTH_NAMES_REASON.to_string(),
+            },
+            "src",
+            "dest",
+        );
+        assert_no_schema_file_name(&err.message);
+        assert_no_schema_file_name(&err.data.unwrap().to_string());
     }
 
     #[tokio::test]
@@ -8427,14 +8055,441 @@ mod tests {
             .unwrap();
 
         let fields = result.structured_content.unwrap()["fields"]
-            .as_array()
+            .as_object()
             .unwrap()
             .clone();
-        let names: Vec<&str> = fields
-            .iter()
-            .map(|f| f["field"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = fields.keys().map(String::as_str).collect();
         assert_eq!(names, vec!["status"], "only closed-set fields are reported");
+    }
+
+    #[tokio::test]
+    async fn get_schema_values_in_use_lists_open_field_values_and_other_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  tags:\n    type: list\n  status:\n    type: enum\n    values: [active]\n",
+        );
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "notes/a.md",
+            serde_json::json!({ "tags": ["docker", "x"], "status": "active", "owner": "me" }),
+        )
+        .await;
+        seed_document(
+            &server,
+            "notes/b.md",
+            serde_json::json!({ "tags": ["docker"], "domain": "notes" }),
+        )
+        .await;
+        seed_document(
+            &server,
+            "other/c.md",
+            serde_json::json!({ "tags": ["elsewhere"] }),
+        )
+        .await;
+
+        let plain = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("notes".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert!(plain["fields"]["tags"].get("in_use").is_none(), "{plain}");
+        assert!(plain.get("other_fields_in_use").is_none(), "{plain}");
+
+        let with_values = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("notes".into()),
+                values_in_use: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(
+            with_values["fields"]["tags"]["in_use"],
+            serde_json::json!({ "docker": 2, "x": 1 }),
+            "counts are scoped to the path: {with_values}"
+        );
+        assert!(
+            with_values["fields"]["status"].get("in_use").is_none(),
+            "a closed field already lists its values: {with_values}"
+        );
+        assert_eq!(
+            with_values["other_fields_in_use"],
+            serde_json::json!(["owner"]),
+            "undeclared fields in use, never a derived one: {with_values}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_schema_other_fields_in_use_skips_fields_a_deeper_scope_declares() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "", "fields:\n  tags:\n    type: list\n");
+        // Declared only below `food/`: a scope governs it, so from `food/` or the
+        // root it is not an undeclared field.
+        write_schema_file(
+            &tmp,
+            "food/recipes",
+            "fields:\n  prep:\n    type: integer\n",
+        );
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "food/recipes/a.md",
+            serde_json::json!({ "prep": 5, "tags": ["x"] }),
+        )
+        .await;
+        seed_document(&server, "food/b.md", serde_json::json!({ "owner": "me" })).await;
+
+        for path in [None, Some("food")] {
+            let result = server
+                .get_schema(Parameters(GetSchemaParams {
+                    path: path.map(str::to_string),
+                    values_in_use: Some(true),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            assert_eq!(
+                result["other_fields_in_use"],
+                serde_json::json!(["owner"]),
+                "{path:?}: {result}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_schema_never_lists_a_derived_field() {
+        // A deployment that filters on `domain` lists it in `indexed_fields`, which
+        // declares it. Ingest still derives it from the folder and a write that
+        // authors it is refused, so it must not be offered as a field to fill in.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = (*make_test_resolved_config(tmp.path())).clone();
+        config.frontmatter.indexed_fields = vec!["domain".into(), "status".into()];
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], Arc::new(config));
+
+        let all = server
+            .get_schema(Parameters(GetSchemaParams::default()))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let names: Vec<&str> = all["fields"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(names, vec!["status"], "{all}");
+        assert!(all.get("omitted_fields").is_none(), "{all}");
+
+        let named = server
+            .get_schema(Parameters(GetSchemaParams {
+                fields: Some(vec!["domain".into()]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert!(named["fields"].as_object().unwrap().is_empty(), "{named}");
+    }
+
+    #[tokio::test]
+    async fn get_schema_counts_values_under_a_directory_however_its_path_is_spelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `food/recipes` has no schema file of its own, so its requested path is used
+        // as given when counting what documents there use.
+        write_schema_file(&tmp, "", "fields:\n  tags:\n    type: list\n");
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "food/recipes/a.md",
+            serde_json::json!({ "tags": ["dinner"] }),
+        )
+        .await;
+
+        let get = |path: &str| {
+            server.get_schema(Parameters(GetSchemaParams {
+                path: Some(path.to_string()),
+                values_in_use: Some(true),
+                ..Default::default()
+            }))
+        };
+        let plain = get("food/recipes")
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(
+            plain["fields"]["tags"]["in_use"],
+            serde_json::json!({ "dinner": 1 }),
+            "{plain}"
+        );
+        for spelling in ["food/./recipes", "food//recipes", "./food/recipes/."] {
+            let got = get(spelling).await.unwrap().structured_content.unwrap();
+            assert_eq!(got, plain, "{spelling:?}");
+        }
+
+        let root = get(".").await.unwrap().structured_content.unwrap();
+        assert_eq!(root["path"], "/", "a lone `.` is the root: {root}");
+    }
+
+    #[tokio::test]
+    async fn search_filter_on_an_unknown_field_lists_the_filterable_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  status:\n    type: enum\n    values: [active]\n",
+        );
+        let server = schema_tool_server(&tmp);
+        seed_document(&server, "notes/a.md", serde_json::json!({ "owner": "me" })).await;
+
+        for backend_query in [None, Some("q".to_string())] {
+            let mut filters = serde_json::Map::new();
+            filters.insert("staus".into(), serde_json::json!("active"));
+            let err = server
+                .search(Parameters(SearchParams {
+                    query: backend_query.clone(),
+                    filters: Some(SearchFiltersInput(filters)),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert!(
+                err.message.contains("unknown filter field 'staus'"),
+                "{}",
+                err.message
+            );
+            for known in ["status", "owner", "domain"] {
+                assert!(err.message.contains(known), "{}", err.message);
+            }
+            assert!(!err.message.contains("file_path"), "{}", err.message);
+        }
+
+        // A field documents use but no schema declares is known.
+        let mut filters = serde_json::Map::new();
+        filters.insert("owner".into(), serde_json::json!("me"));
+        let ok = server
+            .search(Parameters(SearchParams {
+                filters: Some(SearchFiltersInput(filters)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            ok.structured_content.unwrap()["total"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn search_filter_value_outside_a_closed_set_lists_the_allowed_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  status:\n    type: enum\n    values: [active, draft]\n",
+        );
+        write_schema_file(
+            &tmp,
+            "food",
+            "fields:\n  status:\n    type: enum\n    values: [active, cooking]\n",
+        );
+        let server = schema_tool_server(&tmp);
+        // A legacy value no schema lists any more, still used by a document.
+        seed_document(
+            &server,
+            "notes/a.md",
+            serde_json::json!({ "status": "legacy" }),
+        )
+        .await;
+
+        let search = |status: &str, path_prefix: Option<&str>| {
+            let mut filters = serde_json::Map::new();
+            filters.insert("status".into(), serde_json::json!(status));
+            server.search(Parameters(SearchParams {
+                filters: Some(SearchFiltersInput(filters)),
+                path_prefix: path_prefix.map(str::to_string),
+                ..Default::default()
+            }))
+        };
+
+        let err = search("actve", None).await.unwrap_err();
+        assert!(
+            err.message.contains(
+                "filter 'status': 'actve' is not an allowed value; allowed: active, cooking, draft"
+            ),
+            "the union across scopes without a path: {}",
+            err.message
+        );
+        let err = search("actve", Some("food/")).await.unwrap_err();
+        assert!(
+            err.message.contains("allowed: active, cooking"),
+            "path_prefix narrows to the scopes it names: {}",
+            err.message
+        );
+        // Permitted in some scope, or used by a document: never refused.
+        search("cooking", None).await.unwrap();
+        search("legacy", Some("food/")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_filter_any_of_is_refused_only_when_no_value_could_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  status:\n    type: enum\n    values: [active, draft]\n",
+        );
+        let server = schema_tool_server(&tmp);
+        // A legacy value no schema lists any more, still used by a document.
+        seed_document(
+            &server,
+            "notes/a.md",
+            serde_json::json!({ "status": "legacy" }),
+        )
+        .await;
+
+        let search = |filter: serde_json::Value| {
+            let mut filters = serde_json::Map::new();
+            filters.insert("status".into(), filter);
+            server.search(Parameters(SearchParams {
+                filters: Some(SearchFiltersInput(filters)),
+                ..Default::default()
+            }))
+        };
+
+        // An array and `any_of` are the same any-of: one value that can match keeps
+        // it alive, whether the schema permits it or a document merely uses it.
+        search(serde_json::json!(["active", "actve"]))
+            .await
+            .unwrap();
+        search(serde_json::json!({ "any_of": ["actve", "draft"] }))
+            .await
+            .unwrap();
+        search(serde_json::json!(["actve", "legacy"]))
+            .await
+            .unwrap();
+
+        // When none of its values could match it is refused, every one named.
+        for filter in [
+            serde_json::json!(["actve", "draf"]),
+            serde_json::json!({ "any_of": ["actve", "draf"] }),
+        ] {
+            let err = search(filter).await.unwrap_err();
+            assert!(
+                err.message.contains(
+                    "filter 'status': 'actve', 'draf' are not allowed values; \
+                     allowed: active, draft"
+                ),
+                "{}",
+                err.message
+            );
+        }
+        let err = search(serde_json::json!(["actve", "actve"]))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains(
+                "filter 'status': 'actve' is not an allowed value; allowed: active, draft"
+            ),
+            "a repeated value is listed once: {}",
+            err.message
+        );
+
+        // `all_of` needs one document to carry every value, so a single value that
+        // nothing can match sinks it even beside a permitted one.
+        let err = search(serde_json::json!({ "all_of": ["active", "actve"] }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains(
+                "filter 'status': 'actve' is not an allowed value; allowed: active, draft"
+            ),
+            "{}",
+            err.message
+        );
+        search(serde_json::json!({ "all_of": ["active", "draft"] }))
+            .await
+            .unwrap();
+
+        // A scalar is a one-value any-of.
+        let err = search(serde_json::json!("actve")).await.unwrap_err();
+        assert!(
+            err.message.contains(
+                "filter 'status': 'actve' is not an allowed value; allowed: active, draft"
+            ),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn search_filter_vocabulary_narrows_by_the_needle_search_matches_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  status:\n    type: enum\n    values: [active, draft]\n",
+        );
+        write_schema_file(
+            &tmp,
+            "food",
+            "fields:\n  status:\n    type: enum\n    values: [cooking]\n",
+        );
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "food/a.md",
+            serde_json::json!({ "status": "cooking" }),
+        )
+        .await;
+        seed_document(
+            &server,
+            "lifestyle/food/b.md",
+            serde_json::json!({ "status": "active" }),
+        )
+        .await;
+
+        let search = |path_prefix: &str| {
+            let mut filters = serde_json::Map::new();
+            filters.insert("status".into(), serde_json::json!("draft"));
+            server.search(Parameters(SearchParams {
+                filters: Some(SearchFiltersInput(filters)),
+                path_prefix: Some(path_prefix.to_string()),
+                ..Default::default()
+            }))
+        };
+
+        // `food`, `food/` and `FOOD` are one needle: they name the top-level `food/`
+        // scope, whose vocabulary does not permit `draft`.
+        for needle in ["food", "food/", "FOOD"] {
+            let err = search(needle).await.unwrap_err();
+            assert!(
+                err.message.contains("allowed: cooking"),
+                "{needle:?}: {}",
+                err.message
+            );
+        }
+        // `/food` is a fragment of `lifestyle/food/b.md` only — no prefix of the
+        // top-level `food/a.md` — so it names no scope: every scope governs, and the
+        // root permits `draft`.
+        let ok = search("/food").await.unwrap();
+        assert_eq!(
+            ok.structured_content.unwrap()["total"],
+            serde_json::json!(0)
+        );
     }
 
     #[tokio::test]
@@ -8457,12 +8512,20 @@ mod tests {
             .await
             .unwrap();
 
-        let structured = result.structured_content.unwrap();
+        let structured = single_representation(&result);
+        assert_no_schema_file_name(&structured.to_string());
         assert_eq!(structured["dry_run"], serde_json::json!(true));
         assert_eq!(
             structured["would_invalidate"].as_array().unwrap().len(),
             1,
             "the seeded document has no status and would fail the new rule"
+        );
+        // The edited field as the scope would resolve it — not the file.
+        assert!(structured.get("yaml").is_none(), "{structured}");
+        assert_eq!(structured["field"], "status");
+        assert_eq!(
+            structured["definition"],
+            serde_json::json!({"required": true, "declared_in": "notes/"})
         );
         assert!(
             !tmp.path()
@@ -8470,6 +8533,27 @@ mod tests {
                 .join(crate::schema::SCHEMA_FILE_NAME)
                 .exists(),
             "a dry run must not touch the filesystem"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_names_a_scope_without_dot_segments_or_doubled_separators() {
+        // The scope label (and so the commit message built from it) is the normalized
+        // path, never the raw text.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        let mut params = update_params("set_field", "status");
+        params.path = Some("notes/./sub//deep".into());
+        params.definition = Some(definition(serde_json::json!({ "required": true })));
+        params.dry_run = Some(true);
+
+        let result = server.update_schema(Parameters(params)).await.unwrap();
+
+        let structured = single_representation(&result);
+        assert_eq!(structured["path"], "notes/sub/deep/", "{structured}");
+        assert_eq!(
+            structured["definition"]["declared_in"], "notes/sub/deep/",
+            "{structured}"
         );
     }
 
@@ -8551,10 +8635,14 @@ mod tests {
             .await
             .unwrap();
 
+        // Below the cap the list is complete, so neither cap key is sent.
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["would_invalidate"].as_array().unwrap().len(), 1);
-        assert_eq!(structured["casualties_total"], serde_json::json!(1));
-        assert_eq!(structured["casualties_truncated"], serde_json::json!(false));
+        assert!(structured.get("casualties_total").is_none(), "{structured}");
+        assert!(
+            structured.get("casualties_truncated").is_none(),
+            "{structured}"
+        );
     }
 
     #[tokio::test]
@@ -8669,13 +8757,10 @@ mod tests {
             .await
             .unwrap();
 
-        let casualties = result.structured_content.unwrap()["would_invalidate"]
-            .as_array()
-            .unwrap()
-            .clone();
+        let structured = result.structured_content.unwrap();
         assert!(
-            casualties.is_empty(),
-            "notes/archive/ has its own status rule and is unaffected, got: {casualties:?}"
+            structured.get("would_invalidate").is_none(),
+            "notes/archive/ has its own status rule and is unaffected, got: {structured}"
         );
     }
 
@@ -8993,6 +9078,54 @@ mod tests {
             structured["has_more"],
             serde_json::json!(true),
             "truncation must never be silent"
+        );
+    }
+
+    /// An enumeration row carries only what is not already on it or derivable:
+    /// no `mtime` unless the listing is ordered by it, no `offset` echo, no
+    /// `has_more: false`, and no promoted or derived keys in `frontmatter`.
+    #[tokio::test]
+    async fn search_enumerate_rows_omit_promoted_derived_and_default_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "notes/a.md",
+            serde_json::json!({
+                "title": "A", "description": "About A", "domain": "notes", "tags": ["x"],
+            }),
+        )
+        .await;
+
+        let result = server
+            .search(Parameters(SearchParams::default()))
+            .await
+            .unwrap();
+        let structured = single_representation(&result);
+        assert_eq!(
+            structured,
+            serde_json::json!({
+                "total": 1,
+                "returned": 1,
+                "documents": [{
+                    "file_path": "notes/a.md",
+                    "title": "A",
+                    "description": "About A",
+                    "frontmatter": {"tags": ["x"]},
+                }],
+            })
+        );
+
+        let by_mtime = server
+            .search(Parameters(SearchParams {
+                order_by: Some("mtime".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            single_representation(&by_mtime)["documents"][0]["mtime"],
+            serde_json::json!(100)
         );
     }
 
@@ -9678,14 +9811,9 @@ mod tests {
         // returns `description: None` for all six. This asserts against the
         // actual runtime source of the description instead.
         let name = "write_document";
-        let description = crate::descriptions::compose_tool_description(
-            name,
-            false,
-            &Granularity::ALL,
-            false,
-            None,
-        )
-        .unwrap_or_else(|| panic!("no compiled description for tool '{name}'"));
+        let description =
+            crate::descriptions::compose_tool_description(name, false, &Granularity::ALL, None)
+                .unwrap_or_else(|| panic!("no compiled description for tool '{name}'"));
 
         for mode in [
             "content",
@@ -9794,12 +9922,8 @@ mod tests {
         // and its sibling assertions on `tools/list` descriptions.
         let default_config = make_test_resolved_config(&std::env::temp_dir());
         let effective_granularities = default_config.effective_granularities();
-        let overlay = crate::descriptions::compose_tool_descriptions(
-            None,
-            false,
-            &effective_granularities,
-            default_config.chunking.heading_metadata,
-        );
+        let overlay =
+            crate::descriptions::compose_tool_descriptions(None, false, &effective_granularities);
         let server = make_overlay_test_server(overlay.clone());
 
         let tools: Vec<Tool> = KbSearchServer::tool_router()
@@ -9947,12 +10071,10 @@ mod tests {
 
         assert_eq!(names, vec!["chunk", "document"]);
         assert!(
-            enum_values.iter().any(serde_json::Value::is_null),
-            "null must remain a valid value — granularity stays an optional \
-             parameter: {enum_values:?}"
+            !enum_values.iter().any(serde_json::Value::is_null),
+            "an omitted granularity is expressed by leaving the optional property \
+             out, not by a null enum member: {enum_values:?}"
         );
-        // `type` is untouched — still nullable, exactly what schemars produced.
-        assert_eq!(granularity["type"], serde_json::json!(["string", "null"]));
         // The property description is the effective-set text — never the
         // static doc comment, and never mentioning the disabled `section`.
         let description = granularity["description"].as_str().unwrap();
@@ -10063,6 +10185,7 @@ mod tests {
         "no query",
         "without a query",
         "without a `query`",
+        "without `query`",
         "omit to list",
         "exhaustive listing",
         "listing without",
@@ -10093,11 +10216,6 @@ mod tests {
         ];
         let data = tempfile::tempdir().unwrap();
         std::fs::create_dir(data.path().join("area")).unwrap();
-        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
-            url: "http://127.0.0.1:1".into(),
-            collection: "unused".into(),
-        })
-        .unwrap();
         for subset in subsets {
             for heading_metadata in [false, true] {
                 let config = overlay_test_config(subset, heading_metadata);
@@ -10105,24 +10223,13 @@ mod tests {
                 if effective.is_empty() {
                     continue; // Rejected at config load.
                 }
-                let overlay = crate::descriptions::compose_tool_descriptions(
-                    None,
-                    true,
-                    &effective,
-                    heading_metadata,
-                );
+                let overlay =
+                    crate::descriptions::compose_tool_descriptions(None, true, &effective);
                 let server = make_overlay_test_server_with_config(overlay, Arc::clone(&config));
                 let tool = server.get_tool("search").unwrap();
                 let tool_json = serde_json::to_string(&tool).unwrap();
-                let schemas =
-                    crate::schema::SchemaCache::build_for_test(data.path(), &config.frontmatter);
-                let instructions = crate::server::compose_server_instructions(
-                    &config,
-                    &qdrant,
-                    data.path(),
-                    &schemas,
-                )
-                .await;
+                let instructions =
+                    crate::server::compose_server_instructions(&config, data.path()).await;
                 assert!(
                     instructions.contains("Top-level areas"),
                     "the areas sentence must be exercised: {instructions}"
@@ -10139,7 +10246,7 @@ mod tests {
                             assert!(text.contains(&format!("\"{}\"", g.as_str())), "{text}");
                             assert!(text.contains(&format!("`{}`", g.as_str())), "{text}");
                         }
-                        assert!(text.contains("without a `query`"), "{text}");
+                        assert!(text.contains("without `query`"), "{text}");
                         assert!(text.contains("order_by"), "{text}");
                     }
                     for g in Granularity::ALL
@@ -10429,6 +10536,26 @@ mod tests {
     }
 
     #[test]
+    fn batch_entries_advertise_the_same_frontmatter_patch_ops_as_the_top_level() {
+        // Both places use `FrontmatterPatchOp`, so what a batch entry's ops
+        // advertise cannot drift from the single-document ones.
+        let config = overlay_test_config(&[Granularity::Chunk], false);
+        let server = make_overlay_test_server_with_config(HashMap::new(), config);
+        let tool = server
+            .get_tool("write_document")
+            .expect("write_document tool should be registered");
+
+        let properties = &tool.input_schema["properties"];
+        let top = &properties["frontmatter_patch"]["items"];
+        let batch = &properties["documents"]["items"]["properties"]["frontmatter_patch"]["items"];
+        assert!(
+            top["properties"]["field"].is_object(),
+            "the top-level op schema is missing 'field': {top}"
+        );
+        assert_eq!(batch, top);
+    }
+
+    #[test]
     fn self_contained_update_schema_definition_keeps_its_named_properties() {
         // Shape-preservation regression: `update_schema`'s `definition` must
         // still advertise every `RawFieldDef` property (including the
@@ -10441,21 +10568,32 @@ mod tests {
             .get_tool("update_schema")
             .expect("update_schema tool should be registered");
 
-        let definition_schema = &tool.input_schema["properties"]["definition"];
-        let object_branch = definition_schema["anyOf"]
-            .as_array()
-            .expect("definition must offer a typed alternative, not a bare {}")
-            .iter()
-            .find(|branch| branch["type"] != serde_json::json!("null"))
-            .expect("definition must have a non-null branch");
+        // `tool_schema::compact` unwraps the optional property's null arm, so
+        // the object schema is the property itself.
+        let object_branch = &tool.input_schema["properties"]["definition"];
+        assert!(object_branch.get("anyOf").is_none(), "{object_branch}");
 
         assert_eq!(object_branch["type"], serde_json::json!("object"));
+        assert!(
+            object_branch["properties"].get("extend").is_none(),
+            "the deprecated `extend` must not be advertised: {object_branch}"
+        );
+        assert!(
+            object_branch["properties"]["values"]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("$values")),
+            "{object_branch}"
+        );
+        assert!(
+            object_branch["properties"]["type"]["enum"].is_array(),
+            "the field type is a flat enum: {object_branch}"
+        );
         assert_eq!(
             object_branch["additionalProperties"],
             serde_json::json!(false)
         );
         for key in [
-            "type", "required", "indexed", "values", "extend", "default", "open", "fields",
+            "type", "required", "indexed", "values", "default", "open", "fields",
         ] {
             assert!(
                 !object_branch["properties"][key].is_null(),
@@ -10476,13 +10614,8 @@ mod tests {
             .get_tool("search")
             .expect("search tool should be registered");
 
-        let filters_schema = &tool.input_schema["properties"]["filters"];
-        let object_branch = filters_schema["anyOf"]
-            .as_array()
-            .expect("filters must offer a typed alternative, not a bare {}")
-            .iter()
-            .find(|branch| branch["type"] != serde_json::json!("null"))
-            .expect("filters must have a non-null branch");
+        let object_branch = &tool.input_schema["properties"]["filters"];
+        assert!(object_branch.get("anyOf").is_none(), "{object_branch}");
 
         assert_eq!(object_branch["type"], serde_json::json!("object"));
         assert_ne!(
@@ -10624,8 +10757,33 @@ mod tests {
     /// Numbered lines so a failed assertion names the line it actually got.
     const RANGE_DOC: &str = "l1\nl2\nl3\nl4\nl5\n";
 
+    /// The one representation every tool result carries: `structured_content`,
+    /// with a single text block that is exactly its compact JSON serialization
+    /// (so a text-only client reads the same facts). Returns the structured value.
+    fn single_representation(result: &CallToolResult) -> serde_json::Value {
+        let structured = result
+            .structured_content
+            .clone()
+            .expect("every tool result carries structured_content");
+        assert_eq!(result.content.len(), 1, "one content block: {result:?}");
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected a text content block, got {other:?}"),
+        };
+        assert_eq!(
+            text,
+            structured.to_string(),
+            "text must be the structured JSON"
+        );
+        assert!(
+            !text.contains("\n  "),
+            "compact, not pretty-printed: {text}"
+        );
+        structured
+    }
+
     /// Read `range_doc.md` through the real handler and return
-    /// (text content, structured_content).
+    /// (`content`, structured_content).
     async fn get_range(
         server: &KbSearchServer,
         start_line: Option<usize>,
@@ -10639,11 +10797,12 @@ mod tests {
                 ..Default::default()
             }))
             .await?;
-        let text = match &result.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
-            other => panic!("expected a text content block, got {other:?}"),
-        };
-        Ok((text, result.structured_content.unwrap()))
+        let structured = single_representation(&result);
+        let content = structured["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        Ok((content, structured))
     }
 
     fn range_test_server(tmp: &tempfile::TempDir) -> KbSearchServer {
@@ -10681,11 +10840,8 @@ mod tests {
             }))
             .await
             .unwrap();
-        let text = match &result.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
-            other => panic!("expected a text content block, got {other:?}"),
-        };
-        (text, result.structured_content.unwrap())
+        let structured = single_representation(&result);
+        (structured.to_string(), structured)
     }
 
     #[tokio::test]
@@ -10710,17 +10866,24 @@ mod tests {
         let (text, structured) = get_with_history(&server, Some(10)).await;
 
         let history = &structured["history"];
-        assert_eq!(history["available"], true);
-        assert_eq!(history["path"], "range_doc.md");
-        let commits = history["commits"].as_array().unwrap();
-        assert_eq!(commits.len(), 1, "other.md's commit must not appear");
-        assert_eq!(commits[0]["tool"], "mcp-md-wiki");
-        assert_eq!(commits[0]["operation"], "write_document");
-        assert_eq!(commits[0]["tool_authored"], true);
-        assert_eq!(history["truncated"], false);
-        assert!(text.starts_with(RANGE_DOC), "document text comes first");
-        assert!(text.contains("[mcp-md-wiki/write_document]"), "{text}");
-        assert!(text.contains("docs: add range_doc.md"), "{text}");
+        let changes = history["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1, "other.md's change must not appear");
+        let change = changes[0].as_object().unwrap();
+        assert_eq!(change["operation"], "write_document");
+        assert_eq!(change["subject"], "docs: add range_doc.md");
+        assert_eq!(change["author"], "Test");
+        assert!(
+            change["date"].as_str().unwrap().ends_with('Z'),
+            "{change:?}"
+        );
+        // Only what a caller can use: no revision id, email or provenance trailer.
+        let mut keys: Vec<&str> = change.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["author", "date", "operation", "subject"]);
+        assert!(history.get("truncated").is_none(), "{history}");
+        assert!(history.get("available").is_none(), "{history}");
+        assert!(!text.contains("t@localhost"), "{text}");
+        assert_git_free("get_document history", &text);
     }
 
     #[tokio::test]
@@ -10734,12 +10897,19 @@ mod tests {
             run_git(tmp.path(), &["commit", "-q", "-m", &format!("rev {n}")]);
         }
 
-        // 0 clamps up to 1, which leaves older commits unreported.
+        // 0 clamps up to 1, which leaves older changes unreported.
         let (text, structured) = get_with_history(&server, Some(0)).await;
-        assert_eq!(structured["history"]["limit"], 1);
-        assert_eq!(structured["history"]["returned"], 1);
+        assert_eq!(
+            structured["history"]["changes"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(structured["history"]["truncated"], true);
-        assert!(text.contains("older commits not shown"), "{text}");
+        assert!(
+            structured["history"]["changes"][0]
+                .get("operation")
+                .is_none()
+        );
+        assert_git_free("get_document history", &text);
     }
 
     #[tokio::test]
@@ -10749,9 +10919,11 @@ mod tests {
 
         let (text, structured) = get_with_history(&server, Some(5)).await;
 
-        assert_eq!(structured["history"]["available"], false);
-        assert_eq!(structured["history"]["commits"], serde_json::json!([]));
-        assert!(text.contains("not a git repository"), "{text}");
+        assert_eq!(
+            structured["history"],
+            serde_json::json!({ "available": false })
+        );
+        assert_git_free("get_document history", &text);
     }
 
     #[tokio::test]
@@ -10759,9 +10931,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = range_test_server(&tmp);
 
-        let (text, structured) = get_with_history(&server, None).await;
+        let (_, structured) = get_with_history(&server, None).await;
 
-        assert_eq!(text, RANGE_DOC);
+        assert_eq!(structured["content"], RANGE_DOC);
         assert!(structured.get("history").is_none());
     }
 
@@ -10773,13 +10945,13 @@ mod tests {
         let (text, structured) = get_range(&server, None, None).await.unwrap();
 
         assert_eq!(text, RANGE_DOC);
-        assert_eq!(structured["start_line"], 1);
-        assert_eq!(structured["end_line"], 5);
         assert_eq!(structured["total_lines"], 5);
-        assert_eq!(
-            structured["partial"], false,
-            "a full read must not advertise itself as partial"
-        );
+        for key in ["start_line", "end_line", "partial"] {
+            assert!(
+                structured.get(key).is_none(),
+                "a full read carries no range or partial flag: {structured}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10790,10 +10962,6 @@ mod tests {
         let (text, structured) = get_range(&server, Some(2), Some(4)).await.unwrap();
 
         assert_eq!(text, "l2\nl3\nl4\n");
-        assert_eq!(
-            structured["content"], "l2\nl3\nl4\n",
-            "structured_content must mirror the text block, sliced the same way"
-        );
         assert_eq!(structured["start_line"], 2);
         assert_eq!(structured["end_line"], 4);
         assert_eq!(structured["total_lines"], 5);
@@ -10844,7 +11012,7 @@ mod tests {
 
         let (_, structured) = get_range(&server, Some(1), Some(5)).await.unwrap();
 
-        assert_eq!(structured["partial"], false);
+        assert!(structured.get("partial").is_none(), "{structured}");
     }
 
     #[tokio::test]
@@ -10856,13 +11024,13 @@ mod tests {
         let (_, partial) = get_range(&server, Some(2), Some(3)).await.unwrap();
 
         assert_eq!(
-            partial["content_hash"], full["content_hash"],
-            "content_hash is edit_document's expected_hash: it must describe the file \
+            partial["version"], full["version"],
+            "version is write_document's expected_version: it must describe the file \
              on disk, not the slice served"
         );
         assert_eq!(
-            partial["content_hash"],
-            crate::ingest::compute_hash_from_bytes(RANGE_DOC.as_bytes())
+            partial["version"],
+            crate::write::document_version(RANGE_DOC.as_bytes())
         );
     }
 
@@ -10921,23 +11089,66 @@ mod tests {
 
         let (_, structured) = get_range(&server, None, None).await.unwrap();
 
-        let links_out = &structured["links_out"];
-        assert_eq!(links_out["total"], 1);
-        assert_eq!(links_out["has_more"], false);
-        assert_eq!(links_out["links"][0]["target_path"], "missing.md");
-        assert_eq!(links_out["links"][0]["kind"], "markdown");
-        assert_eq!(links_out["links"][0]["score"], serde_json::Value::Null);
+        // missing.md was never indexed, so the outbound edge is a broken link;
+        // the semantic edge is an inferred neighbour, not an author's link.
         assert_eq!(
-            links_out["links"][0]["exists"], false,
-            "missing.md was never indexed, so the outbound edge must be flagged dangling"
+            structured["broken_links"],
+            serde_json::json!(["missing.md"])
         );
+        assert_eq!(
+            structured["similar"],
+            serde_json::json!([{"path": "referrer.md", "score": 0.42}])
+        );
+        for absent in ["links_out", "links_in", "links_out_total", "links_in_total"] {
+            assert!(structured.get(absent).is_none(), "{absent}: {structured}");
+        }
 
-        let links_in = &structured["links_in"];
-        assert_eq!(links_in["total"], 1);
-        assert_eq!(links_in["has_more"], false);
-        assert_eq!(links_in["links"][0]["source_path"], "referrer.md");
-        assert_eq!(links_in["links"][0]["kind"], "semantic");
-        assert_eq!(links_in["links"][0]["score"], 0.42);
+        // A targeted read leaves the link graph out unless asked for.
+        let (_, ranged) = get_range(&server, Some(2), Some(3)).await.unwrap();
+        assert!(ranged.get("broken_links").is_none(), "{ranged}");
+        let asked = server
+            .get_document(Parameters(GetDocumentParams {
+                path: "range_doc.md".into(),
+                start_line: Some(2),
+                end_line: Some(3),
+                links: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            single_representation(&asked)["broken_links"],
+            serde_json::json!(["missing.md"])
+        );
+        let declined = server
+            .get_document(Parameters(GetDocumentParams {
+                path: "range_doc.md".into(),
+                links: Some(false),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(single_representation(&declined).get("similar").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_document_caps_each_link_direction_and_reports_the_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+        let db = server.state_db().await.unwrap();
+        for i in 0..25 {
+            let source = format!("src{i:02}.md");
+            db.replace_links(&source, "markdown", &[("range_doc.md".to_string(), None)])
+                .await
+                .unwrap();
+        }
+        let (_, structured) = get_range(&server, None, None).await.unwrap();
+        assert_eq!(
+            structured["links_in"].as_array().unwrap().len(),
+            retrieval::MAX_LINKS_PER_DIRECTION as usize
+        );
+        assert_eq!(structured["links_in_total"], 25);
+        assert!(structured["links_in"][0].is_string(), "{structured}");
     }
 
     #[tokio::test]
@@ -10968,17 +11179,11 @@ mod tests {
             }))
             .await
             .unwrap();
-        let text = match &result.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
-            other => panic!("expected a text content block, got {other:?}"),
-        };
-        let structured = result.structured_content.unwrap();
+        let structured = single_representation(&result);
 
-        assert_eq!(text, "");
-        assert_eq!(structured["start_line"], 1);
-        assert_eq!(structured["end_line"], 0);
+        assert_eq!(structured["content"], "");
         assert_eq!(structured["total_lines"], 0);
-        assert_eq!(structured["partial"], false);
+        assert!(structured.get("partial").is_none(), "{structured}");
     }
 
     #[tokio::test]
@@ -11023,11 +11228,12 @@ mod tests {
         params: GetDocumentParams,
     ) -> Result<(String, serde_json::Value), McpError> {
         let result = server.get_document(Parameters(params)).await?;
-        let text = match &result.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
-            other => panic!("expected a text content block, got {other:?}"),
-        };
-        Ok((text, result.structured_content.unwrap()))
+        let structured = single_representation(&result);
+        // The text a reader gets: `content` when the view has one, else the JSON.
+        let text = structured["content"]
+            .as_str()
+            .map_or_else(|| structured.to_string(), str::to_string);
+        Ok((text, structured))
     }
 
     fn section_doc_params(overrides: GetDocumentParams) -> GetDocumentParams {
@@ -11086,7 +11292,7 @@ mod tests {
         // Parity with `/api/doc`, structurally: both adapters must emit
         // exactly `retrieval::document_view_json` plus their envelope (web.rs
         // has the mirror test), so neither can grow a field the other lacks.
-        let hash = crate::ingest::compute_hash_from_bytes(SECTION_DOC.as_bytes());
+        let hash = crate::write::document_version(SECTION_DOC.as_bytes());
         let cases: Vec<(usize, GetDocumentParams)> = vec![
             (16000, GetDocumentParams::default()),
             // A whole-document read over the cap, which degrades to the
@@ -11154,13 +11360,12 @@ mod tests {
             let (_, mut structured) = get_document_result(&server, section_doc_params(params))
                 .await
                 .unwrap();
-            let obj = structured.as_object_mut().unwrap();
-            assert!(obj.remove("links_out").is_some(), "{label}");
-            assert!(obj.remove("links_in").is_some(), "{label}");
+            // No links are seeded, so no link list rides on any of these.
+            let _ = structured.as_object_mut().unwrap();
             let view = retrieval::resolve_document_view(SECTION_DOC, &request, cap).unwrap();
             let mut expected = retrieval::document_view_json(&view);
             expected.insert("path".into(), serde_json::json!("section_doc.md"));
-            expected.insert("content_hash".into(), serde_json::json!(hash));
+            expected.insert("version".into(), serde_json::json!(hash));
             assert_eq!(structured, serde_json::Value::Object(expected), "{label}");
         }
     }
@@ -11186,17 +11391,18 @@ mod tests {
         assert_eq!(
             structured["outline"],
             serde_json::json!([{
-                "heading": "Alpha Sub",
                 "heading_path": ["Guide", "Alpha", "Alpha Sub"],
                 "level": 3,
                 "line_start": 7,
                 "line_end": 10,
             }])
         );
-        assert_eq!(structured["truncated"], false);
+        assert!(structured.get("truncated").is_none(), "{structured}");
         assert!(structured.get("content").is_none());
-        assert!(text.contains("Guide > Alpha"), "{text}");
-        assert!(text.contains("### Alpha Sub (lines 7-10)"), "{text}");
+        assert!(
+            !text.contains("\"heading\""),
+            "no duplicate heading key: {text}"
+        );
     }
 
     #[tokio::test]
@@ -11284,19 +11490,16 @@ mod tests {
             serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
         );
         assert_eq!(structured["section"]["level"], 3);
-        assert_eq!(structured["outline_only"], false);
-        assert_eq!(
-            structured["content"], text,
-            "structured_content must mirror the text block"
-        );
+        assert!(structured.get("outline_only").is_none(), "{structured}");
+        assert_eq!(structured["partial"], true);
         assert!(
             structured.get("outline").is_none(),
             "a full section response must not also carry an outline"
         );
-        // content_hash is always over the whole file, matching range mode.
+        // version is always over the whole file, matching range mode.
         assert_eq!(
-            structured["content_hash"],
-            crate::ingest::compute_hash_from_bytes(SECTION_DOC.as_bytes()).to_string()
+            structured["version"],
+            crate::write::document_version(SECTION_DOC.as_bytes()).to_string()
         );
     }
 
@@ -11445,22 +11648,14 @@ mod tests {
             outline[0]["heading_path"],
             serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
         );
-        assert!(
-            text.contains("Alpha Sub"),
-            "the text block should still name the child section, got: {text}"
-        );
-        // The intro is surfaced, and the text block says exactly how to read
-        // it: a plain start_line/end_line range.
+        assert!(text.contains("Alpha Sub"), "{text}");
+        // The intro is surfaced as a plain start_line/end_line range.
         assert_eq!(
             structured["intro"]["heading_path"],
             serde_json::json!(["Guide", "Alpha"])
         );
         let intro_start = structured["intro"]["line_start"].as_u64().unwrap() as usize;
         let intro_end = structured["intro"]["line_end"].as_u64().unwrap() as usize;
-        assert!(
-            text.contains(&format!("start_line: {intro_start}, end_line: {intro_end}")),
-            "{text}"
-        );
         let (intro_text, _) = get_document_result(
             &server,
             section_doc_params(GetDocumentParams {
@@ -11511,10 +11706,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(structured["outline_only"], true);
-        assert!(structured["intro"].is_null());
-        assert!(!text.contains("text of its own"), "{text}");
-        assert!(!text.contains("\"heading_path\""), "{text}");
-        assert!(text.contains("## B (lines 2-3)"), "{text}");
+        assert!(
+            structured.get("intro").is_none(),
+            "a heading-only section has no intro to report: {text}"
+        );
+        assert!(!text.contains("\"heading\""), "{text}");
     }
 
     #[tokio::test]
@@ -11532,7 +11728,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(structured["outline_only"], false);
+        assert!(structured.get("outline_only").is_none(), "{text}");
         // Nothing smaller to narrow into, so text comes back — but bounded by
         // the cap, flagged, and reporting where it stops so the caller can
         // page on with start_line (#290).
@@ -11542,11 +11738,6 @@ mod tests {
         assert_eq!(structured["end_line"], 12);
         assert_eq!(structured["section"]["line_end"], 13);
         assert_eq!(structured["partial"], true);
-        // The text block is the same content, plus a trailer naming the cut —
-        // a text-only client can't see `truncated`.
-        assert!(text.starts_with("## Beta\n\n"), "{text}");
-        assert!(!text.contains("Beta body."), "{text}");
-        assert!(text.contains("start_line: 13"), "{text}");
     }
 
     #[tokio::test]
@@ -11563,13 +11754,12 @@ mod tests {
 
         assert_eq!(structured["outline_only"], true);
         assert!(structured.get("content").is_none(), "{structured}");
-        assert_eq!(structured["outline"][0]["heading"], "Guide");
-        assert_eq!(structured["total_entries"], 4);
+        assert_eq!(
+            structured["outline"][0]["heading_path"],
+            serde_json::json!(["Guide"])
+        );
         // SECTION_DOC opens on its first heading, so there is no intro.
-        assert!(structured["intro"].is_null());
-        assert!(text.contains("10-byte read limit"), "{text}");
-        assert!(text.contains("# Guide (lines 1-13)"), "{text}");
-        assert!(!text.contains("text before its first heading"), "{text}");
+        assert!(structured.get("intro").is_none(), "{text}");
     }
 
     #[tokio::test]
@@ -11595,7 +11785,7 @@ mod tests {
         assert_eq!(structured["outline_only"], true);
         assert_eq!(structured["intro"]["line_start"], 1);
         assert_eq!(structured["intro"]["line_end"], 2);
-        assert!(text.contains("start_line: 1, end_line: 2"), "{text}");
+        assert!(!text.contains("\"heading\""), "{text}");
     }
 
     #[tokio::test]
@@ -11625,8 +11815,62 @@ mod tests {
         assert_eq!(structured["end_line"], 1);
         assert_eq!(structured["total_lines"], 3);
         assert_eq!(structured["partial"], true);
-        assert!(text.starts_with("one line\n"), "{text}");
-        assert!(text.contains("start_line: 2"), "{text}");
+        assert_eq!(text, "one line\n");
+    }
+
+    #[tokio::test]
+    async fn get_document_truncated_whole_read_without_headings_keeps_the_link_lists() {
+        // An oversized document with headings degrades to an outline and keeps its
+        // link lists; the heading-less one degrades to a truncated slice and must
+        // too, or a missing list reads as "no links".
+        let tmp = tempfile::tempdir().unwrap();
+        let server = section_test_server(&tmp, 10);
+        std::fs::write(
+            tmp.path().join("flat.md"),
+            "one line\ntwo line\nthree line\n",
+        )
+        .unwrap();
+        let db = server.state_db().await.unwrap();
+        db.replace_links("flat.md", "markdown", &[("missing.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("referrer.md", "markdown", &[("flat.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        let (_, whole) = get_document_result(
+            &server,
+            GetDocumentParams {
+                path: "flat.md".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(whole["truncated"], true, "{whole}");
+        assert_eq!(
+            whole["broken_links"],
+            serde_json::json!(["missing.md"]),
+            "{whole}"
+        );
+        assert_eq!(whole["links_in"], serde_json::json!(["referrer.md"]));
+
+        // A range the caller named is a targeted read: no link lists.
+        let (_, ranged) = get_document_result(
+            &server,
+            GetDocumentParams {
+                path: "flat.md".into(),
+                start_line: Some(1),
+                end_line: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ranged["partial"], true, "{ranged}");
+        for absent in ["links_out", "broken_links", "links_in", "similar"] {
+            assert!(ranged.get(absent).is_none(), "{absent}: {ranged}");
+        }
     }
 
     #[tokio::test]
@@ -11641,7 +11885,7 @@ mod tests {
 
         assert_eq!(text, SECTION_DOC);
         assert_eq!(structured["content"], SECTION_DOC);
-        assert_eq!(structured["partial"], false);
+        assert!(structured.get("partial").is_none(), "{structured}");
         assert!(structured.get("truncated").is_none(), "{structured}");
         assert!(structured.get("outline_only").is_none(), "{structured}");
     }
@@ -11727,25 +11971,20 @@ mod tests {
             outline[1]["heading_path"],
             serde_json::json!(["Guide", "Alpha"])
         );
-        // Text block and structured_content must describe the same headings.
         for heading in ["Guide", "Alpha", "Alpha Sub", "Beta"] {
             assert!(
                 text.contains(heading),
-                "text block missing heading {heading:?}, got: {text}"
+                "missing heading {heading:?}: {text}"
             );
         }
-        assert!(
-            !text.is_empty(),
-            "the text block should still describe the outline"
-        );
         assert_eq!(
-            structured["content_hash"],
-            crate::ingest::compute_hash_from_bytes(SECTION_DOC.as_bytes()).to_string()
+            structured["version"],
+            crate::write::document_version(SECTION_DOC.as_bytes()).to_string()
         );
-        // Outline responses report the untruncated total and whether
-        // this response was capped, plus the whole document's line count.
-        assert_eq!(structured["total_entries"], 4);
-        assert_eq!(structured["truncated"], false);
+        // An uncapped outline carries no truncation keys; it always reports
+        // the whole document's line count.
+        assert!(structured.get("total_entries").is_none(), "{structured}");
+        assert!(structured.get("truncated").is_none(), "{structured}");
         assert_eq!(
             structured["total_lines"].as_u64().unwrap(),
             crate::retrieval::count_lines(SECTION_DOC) as u64
@@ -11910,7 +12149,7 @@ mod tests {
             new_string: None,
             content: Some("---\ntitle: Test\n---\n# Body".to_string()),
             message: None,
-            expected_hash: None,
+            expected_version: None,
             new_path: None,
             force_new: Some(true),
             frontmatter_patch: None,
@@ -11920,11 +12159,9 @@ mod tests {
         let result = server.write_document(Parameters(params)).await;
 
         let result = result.expect("a write against a nonexistent path must create it");
-        let text = format!("{:?}", result.content);
-        assert!(
-            text.contains("Created 'docs/nonexistent.md'"),
-            "a write against a nonexistent path is a CREATE: {text}"
-        );
+        let structured = single_representation(&result);
+        assert_eq!(structured["action"], "created", "{structured}");
+        assert_eq!(structured["path"], "docs/nonexistent.md");
     }
 
     #[tokio::test]
@@ -11953,7 +12190,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: version_at(&work, "docs/existing.md"),
             force_new: None,
             frontmatter_patch: None,
             append: None,
@@ -11963,11 +12200,12 @@ mod tests {
 
         let result =
             result.expect("write_document must upsert rather than refuse an existing path");
-        let text = format!("{:?}", result.content);
-        assert!(
-            text.contains("Edited 'docs/existing.md'"),
-            "an upsert onto an existing path is an EDIT, not a create: {text}"
+        let structured = single_representation(&result);
+        assert_eq!(
+            structured["action"], "updated",
+            "an upsert onto an existing path is an EDIT, not a create: {structured}"
         );
+        assert_eq!(structured["path"], "docs/existing.md");
         assert_eq!(
             std::fs::read_to_string(work.path().join("docs/existing.md")).unwrap(),
             "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n",
@@ -11994,7 +12232,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: Some(vec![FrontmatterPatchOp {
                 operation: "set_field".to_string(),
@@ -12007,8 +12245,14 @@ mod tests {
         };
         let result = server.write_document(Parameters(params)).await;
         let result = result.expect("frontmatter_patch must succeed against an existing document");
-        let text = format!("{:?}", result.content);
-        assert!(text.contains("Edited 'docs/log.md'"), "got: {text}");
+        let structured = single_representation(&result);
+        assert_eq!(structured["action"], "updated", "{structured}");
+        assert!(
+            structured["diff"]
+                .as_str()
+                .is_some_and(|d| d.contains("+status: active")),
+            "an edit carries its diff: {structured}"
+        );
 
         let on_disk = std::fs::read_to_string(work.path().join("docs/log.md")).unwrap();
         assert!(on_disk.contains("status: active"), "got: {on_disk}");
@@ -12039,7 +12283,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: None,
             append: Some("- entry two".to_string()),
@@ -12074,7 +12318,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: Some(vec![FrontmatterPatchOp {
                 operation: "set_field".to_string(),
@@ -12121,7 +12365,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: Some(vec![FrontmatterPatchOp {
                 operation: "remove_field".to_string(),
@@ -12155,7 +12399,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: Some(vec![FrontmatterPatchOp {
                 operation: "set_field".to_string(),
@@ -12190,7 +12434,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: None,
             append: Some("text".to_string()),
@@ -12231,7 +12475,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: None,
             append: None,
@@ -12333,7 +12577,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: None,
             append: None,
@@ -12367,7 +12611,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: None,
             append: None,
@@ -12422,7 +12666,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: None,
             append: None,
@@ -12516,7 +12760,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: None,
             append: None,
@@ -12774,7 +13018,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: None,
             append: None,
@@ -12814,7 +13058,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: Some(true),
             frontmatter_patch: None,
             append: None,
@@ -12854,7 +13098,7 @@ mod tests {
             new_string: None,
             content: Some("---\ntitle: Edited Doc\n---\n# New content".to_string()),
             message: None,
-            expected_hash: None,
+            expected_version: None,
             new_path: None,
             force_new: None,
             frontmatter_patch: None,
@@ -12885,6 +13129,7 @@ mod tests {
         let params = DeleteDocumentParams {
             path: "docs/nonexistent.md".to_string(),
             message: None,
+            expected_version: None,
         };
         let result = server.delete_document(Parameters(params)).await;
 
@@ -12977,6 +13222,7 @@ mod tests {
         let params = DeleteDocumentParams {
             path: "   ".to_string(), // whitespace-only
             message: None,
+            expected_version: None,
         };
         let result = server.delete_document(Parameters(params)).await;
 
@@ -12993,7 +13239,7 @@ mod tests {
     async fn delete_document_overlong_path_rejected() {
         // Mirrors `get_document`'s overlong-path test (see that test's comment on
         // MAX_PATH_LEN): `delete_document` must reject the same class of input
-        // before the fuzzy resolver ever runs, not fall through to a resolver-level
+        // before the resolver ever runs, not fall through to a resolver-level
         // "not found" error.
         let tmp = tempfile::tempdir().unwrap();
         let config = make_test_resolved_config(tmp.path());
@@ -13002,6 +13248,7 @@ mod tests {
         let params = DeleteDocumentParams {
             path: "a".repeat(MAX_PATH_LEN + 1),
             message: None,
+            expected_version: None,
         };
         let err = server
             .delete_document(Parameters(params))
@@ -13011,6 +13258,48 @@ mod tests {
             err.message.contains("exceeds maximum length"),
             "error should name the length problem, got: {}",
             err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_document_path_is_literal_and_its_description_does_not_promise_a_basename() {
+        // Only `get_document` falls back to a unique basename; `delete_document`
+        // resolves `path` relative to the KB root, so the served description must
+        // not promise more than that.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::fs::write(tmp.path().join("docs/guide.md"), "# Guide\n").unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let err = server
+            .delete_document(Parameters(DeleteDocumentParams {
+                path: "guide.md".to_string(),
+                message: None,
+                expected_version: None,
+            }))
+            .await
+            .expect_err("a bare basename is not a path relative to the KB root");
+        assert!(
+            err.message.contains("document does not exist"),
+            "{}",
+            err.message
+        );
+        assert!(tmp.path().join("docs/guide.md").exists());
+
+        let tool = server
+            .get_tool("delete_document")
+            .expect("delete_document tool should be registered");
+        let description = tool.input_schema["properties"]["path"]["description"]
+            .as_str()
+            .expect("the path property is described");
+        assert!(
+            !description.to_lowercase().contains("basename"),
+            "{description}"
+        );
+        assert!(
+            description.contains("relative to the KB root"),
+            "{description}"
         );
     }
 
@@ -13041,7 +13330,7 @@ mod tests {
             old_string: old_string.map(|s| s.to_string()),
             new_string: new_string.map(|s| s.to_string()),
             message: None,
-            expected_hash: None,
+            expected_version: None,
             new_path: new_path.map(|s| s.to_string()),
             force_new: None,
             frontmatter_patch: None,
@@ -13650,7 +13939,7 @@ mod tests {
                 new_string: None,
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
@@ -13659,18 +13948,15 @@ mod tests {
             .await;
 
         let result = result.expect("write must succeed even though nothing indexes it inline");
-        let text = format!("{:?}", result.content);
-        assert!(
-            text.contains("Created 'docs/queued.md'"),
-            "must report the successful create: {text}"
-        );
-        assert!(
-            text.contains("queued"),
-            "must tell the caller indexing is queued, not synchronous: {text}"
-        );
-        assert!(
-            !text.contains("SKIPPED"),
-            "the old skipped-index warning language must be gone: {text}"
+        let structured = single_representation(&result);
+        assert_eq!(
+            structured,
+            serde_json::json!({
+                "action": "created",
+                "path": "docs/queued.md",
+                "version": structured["version"],
+            }),
+            "a create reports where and what, and echoes no diff of what was sent"
         );
 
         crate::reindex::test_support::assert_marked_dirty(
@@ -13709,7 +13995,7 @@ mod tests {
                 new_string: None,
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
@@ -13746,7 +14032,7 @@ mod tests {
                 new_string: None,
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
@@ -13795,22 +14081,16 @@ mod tests {
             .delete_document(Parameters(DeleteDocumentParams {
                 path: "doomed-queued-cleanup-test.md".to_string(),
                 message: None,
+                expected_version: version_at(&work, "doomed-queued-cleanup-test.md"),
             }))
             .await;
 
         let result = result.expect("delete must succeed even though nothing purges it inline");
-        let text = format!("{:?}", result.content);
-        assert!(
-            text.contains("Deleted 'doomed-queued-cleanup-test.md'"),
-            "must report the successful delete: {text}"
-        );
-        assert!(
-            text.contains("queued"),
-            "must tell the caller cleanup is queued, not synchronous: {text}"
-        );
-        assert!(
-            !text.contains("REMAINS in the search index"),
-            "the old skipped-purge warning language must be gone: {text}"
+        let structured = single_representation(&result);
+        assert_eq!(
+            structured,
+            serde_json::json!({"action": "deleted", "path": "doomed-queued-cleanup-test.md"}),
+            "a delete echoes no diff of the removed document"
         );
 
         crate::reindex::test_support::assert_marked_dirty(
@@ -13849,19 +14129,12 @@ mod tests {
             .delete_document(Parameters(DeleteDocumentParams {
                 path: "linked.md".to_string(),
                 message: None,
+                expected_version: version_at(&work, "linked.md"),
             }))
             .await
             .expect("an inbound link must not block the delete");
 
-        let text = format!("{:?}", result.content);
-        assert!(
-            text.contains("referencer.md"),
-            "the human-readable summary must name the referencing document: {text}"
-        );
-
-        let structured = result
-            .structured_content
-            .expect("delete_document must attach structured_content");
+        let structured = single_representation(&result);
         assert_eq!(
             structured["referencing_paths"],
             serde_json::json!(["referencer.md"])
@@ -13884,99 +14157,80 @@ mod tests {
             .delete_document(Parameters(DeleteDocumentParams {
                 path: "unlinked.md".to_string(),
                 message: None,
+                expected_version: version_at(&work, "unlinked.md"),
             }))
             .await
             .unwrap();
 
         let structured = result.structured_content.unwrap();
-        assert_eq!(structured["referencing_paths"], serde_json::json!([]));
+        assert!(
+            structured.get("referencing_paths").is_none(),
+            "an empty list is omitted: {structured}"
+        );
     }
 
     // -----------------------------------------------------------------------
-    // structured_content parity with the text summary (sha/diff/rebased_paths) —
-    // fix #129
+    // An edit's diff in the result — fix #129 — and
+    // no versioning internals in either
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn write_document_structured_content_carries_sha_and_diff() {
-        // Before the fix, `structured_content` for a create/edit carried only
-        // `{"outcome", "rewritten_paths"}` — a client reading only structured
-        // content (Claude Code does) had no programmatic way to learn the commit
-        // SHA or see the diff, even though both are in the text summary.
+    async fn write_document_edit_carries_the_diff_and_no_versioning_detail() {
+        // A client reading only structured content (Claude Code does) must see the
+        // diff of an edit (#129) — and nothing may say how the change was versioned.
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        std::fs::write(
+            work.path().join("docs/new.md"),
+            "---\ntitle: Test\n---\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "docs/new.md", "add docs/new.md");
         let (server, _config) = make_git_backed_server(&work);
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
                 path: Some("docs/new.md".to_string()),
-                old_string: None,
-                new_string: None,
-                content: Some("---\ntitle: Test\n---\n# Body".to_string()),
-                message: None,
-                expected_hash: None,
-                new_path: None,
-                force_new: Some(true),
-                frontmatter_patch: None,
-                append: None,
-                documents: None,
+                old_string: Some("# Body".to_string()),
+                new_string: Some("# Better body".to_string()),
+                ..Default::default()
             }))
             .await
             .unwrap();
 
-        let text = match &result.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
-            other => panic!("expected a text content block, got {other:?}"),
-        };
-        let structured = result
-            .structured_content
-            .expect("write_document must attach structured_content");
-
-        let sha = structured["sha"]
-            .as_str()
-            .expect("structured_content must carry the commit sha as a string");
-        assert_eq!(
-            sha,
-            head_sha(&work),
-            "structured sha must match the commit the text summary names"
-        );
+        let structured = single_representation(&result);
         assert!(
-            text.contains(sha),
-            "sanity: the text summary must name the same sha, got: {text}"
+            !structured.to_string().contains(&head_sha(&work)[..8]),
+            "the result must not name the commit: {structured}"
         );
-
         let diff = structured["diff"]
             .as_str()
-            .expect("structured_content must carry the diff as a string");
+            .expect("an edit carries the diff as a string");
+        assert!(diff.contains("+# Better body"), "{diff}");
         assert!(
-            !diff.is_empty(),
-            "a real create must produce a non-empty diff"
+            structured.get("diff_truncated").is_none()
+                && structured.get("diff_total_bytes").is_none(),
+            "an uncut diff carries no cap keys: {structured}"
         );
-        assert!(
-            text.contains(diff),
-            "the structured diff must match what the text channel already carries, got \
-             text: {text} structured diff: {diff}"
-        );
-        assert_eq!(structured["diff_truncated"], serde_json::json!(false));
-        assert_eq!(
-            structured["diff_total_bytes"],
-            serde_json::json!(diff.len())
-        );
-        assert_eq!(structured["rebased_paths"], serde_json::json!([]));
-        assert!(
-            structured.get("sync_failure_cause").is_none(),
-            "a fully synced write must not carry sync_failure_cause"
-        );
+        assert!(structured.get("merged_with_other_changes").is_none());
+        assert!(structured.get("rewritten_paths").is_none());
+        assert_plain_success(&result);
     }
 
     #[tokio::test]
     async fn write_document_structured_diff_is_capped_for_a_large_write() {
-        // The diff can be large (a full replace of a big document) — this
-        // codebase never truncates a structured payload silently (`search`'s
-        // `has_more`, `update_schema`'s `casualties_truncated`), so a large diff
-        // must be capped WITH a flag saying so, the same convention.
+        // The diff of a full replace of a big document can be large — never
+        // truncated silently: capped WITH a flag and the true size.
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        std::fs::write(
+            work.path().join("docs/big.md"),
+            "---\ntitle: Big\n---\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "docs/big.md", "add docs/big.md");
         let (server, _config) = make_git_backed_server(&work);
 
         // Comfortably over MAX_STRUCTURED_DIFF_BYTES (8 KiB) so the added-lines
@@ -13989,26 +14243,14 @@ mod tests {
         let result = server
             .write_document(Parameters(WriteDocumentParams {
                 path: Some("docs/big.md".to_string()),
-                old_string: None,
-                new_string: None,
                 content: Some(content),
-                message: None,
-                expected_hash: None,
-                new_path: None,
-                force_new: Some(true),
-                frontmatter_patch: None,
-                append: None,
-                documents: None,
+                expected_version: version_at(&work, "docs/big.md"),
+                ..Default::default()
             }))
             .await
             .unwrap();
 
-        let text = match &result.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
-            other => panic!("expected a text content block, got {other:?}"),
-        };
-        let structured = result.structured_content.unwrap();
-
+        let structured = single_representation(&result);
         let diff = structured["diff"].as_str().unwrap();
         assert!(
             diff.len() <= MAX_STRUCTURED_DIFF_BYTES,
@@ -14021,18 +14263,46 @@ mod tests {
             diff_total_bytes > MAX_STRUCTURED_DIFF_BYTES,
             "diff_total_bytes must report the TRUE, uncapped length"
         );
-        assert!(
-            text.contains(diff),
-            "the capped structured diff must still be a prefix of the full text diff"
-        );
-        assert!(
-            text.len() > diff.len(),
-            "the TEXT channel must never be truncated by this cap — only structured_content"
-        );
     }
 
     #[tokio::test]
-    async fn delete_document_structured_content_carries_sha_and_diff() {
+    async fn write_document_refuses_an_authored_derived_field() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let err = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: Some("docs/fresh.md".to_string()),
+                content: Some("---\ntitle: Fresh\ndomain: docs\n---\n# Body\n".to_string()),
+                force_new: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("`domain` is set by the document's top-level folder"),
+            "{text}"
+        );
+        assert!(!work.path().join("docs/fresh.md").exists());
+
+        // The same document without it is accepted.
+        server
+            .write_document(Parameters(WriteDocumentParams {
+                path: Some("docs/fresh.md".to_string()),
+                content: Some("---\ntitle: Fresh\n---\n# Body\n".to_string()),
+                force_new: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_document_create_and_delete_echo_no_diff() {
+        // The caller just sent the content (create) or knows what it removed
+        // (delete); echoing it back as a diff only costs context.
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         std::fs::write(
@@ -14043,30 +14313,36 @@ mod tests {
         git_commit_all(&work, "gone.md", "add gone.md");
         let (server, _config) = make_git_backed_server(&work);
 
+        let created = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: Some("docs/fresh.md".to_string()),
+                content: Some("---\ntitle: Fresh\n---\n# Body\n".to_string()),
+                force_new: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let created = single_representation(&created);
+        assert!(created.get("diff").is_none(), "{created}");
+        assert_eq!(created["action"], "created");
+
         let result = server
             .delete_document(Parameters(DeleteDocumentParams {
                 path: "gone.md".to_string(),
                 message: None,
+                expected_version: version_at(&work, "gone.md"),
             }))
             .await
             .unwrap();
-
-        let structured = result.structured_content.unwrap();
-        assert_eq!(
-            structured["sha"].as_str().unwrap(),
-            head_sha(&work),
-            "delete_document's structured_content must carry the commit sha too"
-        );
-        let diff = structured["diff"].as_str().unwrap();
-        assert!(
-            !diff.is_empty(),
-            "a delete must produce a non-empty (all-removals) diff"
-        );
-        assert_eq!(structured["rebased_paths"], serde_json::json!([]));
+        let structured = single_representation(&result);
+        assert!(structured.get("diff").is_none(), "{structured}");
+        assert_eq!(structured["action"], "deleted");
+        assert_eq!(structured["path"], "gone.md");
+        assert_plain_success(&result);
     }
 
     #[tokio::test]
-    async fn write_document_directory_move_structured_content_carries_sha_and_rebased_paths() {
+    async fn write_document_directory_move_result_carries_no_versioning_detail() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         std::fs::create_dir_all(work.path().join("old-project7")).unwrap();
@@ -14083,7 +14359,7 @@ mod tests {
                 new_string: None,
                 new_path: Some("archive/new-project7".to_string()),
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
@@ -14092,13 +14368,760 @@ mod tests {
             .await
             .unwrap();
 
-        let structured = result.structured_content.unwrap();
         assert_eq!(
-            structured["sha"].as_str().unwrap(),
-            head_sha(&work),
-            "a directory move's structured_content must carry the commit sha too"
+            result.structured_content.as_ref().unwrap()["moved"][0]["to"],
+            "archive/new-project7/a.md"
         );
-        assert_eq!(structured["rebased_paths"], serde_json::json!([]));
+        assert_plain_success(&result);
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent changes: re-applied under the lock, merged, or refused
+    // -----------------------------------------------------------------------
+
+    /// Run git in `dir` as a peer writer, never escaping into an enclosing repo.
+    fn peer_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.email=peer@test.com", "-c", "user.name=Peer"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap_or(dir))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A knowledge base clone the server writes through (`work`, syncing to
+    /// `bare`), seeded with `docs/target.md` (`target`), plus a second clone
+    /// (`peer`) of the same state for a concurrent writer.
+    struct ConcurrentHarness {
+        _bare: tempfile::TempDir,
+        work: tempfile::TempDir,
+        peer: tempfile::TempDir,
+        server: KbSearchServer,
+    }
+
+    const CONCURRENT_TARGET: &str = "---\ntitle: Old\n---\n\n# Body\n\none\ntwo\nthree\nfour\n\
+                                     five\nsix\nseven\neight\nlast line\n";
+
+    fn concurrent_harness() -> ConcurrentHarness {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        std::fs::write(work.path().join("docs/target.md"), CONCURRENT_TARGET).unwrap();
+        peer_git(work.path(), &["add", "docs/target.md"]);
+        peer_git(work.path(), &["commit", "-q", "-m", "seed"]);
+        peer_git(work.path(), &["push", "-q", "origin", "HEAD:master"]);
+        let peer = crate::git::tests::clone_bare_repo(bare.path(), "master");
+
+        let mut config = make_test_resolved_config(work.path());
+        {
+            let c = Arc::get_mut(&mut config).unwrap();
+            c.write.dedup_enabled = false;
+            c.source.git_url = Some(format!("file://{}", bare.path().display()));
+        }
+        let server = make_write_test_server(&work, &["**/*.md".to_string()], config);
+        ConcurrentHarness {
+            _bare: bare,
+            work,
+            peer,
+            server,
+        }
+    }
+
+    fn retitle_target() -> WriteDocumentParams {
+        WriteDocumentParams {
+            path: Some("docs/target.md".to_string()),
+            old_string: Some("title: Old".to_string()),
+            new_string: Some("title: New".to_string()),
+            content: None,
+            message: None,
+            expected_version: None,
+            new_path: None,
+            force_new: None,
+            frontmatter_patch: None,
+            append: None,
+            documents: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_change_to_another_document_is_not_reported() {
+        let h = concurrent_harness();
+        std::fs::write(h.peer.path().join("elsewhere.md"), "# Elsewhere\n").unwrap();
+        peer_git(h.peer.path(), &["add", "elsewhere.md"]);
+        peer_git(
+            h.peer.path(),
+            &["commit", "-q", "-m", "peer adds elsewhere"],
+        );
+        peer_git(h.peer.path(), &["push", "-q", "origin", "HEAD:master"]);
+
+        let result = h
+            .server
+            .write_document(Parameters(retitle_target()))
+            .await
+            .expect("the edit must succeed");
+
+        // The server did pull the peer's document in — and marks it for indexing…
+        assert!(h.work.path().join("elsewhere.md").exists());
+        crate::reindex::test_support::assert_marked_dirty(
+            &h.server.reindex_queue,
+            &["docs/target.md", "elsewhere.md"],
+        );
+        // …but the caller hears nothing about it.
+        assert_plain_success(&result);
+        let structured = result.structured_content.as_ref().unwrap();
+        assert!(
+            structured.get("merged_with_other_changes").is_none(),
+            "{structured}"
+        );
+        let text = format!("{:?}", result.content);
+        assert!(!text.contains("elsewhere"), "{text}");
+        assert!(!text.contains("someone else"), "{text}");
+    }
+
+    /// Run `fut` with a git test hook that runs `action` the first time the write
+    /// reaches `point` (a nested write inside `action` reaches it too, and is left
+    /// alone, since the action is already taken).
+    async fn with_hook_once<A, AF, T>(
+        point: crate::git::HookPoint,
+        action: A,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T
+    where
+        A: FnOnce() -> AF + Send + 'static,
+        AF: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let action = Arc::new(std::sync::Mutex::new(Some(action)));
+        let hook: crate::git::TestHook = Arc::new(move |p| {
+            let action = Arc::clone(&action);
+            Box::pin(async move {
+                if p != point {
+                    return;
+                }
+                let taken = action.lock().unwrap().take();
+                if let Some(action) = taken {
+                    action().await;
+                }
+            })
+        });
+        crate::git::TEST_HOOK.scope(hook, fut).await
+    }
+
+    /// Like [`with_hook_once`], but runs `action(n)` every time (`n` counts from 1).
+    async fn with_hook_each<A, T>(
+        point: crate::git::HookPoint,
+        action: A,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T
+    where
+        A: Fn(usize) + Send + Sync + 'static,
+    {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let action = Arc::new(action);
+        let hook: crate::git::TestHook = Arc::new(move |p| {
+            let count = Arc::clone(&count);
+            let action = Arc::clone(&action);
+            Box::pin(async move {
+                if p == point {
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    action(n);
+                }
+            })
+        });
+        crate::git::TEST_HOOK.scope(hook, fut).await
+    }
+
+    /// Commit `content` to `rel` in the peer clone and push it.
+    fn peer_push(peer: &std::path::Path, rel: &str, content: &str) {
+        if let Some(parent) = std::path::Path::new(rel).parent() {
+            std::fs::create_dir_all(peer.join(parent)).unwrap();
+        }
+        peer_git(peer, &["pull", "-q", "--rebase", "origin", "master"]);
+        std::fs::write(peer.join(rel), content).unwrap();
+        peer_git(peer, &["add", rel]);
+        peer_git(peer, &["commit", "-q", "-m", &format!("peer writes {rel}")]);
+        peer_git(peer, &["push", "-q", "origin", "HEAD:master"]);
+    }
+
+    fn rev(dir: &std::path::Path, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(dir)
+            .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap_or(dir))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn target_version(h: &ConcurrentHarness) -> String {
+        write::document_version(&std::fs::read(h.work.path().join("docs/target.md")).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_relative_edit_and_this_one_both_land() {
+        let h = concurrent_harness();
+        let other = h.server.clone();
+        let result = with_hook_once(
+            crate::git::HookPoint::BeforeLock,
+            move || async move {
+                other
+                    .write_document(Parameters(WriteDocumentParams {
+                        old_string: Some("last line".to_string()),
+                        new_string: Some("last line, edited concurrently".to_string()),
+                        ..retitle_target()
+                    }))
+                    .await
+                    .expect("the concurrent edit lands");
+            },
+            h.server.write_document(Parameters(retitle_target())),
+        )
+        .await
+        .expect("the edit applies to the content as it is under the lock");
+
+        let on_disk = std::fs::read_to_string(h.work.path().join("docs/target.md")).unwrap();
+        assert!(
+            on_disk.contains("title: New") && on_disk.contains("edited concurrently"),
+            "{on_disk}"
+        );
+        // Applied to current content, not merged after the fact: nothing to report.
+        assert_plain_success(&result);
+        let structured = result.structured_content.as_ref().unwrap();
+        assert!(structured.get("merged_with_other_changes").is_none());
+        assert_eq!(
+            structured["version"],
+            serde_json::json!(write::document_version(on_disk.as_bytes()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relative_edit_based_on_a_stale_version_says_it_merged() {
+        // The anchor still applies, so the edit lands on the peer's content —
+        // and the result must say so, or a caller chaining a full replace from
+        // its stale copy with the returned version would revert the peer's edit.
+        let h = concurrent_harness();
+        let base = target_version(&h);
+        peer_push(
+            h.peer.path(),
+            "docs/target.md",
+            &CONCURRENT_TARGET.replace("last line", "last line, edited by the peer"),
+        );
+
+        let result = h
+            .server
+            .write_document(Parameters(WriteDocumentParams {
+                expected_version: Some(base),
+                ..retitle_target()
+            }))
+            .await
+            .expect("the anchor still applies");
+
+        let on_disk = std::fs::read_to_string(h.work.path().join("docs/target.md")).unwrap();
+        assert!(
+            on_disk.contains("title: New") && on_disk.contains("edited by the peer"),
+            "{on_disk}"
+        );
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(
+            structured["merged_with_other_changes"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            structured["version"],
+            serde_json::json!(write::document_version(on_disk.as_bytes()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_create_carrying_expected_version_says_the_document_is_gone() {
+        // `path` resolves nowhere, so this is a create — but `expected_version`
+        // says the caller read a document there, which has since been deleted or
+        // moved: re-creating it silently would resurrect it.
+        let h = concurrent_harness();
+        let base = target_version(&h);
+        let head_before = rev(h.work.path(), "HEAD");
+
+        let err = h
+            .server
+            .write_document(Parameters(WriteDocumentParams {
+                path: Some("docs/moved-away.md".to_string()),
+                old_string: None,
+                new_string: None,
+                content: Some(CONCURRENT_TARGET.to_string()),
+                expected_version: Some(base),
+                ..retitle_target()
+            }))
+            .await
+            .expect_err("nothing is at that path any more");
+        for needle in [
+            "does not exist",
+            "search",
+            "get_document",
+            "expected_version",
+        ] {
+            assert!(err.message.contains(needle), "{}", err.message);
+        }
+        assert!(!h.work.path().join("docs/moved-away.md").exists());
+        assert_eq!(rev(h.work.path(), "HEAD"), head_before);
+    }
+
+    #[tokio::test]
+    async fn a_relative_edit_whose_anchor_a_concurrent_edit_removed_is_refused() {
+        let h = concurrent_harness();
+        let peer = h.peer.path().to_path_buf();
+        let err = with_hook_once(
+            crate::git::HookPoint::BeforeLock,
+            move || async move {
+                peer_push(
+                    &peer,
+                    "docs/target.md",
+                    &CONCURRENT_TARGET.replace("title: Old", "title: Peer"),
+                );
+            },
+            h.server.write_document(Parameters(retitle_target())),
+        )
+        .await
+        .expect_err("the anchor is gone");
+        assert!(
+            err.message.contains(write::EDITED_ELSEWHERE),
+            "{}",
+            err.message
+        );
+        let on_disk = std::fs::read_to_string(h.work.path().join("docs/target.md")).unwrap();
+        assert!(on_disk.contains("title: Peer"), "{on_disk}");
+    }
+
+    #[tokio::test]
+    async fn a_stale_full_replace_merges_a_non_overlapping_concurrent_change() {
+        let h = concurrent_harness();
+        let base = target_version(&h);
+        peer_push(
+            h.peer.path(),
+            "docs/target.md",
+            &CONCURRENT_TARGET.replace("last line", "last line, edited by the peer"),
+        );
+
+        let result = h
+            .server
+            .write_document(Parameters(WriteDocumentParams {
+                old_string: None,
+                new_string: None,
+                content: Some(CONCURRENT_TARGET.replace("title: Old", "title: Mine")),
+                expected_version: Some(base),
+                ..retitle_target()
+            }))
+            .await
+            .expect("non-overlapping changes merge");
+
+        let on_disk = std::fs::read_to_string(h.work.path().join("docs/target.md")).unwrap();
+        assert!(
+            on_disk.contains("title: Mine") && on_disk.contains("edited by the peer"),
+            "{on_disk}"
+        );
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(
+            structured["merged_with_other_changes"],
+            serde_json::json!(true)
+        );
+        let text = single_representation(&result).to_string();
+        assert_git_free("merged write result", &text);
+    }
+
+    #[tokio::test]
+    async fn a_stale_full_replace_overlapping_a_concurrent_change_is_refused() {
+        let h = concurrent_harness();
+        let base = target_version(&h);
+        let peer_content = CONCURRENT_TARGET.replace("title: Old", "title: Peer");
+        peer_push(h.peer.path(), "docs/target.md", &peer_content);
+
+        let err = h
+            .server
+            .write_document(Parameters(WriteDocumentParams {
+                old_string: None,
+                new_string: None,
+                content: Some(CONCURRENT_TARGET.replace("title: Old", "title: Mine")),
+                expected_version: Some(base),
+                ..retitle_target()
+            }))
+            .await
+            .expect_err("overlapping changes conflict");
+        assert!(
+            err.message.contains(write::EDITED_ELSEWHERE),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(h.work.path().join("docs/target.md")).unwrap(),
+            peer_content
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_changes_without_expected_version_are_refused() {
+        let h = concurrent_harness();
+        let replace = h
+            .server
+            .write_document(Parameters(WriteDocumentParams {
+                old_string: None,
+                new_string: None,
+                content: Some(CONCURRENT_TARGET.replace("Old", "New")),
+                ..retitle_target()
+            }))
+            .await
+            .expect_err("a full replace needs expected_version");
+        assert!(
+            replace.message.contains("expected_version"),
+            "{}",
+            replace.message
+        );
+
+        let moved = h
+            .server
+            .write_document(Parameters(WriteDocumentParams {
+                old_string: None,
+                new_string: None,
+                new_path: Some("docs/moved.md".to_string()),
+                ..retitle_target()
+            }))
+            .await
+            .expect_err("a move needs expected_version");
+        assert!(
+            moved.message.contains("expected_version"),
+            "{}",
+            moved.message
+        );
+
+        let deleted = h
+            .server
+            .delete_document(Parameters(DeleteDocumentParams {
+                path: "docs/target.md".to_string(),
+                message: None,
+                expected_version: None,
+            }))
+            .await
+            .expect_err("a delete needs expected_version");
+        assert!(
+            deleted.message.contains("expected_version"),
+            "{}",
+            deleted.message
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(h.work.path().join("docs/target.md")).unwrap(),
+            CONCURRENT_TARGET
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_and_move_of_a_stale_version_are_refused() {
+        let h = concurrent_harness();
+        let base = target_version(&h);
+        let peer_content = CONCURRENT_TARGET.replace("last line", "peer line");
+        peer_push(h.peer.path(), "docs/target.md", &peer_content);
+
+        let deleted = h
+            .server
+            .delete_document(Parameters(DeleteDocumentParams {
+                path: "docs/target.md".to_string(),
+                message: None,
+                expected_version: Some(base.clone()),
+            }))
+            .await
+            .expect_err("a stale delete is refused");
+        assert!(
+            deleted.message.contains(write::EDITED_ELSEWHERE),
+            "{}",
+            deleted.message
+        );
+
+        let moved = h
+            .server
+            .write_document(Parameters(WriteDocumentParams {
+                old_string: None,
+                new_string: None,
+                new_path: Some("docs/moved.md".to_string()),
+                expected_version: Some(base),
+                ..retitle_target()
+            }))
+            .await
+            .expect_err("a stale move is refused");
+        assert!(
+            moved.message.contains(write::EDITED_ELSEWHERE),
+            "{}",
+            moved.message
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(h.work.path().join("docs/target.md")).unwrap(),
+            peer_content
+        );
+        assert!(!h.work.path().join("docs/moved.md").exists());
+    }
+
+    #[tokio::test]
+    async fn a_push_rejected_by_a_concurrent_push_resets_and_retries() {
+        let h = concurrent_harness();
+        let peer = h.peer.path().to_path_buf();
+        let result = with_hook_once(
+            crate::git::HookPoint::BeforePush,
+            move || async move { peer_push(&peer, "elsewhere.md", "# Elsewhere\n") },
+            h.server.write_document(Parameters(retitle_target())),
+        )
+        .await
+        .expect("a push race with another file is retried, not refused");
+        assert_plain_success(&result);
+
+        // Both changes are on the remote, and the clone is exactly the remote tip.
+        let bare = h._bare.path();
+        assert_eq!(rev(h.work.path(), "HEAD"), rev(bare, "master"));
+        assert!(h.work.path().join("elsewhere.md").exists());
+        let on_disk = std::fs::read_to_string(h.work.path().join("docs/target.md")).unwrap();
+        assert!(on_disk.contains("title: New"), "{on_disk}");
+        crate::reindex::test_support::assert_marked_dirty(
+            &h.server.reindex_queue,
+            &["docs/target.md", "elsewhere.md"],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_remote_change_refuses_the_write_and_leaves_no_divergence() {
+        let h = concurrent_harness();
+        let peer = h.peer.path().to_path_buf();
+        let err = with_hook_each(
+            crate::git::HookPoint::BeforePush,
+            move |n| {
+                peer_push(
+                    &peer,
+                    "docs/target.md",
+                    &CONCURRENT_TARGET.replace("title: Old", &format!("title: Peer {n}")),
+                )
+            },
+            h.server.write_document(Parameters(retitle_target())),
+        )
+        .await
+        .expect_err("the peer's change removed the anchor");
+        assert!(
+            err.message.contains(write::EDITED_ELSEWHERE),
+            "{}",
+            err.message
+        );
+
+        // No diverged clone: HEAD is the remote tip and nothing is left behind, so
+        // the webhook's fetch + ff-only merge keeps working.
+        let bare = h._bare.path();
+        assert_eq!(rev(h.work.path(), "HEAD"), rev(bare, "master"));
+        assert_eq!(git_status(&h.work), "");
+        peer_push(h.peer.path(), "after.md", "# After\n");
+        peer_git(h.work.path(), &["fetch", "-q", "origin", "master"]);
+        peer_git(h.work.path(), &["merge", "--ff-only", "FETCH_HEAD"]);
+        assert!(h.work.path().join("after.md").exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_update_schema_operations_both_land() {
+        let h = concurrent_harness();
+        let schema_rel = format!("docs/{}", crate::schema::SCHEMA_FILE_NAME);
+        peer_push(
+            h.peer.path(),
+            &schema_rel,
+            "fields:\n  status:\n    type: enum\n    values: [active]\n",
+        );
+        let other = h.server.clone();
+        with_hook_once(
+            crate::git::HookPoint::BeforeLock,
+            move || async move {
+                other
+                    .update_schema(Parameters(add_values_params("docs", "status", &["gamma"])))
+                    .await
+                    .expect("the concurrent schema edit lands");
+            },
+            h.server
+                .update_schema(Parameters(add_values_params("docs", "status", &["beta"]))),
+        )
+        .await
+        .expect("the schema edit applies to the schema as it is under the lock");
+
+        let written = std::fs::read_to_string(h.work.path().join(&schema_rel)).unwrap();
+        assert!(
+            written.contains("active") && written.contains("beta") && written.contains("gamma"),
+            "{written}"
+        );
+        assert_eq!(rev(h.work.path(), "HEAD"), rev(h._bare.path(), "master"));
+    }
+
+    #[tokio::test]
+    async fn update_schema_refused_after_its_last_conflict_still_marks_what_reached_the_remote() {
+        let h = concurrent_harness();
+        let schema_rel = format!("docs/{}", crate::schema::SCHEMA_FILE_NAME);
+        peer_push(
+            h.peer.path(),
+            &schema_rel,
+            "fields:\n  status:\n    type: enum\n    values: [active]\n",
+        );
+
+        // Every attempt loses its push race, so the edit is refused after the last
+        // one. In each, a peer commit lands before the fetch and another before the
+        // push, which makes the push lose; the sync after the dropped commit is what
+        // brings both into the clone.
+        let peer = h.peer.path().to_path_buf();
+        let attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook: crate::git::TestHook = Arc::new(move |point| {
+            let peer = peer.clone();
+            let attempt = Arc::clone(&attempt);
+            Box::pin(async move {
+                match point {
+                    crate::git::HookPoint::BeforeSync => {
+                        let n = attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        peer_push(&peer, &format!("elsewhere-{n}.md"), "# Elsewhere\n");
+                    }
+                    crate::git::HookPoint::BeforePush => {
+                        let n = attempt.load(std::sync::atomic::Ordering::SeqCst);
+                        peer_push(&peer, &format!("late-{n}.md"), "# Late\n");
+                    }
+                    crate::git::HookPoint::BeforeLock => {}
+                }
+            })
+        });
+        let err = crate::git::TEST_HOOK
+            .scope(
+                hook,
+                h.server
+                    .update_schema(Parameters(add_values_params("docs", "status", &["beta"]))),
+            )
+            .await
+            .expect_err("every attempt lost its push, so the edit is refused");
+        assert!(
+            err.message.contains("edited by someone else"),
+            "{}",
+            err.message
+        );
+
+        // The last attempt's commits are marked like the earlier attempts' were,
+        // and the clone is left on the remote tip the webhook's ff-only merge needs.
+        let expected: Vec<String> = (1..=write::MAX_WRITE_ATTEMPTS)
+            .flat_map(|n| [format!("elsewhere-{n}.md"), format!("late-{n}.md")])
+            .collect();
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        crate::reindex::test_support::assert_marked_dirty(&h.server.reindex_queue, &expected);
+        assert_eq!(rev(h.work.path(), "HEAD"), rev(h._bare.path(), "master"));
+    }
+
+    #[test]
+    fn write_and_delete_are_annotated_destructive_and_reads_read_only() {
+        let router = KbSearchServer::tool_router();
+        let annotations = |name: &str| {
+            router
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is registered"))
+                .annotations
+                .clone()
+                .unwrap_or_else(|| panic!("{name} has annotations"))
+        };
+        for name in ["write_document", "delete_document"] {
+            let a = annotations(name);
+            assert_eq!(a.destructive_hint, Some(true), "{name}");
+            assert_eq!(a.idempotent_hint, Some(false), "{name}");
+        }
+        for name in ["search", "get_document", "get_schema"] {
+            assert_eq!(annotations(name).read_only_hint, Some(true), "{name}");
+        }
+    }
+
+    #[test]
+    fn write_failures_relay_no_cause() {
+        let raw = "git commit failed: error: gpg failed to sign the data; HEAD is abc123";
+        let create = create_edit_error_to_mcp_error(
+            WriteError::PreCommitFailed {
+                rolled_back: true,
+                msg: raw.to_string(),
+            },
+            "a.md",
+            true,
+            Path::new("/kb"),
+            None,
+        );
+        assert_not_saved(&create);
+        assert!(!create.message.contains("gpg"), "{}", create.message);
+        let delete = delete_error_to_mcp_error(
+            WriteError::PreCommitFailed {
+                rolled_back: false,
+                msg: raw.to_string(),
+            },
+            "a.md",
+        );
+        assert_not_saved_unverified(&delete);
+        assert_not_saved(&batch_write_error_to_mcp_error(
+            write::BatchWriteError::PreCommitFailed { rolled_back: true },
+        ));
+        assert_not_saved_unverified(&move_directory_error_to_mcp_error(
+            DirectoryMoveError::PreCommitFailed { rolled_back: false },
+            "src",
+            "dest",
+        ));
+        let message = create_edit_error_to_mcp_error(
+            WriteError::InvalidCommitMessage {
+                reason: "commit message must not contain newlines".to_string(),
+            },
+            "a.md",
+            false,
+            Path::new("/kb"),
+            None,
+        );
+        assert_git_free("message error", &message.message);
+        let credential = credential_error("GIT_PULL_TOKEN_FILE is unreadable");
+        assert_git_free("credential error", &credential.message);
+        assert!(
+            !credential.message.contains("TOKEN"),
+            "{}",
+            credential.message
+        );
+    }
+
+    #[test]
+    fn dedup_refusal_data_reports_scores_without_f32_widening_noise() {
+        let err = create_edit_error_to_mcp_error(
+            WriteError::DedupHit {
+                duplicate_of: "docs/existing.md".to_string(),
+                similarity: 0.93,
+                threshold: 0.95,
+            },
+            "docs/new.md",
+            true,
+            Path::new("/kb"),
+            None,
+        );
+        let data = err.data.expect("a dedup refusal carries structured data");
+        assert_eq!(data["duplicate_of"], "docs/existing.md");
+        // `json!(0.93_f32)` would widen to 0.9300000071525574.
+        assert_eq!(data["similarity"], serde_json::json!(0.93));
+        assert_eq!(data["threshold"], serde_json::json!(0.95));
+    }
+
+    #[test]
+    fn no_tool_description_or_input_schema_mentions_versioning() {
+        let mechanics = crate::descriptions::compose_server_mechanics();
+        assert_git_free("server instructions", &mechanics);
+        for phrase in [true, false] {
+            let overlay = crate::descriptions::compose_tool_descriptions(
+                None,
+                phrase,
+                &crate::config::Granularity::ALL,
+            );
+            let server = make_overlay_test_server(overlay);
+            for tool in KbSearchServer::tool_router().list_all() {
+                let tool = tool_schema::self_contained(
+                    server.overlay_input_schema(server.overlay_description(tool)),
+                );
+                let description = tool.description.as_deref().unwrap_or_default();
+                assert_git_free(&format!("{} description", tool.name), description);
+                let schema = serde_json::Value::Object((*tool.input_schema).clone());
+                assert_git_free(&format!("{} input schema", tool.name), &schema.to_string());
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -14107,6 +15130,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `HEAD` of `work`, as a trimmed hex string.
+    /// The current version of `rel` under `dir`, as `get_document` would report
+    /// it; `None` when it does not exist.
+    fn version_at(dir: &tempfile::TempDir, rel: &str) -> Option<String> {
+        std::fs::read(dir.path().join(rel))
+            .ok()
+            .map(|bytes| write::document_version(&bytes))
+    }
+
     fn head_sha(work: &tempfile::TempDir) -> String {
         let out = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -14173,11 +15204,65 @@ mod tests {
         }
     }
 
-    /// Extract `structured_content["outcome"]` (success path) or `data["outcome"]`
-    /// (error path) as a `&str`, so tests can assert on the machine-readable
-    /// discriminant instead of parsing prose.
-    fn outcome_of(value: &Option<serde_json::Value>) -> Option<&str> {
-        value.as_ref()?.get("outcome")?.as_str()
+    /// Words that name how the server versions the knowledge base. None of them
+    /// may reach an MCP tool caller — results, errors or descriptions. Matched
+    /// against whole lowercase alphanumeric tokens (`commit` also as a prefix, for
+    /// `commits`/`committed`), so `github` or a word like `pushes` in a document's
+    /// own diff body is not a false positive unless it really is the token.
+    fn git_terms_in(text: &str) -> Vec<String> {
+        text.to_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| {
+                matches!(
+                    *t,
+                    "git" | "sha" | "push" | "pushed" | "rebase" | "rebased" | "remote"
+                ) || t.starts_with("commit")
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn assert_git_free(what: &str, text: &str) {
+        let hits = git_terms_in(text);
+        assert!(hits.is_empty(), "{what} leaks {hits:?}: {text}");
+    }
+
+    /// A plain success: none of the removed versioning fields, and git-free text.
+    fn assert_plain_success(result: &CallToolResult) {
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("a write result carries structured_content");
+        for key in ["outcome", "sha", "rebased_paths", "sync_failure_cause"] {
+            assert!(structured.get(key).is_none(), "{key} leaked: {structured}");
+        }
+        assert_git_free("structured_content", &structured.to_string());
+        assert_git_free("result text", &format!("{:?}", result.content));
+    }
+
+    /// A rolled-back write: "not saved, nothing changed, try again", no data
+    /// payload, nothing about the cause.
+    fn assert_not_saved(err: &McpError) {
+        assert!(
+            err.message.contains("could not be saved") && err.message.contains("try again"),
+            "{}",
+            err.message
+        );
+        assert!(err.data.is_none(), "{err:?}");
+        assert_git_free("error", &err.message);
+    }
+
+    /// A write whose rollback also failed: told not to trust the state.
+    fn assert_not_saved_unverified(err: &McpError) {
+        assert!(
+            err.message.contains("could not be saved")
+                && err.message.contains("could not confirm")
+                && err.message.contains("operator"),
+            "{}",
+            err.message
+        );
+        assert!(err.data.is_none(), "{err:?}");
+        assert_git_free("error", &err.message);
     }
 
     #[tokio::test]
@@ -14196,16 +15281,12 @@ mod tests {
             .delete_document(Parameters(DeleteDocumentParams {
                 path: "doomed.md".to_string(),
                 message: None,
+                expected_version: version_at(&work, "doomed.md"),
             }))
             .await;
 
         let err = result.expect_err("a rejected pre-commit hook must fail the delete");
-        assert_eq!(
-            outcome_of(&err.data),
-            Some("failed_no_change"),
-            "error data must carry the outcome discriminant, got: {:?}",
-            err
-        );
+        assert_not_saved(&err);
 
         assert!(
             work.path().join("doomed.md").exists(),
@@ -14259,21 +15340,14 @@ mod tests {
             .delete_document(Parameters(DeleteDocumentParams {
                 path: "doomed.md".to_string(),
                 message: None,
+                expected_version: version_at(&work, "doomed.md"),
             }))
             .await;
 
         let result = result.expect("a post-commit sync failure must still report as success");
-        assert_eq!(
-            outcome_of(&result.structured_content),
-            Some("committed_pending_sync"),
-            "got: {:?}",
-            result
-        );
-        let text = format!("{:?}", result.content);
-        assert!(
-            text.contains("push") && text.contains("sync on the next successful write"),
-            "must explain the push failure and that sync is pending: {text}"
-        );
+        // A saved-but-unsynced delete is, to the caller, simply a delete.
+        assert_plain_success(&result);
+        assert_eq!(single_representation(&result)["action"], "deleted");
 
         // The deletion IS a real local commit — the file must remain gone, and HEAD
         // must record the deletion. None of this is rolled back.
@@ -14314,21 +15388,12 @@ mod tests {
         let params = DeleteDocumentParams {
             path: "docs/delete-me.md".to_string(),
             message: None,
+            expected_version: version_at(&tmp, "docs/delete-me.md"),
         };
         let result = server.delete_document(Parameters(params)).await;
 
         let err = result.expect_err("deleting with no git repo must fail");
-        assert_eq!(
-            outcome_of(&err.data),
-            Some("failed_inconsistent_state"),
-            "got: {:?}",
-            err
-        );
-        assert!(
-            err.message.contains("INCONSISTENT"),
-            "the message must call out the inconsistent state loudly, got: {}",
-            err.message
-        );
+        assert_not_saved_unverified(&err);
 
         // The restore could not put it back (there is no repo to restore from), so
         // the file really is gone — that IS the inconsistent state being reported.
@@ -14355,7 +15420,7 @@ mod tests {
                 new_string: None,
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
@@ -14364,12 +15429,7 @@ mod tests {
             .await;
 
         let err = result.expect_err("a rejected pre-commit hook must fail the create");
-        assert_eq!(
-            outcome_of(&err.data),
-            Some("failed_no_change"),
-            "got: {:?}",
-            err
-        );
+        assert_not_saved(&err);
 
         assert!(
             !work.path().join("docs/new.md").exists(),
@@ -14412,7 +15472,7 @@ mod tests {
                         .to_string(),
                 ),
                 message: None,
-                expected_hash: None,
+                expected_version: version_at(&work, "edit-me.md"),
                 new_path: None,
                 force_new: None,
                 frontmatter_patch: None,
@@ -14422,12 +15482,7 @@ mod tests {
             .await;
 
         let err = result.expect_err("a rejected pre-commit hook must fail the edit");
-        assert_eq!(
-            outcome_of(&err.data),
-            Some("failed_no_change"),
-            "got: {:?}",
-            err
-        );
+        assert_not_saved(&err);
 
         assert_eq!(
             std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
@@ -14472,7 +15527,7 @@ mod tests {
                 new_string: None,
                 content: Some(new_content.to_string()),
                 message: None,
-                expected_hash: None,
+                expected_version: version_at(&work, "edit-me.md"),
                 new_path: None,
                 force_new: None,
                 frontmatter_patch: None,
@@ -14482,12 +15537,8 @@ mod tests {
             .await;
 
         let result = result.expect("a post-commit sync failure must still report as success");
-        assert_eq!(
-            outcome_of(&result.structured_content),
-            Some("committed_pending_sync"),
-            "got: {:?}",
-            result
-        );
+        // A saved-but-unsynced edit is, to the caller, simply an edit.
+        assert_plain_success(&result);
 
         // The edit IS a real local commit — the new content stays on disk, and HEAD
         // records it. None of this is rolled back just because the push failed.
@@ -14505,11 +15556,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // expected_hash — optional stale-read guard (issue #88)
+    // expected_version — the document version token
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn get_document_reports_a_content_hash_matching_indexed_files_hashing() {
+    async fn get_document_reports_the_document_version() {
         let tmp = tempfile::tempdir().unwrap();
         let sub = tmp.path().join("docs");
         std::fs::create_dir_all(&sub).unwrap();
@@ -14529,15 +15580,14 @@ mod tests {
 
         let structured = result
             .structured_content
-            .expect("get_document must report a content_hash in structured_content");
-        let hash = structured["content_hash"]
+            .expect("get_document must report a version in structured_content");
+        let hash = structured["version"]
             .as_str()
-            .expect("content_hash must be a string");
+            .expect("version must be a string");
         assert_eq!(
             hash,
-            crate::ingest::compute_hash_from_bytes(content.as_bytes()),
-            "must be the exact same hashing indexed_files.content_hash uses, so a \
-             caller can round-trip it into edit_document's expected_hash"
+            crate::write::document_version(content.as_bytes()),
+            "a caller round-trips the version into write_document's expected_version"
         );
         assert_eq!(
             structured["content"].as_str(),
@@ -14550,7 +15600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_document_with_a_stale_expected_hash_is_rejected_before_touching_the_file() {
+    async fn full_replace_with_an_unknown_expected_version_is_refused_before_touching_the_file() {
         let tmp = tempfile::tempdir().unwrap();
         let sub = tmp.path().join("docs");
         std::fs::create_dir_all(&sub).unwrap();
@@ -14562,7 +15612,7 @@ mod tests {
 
         // A hash of some OTHER content — as if the caller read the document at an
         // earlier revision.
-        let stale_hash = crate::ingest::compute_hash_from_bytes(b"not the current content");
+        let stale_hash = crate::write::document_version(b"not the current content");
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
@@ -14571,7 +15621,7 @@ mod tests {
                 new_string: None,
                 content: Some("---\ntitle: New\ntype: guide\n---\n# New body\n".to_string()),
                 message: None,
-                expected_hash: Some(stale_hash),
+                expected_version: Some(stale_hash),
                 new_path: None,
                 force_new: None,
                 frontmatter_patch: None,
@@ -14580,14 +15630,14 @@ mod tests {
             }))
             .await;
 
-        let err = result.expect_err("a stale expected_hash must be rejected");
+        let err = result.expect_err("a stale expected_version must be rejected");
         assert!(
-            err.message.contains("changed since you read it"),
+            err.message.contains("edited by someone else"),
             "expected an explicit stale-read message, got: {}",
             err.message
         );
         assert!(
-            err.message.contains("get_document"),
+            err.message.contains("re-read it"),
             "expected guidance to re-read via get_document, got: {}",
             err.message
         );
@@ -14596,12 +15646,12 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(sub.join("edit-me.md")).unwrap(),
             original,
-            "a stale expected_hash must fail before the file is touched"
+            "a stale expected_version must fail before the file is touched"
         );
     }
 
     #[tokio::test]
-    async fn edit_document_with_a_matching_expected_hash_proceeds_to_a_synced_write() {
+    async fn full_replace_with_a_matching_expected_version_proceeds_to_a_synced_write() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         let original =
@@ -14610,7 +15660,7 @@ mod tests {
         git_commit_all(&work, "edit-me.md", "add edit-me.md");
         let (server, _config) = make_git_backed_server(&work);
 
-        let correct_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
+        let correct_hash = crate::write::document_version(original.as_bytes());
         let new_content =
             "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
 
@@ -14621,7 +15671,7 @@ mod tests {
                 new_string: None,
                 content: Some(new_content.to_string()),
                 message: None,
-                expected_hash: Some(correct_hash),
+                expected_version: Some(correct_hash),
                 new_path: None,
                 force_new: None,
                 frontmatter_patch: None,
@@ -14630,109 +15680,12 @@ mod tests {
             }))
             .await;
 
-        let result = result.expect("a correct expected_hash must not block the edit");
-        assert_eq!(
-            outcome_of(&result.structured_content),
-            Some("synced"),
-            "got: {:?}",
-            result
-        );
+        let result = result.expect("a correct expected_version must not block the edit");
+        assert_plain_success(&result);
         assert_eq!(
             std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
             new_content
         );
-    }
-
-    /// #243 regression, at the MCP layer specifically — `write.rs`'s own
-    /// `stale_hash_re_check_catches_a_change_made_after_the_first_check`
-    /// already covers the re-check itself, but that test (and every
-    /// `expected_hash` test above this one) constructs the concurrent change
-    /// BEFORE the call, which `write_document_edit`'s own up-front check
-    /// (comparing against the `old_content` it freshly reads from disk right
-    /// then) catches on its own regardless of whether `run_document_write`
-    /// threads `expected_hash` into `WriteRequest` at all — so none of those
-    /// would have failed before the fix. This test instead makes the change
-    /// land DURING the call, in the `validate::validate_content` await, via a
-    /// `lint_command` that overwrites the file mid-flight — the exact failure
-    /// scenario #243 describes (a webhook merge landing while an arbitrarily
-    /// slow lint command runs). Before the fix, `run_document_write` passed
-    /// `expected_hash: None` into `WriteRequest` no matter what the caller
-    /// sent, so `write::write_document`'s live-disk re-check was skipped
-    /// entirely and the write proceeded, silently clobbering the concurrent
-    /// change. After the fix, the re-check catches it and the write is
-    /// rejected before ever reaching the filesystem overwrite.
-    #[tokio::test]
-    async fn write_document_tool_re_checks_expected_hash_against_a_change_made_during_the_call() {
-        let bare = crate::git::tests::create_bare_repo("master");
-        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
-        let original =
-            "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
-        std::fs::write(work.path().join("edit-me.md"), original).unwrap();
-        git_commit_all(&work, "edit-me.md", "add edit-me.md");
-        let head_before = head_sha(&work);
-
-        // Simulates a concurrent change (a webhook merge, in production)
-        // landing between `write_document_edit`'s own read of the file and the
-        // actual overwrite inside `write::write_document` — modeled here as a
-        // `lint_command` that overwrites the file mid-flight, during the
-        // `validate::validate_content` await that runs before the re-check.
-        let concurrent = "---\ntitle: Concurrent\ndescription: d\ntype: guide\ntags: \
-                           [t]\n---\n\n# Concurrent body\n";
-        let abs_path = work.path().join("edit-me.md");
-
-        let mut config = make_test_resolved_config(work.path());
-        Arc::get_mut(&mut config).unwrap().validation.lint_command = Some(vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            format!("printf '%s' '{}' > '{}'", concurrent, abs_path.display()),
-        ]);
-        let server = make_write_test_server(&work, &["**/*.md".to_string()], config);
-
-        let expected_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
-        let concurrent_hash = crate::ingest::compute_hash_from_bytes(concurrent.as_bytes());
-        let new_content =
-            "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
-
-        let result = server
-            .write_document(Parameters(WriteDocumentParams {
-                path: Some("edit-me.md".to_string()),
-                old_string: None,
-                new_string: None,
-                content: Some(new_content.to_string()),
-                message: None,
-                expected_hash: Some(expected_hash),
-                new_path: None,
-                force_new: None,
-                frontmatter_patch: None,
-                append: None,
-                documents: None,
-            }))
-            .await;
-
-        let err = result.expect_err(
-            "a concurrent on-disk change made during the call must be caught by the \
-             live-disk re-check, not silently clobbered",
-        );
-        assert!(
-            err.message.contains("changed since you read it"),
-            "expected the stale-hash message, got: {}",
-            err.message
-        );
-        assert!(
-            err.message.contains(&concurrent_hash),
-            "the rejection must report the LIVE on-disk hash (the lint_command's \
-             concurrent write), not the caller's original — got: {}",
-            err.message
-        );
-
-        // The concurrent write must survive untouched — that is the whole
-        // point of the re-check: it must never be silently clobbered.
-        assert_eq!(
-            std::fs::read_to_string(&abs_path).unwrap(),
-            concurrent,
-            "the concurrent change must survive the rejected write"
-        );
-        assert_eq!(head_before, head_sha(&work), "no commit must be made");
     }
 
     // -----------------------------------------------------------------------
@@ -14757,7 +15710,7 @@ mod tests {
                 new_string: None,
                 content: None,
                 message: None,
-                expected_hash: None,
+                expected_version: version_at(&work, "docs/old-home.md"),
                 new_path: Some("docs/new-home.md".to_string()),
                 force_new: None,
                 frontmatter_patch: None,
@@ -14767,12 +15720,7 @@ mod tests {
             .await;
 
         let result = result.expect("a pure move (new_path alone) must succeed");
-        assert_eq!(
-            outcome_of(&result.structured_content),
-            Some("synced"),
-            "got: {:?}",
-            result
-        );
+        assert_plain_success(&result);
 
         assert_eq!(
             std::fs::read_to_string(work.path().join("docs/new-home.md")).unwrap(),
@@ -14805,7 +15753,7 @@ mod tests {
                 new_string: None,
                 content: Some(new_content.to_string()),
                 message: None,
-                expected_hash: None,
+                expected_version: version_at(&work, "edit-me.md"),
                 new_path: Some("archive/edit-me.md".to_string()),
                 force_new: None,
                 frontmatter_patch: None,
@@ -14815,12 +15763,7 @@ mod tests {
             .await;
 
         let result = result.expect("a combined move+edit must succeed");
-        assert_eq!(
-            outcome_of(&result.structured_content),
-            Some("synced"),
-            "got: {:?}",
-            result
-        );
+        assert_plain_success(&result);
 
         assert_eq!(
             std::fs::read_to_string(work.path().join("archive/edit-me.md")).unwrap(),
@@ -14855,7 +15798,7 @@ mod tests {
                 new_string: None,
                 content: None,
                 message: None,
-                expected_hash: None,
+                expected_version: version_at(&work, "source.md"),
                 new_path: Some("dest.md".to_string()),
                 force_new: None,
                 frontmatter_patch: None,
@@ -14919,7 +15862,7 @@ mod tests {
                 new_string: None,
                 new_path: Some("archive/new-project".to_string()),
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
@@ -14928,10 +15871,11 @@ mod tests {
             .await;
 
         let result = result.expect("a directory path must dispatch to a directory move");
-        let text = format!("{:?}", result.content);
-        assert!(
-            text.contains("Moved 1 document(s)"),
-            "must report the directory move, not a single-document write: {text}"
+        let structured = single_representation(&result);
+        assert_eq!(
+            structured["moved"],
+            serde_json::json!([{"from": "old-project/a.md", "to": "archive/new-project/a.md"}]),
+            "must report the directory move, not a single-document write: {structured}"
         );
         assert!(
             !work.path().join("old-project/a.md").exists(),
@@ -14958,7 +15902,7 @@ mod tests {
                 new_string: None,
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
@@ -14990,7 +15934,7 @@ mod tests {
             new_string: None,
             new_path: Some("other-dir".to_string()),
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: None,
             append: None,
@@ -15020,9 +15964,9 @@ mod tests {
                 },
             ),
             (
-                "expected_hash",
+                "expected_version",
                 WriteDocumentParams {
-                    expected_hash: Some("deadbeef".to_string()),
+                    expected_version: Some("deadbeef".to_string()),
                     ..base()
                 },
             ),
@@ -15085,7 +16029,7 @@ mod tests {
                 new_string: None,
                 frontmatter_patch: None,
                 append: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
             }])
         };
@@ -15096,7 +16040,7 @@ mod tests {
             new_string: None,
             new_path: None,
             message: None,
-            expected_hash: None,
+            expected_version: None,
             force_new: None,
             frontmatter_patch: None,
             append: None,
@@ -15153,7 +16097,7 @@ mod tests {
                 new_string: None,
                 frontmatter_patch: None,
                 append: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
             })
             .collect();
@@ -15166,7 +16110,7 @@ mod tests {
                 new_string: None,
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
@@ -15199,7 +16143,7 @@ mod tests {
                 new_string: None,
                 frontmatter_patch: None,
                 append: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: Some(true),
             },
             BatchDocumentInput {
@@ -15212,7 +16156,7 @@ mod tests {
                 new_string: None,
                 frontmatter_patch: None,
                 append: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: Some(true),
             },
         ];
@@ -15225,7 +16169,7 @@ mod tests {
                 new_string: None,
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
@@ -15234,20 +16178,16 @@ mod tests {
             .await
             .expect("batch write should succeed");
 
-        let text = format!("{:?}", result.content);
-        assert!(text.contains("2 document(s) synced"), "got: {text}");
-        assert!(text.contains("docs/batch-a.md"), "got: {text}");
-        assert!(text.contains("docs/batch-b.md"), "got: {text}");
-
-        let structured = result
-            .structured_content
-            .expect("batch write must carry structured_content");
-        assert_eq!(structured["outcome"], "synced");
-        assert!(!structured["sha"].as_str().unwrap().is_empty());
+        assert_plain_success(&result);
+        let structured = single_representation(&result);
         let docs = structured["documents"].as_array().unwrap();
         assert_eq!(docs.len(), 2);
         assert_eq!(docs[0]["path"], "docs/batch-a.md");
-        assert_eq!(docs[0]["is_create"], true);
+        assert_eq!(docs[0]["action"], "created");
+        assert!(
+            docs[0].get("diff").is_none(),
+            "a create echoes no diff: {structured}"
+        );
         assert_eq!(docs[1]["path"], "docs/batch-b.md");
 
         crate::reindex::test_support::assert_marked_dirty(
@@ -15273,7 +16213,7 @@ mod tests {
                 new_string: None,
                 frontmatter_patch: None,
                 append: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: Some(true),
             },
             // Neither content, old_string/new_string, frontmatter_patch, nor
@@ -15286,7 +16226,7 @@ mod tests {
                 new_string: None,
                 frontmatter_patch: None,
                 append: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
             },
         ];
@@ -15299,7 +16239,7 @@ mod tests {
                 new_string: None,
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
@@ -15338,7 +16278,7 @@ mod tests {
                 new_string: Some("new".to_string()),
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
@@ -15372,7 +16312,7 @@ mod tests {
                 new_string: None,
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
@@ -15408,7 +16348,7 @@ mod tests {
                 new_string: None,
                 new_path: Some("a".repeat(MAX_PATH_LEN + 1)),
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
@@ -15437,7 +16377,7 @@ mod tests {
                 new_string: None,
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
@@ -15473,7 +16413,7 @@ mod tests {
                 new_string: None,
                 new_path: Some("docs/elsewhere.md".to_string()),
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
@@ -15541,12 +16481,7 @@ mod tests {
             .await;
 
         let err = result.expect_err("a rejected pre-commit hook must fail the schema write");
-        assert_eq!(
-            outcome_of(&err.data),
-            Some("failed_no_change"),
-            "got: {:?}",
-            err
-        );
+        assert_not_saved(&err);
 
         assert!(
             !work
@@ -15606,12 +16541,7 @@ mod tests {
             .await;
 
         let err = result.expect_err("a rejected pre-commit hook must fail the schema write");
-        assert_eq!(
-            outcome_of(&err.data),
-            Some("failed_no_change"),
-            "got: {:?}",
-            err
-        );
+        assert_not_saved(&err);
 
         let written = work
             .path()
@@ -15633,6 +16563,307 @@ mod tests {
             "",
             "working tree must be clean after rollback"
         );
+    }
+
+    fn add_values_params(path: &str, field: &str, values: &[&str]) -> UpdateSchemaParams {
+        UpdateSchemaParams {
+            path: Some(path.into()),
+            operation: "add_values".into(),
+            field: field.into(),
+            values: Some(values.iter().map(|v| v.to_string()).collect()),
+            definition: None,
+            dry_run: None,
+            force: None,
+            acknowledge_root_change: None,
+        }
+    }
+
+    fn write_legacy_schema_file(work: &tempfile::TempDir, dir: &str, yaml: &str) -> String {
+        let target = work.path().join(dir);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(crate::schema::LEGACY_SCHEMA_FILE_NAME), yaml).unwrap();
+        format!("{dir}/{}", crate::schema::LEGACY_SCHEMA_FILE_NAME)
+    }
+
+    #[tokio::test]
+    async fn update_schema_migrates_a_legacy_schema_file_in_the_same_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let legacy = write_legacy_schema_file(
+            &work,
+            "notes",
+            "fields:\n  status:\n    type: enum\n    values: [active]\n",
+        );
+        git_commit_all(&work, &legacy, "add legacy notes schema");
+        let head_before = head_sha(&work);
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .update_schema(Parameters(add_values_params("notes", "status", &["beta"])))
+            .await
+            .expect("update_schema on a legacy-named schema must succeed");
+
+        let structured = single_representation(&result);
+        assert_eq!(
+            structured["path"], "notes/",
+            "result path is the scope directory"
+        );
+        assert!(
+            !structured.to_string().contains("schema.yaml"),
+            "{structured}"
+        );
+
+        let canonical = work
+            .path()
+            .join("notes")
+            .join(crate::schema::SCHEMA_FILE_NAME);
+        let written = std::fs::read_to_string(&canonical).unwrap();
+        assert!(
+            written.contains("active") && written.contains("beta"),
+            "{written}"
+        );
+        assert!(
+            !work.path().join(&legacy).exists(),
+            "the legacy file is removed"
+        );
+
+        // Exactly one commit, carrying both the addition and the removal.
+        let parent = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD~1"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&parent.stdout).trim(), head_before);
+        let show = std::process::Command::new("git")
+            .args(["show", "--name-status", "--format=", "HEAD"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        let show = String::from_utf8_lossy(&show.stdout);
+        assert!(show.contains("D\tnotes/.kb-schema.yaml"), "{show}");
+        assert!(show.contains("A\tnotes/.schema.yaml"), "{show}");
+        assert_eq!(git_status_ignoring_state_db(&work), "");
+
+        let got = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("notes".into()),
+                fields: None,
+                values_only: None,
+                values_in_use: None,
+            }))
+            .await
+            .unwrap();
+        let fields = got.structured_content.unwrap()["fields"].clone();
+        assert_eq!(fields["status"]["declared_in"], "notes/", "{fields}");
+    }
+
+    #[tokio::test]
+    async fn update_schema_precommit_failure_restores_the_legacy_schema_file() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original = "fields:\n  status:\n    type: enum\n    values: [active]\n";
+        let legacy = write_legacy_schema_file(&work, "notes", original);
+        git_commit_all(&work, &legacy, "add legacy notes schema");
+        let head_before = head_sha(&work);
+        force_git_commit_to_fail(&work);
+        let (server, _config) = make_git_backed_server(&work);
+
+        let err = server
+            .update_schema(Parameters(add_values_params("notes", "status", &["beta"])))
+            .await
+            .expect_err("a rejected commit must fail the schema write");
+        assert_not_saved(&err);
+        assert!(!err.message.contains("schema.yaml"), "{}", err.message);
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join(&legacy)).unwrap(),
+            original,
+            "the legacy file is restored"
+        );
+        assert!(
+            !work
+                .path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists()
+        );
+        assert_eq!(head_before, head_sha(&work));
+        assert_eq!(git_status_ignoring_state_db(&work), "");
+    }
+
+    #[tokio::test]
+    async fn update_schema_migrating_an_untracked_legacy_file_leaves_it_out_of_the_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        // Never committed: git does not know the legacy file, so the commit cannot
+        // name its removal (`git add` of a missing untracked path fails).
+        let legacy = write_legacy_schema_file(
+            &work,
+            "notes",
+            "fields:\n  status:\n    type: enum\n    values: [active]\n",
+        );
+        let (server, _config) = make_git_backed_server(&work);
+
+        server
+            .update_schema(Parameters(add_values_params("notes", "status", &["beta"])))
+            .await
+            .expect("an untracked legacy schema file must still migrate");
+
+        assert!(
+            !work.path().join(&legacy).exists(),
+            "the legacy file is removed"
+        );
+        let show = std::process::Command::new("git")
+            .args(["show", "--name-status", "--format=", "HEAD"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        let show = String::from_utf8_lossy(&show.stdout);
+        assert!(show.contains("A\tnotes/.schema.yaml"), "{show}");
+        assert!(!show.contains("kb-schema"), "{show}");
+        assert_eq!(git_status_ignoring_state_db(&work), "");
+    }
+
+    #[tokio::test]
+    async fn update_schema_precommit_failure_rewrites_an_untracked_legacy_file() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original = "fields:\n  status:\n    type: enum\n    values: [active]\n";
+        let legacy = write_legacy_schema_file(&work, "notes", original);
+        let head_before = head_sha(&work);
+        force_git_commit_to_fail(&work);
+        let (server, _config) = make_git_backed_server(&work);
+
+        let err = server
+            .update_schema(Parameters(add_values_params("notes", "status", &["beta"])))
+            .await
+            .expect_err("a rejected commit must fail the schema write");
+        assert_not_saved(&err);
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join(&legacy)).unwrap(),
+            original,
+            "an untracked legacy file has no HEAD copy, so it is rewritten from memory"
+        );
+        assert!(
+            !work
+                .path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists()
+        );
+        assert_eq!(head_before, head_sha(&work));
+    }
+
+    #[tokio::test]
+    async fn update_schema_add_values_of_an_inherited_value_changes_nothing() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        write_schema_file(
+            &work,
+            "",
+            "fields:\n  tags:\n    type: list\n    values: [a, b]\n",
+        );
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
+        let head_before = head_sha(&work);
+        let (server, _config) = make_git_backed_server(&work);
+
+        // The scope already permits `a` through the root, so there is nothing to
+        // write: no child schema, no commit, and no claim that `a` was added.
+        let err = server
+            .update_schema(Parameters(add_values_params("notes", "tags", &["a"])))
+            .await
+            .expect_err("an inherited value leaves nothing to add");
+        assert!(err.message.contains("already permits"), "{}", err.message);
+        assert_eq!(head_before, head_sha(&work));
+        assert!(
+            !work
+                .path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_add_values_in_a_child_scope_extends_the_inherited_set() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        write_schema_file(
+            &work,
+            "",
+            "fields:\n  tags:\n    type: list\n    values: [a, b]\n",
+        );
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
+        let (server, _config) = make_git_backed_server(&work);
+
+        server
+            .update_schema(Parameters(add_values_params("notes", "tags", &["c"])))
+            .await
+            .expect("add_values in a child scope");
+
+        let written = std::fs::read_to_string(
+            work.path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME),
+        )
+        .unwrap();
+        let parsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&written).unwrap();
+        let tags = &parsed.fields["tags"];
+        assert_eq!(
+            tags.values.as_deref(),
+            Some(&["$values".to_string(), "c".to_string()][..])
+        );
+        assert_eq!(
+            tags.ty, None,
+            "the inherited type is kept, not forced to enum"
+        );
+
+        let got = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("notes".into()),
+                fields: Some(vec!["tags".into()]),
+                values_only: None,
+                values_in_use: None,
+            }))
+            .await
+            .unwrap();
+        let tags = got.structured_content.unwrap()["fields"]["tags"].clone();
+        assert_eq!(tags["values"], serde_json::json!(["a", "b", "c"]));
+        assert_eq!(tags["type"], "list");
+    }
+
+    /// A schema change saved while ANOTHER directory's schema is invalid is not
+    /// in effect yet. Clients that read only `structured_content` (Claude Code)
+    /// must be told, or they write against rules that are not enforced.
+    #[tokio::test]
+    async fn update_schema_reports_a_saved_but_not_in_effect_change_in_structured_content() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+        // Arrives outside update_schema (as a push would) after startup.
+        std::fs::create_dir_all(work.path().join("broken")).unwrap();
+        std::fs::write(
+            work.path()
+                .join("broken")
+                .join(crate::schema::SCHEMA_FILE_NAME),
+            "not_a_schema_key: true\n",
+        )
+        .unwrap();
+
+        let result = server
+            .update_schema(Parameters(add_values_params(
+                "notes",
+                "status",
+                &["active"],
+            )))
+            .await
+            .expect("the change itself is valid and saved");
+        let structured = single_representation(&result);
+        let warning = structured["warning"].as_str().expect("warning present");
+        assert!(warning.contains("NOT in effect"), "{warning}");
+        assert!(warning.contains("broken/"), "{warning}");
+        assert_git_free("update_schema warning", warning);
     }
 
     #[tokio::test]
@@ -15665,17 +16896,11 @@ mod tests {
             .await;
 
         let result = result.expect("a post-commit sync failure must still report as success");
-        assert_eq!(
-            outcome_of(&result.structured_content),
-            Some("committed_pending_sync"),
-            "got: {:?}",
-            result
-        );
-        let text = format!("{:?}", result.content);
-        assert!(
-            text.contains("push") && text.contains("sync on the next successful write"),
-            "must explain the push failure and that sync is pending: {text}"
-        );
+        // A saved-but-unsynced schema change is, to the caller, simply saved.
+        assert_plain_success(&result);
+        let structured = single_representation(&result);
+        assert_eq!(structured["path"], "notes/");
+        assert!(structured.get("warning").is_none(), "{structured}");
 
         // The schema change IS a real local commit — the file stays written, and HEAD
         // records it. None of this is rolled back just because the push failed.
@@ -15709,7 +16934,7 @@ mod tests {
                 new_string: None,
                 new_path: None,
                 message: None,
-                expected_hash: None,
+                expected_version: None,
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
@@ -15756,17 +16981,7 @@ mod tests {
             .await;
 
         let err = result.expect_err("writing a schema with no git repo must fail");
-        assert_eq!(
-            outcome_of(&err.data),
-            Some("failed_inconsistent_state"),
-            "got: {:?}",
-            err
-        );
-        assert!(
-            err.message.contains("INCONSISTENT"),
-            "the message must call out the inconsistent state loudly, got: {}",
-            err.message
-        );
+        assert_not_saved_unverified(&err);
 
         // The remove succeeded (there is no repo to fail that part), but the
         // subsequent `unstage` could not run against a nonexistent repo — that
@@ -15780,10 +16995,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn move_directory_success_reports_a_carried_schema_by_directory() {
+        let success = DirectoryMoveSuccess {
+            moved: vec![
+                ("src/a.md".to_string(), "dest/a.md".to_string()),
+                (
+                    "src/sub/.kb-schema.yaml".to_string(),
+                    "dest/sub/.kb-schema.yaml".to_string(),
+                ),
+            ],
+            rewritten_paths: Vec::new(),
+            merged: false,
+        };
+
+        let result = move_directory_success_to_result(success, "src", "dest");
+
+        let structured = single_representation(&result);
+        assert_eq!(structured["action"], "moved");
+        assert_eq!(structured["from"], "src");
+        assert_eq!(structured["path"], "dest");
+        assert_eq!(
+            structured["moved"],
+            serde_json::json!([{"from": "src/a.md", "to": "dest/a.md"}])
+        );
+        assert!(structured.get("rewritten_paths").is_none(), "{structured}");
+        assert_eq!(structured["moved_schema_dirs"][0]["from"], "src/sub/");
+        assert_eq!(structured["moved_schema_dirs"][0]["to"], "dest/sub/");
+        assert_no_schema_file_name(&structured.to_string());
+    }
+
     // -- move_directory_error_to_mcp_error: destination-cascade wording -----
 
     #[test]
-    fn invalid_schema_in_source_names_the_file_reason_and_fix() {
+    fn invalid_schema_in_source_names_the_directory_reason_and_fix() {
         let err = move_directory_error_to_mcp_error(
             DirectoryMoveError::InvalidSchemaInSource {
                 path: "src/.kb-schema.yaml".to_string(),
@@ -15793,11 +17038,14 @@ mod tests {
             "dest",
         );
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-        for needle in ["src/.kb-schema.yaml", "fields: expected a map", "git"] {
+        for needle in ["'src/'", "fields: expected a map", "operator must repair"] {
             assert!(err.message.contains(needle), "{needle}: {}", err.message);
         }
+        assert!(!err.message.contains("git"), "{}", err.message);
+        assert!(!err.message.contains("schema.yaml"), "{}", err.message);
         let data = err.data.expect("structured data");
-        assert_eq!(data["invalid_schema_file"], "src/.kb-schema.yaml");
+        assert_eq!(data["invalid_schema_dir"], "src/");
+        assert!(data.get("invalid_schema_file").is_none());
     }
 
     #[test]
@@ -15842,11 +17090,15 @@ mod tests {
             err.message
         );
         assert!(
-            err.message
-                .contains(&format!("src/sub/{}", crate::schema::SCHEMA_FILE_NAME)),
-            "must name which schema file relocated: {}",
+            err.message.contains("src/sub/ -> dest/target/sub/"),
+            "must name which directory schema relocated: {}",
             err.message
         );
+        assert!(!err.message.contains("schema.yaml"), "{}", err.message);
+        let data = err.data.expect("structured data");
+        assert_eq!(data["moved_schema_dirs"][0]["from"], "src/sub/");
+        assert_eq!(data["moved_schema_dirs"][0]["to"], "dest/target/sub/");
+        assert!(data.get("moved_schema_files").is_none());
     }
 
     #[test]
@@ -15879,11 +17131,7 @@ mod tests {
     //
     // These drive the response-assembly seam directly with hand-built
     // `SearchResult`/`GroupedDocument` values — no network, no mocked
-    // `KbSearchServer`, none of `EmbedClient`'s retry/backoff to defeat. This is
-    // exactly the gap that let `search_chunks` ship with `structured_content`
-    // carrying only `{"path_prefix_truncated": ...}` while the text content had
-    // full results: nothing between "retrieval returned results" and
-    // "CallToolResult handed to the client" was reachable by any test.
+    // `KbSearchServer`, none of `EmbedClient`'s retry/backoff to defeat.
 
     fn payload_search_result(
         file_path: &str,
@@ -15904,29 +17152,29 @@ mod tests {
         }
     }
 
+    fn chunk_payload(
+        results: &[crate::qdrant::SearchResult],
+        explain: bool,
+        path_prefix_truncated: bool,
+        offset_truncated: bool,
+    ) -> serde_json::Value {
+        build_chunk_search_payload(
+            results,
+            Path::new("/data"),
+            explain,
+            "dense cosine",
+            path_prefix_truncated,
+            offset_truncated,
+        )
+    }
+
     #[test]
     fn build_chunk_search_payload_structured_results_present_and_populated() {
-        // The regression itself: a non-empty result set must produce a
-        // `structured_content.results` array of the same length as the input,
-        // with each entry carrying `file_path`/`title`/`score`/`text`. Against
-        // the old `{"path_prefix_truncated": ...}`-only payload, `structured
-        // ["results"]` would be `Value::Null` and every index below would fail.
         let results = vec![
             payload_search_result("/data/notes/a.md", "A", 0.9),
             payload_search_result("/data/notes/b.md", "B", 0.5),
         ];
-
-        let (_text, structured) = build_chunk_search_payload(
-            &results,
-            Path::new("/data"),
-            false,
-            "dense cosine",
-            false,
-            false,
-            0,
-            None,
-        );
-
+        let structured = chunk_payload(&results, false, false, false);
         let arr = structured["results"]
             .as_array()
             .expect("results must be an array, not missing/null");
@@ -15938,6 +17186,12 @@ mod tests {
             assert!(entry["text"].is_string());
         }
         assert_eq!(structured["returned"], serde_json::json!(2));
+        assert_eq!(
+            arr.iter()
+                .map(|e| e["file_path"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["notes/a.md", "notes/b.md"]
+        );
     }
 
     #[test]
@@ -15948,16 +17202,7 @@ mod tests {
             crate::qdrant::HEADING_PATH_KEY.to_string(),
             serde_json::json!(["Guide", "Setup"]),
         );
-        let (_text, structured) = build_chunk_search_payload(
-            &[bare, with_path],
-            Path::new("/data"),
-            false,
-            "dense cosine",
-            false,
-            false,
-            0,
-            None,
-        );
+        let structured = chunk_payload(&[bare, with_path], false, false, false);
         let rows = structured["results"].as_array().unwrap();
         assert!(
             rows[0].get("heading_path").is_none(),
@@ -15972,253 +17217,126 @@ mod tests {
 
     #[test]
     fn build_chunk_search_payload_empty_results_report_zero_not_missing_key() {
-        let (text, structured) = build_chunk_search_payload(
-            &[],
-            Path::new("/data"),
-            false,
-            "dense cosine",
-            false,
-            false,
-            0,
-            None,
-        );
-
-        assert_eq!(text, "No results found.");
-        assert_eq!(structured["returned"], serde_json::json!(0));
+        let structured = chunk_payload(&[], false, false, false);
         assert_eq!(
-            structured["results"]
-                .as_array()
-                .expect("must be an array, not missing"),
-            &Vec::<serde_json::Value>::new()
+            structured,
+            serde_json::json!({"returned": 0, "results": []})
         );
     }
 
+    /// A row carries nothing that is null, false, empty, internal or derived:
+    /// no `chunk_index`, no `domain`, no unset per-arm scores, no
+    /// `phrase_matched: false`, no `text_truncated`, and no false envelope flags.
     #[test]
-    fn build_chunk_search_payload_text_and_structured_agree() {
-        let results = vec![
-            payload_search_result("/data/notes/a.md", "A", 0.9),
-            payload_search_result("/data/notes/b.md", "B", 0.5),
-            payload_search_result("/data/notes/c.md", "C", 0.1),
-        ];
-
-        let (text, structured) = build_chunk_search_payload(
-            &results,
-            Path::new("/data"),
-            false,
-            "dense cosine",
-            false,
-            false,
-            0,
-            None,
-        );
-
-        let arr = structured["results"].as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        let structured_paths: Vec<&str> = arr
-            .iter()
-            .map(|e| e["file_path"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            structured_paths,
-            vec!["notes/a.md", "notes/b.md", "notes/c.md"]
-        );
-
-        // Text content lists the same files, in the same order.
-        let text_result_1_pos = text.find("notes/a.md").unwrap();
-        let text_result_2_pos = text.find("notes/b.md").unwrap();
-        let text_result_3_pos = text.find("notes/c.md").unwrap();
-        assert!(text_result_1_pos < text_result_2_pos);
-        assert!(text_result_2_pos < text_result_3_pos);
+    fn build_chunk_search_payload_omits_null_false_and_internal_fields() {
+        let mut result = payload_search_result("/data/notes/a.md", "A", 0.9);
+        result
+            .payload
+            .insert("chunk_index".to_string(), serde_json::json!(3));
+        result
+            .payload
+            .insert("domain".to_string(), serde_json::json!("notes"));
+        result
+            .payload
+            .insert("tags".to_string(), serde_json::json!([]));
+        result
+            .payload
+            .insert("type".to_string(), serde_json::json!(""));
+        for explain in [false, true] {
+            let structured = chunk_payload(std::slice::from_ref(&result), explain, false, false);
+            let text = structured.to_string();
+            for absent in [
+                "chunk_index",
+                "domain",
+                "dense_score",
+                "sparse_score",
+                "pre_rerank_score",
+                "phrase_matched",
+                "text_truncated",
+                "path_prefix_truncated",
+                "offset_truncated",
+                "\"tags\"",
+                "\"type\"",
+                "null",
+                "false",
+            ] {
+                assert!(!text.contains(absent), "{absent} present: {text}");
+            }
+        }
     }
 
     #[test]
-    fn build_chunk_search_payload_path_prefix_truncated_note_and_flag() {
-        let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
+    fn build_chunk_search_payload_rounds_scores_to_four_significant_digits() {
+        let mut result = payload_search_result("/data/notes/a.md", "A", 3.342_690_5);
+        result.dense_score = Some(0.012_345_678);
+        let structured = chunk_payload(&[result], true, false, false);
+        let row = &structured["results"][0];
+        assert_eq!(row["score"], serde_json::json!(3.343));
+        assert_eq!(row["dense_score"], serde_json::json!(0.01235));
+    }
 
-        let (text, structured) = build_chunk_search_payload(
-            &results,
-            Path::new("/data"),
-            false,
-            "dense cosine",
-            true,
-            false,
-            0,
-            None,
+    /// The breadcrumb/description prefix the chunker adds for the embedding is
+    /// not part of the snippet: a stored body offset skips it, and a payload
+    /// written before the offset existed still drops a leading description.
+    #[test]
+    fn build_chunk_search_payload_snippet_starts_at_the_chunk_body() {
+        let mut with_offset = payload_search_result("/data/notes/a.md", "A", 0.9);
+        let prefix = "Guide > Setup\n\nA long document description.\n\n";
+        with_offset.payload.insert(
+            "text".to_string(),
+            serde_json::json!(format!("{prefix}## Setup\n\nBody text.")),
         );
-
-        assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
-        assert!(
-            text.contains("path_prefix matched more documents"),
-            "text must render the truncation note; got: {text}"
+        with_offset.payload.insert(
+            crate::qdrant::CHUNK_BODY_OFFSET_KEY.to_string(),
+            serde_json::json!(prefix.len()),
         );
-
-        // Same for the empty-results branch.
-        let (empty_text, empty_structured) = build_chunk_search_payload(
-            &[],
-            Path::new("/data"),
-            false,
-            "dense cosine",
-            true,
-            false,
-            0,
-            None,
+        let mut legacy = payload_search_result("/data/notes/b.md", "B", 0.5);
+        legacy.payload.insert(
+            "description".to_string(),
+            serde_json::json!("A long document description."),
         );
-        assert_eq!(
-            empty_structured["path_prefix_truncated"],
-            serde_json::json!(true)
+        legacy.payload.insert(
+            "text".to_string(),
+            serde_json::json!("A long document description.\n\nLegacy body."),
         );
-        assert!(
-            empty_text.contains("path_prefix matched more documents"),
-            "empty-results text must also render the truncation note; got: {empty_text}"
-        );
+        let structured = chunk_payload(&[with_offset, legacy], false, false, false);
+        let rows = structured["results"].as_array().unwrap();
+        assert_eq!(rows[0]["text"], "## Setup\n\nBody text.");
+        assert_eq!(rows[1]["text"], "Legacy body.");
     }
 
     #[test]
-    fn build_chunk_search_payload_offset_truncated_note_and_flag() {
-        // #224: mirrors the path_prefix_truncated test above, but for the
-        // offset-depth-bound signal — proves the flag reaches structured_content
-        // AND that the text body explains why the page may be short, on both
-        // the non-empty and empty-results branches. `offset` is non-zero here
-        // (the "usual" paging-too-deep case), so the note still tells the
-        // caller to narrow the query or lower offset — see the offset == 0
-        // variant below (#240) for the case where that advice is wrong.
-        let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
-
-        let (text, structured) = build_chunk_search_payload(
-            &results,
-            Path::new("/data"),
-            false,
-            "dense cosine",
-            false,
-            true,
-            5,
-            None,
-        );
-
-        assert_eq!(structured["offset_truncated"], serde_json::json!(true));
-        assert!(
-            text.contains("offset + limit reached past"),
-            "text must render the offset-truncation note; got: {text}"
-        );
-        assert!(
-            text.contains("Narrow the query or lower offset"),
-            "a non-zero offset must still get the lower-offset advice; got: {text}"
-        );
-
-        let (empty_text, empty_structured) = build_chunk_search_payload(
-            &[],
-            Path::new("/data"),
-            false,
-            "dense cosine",
-            false,
-            true,
-            5,
-            None,
-        );
-        assert_eq!(
-            empty_structured["offset_truncated"],
-            serde_json::json!(true)
-        );
-        assert!(
-            empty_text.contains("offset + limit reached past"),
-            "empty-results text must also render the offset-truncation note; got: {empty_text}"
-        );
-    }
-
-    /// #240: at `offset == 0` the depth bound was tripped by `limit` alone —
-    /// there is no offset to lower (it's already zero), so telling the caller
-    /// to "narrow the query or lower offset" is nonsensical advice pointing at
-    /// a knob they never touched. The note must instead point at `limit` and
-    /// (when a reranker sized the bound) name `reranking.candidate_limit`
-    /// directly, rather than reuse the offset > 0 wording.
-    #[test]
-    fn build_chunk_search_payload_offset_truncated_at_offset_zero_names_the_right_knob() {
-        let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
-
-        // No reranker configured: the bound is the fixed absolute ceiling, not
-        // a tunable `reranking.candidate_limit`.
-        let (text_no_reranker, _) = build_chunk_search_payload(
-            &results,
-            Path::new("/data"),
-            false,
-            "dense cosine",
-            false,
-            true,
-            0,
-            None,
-        );
-        assert!(
-            !text_no_reranker.contains("lower offset"),
-            "offset is already 0 — must not tell the caller to lower it: {text_no_reranker}"
-        );
-        assert!(
-            text_no_reranker.contains("Lower limit"),
-            "must point at limit instead: {text_no_reranker}"
-        );
-        assert!(
-            !text_no_reranker.contains("reranking.candidate_limit"),
-            "no reranker is configured, so the note must not name a knob that \
-             does not apply: {text_no_reranker}"
-        );
-
-        // Reranker configured with a candidate_limit: the note should name it
-        // directly, as the actual knob to raise.
-        let (text_reranker, _) = build_chunk_search_payload(
-            &results,
-            Path::new("/data"),
-            false,
-            "dense cosine",
-            false,
-            true,
-            0,
-            Some(50),
-        );
-        assert!(
-            !text_reranker.contains("lower offset"),
-            "offset is already 0 — must not tell the caller to lower it: {text_reranker}"
-        );
-        assert!(
-            text_reranker.contains("reranking.candidate_limit is currently 50"),
-            "must name the actual configured bound: {text_reranker}"
-        );
-        assert!(
-            text_reranker.contains("Raise reranking.candidate_limit or lower limit"),
-            "must give actionable advice naming the real knobs: {text_reranker}"
-        );
+    fn build_chunk_search_payload_cuts_a_long_snippet_with_an_ellipsis() {
+        let mut result = payload_search_result("/data/notes/a.md", "A", 0.9);
+        result
+            .payload
+            .insert("text".to_string(), serde_json::json!("x".repeat(900)));
+        let structured = chunk_payload(&[result], false, false, false);
+        let text = structured["results"][0]["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), SNIPPET_CHARS + 1);
+        assert!(text.ends_with('…'));
     }
 
     #[test]
-    fn build_chunk_search_payload_explain_toggles_score_breakdown_line() {
-        let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
-
-        let (text_off, _) = build_chunk_search_payload(
-            &results,
-            Path::new("/data"),
-            false,
-            "dense cosine",
-            false,
-            false,
-            0,
-            None,
-        );
-        assert!(!text_off.contains("Score breakdown"));
-
-        let (text_on, _) = build_chunk_search_payload(
-            &results,
-            Path::new("/data"),
-            true,
-            "dense cosine",
-            false,
-            false,
-            0,
-            None,
-        );
-        assert!(text_on.contains("Score breakdown"));
+    fn build_chunk_search_payload_truncation_flags_appear_only_when_set() {
+        let results = [payload_search_result("/data/notes/a.md", "A", 0.9)];
+        for rows in [&results[..], &[]] {
+            let structured = chunk_payload(rows, false, true, true);
+            assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
+            assert_eq!(structured["offset_truncated"], serde_json::json!(true));
+        }
     }
 
     #[test]
-    fn build_chunk_search_payload_mode_label_appears_verbatim() {
-        let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
+    fn build_chunk_search_payload_explain_adds_mode_and_per_arm_scores() {
+        let mut matched = payload_search_result("/data/notes/a.md", "A", 0.9);
+        matched.phrase_score = Some(0.7);
+        matched.dense_score = Some(0.8);
+        let unmatched = payload_search_result("/data/notes/b.md", "B", 0.5);
+
+        let off = chunk_payload(&[matched.clone(), unmatched.clone()], false, false, false);
+        assert!(off.get("mode").is_none(), "{off}");
+        assert!(off["results"][0].get("dense_score").is_none(), "{off}");
 
         for mode in [
             "hybrid RRF + phrase",
@@ -16226,44 +17344,19 @@ mod tests {
             "dense + phrase RRF",
             "dense cosine",
         ] {
-            let (text, _) = build_chunk_search_payload(
-                &results,
+            let on = build_chunk_search_payload(
+                &[matched.clone(), unmatched.clone()],
                 Path::new("/data"),
                 true,
                 mode,
                 false,
                 false,
-                0,
-                None,
             );
-            assert!(
-                text.contains(&format!("mode={mode}")),
-                "expected mode label {mode:?} verbatim in: {text}"
-            );
+            assert_eq!(on["mode"], serde_json::json!(mode));
+            assert_eq!(on["results"][0]["phrase_matched"], serde_json::json!(true));
+            assert_eq!(on["results"][0]["dense_score"], serde_json::json!(0.8));
+            assert!(on["results"][1].get("phrase_matched").is_none(), "{on}");
         }
-    }
-
-    #[test]
-    fn build_chunk_search_payload_phrase_matched_tracks_phrase_score_presence() {
-        let mut matched = payload_search_result("/data/notes/a.md", "A", 0.9);
-        matched.phrase_score = Some(0.7);
-        let mut unmatched = payload_search_result("/data/notes/b.md", "B", 0.5);
-        unmatched.phrase_score = None;
-
-        let (_text, structured) = build_chunk_search_payload(
-            &[matched, unmatched],
-            Path::new("/data"),
-            false,
-            "dense + phrase RRF",
-            false,
-            false,
-            0,
-            None,
-        );
-
-        let arr = structured["results"].as_array().unwrap();
-        assert_eq!(arr[0]["phrase_matched"], serde_json::json!(true));
-        assert_eq!(arr[1]["phrase_matched"], serde_json::json!(false));
     }
 
     fn payload_grouped_document(
@@ -16290,9 +17383,7 @@ mod tests {
             payload_grouped_document("notes/a.md", "A", 0.9),
             payload_grouped_document("notes/b.md", "B", 0.5),
         ];
-
-        let (_text, structured) = build_grouped_search_payload(&documents, false, false, 0);
-
+        let structured = build_grouped_search_payload(&documents, None, false, false);
         let obj = structured.as_object().unwrap();
         assert!(
             !obj.contains_key("total"),
@@ -16302,7 +17393,6 @@ mod tests {
             !obj.contains_key("has_more"),
             "grouped search cannot back `has_more` and must not claim one: {structured}"
         );
-
         let docs = structured["documents"].as_array().unwrap();
         assert_eq!(docs.len(), 2);
         for doc in docs {
@@ -16316,60 +17406,54 @@ mod tests {
 
     #[test]
     fn build_grouped_search_payload_empty_reports_zero() {
-        let (text, structured) = build_grouped_search_payload(&[], false, false, 0);
-        assert_eq!(text, "No documents matched.");
-        assert_eq!(structured["returned"], serde_json::json!(0));
-        assert_eq!(structured["documents"].as_array().unwrap().len(), 0);
+        let structured = build_grouped_search_payload(&[], None, false, false);
+        assert_eq!(
+            structured,
+            serde_json::json!({"returned": 0, "documents": []})
+        );
     }
 
     #[test]
-    fn build_grouped_search_payload_path_prefix_truncated_note_and_flag() {
+    fn build_grouped_search_payload_truncation_flags_appear_only_when_set() {
         let documents = vec![payload_grouped_document("notes/a.md", "A", 0.9)];
-        let (text, structured) = build_grouped_search_payload(&documents, true, false, 0);
-
+        let structured = build_grouped_search_payload(&documents, None, true, true);
         assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
-        assert!(
-            text.contains("path_prefix matched more documents"),
-            "text must render the truncation note; got: {text}"
-        );
-    }
-
-    #[test]
-    fn build_grouped_search_payload_offset_truncated_note_and_flag() {
-        // #224: grouped granularity's mirror of the chunk-payload test above.
-        // `offset` is non-zero, so the note still tells the caller to narrow
-        // the query or lower offset.
-        let documents = vec![payload_grouped_document("notes/a.md", "A", 0.9)];
-        let (text, structured) = build_grouped_search_payload(&documents, false, true, 5);
-
         assert_eq!(structured["offset_truncated"], serde_json::json!(true));
-        assert!(
-            text.contains("offset + limit reached past"),
-            "text must render the offset-truncation note; got: {text}"
-        );
-        assert!(text.contains("Narrow the query or lower offset"));
+        let plain = build_grouped_search_payload(&documents, None, false, false);
+        assert!(plain.get("path_prefix_truncated").is_none(), "{plain}");
+        assert!(plain.get("offset_truncated").is_none(), "{plain}");
     }
 
-    /// #240: grouped granularity's mirror of the chunk-payload zero-offset
-    /// test above — grouped search never runs a reranker (there is no
-    /// `reranking.candidate_limit` for it to name), so the note must point at
-    /// `limit` and the fixed ceiling, not tell the caller to lower an offset
-    /// that is already 0.
+    /// A document row's `frontmatter` drops what the row already promotes
+    /// (`title`, `description`) and what the path derives (`domain`), keeping
+    /// `domain` only when the caller asked for it by name; `mtime` is not on a
+    /// grouped row at all.
     #[test]
-    fn build_grouped_search_payload_offset_truncated_at_offset_zero_names_the_right_knob() {
-        let documents = vec![payload_grouped_document("notes/a.md", "A", 0.9)];
-        let (text, _) = build_grouped_search_payload(&documents, false, true, 0);
+    fn document_rows_drop_promoted_and_derived_frontmatter_keys() {
+        let mut doc = payload_grouped_document("notes/a.md", "A", 0.9);
+        doc.summary.description = Some("About A".to_string());
+        doc.summary.frontmatter = serde_json::json!({
+            "title": "A", "description": "About A", "domain": "notes", "tags": ["x"],
+        });
+        let structured =
+            build_grouped_search_payload(std::slice::from_ref(&doc), None, false, false);
+        let row = &structured["documents"][0];
+        assert_eq!(row["frontmatter"], serde_json::json!({"tags": ["x"]}));
+        assert_eq!(row["description"], "About A");
+        assert!(row.get("mtime").is_none(), "{row}");
 
+        let fields = vec!["domain".to_string()];
+        let asked = build_grouped_search_payload(&[doc], Some(&fields), false, false);
+        assert_eq!(asked["documents"][0]["frontmatter"]["domain"], "notes");
+
+        let mut bare = payload_grouped_document("notes/b.md", "B", 0.5);
+        bare.summary.frontmatter = serde_json::json!({"title": "B"});
+        let structured = build_grouped_search_payload(&[bare], None, false, false);
         assert!(
-            !text.contains("lower offset"),
-            "offset is already 0 — must not tell the caller to lower it: {text}"
-        );
-        assert!(
-            text.contains("Lower limit"),
-            "must point at limit instead: {text}"
+            structured["documents"][0].get("frontmatter").is_none(),
+            "an empty projection is omitted: {structured}"
         );
     }
-
     /// `WriteDocumentParams::documents`'s doc comment states the batch cap as a
     /// literal (doc comments cannot interpolate a const); this keeps that
     /// served number in step with `write::MAX_BATCH_DOCUMENTS`.
@@ -16379,7 +17463,7 @@ mod tests {
         let description = schema.as_value()["properties"]["documents"]["description"]
             .as_str()
             .expect("documents must carry a description");
-        let expected = format!("at most\n{} documents per call", write::MAX_BATCH_DOCUMENTS);
+        let expected = format!("at most {}", write::MAX_BATCH_DOCUMENTS);
         assert!(
             description
                 .replace('\n', " ")

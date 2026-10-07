@@ -23,8 +23,9 @@ pub struct FieldError {
     pub got: Option<String>,
     /// The set of allowed values, populated for `rule == "allowed_value"`.
     pub expected: Option<Vec<String>>,
-    /// Which schema file declared the violated rule — a `.kb-schema.yaml` path
-    /// relative to the KB root, or `"config.yaml"` for the legacy global config.
+    /// Which schema declared the violated rule — its scope directory as
+    /// `schema::scope_label` writes it (`food/`, the root as `/` — including the
+    /// config-derived root), never a file name.
     /// `None` for non-schema rules (`"lint"`, `"io"`). The cascade means the rule
     /// may come from an ancestor directory rather than the document's own, so a
     /// caller cannot fix what it cannot locate — this is also embedded in
@@ -79,13 +80,13 @@ pub async fn validate_file(
     validate_content(path, &content, schema, validation).await
 }
 
-/// Which schema file declared `field`'s rule, formatted both as a bracketed message
+/// Which schema declared `field`'s rule, formatted both as a bracketed message
 /// suffix and as the bare (sanitized) origin string for `FieldError::schema_origin`.
 ///
 /// The cascade means the rule enforced against a document in `a/b/c.md` may come from
-/// `a/.kb-schema.yaml`, `a/b/.kb-schema.yaml`, or the implicit root schema — naming it
-/// is the difference between a caller that can go fix the right file and one that has
-/// to guess. Sanitized the same way `get_schema`'s `declared_in` is: schema paths
+/// the schema for `a/`, for `a/b/`, or the implicit root schema — naming it is the
+/// difference between a caller that can go fix the right scope and one that has to
+/// guess. Sanitized the same way `get_schema`'s `declared_in` is: schema paths
 /// originate in directory names from a synced git repo and are reflected straight into
 /// an error a caller reads, so they get the same control-character/length treatment as
 /// any other knowledge-base-controlled string reaching an agent.
@@ -145,12 +146,23 @@ pub(crate) fn parse_frontmatter_raw(content: &str) -> (HashMap<String, Value>, S
     (frontmatter, parsed.content)
 }
 
-/// Fill in schema-declared defaults for fields the document omitted.
+/// Whether `field` is one ingest derives rather than reads (`ingest::DERIVED_FIELDS`):
+/// never required of an author, and never filled from a schema default — ingest
+/// sets it from the document's location whatever the frontmatter says.
+fn is_derived_field(field: &str) -> bool {
+    crate::ingest::DERIVED_FIELDS.contains(&field)
+}
+
+/// Fill in schema-declared defaults for fields the document omitted. A default
+/// declared for a derived field is ignored.
 pub(crate) fn apply_defaults(frontmatter: &mut HashMap<String, Value>, schema: &ResolvedSchema) {
     for (path, def) in &schema.fields {
         let Some(default) = &def.default else {
             continue;
         };
+        if is_derived_field(path) {
+            continue;
+        }
         if schema::get_by_dotpath(frontmatter, path).is_none() {
             schema::set_by_dotpath(frontmatter, path, default.clone());
         }
@@ -178,7 +190,7 @@ pub fn validate_frontmatter(
         let absent = matches!(value, None | Some(Value::Null));
 
         if absent || empty_string {
-            if def.required {
+            if def.required && !is_derived_field(field) {
                 let (schema_origin, suffix) = origin_suffix(schema, field);
                 field_errors.push(FieldError {
                     field: field.clone(),
@@ -333,7 +345,7 @@ pub async fn validate_content(
                     message: msg,
                     got: None,
                     expected: None,
-                    // Not a schema rule — nothing in .kb-schema.yaml to point at.
+                    // Not a schema rule — no schema to point at.
                     schema_origin: None,
                 });
             }
@@ -732,6 +744,32 @@ mod tests {
             vf.frontmatter.get("status").unwrap().as_str().unwrap(),
             "active"
         );
+    }
+
+    /// `domain` is derived from the document's folder at index time: a rule that
+    /// requires it, or a default for it, is never applied to the frontmatter.
+    #[tokio::test]
+    async fn a_derived_field_is_never_required_nor_defaulted() {
+        let required = FrontmatterConfig {
+            required: vec!["title".into(), "domain".into()],
+            ..default_fm_config()
+        };
+        let defaulted = FrontmatterConfig {
+            defaults: HashMap::from([("domain".into(), "x".into())]),
+            ..default_fm_config()
+        };
+        for config in [required, defaulted] {
+            let (result, validated) = validate_content(
+                Path::new("docs/a.md"),
+                "---\ntitle: Test\ntype: guide\n---\nBody",
+                &as_schema(&config),
+                &default_val_config(),
+            )
+            .await
+            .unwrap();
+            assert!(result.valid, "{:?}", result.errors);
+            assert!(!validated.unwrap().frontmatter.contains_key("domain"));
+        }
     }
 
     #[tokio::test]
@@ -1203,7 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn required_field_error_names_its_declaring_schema() {
         // The legacy config-only cascade root is a synthetic schema whose origin is
-        // always "config.yaml" (see `ResolvedSchema::from_config`).
+        // the root scope, "/" (see `ResolvedSchema::from_config`).
         let content = "---\ntitle: Test\n---\nBody"; // missing 'type'
         let f = write_temp(content);
         let (result, _) = validate_file(
@@ -1219,9 +1257,9 @@ mod tests {
             .iter()
             .find(|e| e.field == "type" && e.rule == "required")
             .expect("expected a required-field error for 'type'");
-        assert_eq!(fe.schema_origin.as_deref(), Some("config.yaml"));
+        assert_eq!(fe.schema_origin.as_deref(), Some("/"));
         assert!(
-            fe.message.contains("[declared in config.yaml]"),
+            fe.message.contains("[declared in /]"),
             "expected the message to name the declaring schema, got: {}",
             fe.message
         );
@@ -1229,14 +1267,13 @@ mod tests {
 
     #[tokio::test]
     async fn allowed_value_error_names_the_cascaded_schema_file_not_the_root() {
-        // A field redeclared by a directory-level .kb-schema.yaml must report THAT
+        // A field redeclared by a directory-level schema must report THAT
         // file, not the root the cascade started from — the whole point of provenance
         // is that a deeper scope can override a shallower one's rule.
         let schema: SchemaFile =
             serde_yaml_ng::from_str("fields:\n  status:\n    type: enum\n    values: [archived]\n")
                 .unwrap();
-        let resolved =
-            ResolvedSchema::default().merged_with_for_test(&schema, "food/.kb-schema.yaml");
+        let resolved = ResolvedSchema::default().merged_with_for_test(&schema, "food/");
 
         let (result, _) = validate_content(
             Path::new("food/d.md"),
@@ -1252,9 +1289,9 @@ mod tests {
             .iter()
             .find(|e| e.field == "status" && e.rule == "allowed_value")
             .expect("expected an allowed_value error for 'status'");
-        assert_eq!(fe.schema_origin.as_deref(), Some("food/.kb-schema.yaml"));
+        assert_eq!(fe.schema_origin.as_deref(), Some("food/"));
         assert!(
-            fe.message.contains("[declared in food/.kb-schema.yaml]"),
+            fe.message.contains("[declared in food/]"),
             "got: {}",
             fe.message
         );

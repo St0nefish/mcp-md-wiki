@@ -7,18 +7,24 @@
  * Talks to the write pipeline via the fixed HTTP API contract:
  *   GET    api/schema/<path>  -> schema hints panel + new-document template
  *   GET    api/doc/<path>?start_line=1
- *                             -> load content + content_hash for editing.
+ *                             -> load content + version for editing.
  *                                The range is what makes the read exempt from
  *                                the server's section_max_bytes cap (#290);
  *                                without it a large document comes back as an
  *                                outline and a save would truncate the file.
  *   POST   api/doc/<path>     -> create/edit/move
- *                                {content, commit_message, create, expected_hash?, new_path?}
+ *                                {content, commit_message, create, expected_version?, new_path?}
  *                                `new_path` turns the same POST into an atomic
  *                                move/rename (see doMove() below) — the server
  *                                never reads the source itself, so `content` is
  *                                always sent, same as a plain edit.
- *   DELETE api/doc/<path>     -> delete {commit_message}
+ *   DELETE api/doc/<path>     -> delete {commit_message, expected_version}
+ *                                The Delete button is in the document view,
+ *                                not the editor, so `expected_version` is the
+ *                                version that view rendered
+ *                                (KBViz.getCurrentVersion()) — never a fresh
+ *                                read, which would name whatever the document
+ *                                has become and defeat the server's check.
  *
  * Editor engine: a plain <textarea> plus a live marked.js preview pane —
  * "Plan B" from the implementation plan (no vendored CodeMirror bundle).
@@ -43,7 +49,7 @@
   // Editor session state. `mode` is null when the overlay is closed.
   let mode = null; // "create" | "edit"
   let originalPath = null;
-  let originalHash = null; // content_hash of the last-loaded/last-saved content
+  let originalVersion = null; // version of the last-loaded/last-saved content
   let previewTimer = null;
   let confirmCallback = null;
 
@@ -146,7 +152,7 @@
   async function openEditor(newMode, path) {
     mode = newMode;
     originalPath = path;
-    originalHash = null;
+    originalVersion = null;
     clearErrors();
     setStatus("", null);
     updateModeBadge();
@@ -172,9 +178,9 @@
     if (mode === "edit") {
       els.textarea.disabled = true;
       els.textarea.value = "Loading…";
-      // Disabled until a fresh load confirms we have a content_hash to key
+      // Disabled until a fresh load confirms we have a version to key
       // the save on — otherwise a failed/aborted load would leave Save
-      // clickable with a stale (or missing) originalHash. See save()'s own
+      // clickable with a stale (or missing) originalVersion. See save()'s own
       // belt-and-suspenders guard for non-click save paths (Cmd/Ctrl+S).
       disableSave("Waiting for the document to load before you can save.");
       try {
@@ -199,7 +205,7 @@
           );
           disableSave("Only part of the document loaded — editing it here would truncate it.");
         } else {
-          originalHash = data.content_hash;
+          originalVersion = data.version;
           els.textarea.value = data.content;
           enableSave();
         }
@@ -222,7 +228,7 @@
   }
 
   /** Disable the Save button and surface why via its tooltip. Used whenever
-   * an edit-mode load hasn't (yet) produced a trustworthy `originalHash` —
+   * an edit-mode load hasn't (yet) produced a trustworthy `originalVersion` —
    * saving without one would make write.rs's stale-read guard a no-op. */
   function disableSave(reason) {
     if (!els.saveBtn) return;
@@ -240,7 +246,7 @@
     els.overlay.hidden = true;
     mode = null;
     originalPath = null;
-    originalHash = null;
+    originalVersion = null;
     clearErrors();
     setStatus("", null);
     enableSave();
@@ -455,9 +461,9 @@
 
     // Belt-and-suspenders: the Save button is disabled while an edit-mode
     // load is pending/failed, but Cmd/Ctrl+S calls save() directly and
-    // bypasses that. Without originalHash, a save would omit expected_hash
+    // bypasses that. Without originalVersion, a save would omit expected_version
     // and clobber concurrent edits — refuse rather than proceed unguarded.
-    if (mode === "edit" && !originalHash) {
+    if (mode === "edit" && !originalVersion) {
       showError(
         "Cannot save: the document hasn't finished loading (or failed to load). Close and reopen the editor."
       );
@@ -487,7 +493,7 @@
       commit_message: commitMessage,
       create: mode === "create",
     };
-    if (mode === "edit") body.expected_hash = originalHash;
+    if (mode === "edit") body.expected_version = originalVersion;
 
     setStatus("Saving…", null);
     els.saveBtn.disabled = true;
@@ -535,16 +541,24 @@
     const rewriteNote = rewrittenCount
       ? ` — updated links in ${rewrittenCount} document${rewrittenCount === 1 ? "" : "s"}`
       : "";
+    // The server merged someone else's concurrent, non-overlapping change
+    // into this save; the re-fetch below loads the merged result.
+    const mergeNote =
+      data && data.merged_with_other_changes
+        ? " — merged with someone else's changes; review the result"
+        : "";
     setStatus(
       (pendingSync
         ? `Committed locally${sha ? ` (${sha})` : ""} — push pending`
-        : `${movedFrom ? "Moved" : "Saved"}${sha ? ` (${sha})` : ""}`) + rewriteNote,
+        : `${movedFrom ? "Moved" : "Saved"}${sha ? ` (${sha})` : ""}`) +
+        rewriteNote +
+        mergeNote,
       "ok"
     );
 
     if (movedFrom) window.KBViz.removeNodeById(movedFrom);
 
-    // Re-fetch to pick up the fresh content_hash for any further save in
+    // Re-fetch to pick up the fresh version for any further save in
     // this session, and to reflect any server-side normalization.
     try {
       const res = await fetch(
@@ -552,7 +566,7 @@
       );
       if (res.ok) {
         const doc = await res.json();
-        originalHash = doc.content_hash;
+        originalVersion = doc.version;
         els.textarea.value = doc.content || els.textarea.value;
       }
     } catch (err) {
@@ -609,13 +623,13 @@
   /** Send the move as a POST with `new_path` set, carrying whatever content
    * currently sits in the textarea — including unsaved edits, so a rename
    * and an in-flight edit land in one commit rather than requiring two
-   * saves. Mirrors save()'s shape (same endpoint, same expected_hash guard)
+   * saves. Mirrors save()'s shape (same endpoint, same expected_version guard)
    * but is kept as its own function rather than folded into save(): the
    * two have different confirmation copy, different success framing
    * ("moved" vs "saved"), and — the part most worth keeping separate —
    * different 409 handling (see renderMoveConflict). */
   async function doMove(newPath) {
-    if (!originalHash) {
+    if (!originalVersion) {
       showError(
         "Cannot move: the document hasn't finished loading (or failed to load). Close and reopen the editor."
       );
@@ -637,7 +651,7 @@
       content: els.textarea.value,
       commit_message: commitMessage,
       create: false,
-      expected_hash: originalHash,
+      expected_version: originalVersion,
       new_path: newPath,
     };
 
@@ -666,18 +680,18 @@
         );
       } else if (res.status === 409) {
         // A move can 409 two different ways, and they need OPPOSITE
-        // guidance: a stale expected_hash (someone else changed the SOURCE
+        // guidance: a stale expected_version (someone else changed the SOURCE
         // since it was loaded — see write.rs's write_document_move) means
         // reload and retry, while a destination collision means the reload
         // is useless and the fix is to pick a different destination path.
         // Discriminate on the response body's actual shape rather than its
-        // prose: `write_error_response`'s StaleHash arm always includes an
-        // `expected_hash` field (web.rs), while `post_doc_handler`'s
+        // prose: `write_error_response`'s EditedElsewhere arm always includes
+        // `edited_elsewhere: true` (web.rs), while `post_doc_handler`'s
         // destination-collision arm (the `AlreadyExists` special case for a
         // move) never does.
-        if (data && Object.prototype.hasOwnProperty.call(data, "expected_hash")) {
+        if (data && data.edited_elsewhere === true) {
           // Stale read of the source: same remedy as a plain save's
-          // stale-hash 409, so reuse renderConflict() (its "Reload latest
+          // stale-read 409, so reuse renderConflict() (its "Reload latest
           // version" button reloads `path`, the SOURCE — exactly what's
           // stale here). Picking a different destination would not help
           // and would silently branch the document.
@@ -697,7 +711,7 @@
   }
 
   /** 409 for a move: the destination path already has a document at it.
-   * Distinct from renderConflict() (stale expected_hash / create-on-existing
+   * Distinct from renderConflict() (stale expected_version / create-on-existing
    * / edit-on-missing) — a move can also hit a stale-hash 409 (a concurrent
    * edit of the SOURCE), but doMove() routes that case to renderConflict()
    * instead, since "reload and retry" is the right guidance there, not
@@ -725,15 +739,38 @@
   // Delete
   // -------------------------------------------------------------------
 
+  /** Ask for confirmation to delete the document in the doc view. The Delete
+   * button lives there, not in the editor, so the version the delete names is
+   * the one that view rendered: what the user is looking at as they choose.
+   * It is read here, together with the id, and handed to doDelete() so the two
+   * cannot come from different renders. It is deliberately never re-fetched —
+   * a read just before the DELETE would name whatever the document has become
+   * since the user saw it, and the server's stale-version check would pass. */
   function confirmDeleteCurrent() {
     const id = window.KBViz.getCurrentId();
     if (!id) return;
+    const version = window.KBViz.getCurrentVersion();
+    if (!version) {
+      // The view has no version for this document: its body is still loading,
+      // failed to load, or came back without one. Refuse rather than delete a
+      // version nobody saw.
+      window.alert(
+        "Cannot delete: the document hasn't finished loading (or failed to load), " +
+          "so the version you would be deleting is unknown. " +
+          "Wait for it to load or reload the page, then try again."
+      );
+      return;
+    }
     showConfirm(`Delete "${id}"? This cannot be undone from the UI.`, () =>
-      doDelete(id)
+      doDelete(id, version)
     );
   }
 
-  async function doDelete(path) {
+  /** DELETE `path`, naming `expectedVersion`, the version the doc view showed
+   * when the user chose to delete it. A document changed since is refused (409
+   * `edited_elsewhere`) and handed to showDeleteConflict(); it is never
+   * retried here. */
+  async function doDelete(path, expectedVersion) {
     const commitMessage = window.prompt("Commit message:", `docs: delete ${path}`);
     if (commitMessage === null) return;
     if (!commitMessage.trim()) {
@@ -750,13 +787,21 @@
       const res = await fetch(`api/doc/${window.KBViz.encodePathForApi(path)}`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ commit_message: commitMessage }),
+        body: JSON.stringify({
+          commit_message: commitMessage,
+          expected_version: expectedVersion,
+        }),
       });
       const data = await safeJson(res);
       if (res.ok) {
         if (mode === "edit" && originalPath === path) closeEditor();
         window.KBViz.removeNodeById(path);
         await window.KBViz.refreshGraph();
+      } else if (res.status === 409 && data && data.edited_elsewhere === true) {
+        // A 409 is also what a document that no longer exists gets (the
+        // generic message below); only the stale-version refusal carries
+        // `edited_elsewhere: true` (web.rs's write_error_response).
+        await showDeleteConflict(path);
       } else {
         window.alert(
           `Delete failed (HTTP ${res.status}): ${
@@ -769,6 +814,24 @@
     } finally {
       els.deleteBtn.disabled = false;
     }
+  }
+
+  /** 409 `edited_elsewhere` on a delete: the document changed after the
+   * version the user saw, so nothing was deleted. Re-render the doc view so it
+   * shows the document as it is now — which also replaces the version the
+   * next delete will name — then say so. Deleting again is the user's call,
+   * made against what is now on screen. The graph is refreshed first because
+   * the view's header (title, tags, status) is drawn from it, so a change that
+   * touched only the frontmatter shows up too — the same order onSaveSuccess()
+   * uses. */
+  async function showDeleteConflict(path) {
+    await window.KBViz.refreshGraph();
+    window.KBViz.showDetail(path);
+    window.alert(
+      `"${path}" was edited by someone else since you opened it, so it was not deleted. ` +
+        "The view has been refreshed with its latest version. " +
+        "Review it, and delete it again if you still want to."
+    );
   }
 
   // -------------------------------------------------------------------
@@ -841,7 +904,7 @@
     setStatus("Validation failed", "err");
   }
 
-  /** 409: either a stale `expected_hash` (someone else edited this file
+  /** 409: either a stale `expected_version` (someone else edited this file
    * since it was loaded) or a create/edit mismatch (create-on-existing,
    * edit-on-missing). Either way, offer to reload the current server
    * state into the editor rather than guessing which case it was. */

@@ -1393,24 +1393,95 @@ impl StateDb {
         Ok(rows.into_iter().map(|(f, n, _docs)| (f, n)).collect())
     }
 
-    /// Document counts per value of `field`, most common first.
+    /// Document counts per value of `field`, most common first, over every
+    /// document — [`Self::top_values`] with no directory.
     ///
     /// Counts distinct documents rather than rows: multi-valued fields such as `tags`
     /// store one row per value, so a `COUNT(*)` here would be counting projections
     /// rather than documents the moment a field ever repeats within one document.
     pub async fn count_by_field(&self, field: &str, limit: i64) -> Result<Vec<(String, i64)>> {
+        self.top_values(field, None, limit).await
+    }
+
+    /// Whether any document carries `field` — `search`'s unknown-filter-field
+    /// check, run only for a field no schema declares.
+    pub async fn field_in_use(&self, field: &str) -> Result<bool> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM document_fields WHERE field = ? LIMIT 1")
+                .bind(field)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    /// Which of `values` some document actually uses for `field` — `search`'s
+    /// closed-value check accepts these even when no governing schema lists
+    /// them, so it can never reject a filter that would have matched.
+    pub async fn values_present(
+        &self,
+        field: &str,
+        values: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        if values.is_empty() {
+            return Ok(Default::default());
+        }
+        let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT DISTINCT value_text FROM document_fields WHERE field = ",
+        );
+        builder.push_bind(field);
+        builder.push(" AND value_text IN (");
+        let mut separated = builder.separated(", ");
+        for value in values {
+            separated.push_bind(value.clone());
+        }
+        builder.push(")");
+        let rows: Vec<(String,)> = builder.build_query_as().fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(v,)| v).collect())
+    }
+
+    /// Distinct field names documents use, most widely used first, optionally
+    /// only among documents under `dir_prefix` (a KB-relative directory, no
+    /// trailing slash).
+    pub async fn fields_in_use(
+        &self,
+        dir_prefix: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        let pattern = dir_prefix.map(escape_like_dir_prefix);
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT field, COUNT(DISTINCT file_path) AS n FROM document_fields \
+             WHERE (?1 IS NULL OR file_path LIKE ?1 ESCAPE '\\') \
+             GROUP BY field ORDER BY n DESC, field ASC LIMIT ?2",
+        )
+        .bind(pattern)
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// The most-used values of `field`, with document counts, optionally only
+    /// among documents under `dir_prefix` — `get_schema`'s `values_in_use`.
+    pub async fn top_values(
+        &self,
+        field: &str,
+        dir_prefix: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        let pattern = dir_prefix.map(escape_like_dir_prefix);
         // SQLite reads a negative LIMIT as "no limit", so a caller passing one through
         // from arithmetic would silently get the whole vocabulary instead of a page.
         let limit = limit.max(0);
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT value_text, COUNT(DISTINCT file_path) AS n FROM document_fields \
-             WHERE field = ? GROUP BY value_text ORDER BY n DESC, value_text ASC LIMIT ?",
+             WHERE field = ?1 AND (?2 IS NULL OR file_path LIKE ?2 ESCAPE '\\') \
+             GROUP BY value_text ORDER BY n DESC, value_text ASC LIMIT ?3",
         )
         .bind(field)
+        .bind(pattern)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-
         Ok(rows)
     }
 
@@ -1462,6 +1533,15 @@ fn escape_like_metachars(raw: &str) -> String {
         }
     }
     out
+}
+
+/// Escape a KB-relative directory (no trailing slash) into the `LIKE ... ESCAPE '\'`
+/// pattern for every path beneath it, as `fields_in_use` and `top_values` filter on.
+///
+/// The `/%` is added after escaping, so it is the only wildcard and is never
+/// caller-controlled — the same rule [`escape_like_substring`] follows.
+fn escape_like_dir_prefix(dir: &str) -> String {
+    format!("{}/%", escape_like_metachars(dir))
 }
 
 /// Escape a caller-supplied path fragment for a *substring* `LIKE ... ESCAPE '\'`.

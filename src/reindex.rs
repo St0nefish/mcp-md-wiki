@@ -115,7 +115,7 @@ impl ReindexQueue {
         self.notify.notify_one();
     }
 
-    /// Queue a full reconcile when any of `changed` is a `.kb-schema.yaml`, and say
+    /// Queue a full reconcile when any of `changed` is a schema file, and say
     /// whether it did. Returns immediately, like every other producer call.
     ///
     /// For producers that learn about changed paths from git — the webhook's push
@@ -248,7 +248,7 @@ fn backoff_for_attempt(attempt: u32) -> Duration {
 /// Whether a failed run should be dropped (permanent) rather than requeued
 /// (transient — the default).
 ///
-/// An invalid `.kb-schema.yaml` is permanent: the run aborted because
+/// An invalid schema file is permanent: the run aborted because
 /// `SchemaCache::build` refused the tree (a [`crate::schema::SchemaBuildError`]
 /// anywhere in the error chain — typed, not a substring match), and retrying with
 /// backoff cannot fix a file on disk. The fix itself queues a full reconcile
@@ -306,7 +306,7 @@ fn schema_build_error(err: &anyhow::Error) -> Option<&crate::schema::SchemaBuild
         .find_map(|cause| cause.downcast_ref::<crate::schema::SchemaBuildError>())
 }
 
-/// A run aborted because a `.kb-schema.yaml` is invalid (#272): record it as the
+/// A run aborted because a schema file is invalid (#272): record it as the
 /// schema error at once — the same state a refused `schema::apply_rebuild` sets,
 /// keeping the streak's original `since` — rather than leaving `/status` and
 /// `/metrics` silent until the next sweep's rebuild notices, and log every invalid
@@ -322,15 +322,14 @@ fn report_dropped_for_invalid_schema(
     for file in &err.invalid {
         error!(
             path = %file.path.display(),
-            "invalid {}: {}",
-            crate::schema::SCHEMA_FILE_NAME,
+            "invalid schema file: {}",
             file.reason
         );
     }
     error!(
         ?unit,
         invalid_files = err.invalid.len(),
-        "Indexing run REFUSED: a .kb-schema.yaml is invalid. Dropped this unit without \
+        "Indexing run REFUSED: a schema file is invalid. Dropped this unit without \
          retrying; its paths stay dirty and are indexed by the full reconcile queued \
          once every schema file is valid again"
     );
@@ -358,7 +357,7 @@ enum Unit {
 /// in BEFORE this unit is indexed — not after.
 ///
 /// Ordering matters: `ingest::index_paths`/`ingest::scan_and_index` always re-read
-/// `.kb-schema.yaml` fresh off disk on every run (they build their own throwaway
+/// schema file fresh off disk on every run (they build their own throwaway
 /// `SchemaCache` internally, unrelated to this shared one), so indexing itself is
 /// never stale. What WOULD go stale is every concurrent MCP call in the meantime:
 /// `get_schema` describing the old rules, or a write validating against them, while
@@ -370,12 +369,12 @@ enum Unit {
 /// A `FullReconcile` always rebuilds: it already means "something the queue's own
 /// path-level tracking doesn't capture may have changed" (periodic sweep, startup
 /// catch-up, `write_raw_file` after ANY schema write, or a producer that saw a
-/// `.kb-schema.yaml` change — a webhook push, a write's rebase, a `move_directory`
+/// schema file change — a webhook push, a write's rebase, a `move_directory`
 /// — via [`ReindexQueue::mark_schema_changes`]), and `scan_for_dirty` is about to do
 /// its own full walk regardless — a schema rebuild alongside it is a rounding error
 /// on that cost, not worth the precision of trying to detect "no, THIS particular
 /// full reconcile didn't touch a schema". A `Paths` unit rebuilds only when one of
-/// its paths is literally a `.kb-schema.yaml`; producers route those through
+/// its paths is literally a schema file; producers route those through
 /// `mark_schema_changes` instead (the include filter they apply before
 /// `mark_paths` drops schema files), so this arm is a backstop for a caller that
 /// marks one directly. As there, a schema file the rebuild would never read (in a
@@ -403,7 +402,7 @@ type RunFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Resu
 
 /// Same shape as [`RunFuture`], for the schema-rebuild step. Resolves to whether
 /// the unit should still be indexed: `false` exactly when the rebuild was refused
-/// because a `.kb-schema.yaml` is invalid (see `schema::apply_rebuild`) — the
+/// because a schema file is invalid (see `schema::apply_rebuild`) — the
 /// unit's own indexing run would rebuild from the same files and fail the same
 /// way, so it is skipped rather than run into a certain, retried failure. Every
 /// path it carried is still on disk in its changed state and is picked up by the
@@ -538,7 +537,7 @@ pub async fn run_worker(
 /// `schema::apply_rebuild` records a refused rebuild on — and a private one in
 /// tests. It carries the schema error between the two halves of the invalid-schema
 /// handling: [`run_with_retry`] records one when a run aborts on an invalid
-/// `.kb-schema.yaml`, and a later rebuild that clears it queues the recovery
+/// schema file, and a later rebuild that clears it queues the recovery
 /// reconcile below (#272).
 async fn drain_and_run_with(
     queue: &ReindexQueue,
@@ -569,7 +568,7 @@ async fn drain_and_run_with(
                 // invalid schema file(s) the rebuild just reported.
                 error!(
                     ?unit,
-                    "Skipping this indexing run: a .kb-schema.yaml is invalid, so nothing \
+                    "Skipping this indexing run: a schema file is invalid, so nothing \
                      is indexed until it is fixed (the fix itself queues a full reconcile)"
                 );
                 continue;
@@ -580,7 +579,7 @@ async fn drain_and_run_with(
             // unit is that reconcile already (#272).
             if was_invalid && status.schema_error().is_none() && matches!(unit, Unit::Paths(_)) {
                 warn!(
-                    "Every .kb-schema.yaml is valid again; queueing a full reconcile to \
+                    "Every schema file is valid again; queueing a full reconcile to \
                      index what was dropped while one was invalid"
                 );
                 queue.mark_full();
@@ -607,7 +606,7 @@ async fn run_with_retry(
         }
         if is_permanent_failure(&e) {
             // Only the vestigial "(strict mode)" wording reaches this branch — see
-            // `is_permanent_failure`'s doc comment; an invalid `.kb-schema.yaml` is
+            // `is_permanent_failure`'s doc comment; an invalid schema file is
             // handled just above.
             error!(
                 ?unit,
@@ -1461,5 +1460,20 @@ mod tests {
             &Unit::Paths(vec![path("notes/.kb-schema.yaml")]),
             &indexing
         ));
+    }
+
+    /// Both the canonical and the legacy schema file name queue a full reconcile.
+    #[test]
+    fn either_schema_file_name_queues_a_full_reconcile() {
+        let indexing = crate::config::IndexingConfig::default();
+        for p in ["notes/.schema.yaml", "notes/.kb-schema.yaml"] {
+            let q = ReindexQueue::new();
+            assert!(q.mark_schema_changes(&indexing, &[path(p)]), "{p}");
+            assert!(q.snapshot().full_pending, "{p}");
+            assert!(
+                unit_touches_schema(&Unit::Paths(vec![path(p)]), &indexing),
+                "{p}"
+            );
+        }
     }
 }

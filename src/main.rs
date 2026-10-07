@@ -331,10 +331,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                         eprintln!();
                         anyhow::bail!(
-                            "{} {} file(s) are invalid; no document was validated, and the \
+                            "{} schema file(s) are invalid; no document was validated, and the \
                          server will refuse to start until they are fixed",
                             e.invalid.len(),
-                            schema::SCHEMA_FILE_NAME
                         );
                     }
                 };
@@ -830,13 +829,26 @@ fn print_search_results(results: &[qdrant::SearchResult], explain: bool, hybrid:
             };
             println!("Explain: {score_line}{arm_scores}");
         }
-        if let Some(text) = r.payload.get("text").and_then(|v| v.as_str()) {
-            let snippet: String = text.chars().take(300).collect();
+        if let Some(snippet) = result_snippet(&r.payload) {
             println!();
             println!("{snippet}");
         }
         println!();
     }
+}
+
+/// How many characters of a result's text `search` prints under it.
+const SNIPPET_CHARS: usize = 300;
+
+/// The text `search` prints under a result: the start of the chunk's own text,
+/// without the breadcrumb/description prefix the chunker adds for embedding
+/// (`qdrant::chunk_body_text`) — the same body MCP `search` and `/api/search`
+/// show. `None` when the chunk has no text.
+fn result_snippet(
+    payload: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    let body = qdrant::chunk_body_text(payload);
+    (!body.is_empty()).then(|| body.chars().take(SNIPPET_CHARS).collect())
 }
 
 /// Human-readable rendering of an `eval::EvalReport`.
@@ -1004,6 +1016,41 @@ mod tests {
             failed: 1,
         };
         print_eval_report(&mixed);
+    }
+
+    // --- `search` snippets ---------------------------------------------------
+
+    #[test]
+    fn search_snippet_starts_at_the_chunks_own_text() {
+        // The stored text opens with the breadcrumb the chunker adds for embedding;
+        // the body offset says where the chunk's own text begins.
+        let breadcrumb = "Spells > Fireball\n\n";
+        let payload = std::collections::HashMap::from([
+            (
+                qdrant::CHUNK_TEXT_KEY.to_string(),
+                serde_json::json!(format!("{breadcrumb}Deals fire damage.")),
+            ),
+            (
+                qdrant::CHUNK_BODY_OFFSET_KEY.to_string(),
+                serde_json::json!(breadcrumb.len()),
+            ),
+        ]);
+        assert_eq!(
+            result_snippet(&payload).as_deref(),
+            Some("Deals fire damage.")
+        );
+
+        let long = std::collections::HashMap::from([(
+            qdrant::CHUNK_TEXT_KEY.to_string(),
+            serde_json::json!("é".repeat(SNIPPET_CHARS + 50)),
+        )]);
+        assert_eq!(
+            result_snippet(&long).map(|s| s.chars().count()),
+            Some(SNIPPET_CHARS),
+            "capped in characters, not bytes"
+        );
+
+        assert_eq!(result_snippet(&std::collections::HashMap::new()), None);
     }
 
     #[test]

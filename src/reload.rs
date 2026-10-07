@@ -283,7 +283,7 @@ const DIFF_TABLE: &[DiffField] = &[
                 note: "read fresh per indexing run by ingest::discover_files (ingest.rs), \
                        and by index_paths_generic, which purges a newly excluded file (#266); \
                        unlike indexing.include, no MCP path filter bakes this in. It also \
-                       decides which directories' .kb-schema.yaml files are part of the \
+                       decides which directories' schema files are part of the \
                        schema tree (schema::SchemaWalkFilter, #272); the shared schema \
                        cache re-reads it on the full reconcile every reload queues.",
             },
@@ -638,11 +638,10 @@ const DIFF_TABLE: &[DiffField] = &[
                    `listChanged` tool capability, so no notifications/tools/list_changed is \
                    sent — a client that cached an earlier tools/list keeps offering a \
                    now-disabled tool until it calls tools/list again, though the call itself is \
-                   still refused. The cross-reference sentences naming search/get_schema in \
-                   server instructions (descriptions.rs top_level_areas_sentence, server.rs's \
-                   scoped-schema-directories sentence) DO follow this on the same \
-                   metadata-refresh-tick cadence as every other instructions input, since they \
-                   are computed by compose_server_instructions.",
+                   still refused. The server-instructions pointer naming get_schema \
+                   (descriptions.rs SCHEMA_POINTER_SENTENCE) DOES follow this on the same \
+                   metadata-refresh-tick cadence as every other instructions input, since it \
+                   is computed by compose_server_instructions.",
         }],
     },
     // ── mcp.oauth ────────────────────────────────────────────────────────────
@@ -920,7 +919,7 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::Applied,
             setting: "write.dedup_enabled",
             note: "read fresh from the live config on every create_document call (mcp.rs \
-                   write_document); the global fallback where no .kb-schema.yaml `dedup:` \
+                   write_document); the global fallback where no schema file `dedup:` \
                    block overrides it (write.rs effective_dedup, #272).",
         }],
     },
@@ -931,7 +930,7 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::Applied,
             setting: "write.dedup_threshold",
             note: "read fresh from the live config on every create_document call (mcp.rs \
-                   write_document); the global fallback where no .kb-schema.yaml `dedup:` \
+                   write_document); the global fallback where no schema file `dedup:` \
                    block overrides it (write.rs effective_dedup, #272).",
         }],
     },
@@ -962,9 +961,9 @@ const DIFF_TABLE: &[DiffField] = &[
             setting: "search.phrase",
             note: "read fresh from the live config on every search call (mcp.rs/web.rs, \
                    gated by phrase_matching_available) and by the metadata-refresh \
-                   timer (server.rs compose_server_instructions/compose_tool_overlay) \
-                   that recomposes the server/tool description overlay so it never \
-                   advertises quoted-phrase support the config just turned off.",
+                   timer (server.rs compose_tool_overlay) that recomposes the tool \
+                   description overlay so `search` never advertises quoted-phrase support \
+                   the config just turned off.",
         }],
     },
     DiffField {

@@ -101,6 +101,11 @@ pub struct Chunk {
     pub section_line_start: usize,
     /// Inclusive end of `section_line_start`'s range. Body-relative.
     pub section_line_end: usize,
+    /// Byte offset in `text` where the chunk's own body starts, i.e. the
+    /// length of the breadcrumb/description prefix `prepend_heading_path` and
+    /// `prepend_description` add (0 when neither applies). The prefix is there
+    /// for the embedding; a search snippet starts after it.
+    pub body_offset: usize,
 }
 
 /// When the MarkdownSplitter breaks up an oversized section, merge any
@@ -439,6 +444,7 @@ pub fn chunk_markdown(
             // the same text `prepend_description` alone always has, which is
             // exactly what keeps this change from disturbing the existing
             // description-prepend behavior and its tests.
+            let body_len = raw.text.len();
             let with_desc = match (config.prepend_description, description) {
                 (true, Some(desc)) => format!("{}\n\n{}", desc, raw.text),
                 _ => raw.text,
@@ -453,6 +459,7 @@ pub fn chunk_markdown(
             };
             let (section_line_start, section_line_end) = raw.section.line_range(&tree);
             Chunk {
+                body_offset: text.len() - body_len,
                 text,
                 index,
                 line_start: raw.line_start,
@@ -570,6 +577,35 @@ mod tests {
             &cfg(1000, None, false, false),
         );
         assert_eq!(chunks[0].text, "Body text");
+    }
+
+    /// `body_offset` skips exactly the breadcrumb/description prefix, so a
+    /// search snippet can start at the chunk's own text.
+    #[test]
+    fn body_offset_points_past_the_breadcrumb_and_description() {
+        let body = "# Guide\n\n## Setup\n\nSetup body.";
+        for (prepend_description, prepend_heading_path) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let chunks = chunk_markdown(
+                body,
+                Some("A description"),
+                &cfg(1000, None, prepend_description, prepend_heading_path),
+            );
+            for chunk in &chunks {
+                let own = &chunk.text[chunk.body_offset..];
+                assert!(
+                    !own.starts_with("A description"),
+                    "{prepend_description}/{prepend_heading_path}: {own:?}"
+                );
+                assert!(
+                    own.starts_with('#') || own.starts_with("Setup body."),
+                    "{own:?} does not start at the body's own text"
+                );
+            }
+        }
+        let plain = chunk_markdown(body, None, &cfg(1000, None, false, false));
+        assert!(plain.iter().all(|c| c.body_offset == 0));
     }
 
     #[test]

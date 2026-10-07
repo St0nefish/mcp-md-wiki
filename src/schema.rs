@@ -1,6 +1,6 @@
 //! Directory-scoped frontmatter schemas.
 //!
-//! A `.kb-schema.yaml` file governs every document at or below its directory, the way
+//! A `.schema.yaml` file governs every document at or below its directory, the way
 //! `CLAUDE.md` cascades. Deeper files refine shallower ones, so a `recipes/` folder can
 //! require `planning.cook_minutes` without that field meaning anything elsewhere.
 //!
@@ -15,13 +15,27 @@
 //! `config.yaml` becomes the implicit root schema via [`ResolvedSchema::from_config`].
 //! This is a **deprecated fallback**, though — a schema describes the knowledge base's
 //! own content rules, and `config.yaml` is deployment config that lives on the
-//! container host, not in the KB's git repo. A root `.kb-schema.yaml` is the
+//! container host, not in the KB's git repo. A root `.schema.yaml` is the
 //! non-deprecated way to declare root rules, and once one exists it is authoritative:
 //! it REPLACES the config-derived root outright rather than layering onto it, so a KB
 //! carries its root rules with it wherever it is cloned or served, independent of
 //! whatever `config.yaml` the deploying host happens to have. `config.yaml`'s
-//! `frontmatter` block is consulted only when no root `.kb-schema.yaml` exists at all
+//! `frontmatter` block is consulted only when no root `.schema.yaml` exists at all
 //! — see [`SchemaCache::build`].
+//!
+//! The legacy name `.kb-schema.yaml` ([`LEGACY_SCHEMA_FILE_NAME`]) is still read
+//! wherever the canonical name is, so an existing knowledge base keeps working
+//! unchanged; `update_schema` migrates one directory at a time by writing
+//! `.schema.yaml` and removing the legacy file in the same commit. A directory
+//! holding both names is an invalid schema file, never resolved silently. Only a
+//! regular file at either name is a schema file: a symlink or any other entry there
+//! is absent to the tree walk and to [`SchemaCache::raw_file_at`] alike, so a link
+//! pushed to the knowledge base can neither redirect a read nor count toward the
+//! both-names rule.
+//!
+//! Model-facing text (tool descriptions, results, errors) names a schema by its scope
+//! directory ([`scope_label`]), never by file name; only operator-facing surfaces
+//! (logs, `/status`, the CLI) carry real file paths.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -35,7 +49,47 @@ use crate::config::FrontmatterConfig;
 use crate::qdrant::{IndexKind, IndexedField};
 
 /// Filename that declares a schema for its directory and everything beneath it.
-pub const SCHEMA_FILE_NAME: &str = ".kb-schema.yaml";
+/// `update_schema` always writes this name.
+pub const SCHEMA_FILE_NAME: &str = ".schema.yaml";
+
+/// The schema file name used before [`SCHEMA_FILE_NAME`]. Still read everywhere the
+/// canonical name is; `update_schema` replaces it with the canonical name the next
+/// time it edits that directory.
+pub const LEGACY_SCHEMA_FILE_NAME: &str = ".kb-schema.yaml";
+
+/// Every file name that declares a schema, canonical first.
+pub const SCHEMA_FILE_NAMES: [&str; 2] = [SCHEMA_FILE_NAME, LEGACY_SCHEMA_FILE_NAME];
+
+/// The reason [`SchemaCache::build`] gives for a directory holding both
+/// [`SCHEMA_FILE_NAME`] and [`LEGACY_SCHEMA_FILE_NAME`]. Operator-facing; see
+/// [`model_facing_reason`] for the wording a model sees instead.
+pub(crate) const BOTH_NAMES_REASON: &str = "both .schema.yaml and legacy .kb-schema.yaml \
+     are present in this directory; merge them into .schema.yaml and delete the legacy file";
+
+/// `reason` (an [`InvalidSchemaFile::reason`], or [`SchemaCache::raw_file_at`]'s error)
+/// as a model should read it. [`BOTH_NAMES_REASON`] names both files, so it is
+/// replaced; every other reason (a parse error, the size limit) names none.
+pub(crate) fn model_facing_reason(reason: &str) -> &str {
+    if reason == BOTH_NAMES_REASON {
+        "two schema files declare rules for this directory; an operator must merge them \
+         into one"
+    } else {
+        reason
+    }
+}
+
+/// How model-facing text names the schema governing KB-relative directory `rel_dir`:
+/// the directory with a trailing `/`, and the root as `/`. Never a file name — the
+/// file is an implementation detail a model has no use for.
+pub fn scope_label(rel_dir: &Path) -> String {
+    let dir = rel_dir.to_string_lossy();
+    let dir = dir.trim_matches('/');
+    if dir.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{dir}/")
+    }
+}
 
 /// Largest schema file we will attempt to parse.
 ///
@@ -48,7 +102,22 @@ pub const SCHEMA_FILE_NAME: &str = ".kb-schema.yaml";
 /// `update_schema` refuses to write one.
 pub(crate) const MAX_SCHEMA_FILE_BYTES: u64 = 256 * 1024;
 
-/// Declared type of a frontmatter field. Undeclared fields are not type-checked.
+/// The reason a schema file of `bytes` bytes is refused for being over
+/// [`MAX_SCHEMA_FILE_BYTES`] — the one wording every size check uses
+/// ([`SchemaCache::build`], [`parse_schema_text`], [`SchemaCache::raw_file_at`]).
+fn over_size_limit_reason(bytes: u64) -> String {
+    format!(
+        "file is {bytes} bytes, over the {MAX_SCHEMA_FILE_BYTES} byte limit; a schema this \
+         large is not parsed"
+    )
+}
+
+// Declared type of a frontmatter field. Undeclared fields are not type-checked.
+//
+// `//` rather than `///` on the type and its variants: schemars would turn doc
+// comments into a `oneOf` of described `const` branches in `update_schema`'s
+// advertised schema; without them it emits a flat string `enum`, and the one
+// caller-facing sentence lives on `RawFieldDef::ty`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize, schemars::JsonSchema,
 )]
@@ -58,16 +127,16 @@ pub enum FieldType {
     Integer,
     Number,
     Boolean,
-    /// A scalar drawn from a closed set. Also accepts an array, checking each element —
-    /// this preserves how the pre-cascade `allowed` map behaved.
+    // A scalar drawn from a closed set. Also accepts an array, checking each
+    // element, as the legacy `config.yaml` `allowed` map did.
     Enum,
-    /// An array; elements are checked against `values` when present.
+    // An array; elements are checked against `values` when present.
     List,
-    /// `YYYY-MM-DD`.
+    // `YYYY-MM-DD`.
     Date,
-    /// RFC 3339 datetime.
+    // RFC 3339 datetime.
     Timestamp,
-    /// A container for dot-path children rather than a value of its own.
+    // A container for dot-path children rather than a value of its own.
     Object,
 }
 
@@ -94,7 +163,7 @@ impl FieldType {
 /// so a typo here can never silently degrade into "just another permitted tag."
 pub const VALUES_SENTINEL: &str = "$values";
 
-/// A field definition exactly as written in a `.kb-schema.yaml`.
+/// A field definition exactly as written in a schema file.
 ///
 /// Also doubles as the shape the `update_schema` MCP tool advertises for `set_field`'s
 /// `definition` parameter (see `mcp::FieldDefinitionInput`), via a derived
@@ -103,10 +172,10 @@ pub const VALUES_SENTINEL: &str = "$values";
 /// validation — not just our runtime error — can catch a typo'd key.
 #[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(description = "Frontmatter field definition, as in .kb-schema.yaml.")]
 pub struct RawFieldDef {
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
-    #[schemars(description = "Data type for this field (e.g. text, enum, list).")]
+    #[schemars(description = "Type: `enum` is one of `values`, `date` YYYY-MM-DD, \
+                              `timestamp` RFC 3339, `object` a container for child fields.")]
     pub ty: Option<FieldType>,
     /// `None` means "not declared here" and inherits the parent scope's `required`
     /// (`false` if there is no parent definition either) — see
@@ -128,7 +197,7 @@ pub struct RawFieldDef {
     /// [`check_values`] (every scalar, of any JSON type, must canonicalize to a
     /// permitted string); a field that sets `values` but leaves `ty` unset — which is
     /// how every legacy `config.yaml` `allowed` entry arrives, via
-    /// [`ResolvedSchema::from_config`], but also any hand-written `.kb-schema.yaml`
+    /// [`ResolvedSchema::from_config`], but also any hand-written schema file
     /// field that forgets `type: enum` — is checked by [`check_values_lenient`]
     /// instead, which exempts non-string, non-array values entirely. This is
     /// deliberate (see both functions' docs), not an oversight: it preserves
@@ -140,7 +209,10 @@ pub struct RawFieldDef {
     /// contains the [`VALUES_SENTINEL`] placeholder (`$values`), which splices the
     /// inherited set in at that position — see [`ResolvedSchema::merged_with`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(description = "Closed set of permitted values (enum/list).")]
+    #[schemars(
+        description = "Permitted values (enum/list). Replaces the inherited set \
+                              unless it includes `$values`, which keeps it."
+    )]
     pub values: Option<Vec<String>>,
     /// **Deprecated** alias for a leading [`VALUES_SENTINEL`]: `extend: true` behaves
     /// exactly like writing `values: [$values, ...]` (see [`ResolvedSchema::merged_with`]
@@ -149,8 +221,10 @@ pub struct RawFieldDef {
     /// and cascading correctly; new schemas should write `$values` directly.
     /// `validate_raw` rejects declaring both on the same field — the two ways of saying
     /// "inherit" must not be able to disagree about where the inherited values land.
+    /// Not advertised in `update_schema`'s schema (`schemars(skip)`): a caller
+    /// should never author it, though it is still accepted.
     #[serde(default, skip_serializing_if = "is_false")]
-    #[schemars(description = "Deprecated; use '$values' in `values` instead.")]
+    #[schemars(skip)]
     pub extend: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(description = "Default value when the field is absent.")]
@@ -302,7 +376,7 @@ impl FieldDef {
     }
 }
 
-/// One parsed `.kb-schema.yaml`, before merging with ancestors.
+/// One parsed schema file, before merging with ancestors.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaFile {
@@ -316,7 +390,7 @@ pub struct SchemaFile {
     pub dedup: Option<RawDedup>,
 }
 
-/// The `dedup:` block of a `.kb-schema.yaml`. Each key is independently optional;
+/// The `dedup:` block of a schema file. Each key is independently optional;
 /// an unset key inherits from the nearest ancestor that sets it, then from `write.*`
 /// in `config.yaml` (#272).
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
@@ -606,13 +680,93 @@ pub enum SchemaEdit {
     RemoveField { field: String },
 }
 
+impl SchemaEdit {
+    /// The dot-path field this edit targets.
+    pub fn field(&self) -> &str {
+        match self {
+            SchemaEdit::AddValues { field, .. }
+            | SchemaEdit::RemoveValues { field, .. }
+            | SchemaEdit::SetField { field, .. }
+            | SchemaEdit::RemoveField { field } => field,
+        }
+    }
+}
+
 impl SchemaFile {
-    /// Apply an edit, returning a description of what changed.
+    /// Apply an edit with no inherited definition in play — see
+    /// [`Self::apply_inheriting`].
+    #[cfg(test)]
     pub fn apply(&mut self, edit: &SchemaEdit) -> Result<String, String> {
+        self.apply_inheriting(edit, None)
+    }
+
+    /// Apply an edit, returning a description of what changed.
+    ///
+    /// `inherited` is the definition the edited field resolves to from this scope's
+    /// ancestors alone (`None` when no ancestor declares it). `AddValues` uses it so a
+    /// child scope extends the inherited set rather than narrowing it: with no local
+    /// `values`, the new list starts with [`VALUES_SENTINEL`], and a field created
+    /// here keeps the inherited `type` instead of being forced to `enum` — unless no
+    /// ancestor gives it a type or values, in which case it is `enum`, as a brand-new
+    /// field is.
+    pub fn apply_inheriting(
+        &mut self,
+        edit: &SchemaEdit,
+        inherited: Option<&FieldDef>,
+    ) -> Result<String, String> {
         match edit {
             SchemaEdit::AddValues { field, values } => {
+                // What this scope inherits for the field. A local list only carries it
+                // when it splices it in (a sentinel or the deprecated `extend`); one
+                // without replaces the inherited set outright.
+                let (local_exists, local_values, inherits) =
+                    match find_field_mut(&mut self.fields, field) {
+                        Some(def) => (
+                            true,
+                            def.values.clone(),
+                            def.extend
+                                || def
+                                    .values
+                                    .as_ref()
+                                    .is_none_or(|l| l.iter().any(|v| v == VALUES_SENTINEL)),
+                        ),
+                        None => (false, None, true),
+                    };
+                let inherited_values: &[String] = inherited
+                    .and_then(|d| d.values.as_deref())
+                    .filter(|_| inherits)
+                    .unwrap_or(&[]);
+                // A value already permitted through inheritance needs no local entry:
+                // writing one would only add a redundant declaration. With nothing
+                // else to add, a scope that declares nothing yet is left alone (the
+                // caller would otherwise commit an empty schema file).
+                if values.iter().all(|v| {
+                    local_values.as_ref().is_some_and(|l| l.contains(v))
+                        || inherited_values.contains(v)
+                }) {
+                    return if local_exists {
+                        Ok(format!(
+                            "'{}' already permitted every requested value",
+                            field
+                        ))
+                    } else {
+                        Err(format!(
+                            "'{}' already permits every requested value through an ancestor's \
+                             schema; there is nothing to add here",
+                            field
+                        ))
+                    };
+                }
                 let def = field_entry_mut(&mut self.fields, field, field, || RawFieldDef {
-                    ty: Some(FieldType::Enum),
+                    // `enum` unless an ancestor already supplies a type or a values
+                    // list, which this declaration keeps through per-attribute
+                    // inheritance. A brand-new field qualifies, and so does one an
+                    // ancestor only declares attributes of (`required: true`): left
+                    // typeless, its new list would be enforced leniently and let
+                    // non-string scalars (`status: 3`) through.
+                    ty: inherited
+                        .is_none_or(|d| d.ty.is_none() && d.values.is_none())
+                        .then_some(FieldType::Enum),
                     // Left unset rather than `Some(false)`/`Some(true)`: this
                     // scope may not be the field's first declaration, and a brand
                     // new definition created just to add a value must not clobber
@@ -621,21 +775,37 @@ impl SchemaFile {
                     // inheritance in `ResolvedSchema::merged_with`.
                     required: None,
                     indexed: None,
-                    values: Some(Vec::new()),
+                    values: None,
                     extend: false,
                     default: None,
                     open: None,
                     fields: None,
                 })?;
-                let existing = def.values.get_or_insert_with(Vec::new);
+                // No local list: a fresh one would REPLACE the inherited set, so it
+                // splices that set in first. `extend: true` already means a leading
+                // sentinel, and `validate_raw` refuses the two together.
+                let splice_inherited = !def.extend && !inherited_values.is_empty();
+                let existing = def.values.get_or_insert_with(|| {
+                    if splice_inherited {
+                        vec![VALUES_SENTINEL.to_string()]
+                    } else {
+                        Vec::new()
+                    }
+                });
                 let mut added = Vec::new();
                 for value in values {
-                    if !existing.contains(value) {
+                    if !existing.contains(value) && !inherited_values.contains(value) {
                         existing.push(value.clone());
                         added.push(value.clone());
                     }
                 }
-                existing.sort();
+                // Sort only what follows the sentinel, so the inherited values keep
+                // their position in the spliced result.
+                let start = existing
+                    .iter()
+                    .position(|v| v == VALUES_SENTINEL)
+                    .map_or(0, |i| i + 1);
+                existing[start..].sort();
                 if added.is_empty() {
                     Ok(format!(
                         "'{}' already permitted every requested value",
@@ -710,7 +880,7 @@ impl ResolvedSchema {
     /// Adapt the global `frontmatter` config block into the implicit root schema.
     ///
     /// **Deprecated fallback**, used only when the knowledge base has no root
-    /// `.kb-schema.yaml` of its own — see [`SchemaCache::build`] and the module docs.
+    /// schema file of its own — see [`SchemaCache::build`] and the module docs.
     /// Lossless with respect to the pre-cascade behavior: `allowed` becomes `enum`
     /// fields, which still accept either a scalar or an array of scalars.
     pub fn from_config(config: &FrontmatterConfig) -> Self {
@@ -745,7 +915,10 @@ impl ResolvedSchema {
 
         let origin = fields
             .keys()
-            .map(|k| (k.clone(), "config.yaml".to_string()))
+            // The root scope's label, like a root schema file's: where the rules
+            // come from on the host is deployment detail, not something a caller
+            // can locate or edit.
+            .map(|k| (k.clone(), scope_label(Path::new(""))))
             .collect();
 
         Self {
@@ -802,15 +975,6 @@ impl ResolvedSchema {
             dedup_enabled: dedup.and_then(|d| d.enabled).or(self.dedup_enabled),
             dedup_threshold: dedup.and_then(|d| d.threshold).or(self.dedup_threshold),
         }
-    }
-
-    /// Dot-paths declared `indexed`.
-    pub fn indexed_fields(&self) -> Vec<String> {
-        self.fields
-            .iter()
-            .filter(|(_, def)| def.indexed)
-            .map(|(path, _)| path.clone())
-            .collect()
     }
 
     /// The payload index kind a declared type needs.
@@ -878,9 +1042,15 @@ pub struct SchemaCache {
     root: ResolvedSchema,
     /// KB root, so a scope's raw schema file can be read back for editing.
     root_path: PathBuf,
+    /// When the build that produced this cache started, in the process-wide
+    /// order of [`SchemaCache::build`] calls. [`store_shared`] never replaces a
+    /// cache with one whose build started earlier: two rebuilds racing (the
+    /// reindex worker's and `update_schema`'s) can finish in either order, and
+    /// the one that read the tree first must not win.
+    generation: u64,
 }
 
-/// One `.kb-schema.yaml` that [`SchemaCache::build`] refused, and why.
+/// One schema file that [`SchemaCache::build`] refused, and why.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub struct InvalidSchemaFile {
     /// KB-relative path of the schema file itself (not its governing directory).
@@ -888,7 +1058,7 @@ pub struct InvalidSchemaFile {
     pub reason: String,
 }
 
-/// Every invalid `.kb-schema.yaml` found by one [`SchemaCache::build`] walk, sorted
+/// Every invalid schema file found by one [`SchemaCache::build`] walk, sorted
 /// by path (`read_dir` order is unspecified, and this list is shown in startup
 /// errors and `/status`). Never empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -900,9 +1070,8 @@ impl std::fmt::Display for SchemaBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} invalid {} file(s); a schema file that is present must be valid:",
+            "{} invalid schema file(s); a schema file that is present must be valid:",
             self.invalid.len(),
-            SCHEMA_FILE_NAME
         )?;
         for file in &self.invalid {
             write!(f, "\n  - {}: {}", file.path.display(), file.reason)?;
@@ -913,31 +1082,47 @@ impl std::fmt::Display for SchemaBuildError {
 
 impl std::error::Error for SchemaBuildError {}
 
-/// True when `rel_path`'s file name is [`SCHEMA_FILE_NAME`] — a schema file, not a
-/// document, whichever directory it sits in.
-pub fn is_schema_file_path(rel_path: &Path) -> bool {
-    rel_path.file_name().is_some_and(|n| n == SCHEMA_FILE_NAME)
+impl SchemaBuildError {
+    /// The refusal as a model should read it: each invalid schema named by its scope
+    /// directory ([`scope_label`]) rather than its file path. The `Display` impl keeps
+    /// real paths for logs, `/status` and the CLI.
+    pub fn model_facing(&self) -> String {
+        let mut out = format!("{} directory schema(s) are invalid:", self.invalid.len());
+        for file in &self.invalid {
+            let dir = file.path.parent().unwrap_or(Path::new(""));
+            out.push_str(&format!(
+                "\n  - {}: {}",
+                scope_label(dir),
+                model_facing_reason(&file.reason)
+            ));
+        }
+        out
+    }
 }
 
-/// Parse and self-validate one `.kb-schema.yaml`'s text — the per-file check
+/// True when `rel_path`'s file name is one of [`SCHEMA_FILE_NAMES`] — a schema file,
+/// not a document, whichever directory it sits in.
+pub fn is_schema_file_path(rel_path: &Path) -> bool {
+    rel_path
+        .file_name()
+        .is_some_and(|n| SCHEMA_FILE_NAMES.iter().any(|name| n == *name))
+}
+
+/// Parse and self-validate one schema file's text — the per-file check
 /// [`SchemaCache::build`] applies, and the reason it gives on failure. Also
 /// enforces [`MAX_SCHEMA_FILE_BYTES`] on the text itself, for callers that already
 /// hold the content (`write::move_directory`, checking the schema files it is about
 /// to carry along).
 pub(crate) fn parse_schema_text(text: &str) -> Result<SchemaFile, String> {
     if text.len() as u64 > MAX_SCHEMA_FILE_BYTES {
-        return Err(format!(
-            "file is {} bytes, over the {} byte limit; a schema this large is not parsed",
-            text.len(),
-            MAX_SCHEMA_FILE_BYTES
-        ));
+        return Err(over_size_limit_reason(text.len() as u64));
     }
     let file = serde_yaml_ng::from_str::<SchemaFile>(text).map_err(|e| e.to_string())?;
     file.validate_self()?;
     Ok(file)
 }
 
-/// Which directories' `.kb-schema.yaml` files are part of the schema tree (#272):
+/// Which directories' schema files are part of the schema tree (#272):
 /// every directory except a hidden one (any path component starting with `.`) and
 /// one whose every document `indexing.exclude` rules out
 /// ([`crate::ingest::PathFilter::excludes_dir`]). A schema in such a directory
@@ -959,7 +1144,7 @@ impl SchemaWalkFilter {
             Ok(f) => Self { paths: Some(f) },
             Err(e) => {
                 tracing::error!(
-                    "Failed to build indexing path filter; reading {SCHEMA_FILE_NAME} in \
+                    "Failed to build indexing path filter; reading schema files in \
                      every non-hidden directory, excluded ones included: {e:#}"
                 );
                 Self { paths: None }
@@ -984,7 +1169,7 @@ impl SchemaWalkFilter {
             .is_some_and(|f| f.excludes_dir(&rel_dir.to_string_lossy()))
     }
 
-    /// Whether KB-relative `rel_path` is a `.kb-schema.yaml` that is part of the
+    /// Whether KB-relative `rel_path` is a schema file that is part of the
     /// schema tree — the test a changed path must pass to queue a schema rebuild.
     pub(crate) fn governs(&self, rel_path: &Path) -> bool {
         is_schema_file_path(rel_path) && self.reads_dir(rel_path.parent().unwrap_or(Path::new("")))
@@ -998,9 +1183,9 @@ impl SchemaWalkFilter {
 /// clones the `Arc`, and drops the guard immediately (see [`load_shared`]) — a
 /// handful of atomic operations — which is cheap enough for a read-mostly value
 /// that pulling in a new dependency for lock-free swaps is not justified. The
-/// outer `Arc` is what makes this cloneable across the MCP handler, the reindex
-/// worker, and the instructions-refresh timer, all of which hold a handle to the
-/// SAME lock rather than independent copies.
+/// outer `Arc` is what makes this cloneable across the MCP handler, the web UI,
+/// and the reindex worker, all of which hold a handle to the SAME lock rather than
+/// independent copies.
 pub type SharedSchemaCache = Arc<RwLock<Arc<SchemaCache>>>;
 
 /// Clone the current cache out of `shared`. Cheap: a lock acquisition plus an
@@ -1023,13 +1208,27 @@ pub fn load_shared(shared: &SharedSchemaCache) -> Arc<SchemaCache> {
 /// Callers of [`load_shared`] that are already mid-read hold their own `Arc` clone
 /// and are unaffected by a swap landing underneath them — they simply keep using
 /// the snapshot they took, and the next `load_shared` call sees the new one.
+///
+/// A cache whose build started before the one already installed is discarded
+/// (see [`SchemaCache::generation`]): it read an older tree.
 pub fn store_shared(shared: &SharedSchemaCache, new: SchemaCache) {
-    let new = Arc::new(new);
-    match shared.write() {
-        Ok(mut guard) => *guard = new,
-        Err(poisoned) => *poisoned.into_inner() = new,
+    let mut guard = match shared.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if new.generation < guard.generation {
+        tracing::debug!(
+            "Discarding a schema rebuild that started before the installed one ({} < {})",
+            new.generation,
+            guard.generation
+        );
+        return;
     }
+    *guard = Arc::new(new);
 }
+
+/// The process-wide order of [`SchemaCache::build`] calls.
+static REBUILD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Apply the result of a runtime [`SchemaCache::build`] to `shared` — the one
 /// policy every runtime rebuild (the reindex worker, `update_schema`) goes through.
@@ -1059,7 +1258,7 @@ pub fn apply_rebuild(
             store_shared(shared, schemas);
             if status.schema_error().is_some() {
                 tracing::info!(
-                    "{context}: every {SCHEMA_FILE_NAME} is valid again; the rebuilt schema \
+                    "{context}: every schema file is valid again; the rebuilt schema \
                      is now in effect"
                 );
             }
@@ -1122,7 +1321,7 @@ fn merge_cascade(
 
     for rel_dir in order {
         let file = &files[rel_dir];
-        let origin = rel_dir.join(SCHEMA_FILE_NAME).to_string_lossy().to_string();
+        let origin = scope_label(rel_dir);
         let is_root = rel_dir.as_os_str().is_empty();
         let merged = if is_root {
             root_file_found = true;
@@ -1134,12 +1333,12 @@ fn merge_cascade(
                 // reconcile sweep, so an operator tailing logs sees it consistently
                 // rather than only at the one moment it first became true.
                 warn!(
-                    "a root {} exists at the knowledge-base root; config.yaml's \
+                    "a root schema file exists at the knowledge-base root; config.yaml's \
                      `frontmatter` block no longer applies there — its \
                      required/indexed_fields/defaults/allowed entries are ignored \
                      unless the same fields are also declared in the root {}. Move \
                      anything still needed into it.",
-                    SCHEMA_FILE_NAME, SCHEMA_FILE_NAME
+                    SCHEMA_FILE_NAME
                 );
             }
             // Replaces, not merges: an empty base, not `config_root`.
@@ -1152,17 +1351,17 @@ fn merge_cascade(
     }
 
     if !root_file_found && !config_root.fields.is_empty() {
-        // The deprecated fallback: no root `.kb-schema.yaml` in this map, so
+        // The deprecated fallback: no root schema file in this map, so
         // config.yaml's `frontmatter` block is standing in as the root schema.
         // Still fully supported (see module docs), but this is the direction we
         // want deployments to move away from — flag it every time this runs, same
         // as the "config overridden" warning above, so it stays visible for as
         // long as it is true rather than only at startup.
         warn!(
-            "no root {} found; falling back to the deprecated `frontmatter` block \
-             in config.yaml for root-level rules. This still works, but a root {} \
+            "no root schema file found; falling back to the deprecated `frontmatter` \
+             block in config.yaml for root-level rules. This still works, but a root {} \
              is the non-deprecated way to declare them — see deploy/USAGE.md.",
-            SCHEMA_FILE_NAME, SCHEMA_FILE_NAME
+            SCHEMA_FILE_NAME
         );
     }
 
@@ -1184,11 +1383,11 @@ impl SchemaCache {
     /// One pass over the tree, not one per document: resolution afterwards is an
     /// in-memory prefix lookup that touches no filesystem.
     ///
-    /// A root `.kb-schema.yaml` (governing directory `""`) is handled differently from
+    /// A root schema file (governing directory `""`) is handled differently from
     /// every other scope: instead of merging onto its nearest ancestor — which, at the
     /// root, would mean merging onto the config-derived schema — it REPLACES the
     /// config-derived root outright. Config-derived root rules apply only when no root
-    /// `.kb-schema.yaml` exists at all. See the module docs for why: the config block
+    /// schema file exists at all. See the module docs for why: the config block
     /// is deployment config on the container host, and a KB that brings its own root
     /// schema file must not have that schema silently blended with whatever
     /// `frontmatter` block the current host's `config.yaml` happens to declare.
@@ -1200,7 +1399,7 @@ impl SchemaCache {
     /// [`SchemaCache::with_remapped_scopes`], the merge algorithm's other caller) has
     /// no way to produce, since it starts from content that already parsed.
     ///
-    /// Fail-fast: a `.kb-schema.yaml` that is present must be valid. Any file that
+    /// Fail-fast: a schema file that is present must be valid. Any file that
     /// cannot be read, is over [`MAX_SCHEMA_FILE_BYTES`], fails to parse, or fails
     /// [`SchemaFile::validate_self`] makes the whole build an error — every such file
     /// is collected into the one [`SchemaBuildError`], not just the first, so one
@@ -1212,11 +1411,17 @@ impl SchemaCache {
     /// Only the indexed tree is walked: a hidden directory, or one `indexing.exclude`
     /// rules out entirely, is never read (see [`SchemaWalkFilter`]), so a broken
     /// schema under `templates/**` cannot stop anything (#272).
+    ///
+    /// A directory holding both [`SCHEMA_FILE_NAME`] and [`LEGACY_SCHEMA_FILE_NAME`]
+    /// is an invalid schema file ([`BOTH_NAMES_REASON`]), never resolved by picking
+    /// one: the two could disagree, and which one wins would be invisible.
     pub fn build(
         data_path: &Path,
         fallback: &FrontmatterConfig,
         indexing: &crate::config::IndexingConfig,
     ) -> Result<Self, SchemaBuildError> {
+        // Stamped before the walk reads anything: see `SchemaCache::generation`.
+        let generation = REBUILD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let config_root = ResolvedSchema::from_config(fallback);
         let walk = SchemaWalkFilter::from_config(indexing);
         let mut discovered: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -1225,17 +1430,32 @@ impl SchemaCache {
         let mut raw: BTreeMap<PathBuf, SchemaFile> = BTreeMap::new();
         let mut invalid: Vec<InvalidSchemaFile> = Vec::new();
 
+        let mut seen: BTreeSet<&Path> = BTreeSet::new();
+        let doubled: BTreeSet<PathBuf> = discovered
+            .iter()
+            .filter(|(rel_dir, _)| !seen.insert(rel_dir.as_path()))
+            .map(|(rel_dir, _)| rel_dir.clone())
+            .collect();
+        for dir in &doubled {
+            invalid.push(InvalidSchemaFile {
+                path: dir.join(LEGACY_SCHEMA_FILE_NAME),
+                reason: BOTH_NAMES_REASON.to_string(),
+            });
+        }
+
         for (rel_dir, abs_file) in discovered {
+            if doubled.contains(&rel_dir) {
+                continue;
+            }
+            let file_name = abs_file
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(SCHEMA_FILE_NAME));
             let parsed = std::fs::metadata(&abs_file)
                 .map_err(|e| format!("could not stat: {e}"))
                 .and_then(|meta| {
                     if meta.len() > MAX_SCHEMA_FILE_BYTES {
-                        Err(format!(
-                            "file is {} bytes, over the {} byte limit; a schema this \
-                             large is not parsed",
-                            meta.len(),
-                            MAX_SCHEMA_FILE_BYTES
-                        ))
+                        Err(over_size_limit_reason(meta.len()))
                     } else {
                         Ok(())
                     }
@@ -1251,7 +1471,7 @@ impl SchemaCache {
                     raw.insert(rel_dir, file);
                 }
                 Err(reason) => invalid.push(InvalidSchemaFile {
-                    path: rel_dir.join(SCHEMA_FILE_NAME),
+                    path: rel_dir.join(file_name),
                     reason,
                 }),
             }
@@ -1269,6 +1489,7 @@ impl SchemaCache {
             raw,
             root: config_root,
             root_path: data_path.to_path_buf(),
+            generation,
         })
     }
 
@@ -1333,18 +1554,77 @@ impl SchemaCache {
             raw,
             root: self.root.clone(),
             root_path: self.root_path.clone(),
+            generation: self.generation,
         }
     }
 
-    /// The raw, unmerged schema file governing `rel_dir`, or an empty one when that
-    /// directory has no schema of its own.
-    pub fn raw_file_at(&self, rel_dir: &Path) -> Result<SchemaFile, String> {
-        let file = self.root_path.join(rel_dir).join(SCHEMA_FILE_NAME);
-        match std::fs::read_to_string(&file) {
-            Ok(text) => serde_yaml_ng::from_str(&text).map_err(|e| e.to_string()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SchemaFile::default()),
-            Err(e) => Err(e.to_string()),
+    /// The raw, unmerged schema file governing `rel_dir`, read from disk, and the
+    /// name it is stored under ([`SCHEMA_FILE_NAME`] or [`LEGACY_SCHEMA_FILE_NAME`]);
+    /// an empty file and `None` when that directory has no schema of its own. Both
+    /// names present is an error, as it is for [`Self::build`].
+    ///
+    /// A candidate is read the way [`Self::build`]'s walk finds one
+    /// ([`read_schema_candidate`]): a symlink or any other non-regular entry is not a
+    /// schema file, so it is absent here too — and so does not count toward the
+    /// both-names error — and a regular file over [`MAX_SCHEMA_FILE_BYTES`] is an
+    /// error before it is read.
+    pub fn raw_file_at(
+        &self,
+        rel_dir: &Path,
+    ) -> Result<(SchemaFile, Option<&'static str>), String> {
+        let mut found: Option<(SchemaFile, &'static str)> = None;
+        for name in SCHEMA_FILE_NAMES {
+            let file = self.root_path.join(rel_dir).join(name);
+            let Some(text) = read_schema_candidate(&file)? else {
+                continue;
+            };
+            if found.is_some() {
+                return Err(BOTH_NAMES_REASON.to_string());
+            }
+            let parsed = serde_yaml_ng::from_str(&text).map_err(|e| e.to_string())?;
+            found = Some((parsed, name));
         }
+        Ok(match found {
+            Some((file, name)) => (file, Some(name)),
+            None => (SchemaFile::default(), None),
+        })
+    }
+
+    /// What `rel_dir` resolves to with its own schema file replaced by `own`
+    /// (`None`: what its ancestors alone resolve it to), every ancestor's file
+    /// read from disk through [`Self::raw_file_at`] rather than taken from this
+    /// cache — `update_schema` calls it under the write lock, so it sees the
+    /// same files the edit itself is applied to. The root follows [`Self::build`]'s
+    /// policy: a root schema file on disk (or `own` at the root) replaces the
+    /// config-derived root outright.
+    pub fn resolve_from_disk(
+        &self,
+        rel_dir: &Path,
+        own: Option<&SchemaFile>,
+    ) -> Result<ResolvedSchema, String> {
+        let mut ancestors: Vec<&Path> = rel_dir.ancestors().skip(1).collect();
+        ancestors.reverse();
+        let mut chain: Vec<(&Path, SchemaFile)> = Vec::new();
+        let mut root_file = rel_dir.as_os_str().is_empty() && own.is_some();
+        for dir in ancestors {
+            let (file, name) = self.raw_file_at(dir)?;
+            if name.is_some() {
+                root_file |= dir.as_os_str().is_empty();
+                chain.push((dir, file));
+            }
+        }
+        let mut resolved = if root_file {
+            ResolvedSchema::default()
+        } else {
+            self.root.clone()
+        };
+        for (dir, file) in &chain {
+            resolved = resolved.merged_with(file, &scope_label(dir));
+        }
+        if let Some(own) = own {
+            resolved = resolved.merged_with(own, &scope_label(rel_dir));
+        }
+        Ok(resolved)
     }
 
     /// The schema `doc_path` would resolve to if `edited_dir`'s schema file held
@@ -1382,7 +1662,7 @@ impl SchemaCache {
         }
         chain.sort_by_key(|(scope, _)| scope.components().count());
 
-        // Mirrors `build`'s root policy: when a root `.kb-schema.yaml` governs this
+        // Mirrors `build`'s root policy: when a root schema file governs this
         // document — one already exists on disk, or this very edit is creating one —
         // `chain` already contains an entry for `""` (real or candidate) that fully
         // determines the root's fields, so starting from the config-derived root here
@@ -1397,7 +1677,7 @@ impl SchemaCache {
             self.root.clone()
         };
         for (scope, file) in chain {
-            let origin = scope.join(SCHEMA_FILE_NAME).to_string_lossy().to_string();
+            let origin = scope_label(scope);
             resolved = resolved.merged_with(file, &origin);
         }
         Some(resolved)
@@ -1413,6 +1693,7 @@ impl SchemaCache {
             raw: BTreeMap::new(),
             root: ResolvedSchema::from_config(fallback),
             root_path: PathBuf::new(),
+            generation: 0,
         }
     }
 
@@ -1422,7 +1703,7 @@ impl SchemaCache {
         nearest_schema(&self.scopes, dir).unwrap_or(&self.root)
     }
 
-    /// The root schema: from a root `.kb-schema.yaml` when one exists, otherwise the
+    /// The root schema: from a root schema file when one exists, otherwise the
     /// config-derived fallback. See [`SchemaCache::build`] for why these don't merge.
     pub fn root(&self) -> &ResolvedSchema {
         self.scopes
@@ -1516,13 +1797,82 @@ impl SchemaCache {
         self.scopes.iter().map(|(dir, _)| dir)
     }
 
-    /// Scopes whose resolved schema carries at least one field rule, shallowest
-    /// first. A scope that only sets `dedup:` has no frontmatter rules to advertise.
-    pub fn field_scope_paths(&self) -> impl Iterator<Item = &PathBuf> {
-        self.scopes
-            .iter()
-            .filter(|(_, schema)| !schema.fields.is_empty())
-            .map(|(dir, _)| dir)
+    /// Every field path declared anywhere in the tree — the root and every
+    /// scope — for `search`'s unknown-filter-field check and for `get_schema`'s
+    /// `other_fields_in_use`, so the two agree on what counts as undeclared.
+    pub fn declared_field_paths(&self) -> BTreeSet<String> {
+        std::iter::once(self.root())
+            .chain(self.scopes.iter().map(|(_, schema)| schema))
+            .flat_map(|schema| schema.fields.keys().cloned())
+            .collect()
+    }
+
+    /// The closed value set a `search` filter on `field` is checked against,
+    /// or `None` when the field is open (no value check).
+    ///
+    /// Governing scopes: `path_needle` is `search`'s `path_prefix` exactly as
+    /// `retrieval::normalize_path_needle` returns it — the one needle search
+    /// and enumeration match on — and is only case-folded here, never trimmed
+    /// again: `/food` is a fragment of a deeper path (`lifestyle/food/a.md`),
+    /// not of a top-level `food/a.md`, so it does not name the `food/` scope
+    /// the way `food` does. It is a case-insensitive substring of a document
+    /// path, so it narrows to the scopes whose directory contains the needle
+    /// or is contained in it (`food/` and `food/recipes/` for `food`;
+    /// `food/recipes/` for `food/recipes/pasta`). A needle no scope directory
+    /// matches (a file-name fragment), or no needle, governs by the union of
+    /// every scope and the root. The field is closed only when at least one
+    /// governing scope gives it `values` and none declares it without them;
+    /// the result is the union of those sets. A scope that does not declare
+    /// the field at all does not open it: the caller also accepts any value
+    /// documents actually use, so a value this rejects matches nothing anyway.
+    pub fn filter_closed_values(
+        &self,
+        field: &str,
+        path_needle: Option<&str>,
+    ) -> Option<BTreeSet<String>> {
+        let all: Vec<(String, &ResolvedSchema)> =
+            std::iter::once((scope_label(Path::new("")), self.root()))
+                .chain(
+                    self.scopes
+                        .iter()
+                        .filter(|(dir, _)| !dir.as_os_str().is_empty())
+                        .map(|(dir, schema)| (scope_label(dir), schema)),
+                )
+                .collect();
+        let needle = path_needle.map(str::to_lowercase).filter(|n| !n.is_empty());
+        let narrowed: Vec<&ResolvedSchema> = match &needle {
+            Some(needle) => all
+                .iter()
+                .filter(|(label, _)| label != "/")
+                .filter(|(label, _)| {
+                    let label = label.to_lowercase();
+                    label.contains(needle.as_str())
+                        || format!("{needle}/").starts_with(label.as_str())
+                })
+                .map(|(_, schema)| *schema)
+                .collect(),
+            None => Vec::new(),
+        };
+        let governing: Vec<&ResolvedSchema> = if narrowed.is_empty() {
+            all.iter().map(|(_, schema)| *schema).collect()
+        } else {
+            narrowed
+        };
+
+        let mut closed: Option<BTreeSet<String>> = None;
+        for schema in governing {
+            match schema.fields.get(field) {
+                None => {}
+                Some(FieldDef { values: None, .. }) => return None,
+                Some(FieldDef {
+                    values: Some(values),
+                    ..
+                }) => closed
+                    .get_or_insert_with(BTreeSet::new)
+                    .extend(values.iter().cloned()),
+            }
+        }
+        closed
     }
 }
 
@@ -1572,9 +1922,40 @@ fn collect_schema_files(
 
         if file_type.is_dir() {
             collect_schema_files(root, &path, walk, out);
-        } else if file_type.is_file() && entry.file_name() == SCHEMA_FILE_NAME {
+        } else if file_type.is_file()
+            && SCHEMA_FILE_NAMES
+                .iter()
+                .any(|name| entry.file_name() == *name)
+        {
             out.push((rel_dir.to_path_buf(), path));
         }
+    }
+}
+
+/// The text of the schema file candidate at `path`, read the way
+/// [`collect_schema_files`] finds one: a symlink, or anything else that is not a
+/// regular file, is not a schema file at all (`Ok(None)`) and is neither followed nor
+/// read. Schema files arrive through git, which can plant a link at a schema file's
+/// name; following it would read outside the tree, and a parse error would echo what
+/// it points at to the caller. A regular file over [`MAX_SCHEMA_FILE_BYTES`] is an
+/// error on its metadata size alone, before it is read.
+fn read_schema_candidate(path: &Path) -> Result<Option<String>, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !meta.file_type().is_file() {
+        return Ok(None);
+    }
+    if meta.len() > MAX_SCHEMA_FILE_BYTES {
+        return Err(over_size_limit_reason(meta.len()));
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        // Removed between the stat and the read.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -1700,7 +2081,7 @@ pub fn check_type(ty: FieldType, value: &Value) -> Result<(), String> {
 /// This is the *lenient* counterpart to [`check_values`] — same `values` concept, two
 /// enforcement regimes. `validate::field_errors` is the dispatch point: it calls this
 /// function when `def.ty` is `None` and `check_values` when `def.ty` is `Some(_)`,
-/// regardless of which config surface (`config.yaml` `allowed` vs `.kb-schema.yaml`
+/// regardless of which config surface (`config.yaml` `allowed` vs schema file
 /// `values`) produced the field. The split is deliberate (see [`RawFieldDef::values`]
 /// for the full rationale) — do not converge these two functions.
 pub fn check_values_lenient(value: &Value, permitted: Option<&[String]>) -> Result<(), String> {
@@ -2383,7 +2764,7 @@ mod tests {
         let err = SchemaCache::build(dir.path(), &empty_config(), &Default::default()).unwrap_err();
 
         assert_eq!(err.invalid.len(), 1);
-        assert_eq!(err.invalid[0].path, Path::new("bad/.kb-schema.yaml"));
+        assert_eq!(err.invalid[0].path, Path::new("bad/.schema.yaml"));
         assert!(err.invalid[0].reason.contains("$oops"), "got: {err}");
     }
 
@@ -2635,7 +3016,7 @@ mod tests {
         let err = SchemaCache::build(dir.path(), &empty_config(), &Default::default()).unwrap_err();
 
         let paths: Vec<_> = err.invalid.iter().map(|f| f.path.clone()).collect();
-        assert_eq!(paths, vec![PathBuf::from("bad/.kb-schema.yaml")]);
+        assert_eq!(paths, vec![PathBuf::from("bad/.schema.yaml")]);
     }
 
     /// #272: only the indexed tree is walked. A broken schema under a directory
@@ -2668,7 +3049,7 @@ mod tests {
         write_schema(dir.path(), "archive", "fields: [broken\n");
         let err = SchemaCache::build(dir.path(), &empty_config(), &indexing).unwrap_err();
         let paths: Vec<_> = err.invalid.iter().map(|f| f.path.clone()).collect();
-        assert_eq!(paths, vec![PathBuf::from("archive/.kb-schema.yaml")]);
+        assert_eq!(paths, vec![PathBuf::from("archive/.schema.yaml")]);
 
         // With no exclude rule for it, templates/ is part of the tree again.
         let err = SchemaCache::build(dir.path(), &empty_config(), &Default::default()).unwrap_err();
@@ -2676,9 +3057,9 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                PathBuf::from("archive/.kb-schema.yaml"),
-                PathBuf::from("templates/.kb-schema.yaml"),
-                PathBuf::from("templates/deep/.kb-schema.yaml"),
+                PathBuf::from("archive/.schema.yaml"),
+                PathBuf::from("templates/.schema.yaml"),
+                PathBuf::from("templates/deep/.schema.yaml"),
             ]
         );
     }
@@ -2728,29 +3109,29 @@ mod tests {
             .map(|f| (f.path.to_string_lossy().into_owned(), f.reason.clone()))
             .collect();
         assert_eq!(by_path.len(), 4, "got: {err}");
-        assert!(by_path.remove("parse/.kb-schema.yaml").is_some());
+        assert!(by_path.remove("parse/.schema.yaml").is_some());
         assert!(
             by_path
-                .remove("dedup/.kb-schema.yaml")
+                .remove("dedup/.schema.yaml")
                 .unwrap()
                 .contains("dedup.threshold")
         );
         assert!(
             by_path
-                .remove("unknown/.kb-schema.yaml")
+                .remove("unknown/.schema.yaml")
                 .unwrap()
                 .contains("fieldz")
         );
         assert!(
             by_path
-                .remove("big/.kb-schema.yaml")
+                .remove("big/.schema.yaml")
                 .unwrap()
                 .contains("byte limit")
         );
 
         let shown = err.to_string();
         for dir in ["parse", "dedup", "unknown", "big"] {
-            assert!(shown.contains(&format!("{dir}/.kb-schema.yaml")), "{shown}");
+            assert!(shown.contains(&format!("{dir}/.schema.yaml")), "{shown}");
         }
         assert!(!shown.contains("good/"), "{shown}");
         // Schema files arrive via git sync and are untrusted; deeply nested YAML
@@ -2804,7 +3185,7 @@ mod tests {
             "previous cache kept"
         );
         let recorded = status.schema_error().expect("refusal recorded");
-        assert_eq!(recorded.files[0].path, Path::new("bad/.kb-schema.yaml"));
+        assert_eq!(recorded.files[0].path, Path::new("bad/.schema.yaml"));
 
         fs::remove_dir_all(dir.path().join("bad")).unwrap();
         write_schema(dir.path(), "", "fields:\n  title:\n    required: false\n");
@@ -2820,6 +3201,433 @@ mod tests {
         assert!(is_schema_file_path(Path::new("a/b/.kb-schema.yaml")));
         assert!(!is_schema_file_path(Path::new("a/.kb-schema.yaml.md")));
         assert!(!is_schema_file_path(Path::new(".kb-schema.yaml/doc.md")));
+        assert!(is_schema_file_path(Path::new(".schema.yaml")));
+        assert!(is_schema_file_path(Path::new("a/b/.schema.yaml")));
+        assert!(!is_schema_file_path(Path::new("a/.schema.yaml.md")));
+        assert!(!is_schema_file_path(Path::new("a/schema.yaml")));
+    }
+
+    #[test]
+    fn scope_label_names_the_directory_with_root_as_slash() {
+        assert_eq!(scope_label(Path::new("")), "/");
+        assert_eq!(scope_label(Path::new("food/recipes")), "food/recipes/");
+    }
+
+    #[test]
+    fn either_schema_file_name_is_discovered_on_its_own() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "new", "fields:\n  a:\n    required: true\n");
+        fs::create_dir_all(dir.path().join("old")).unwrap();
+        fs::write(
+            dir.path().join("old").join(LEGACY_SCHEMA_FILE_NAME),
+            "fields:\n  b:\n    required: true\n",
+        )
+        .unwrap();
+
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+        let new = cache.resolve_for(Path::new("new/doc.md"));
+        assert!(new.fields["a"].required);
+        assert_eq!(new.origin["a"], "new/");
+        let old = cache.resolve_for(Path::new("old/doc.md"));
+        assert!(old.fields["b"].required);
+        assert_eq!(old.origin["b"], "old/");
+
+        let (_, name) = cache.raw_file_at(Path::new("new")).unwrap();
+        assert_eq!(name, Some(SCHEMA_FILE_NAME));
+        let (file, name) = cache.raw_file_at(Path::new("old")).unwrap();
+        assert_eq!(name, Some(LEGACY_SCHEMA_FILE_NAME));
+        assert!(file.fields.contains_key("b"));
+        let (file, name) = cache.raw_file_at(Path::new("none")).unwrap();
+        assert_eq!(name, None);
+        assert!(file.fields.is_empty());
+    }
+
+    #[test]
+    fn both_schema_file_names_in_one_directory_fail_the_build() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "both", "fields:\n  a:\n    required: true\n");
+        fs::write(
+            dir.path().join("both").join(LEGACY_SCHEMA_FILE_NAME),
+            "fields:\n  a:\n    required: false\n",
+        )
+        .unwrap();
+        write_schema(dir.path(), "fine", "fields:\n  b:\n    required: true\n");
+
+        let err = SchemaCache::build(dir.path(), &empty_config(), &Default::default())
+            .expect_err("both names in one directory must not resolve silently");
+        assert_eq!(err.invalid.len(), 1, "{err}");
+        assert_eq!(
+            err.invalid[0].path,
+            Path::new("both").join(LEGACY_SCHEMA_FILE_NAME)
+        );
+        assert_eq!(err.invalid[0].reason, BOTH_NAMES_REASON);
+
+        let cache = SchemaCache::from_config_only(&empty_config());
+        let cache = SchemaCache {
+            root_path: dir.path().to_path_buf(),
+            ..cache
+        };
+        assert_eq!(
+            cache.raw_file_at(Path::new("both")).unwrap_err(),
+            BOTH_NAMES_REASON
+        );
+    }
+
+    /// A cache rooted at `root` that has walked nothing: `raw_file_at` reads from
+    /// disk whatever the cache holds, so a test can shape the tree around it.
+    fn cache_rooted_at(root: &Path) -> SchemaCache {
+        SchemaCache {
+            root_path: root.to_path_buf(),
+            ..SchemaCache::from_config_only(&empty_config())
+        }
+    }
+
+    #[test]
+    fn a_symlinked_schema_file_is_absent_to_raw_file_at_and_never_echoed() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        // A one-line scalar outside the tree: what a schema parse error would quote.
+        let secret = outside.path().join("secret");
+        fs::write(&secret, "hunter2-not-a-schema\n").unwrap();
+        write_schema(dir.path(), "", "fields:\n  title:\n    required: true\n");
+        for (scope, name) in [
+            ("notes", SCHEMA_FILE_NAME),
+            ("old", LEGACY_SCHEMA_FILE_NAME),
+        ] {
+            fs::create_dir_all(dir.path().join(scope).join("sub")).unwrap();
+            std::os::unix::fs::symlink(&secret, dir.path().join(scope).join(name)).unwrap();
+        }
+
+        // The walk never sees a link, so the build is clean...
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+        for scope in ["notes", "old"] {
+            // ...and the on-disk read agrees: no schema file, so no error to leak from.
+            let (file, name) = cache
+                .raw_file_at(Path::new(scope))
+                .unwrap_or_else(|e| panic!("{scope}: a symlinked schema file is absent: {e}"));
+            assert_eq!(name, None, "{scope}");
+            assert!(file.fields.is_empty(), "{scope}");
+
+            let sub = Path::new(scope).join("sub");
+            let from_disk = cache
+                .resolve_from_disk(&sub, None)
+                .unwrap_or_else(|e| panic!("{scope}: the resolver reads it as absent: {e}"));
+            assert_eq!(
+                &from_disk,
+                cache.resolve_for(&sub.join("doc.md")),
+                "{scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlinked_or_non_regular_schema_name_does_not_count_toward_both_names() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let other = outside.path().join("other.yaml");
+        fs::write(&other, "fields:\n  other:\n    required: true\n").unwrap();
+        let regular = "fields:\n  a:\n    required: true\n";
+
+        // A regular canonical file beside a link at the legacy name...
+        write_schema(dir.path(), "canonical", regular);
+        let link = dir.path().join("canonical").join(LEGACY_SCHEMA_FILE_NAME);
+        std::os::unix::fs::symlink(&other, link).unwrap();
+        // ...a regular legacy file beside a link at the canonical name...
+        fs::create_dir_all(dir.path().join("legacy")).unwrap();
+        fs::write(
+            dir.path().join("legacy").join(LEGACY_SCHEMA_FILE_NAME),
+            regular,
+        )
+        .unwrap();
+        let link = dir.path().join("legacy").join(SCHEMA_FILE_NAME);
+        std::os::unix::fs::symlink(&other, link).unwrap();
+        // ...and a directory squatting on the canonical name.
+        fs::create_dir_all(dir.path().join("squat").join(SCHEMA_FILE_NAME)).unwrap();
+
+        // The walk finds exactly one file in the first two directories and none in
+        // the third, so `raw_file_at` must too.
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+        for (scope, expected) in [
+            ("canonical", Some(SCHEMA_FILE_NAME)),
+            ("legacy", Some(LEGACY_SCHEMA_FILE_NAME)),
+            ("squat", None),
+        ] {
+            let (file, name) = cache
+                .raw_file_at(Path::new(scope))
+                .unwrap_or_else(|e| panic!("{scope}: {e}"));
+            assert_eq!(name, expected, "{scope}");
+            assert_eq!(file.fields.contains_key("a"), expected.is_some(), "{scope}");
+            assert!(
+                !file.fields.contains_key("other"),
+                "{scope}: link target read"
+            );
+        }
+    }
+
+    #[test]
+    fn an_oversized_schema_file_is_refused_on_its_size_before_it_is_read() {
+        let dir = TempDir::new().unwrap();
+        let cache = cache_rooted_at(dir.path());
+        let limit = MAX_SCHEMA_FILE_BYTES as usize;
+        // Valid YAML padded with a comment to exactly the limit.
+        let head = "fields:\n  a:\n    required: true\n";
+        let at_limit = format!("{head}{}", "#".repeat(limit - head.len()));
+        assert_eq!(at_limit.len(), limit);
+
+        for (i, name) in SCHEMA_FILE_NAMES.into_iter().enumerate() {
+            let scope = format!("big{i}");
+            let target = dir.path().join(&scope);
+            fs::create_dir_all(&target).unwrap();
+
+            // Not UTF-8, so reading it first would fail with a different message:
+            // getting the size reason proves the size was checked before the read.
+            fs::write(target.join(name), vec![0xFF; limit + 1]).unwrap();
+            let err = cache.raw_file_at(Path::new(&scope)).unwrap_err();
+            assert_eq!(
+                err,
+                over_size_limit_reason(MAX_SCHEMA_FILE_BYTES + 1),
+                "{name}"
+            );
+            assert!(err.contains("byte limit"), "{err}");
+
+            // The limit itself is still readable.
+            fs::write(target.join(name), &at_limit).unwrap();
+            let (file, found) = cache.raw_file_at(Path::new(&scope)).unwrap();
+            assert_eq!(found, Some(name));
+            assert_eq!(file.fields["a"].required, Some(true));
+        }
+    }
+
+    fn inherited_tags(values: &[&str]) -> FieldDef {
+        FieldDef {
+            ty: Some(FieldType::List),
+            required: false,
+            indexed: false,
+            values: Some(values.iter().map(|v| v.to_string()).collect()),
+            default: None,
+            open: true,
+        }
+    }
+
+    #[test]
+    fn add_values_in_a_child_scope_extends_the_inherited_set() {
+        let dir = TempDir::new().unwrap();
+        write_schema(
+            dir.path(),
+            "",
+            "fields:\n  tags:\n    type: list\n    values: [a, b]\n",
+        );
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+        let inherited = cache.resolve_for(Path::new("_")).fields["tags"].clone();
+
+        let mut child = SchemaFile::default();
+        child
+            .apply_inheriting(
+                &SchemaEdit::AddValues {
+                    field: "tags".into(),
+                    values: vec!["c".into()],
+                },
+                Some(&inherited),
+            )
+            .unwrap();
+        let tags = &child.fields["tags"];
+        assert_eq!(
+            tags.values.as_deref(),
+            Some(&[VALUES_SENTINEL.to_string(), "c".to_string()][..])
+        );
+        assert_eq!(tags.ty, None, "the inherited type is kept");
+
+        write_schema(dir.path(), "child", &child.to_yaml().unwrap());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+        let resolved = &cache.resolve_for(Path::new("child/doc.md")).fields["tags"];
+        assert_eq!(
+            resolved.values.as_deref(),
+            Some(&["a".to_string(), "b".to_string(), "c".to_string()][..])
+        );
+        assert_eq!(resolved.ty, Some(FieldType::List));
+    }
+
+    #[test]
+    fn add_values_keeps_the_sentinel_leading_and_a_local_list_without_it_as_is() {
+        let inherited = inherited_tags(&["a"]);
+
+        // A second add keeps `$values` first; only what follows it is sorted.
+        let mut file = SchemaFile::default();
+        for value in ["z", "m"] {
+            file.apply_inheriting(
+                &SchemaEdit::AddValues {
+                    field: "tags".into(),
+                    values: vec![value.into()],
+                },
+                Some(&inherited),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            file.fields["tags"].values.as_deref(),
+            Some(
+                &[
+                    VALUES_SENTINEL.to_string(),
+                    "m".to_string(),
+                    "z".to_string()
+                ][..]
+            )
+        );
+
+        // A local list that deliberately replaces the inherited set stays a
+        // replacement: the new value is appended, no sentinel added.
+        let mut file: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [x]\n").unwrap();
+        file.apply_inheriting(
+            &SchemaEdit::AddValues {
+                field: "tags".into(),
+                values: vec!["y".into()],
+            },
+            Some(&inherited),
+        )
+        .unwrap();
+        assert_eq!(
+            file.fields["tags"].values.as_deref(),
+            Some(&["x".to_string(), "y".to_string()][..])
+        );
+
+        // Nothing inherited: a fresh `enum` with just the new values.
+        let mut file = SchemaFile::default();
+        file.apply_inheriting(
+            &SchemaEdit::AddValues {
+                field: "tags".into(),
+                values: vec!["y".into()],
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(file.fields["tags"].ty, Some(FieldType::Enum));
+        assert_eq!(
+            file.fields["tags"].values.as_deref(),
+            Some(&["y".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn add_values_skips_what_the_scope_already_inherits() {
+        let inherited = inherited_tags(&["a", "b"]);
+        let add = |values: &[&str]| SchemaEdit::AddValues {
+            field: "tags".into(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+        };
+
+        // Nothing declared here and everything inherited: an error, and no
+        // declaration is created for the caller to write out as an empty file.
+        let mut file = SchemaFile::default();
+        let err = file
+            .apply_inheriting(&add(&["a", "b"]), Some(&inherited))
+            .unwrap_err();
+        assert!(err.contains("already permits"), "{err}");
+        assert!(file.fields.is_empty());
+
+        // A mix: only the genuinely new value is written, behind the sentinel.
+        file.apply_inheriting(&add(&["a", "c"]), Some(&inherited))
+            .unwrap();
+        assert_eq!(
+            file.fields["tags"].values.as_deref(),
+            Some(&[VALUES_SENTINEL.to_string(), "c".to_string()][..])
+        );
+
+        // A scope that declares the field without a list inherits the set
+        // verbatim, so an inherited value changes nothing and leaves it unlisted.
+        let mut file: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  tags:\n    required: true\n").unwrap();
+        let summary = file
+            .apply_inheriting(&add(&["a"]), Some(&inherited))
+            .unwrap();
+        assert!(summary.contains("already permitted"), "{summary}");
+        assert_eq!(file.fields["tags"].values, None);
+
+        // A local list that replaces the inherited set (no sentinel) does not
+        // inherit, so an inherited value is a real addition there.
+        let mut file: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [x]\n").unwrap();
+        file.apply_inheriting(&add(&["a"]), Some(&inherited))
+            .unwrap();
+        assert_eq!(
+            file.fields["tags"].values.as_deref(),
+            Some(&["a".to_string(), "x".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn add_values_declares_a_field_no_ancestor_typed_as_a_strict_enum() {
+        let dir = TempDir::new().unwrap();
+        // The ancestor declares the field but gives it neither a type nor values.
+        write_schema(dir.path(), "", "fields:\n  status:\n    required: true\n");
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+        let inherited = cache.resolve_for(Path::new("_")).fields["status"].clone();
+        assert_eq!((inherited.ty, inherited.values.as_ref()), (None, None));
+
+        let mut child = SchemaFile::default();
+        child
+            .apply_inheriting(
+                &SchemaEdit::AddValues {
+                    field: "status".into(),
+                    values: vec!["a".into(), "b".into()],
+                },
+                Some(&inherited),
+            )
+            .unwrap();
+        assert_eq!(child.fields["status"].ty, Some(FieldType::Enum));
+        assert_eq!(
+            child.fields["status"].values.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..]),
+            "nothing inherited to splice in"
+        );
+
+        write_schema(dir.path(), "child", &child.to_yaml().unwrap());
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+        let resolved = cache.resolve_for(Path::new("child/doc.md"));
+        assert_eq!(resolved.fields["status"].ty, Some(FieldType::Enum));
+        assert!(
+            resolved.fields["status"].required,
+            "the ancestor's `required` is kept"
+        );
+
+        // Strict enforcement: a non-string scalar outside the set is refused, not
+        // exempted the way a typeless values list would exempt it.
+        let rules = |value: Value| {
+            let frontmatter = HashMap::from([("status".to_string(), value)]);
+            crate::validate::validate_frontmatter(&frontmatter, resolved)
+                .into_iter()
+                .map(|e| e.rule)
+                .collect::<Vec<_>>()
+        };
+        assert!(rules(json!("a")).is_empty());
+        for refused in [json!(3), json!(true), json!("c")] {
+            assert_eq!(rules(refused.clone()), ["allowed_value"], "{refused}");
+        }
+    }
+
+    #[test]
+    fn add_values_keeps_a_typeless_values_list_lenient_when_an_ancestor_supplies_one() {
+        // An ancestor's values list with no type (how a legacy `config.yaml` `allowed`
+        // entry arrives) is a deliberate lenient regime; a child extending it keeps it
+        // rather than tightening the field on its own.
+        let inherited = FieldDef {
+            ty: None,
+            required: false,
+            indexed: false,
+            values: Some(vec!["x".into()]),
+            default: None,
+            open: true,
+        };
+        let mut file = SchemaFile::default();
+        file.apply_inheriting(
+            &SchemaEdit::AddValues {
+                field: "status".into(),
+                values: vec!["y".into()],
+            },
+            Some(&inherited),
+        )
+        .unwrap();
+        assert_eq!(file.fields["status"].ty, None);
     }
 
     #[test]
@@ -2912,7 +3720,7 @@ mod tests {
                 SchemaCache::build(dir.path(), &empty_config(), &Default::default()).unwrap_err();
 
             assert_eq!(err.invalid.len(), 1, "{bad:?}: {err}");
-            assert_eq!(err.invalid[0].path, Path::new("bad/.kb-schema.yaml"));
+            assert_eq!(err.invalid[0].path, Path::new("bad/.schema.yaml"));
         }
     }
 
@@ -3414,12 +4222,8 @@ mod tests {
 
         let resolved = remapped.resolve_for(Path::new("new/doc.md"));
         assert_eq!(
-            resolved.origin["x"],
-            Path::new("new")
-                .join(SCHEMA_FILE_NAME)
-                .to_string_lossy()
-                .to_string(),
-            "provenance must name the field's NEW governing file, not the old one"
+            resolved.origin["x"], "new/",
+            "provenance must name the field's NEW governing directory, not the old one"
         );
     }
 

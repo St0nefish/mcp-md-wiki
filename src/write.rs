@@ -6,8 +6,8 @@
 //! `edit_document`, `delete_document`) and the HTTP UI (`web.rs`, a later chunk)
 //! drive the exact same commit/rollback logic instead of maintaining two copies of
 //! it. `mcp.rs`'s tool methods are thin adapters: they do transport-specific path
-//! resolution (fuzzy basename matching, the `expected_hash` stale-read guard ahead
-//! of a surgical edit) and map [`WriteSuccess`]/[`WriteError`] back onto the exact
+//! resolution (fuzzy basename matching, turning tool parameters into a
+//! [`DocChange`]) and map [`WriteSuccess`]/[`WriteError`] back onto the exact
 //! `CallToolResult`/`McpError` shapes their existing tests pin down.
 //!
 //! A note on `WriteError::PostCommitPending`, which does not exist here: the plan
@@ -16,9 +16,8 @@
 //! caller (and the fixed HTTP contract this module was built against) reports it
 //! as a 200/`Ok` result, just like a fully synced write, so it is modeled as
 //! `WriteSuccess { outcome: WriteOutcome::CommittedPendingSync, .. }` instead. The
-//! extra `sync_failure_cause` field carries the push-failure detail a
-//! human-readable summary needs, which the fixed `WriteSuccess{outcome, sha,
-//! rebased_paths, diff}` shape had no room for otherwise.
+//! push-failure cause is logged where the sync failed and not carried on the
+//! result: no caller relays it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -103,7 +102,7 @@ pub(crate) fn build_dedup_query(
 }
 
 /// The dedup gate's effective `(enabled, threshold)` for a document governed by
-/// `schema`: the `.kb-schema.yaml` `dedup:` cascade where it sets a key, else the
+/// `schema`: the schema file `dedup:` cascade where it sets a key, else the
 /// global `write.*` value in `deps` (#272). Resolved per key, so a scope that only
 /// sets `threshold` still inherits the global `enabled`.
 pub(crate) fn effective_dedup<E: QueryEmbedder, Q: RetrievalStore>(
@@ -288,7 +287,7 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
 /// error, logging loudly, rather than dropping otherwise-legitimate paths
 /// because of a config problem this write did not cause.
 ///
-/// A `.kb-schema.yaml` among `paths` — carried by a `move_directory`, or pulled
+/// A schema file among `paths` — carried by a `move_directory`, or pulled
 /// in by this write's own rebase — is never a document, so the filter drops it;
 /// it instead queues a full reconcile, which rebuilds the shared schema cache
 /// before scanning (see `reindex::ReindexQueue::mark_schema_changes`).
@@ -301,16 +300,13 @@ fn mark_dirty(
     queue.mark_paths(crate::ingest::partition_indexable(indexing, paths).0);
 }
 
-/// A create or edit request against the write pipeline.
+/// A create, edit or move request against the write pipeline.
 pub struct WriteRequest<'a> {
     /// Repo-relative path, already resolved and validated by the caller.
     pub rel_path: &'a str,
-    /// Existing file bytes (empty string for a create).
-    pub old_content: &'a str,
-    /// The content to write, already computed by the caller (e.g. after applying
-    /// a surgical old_string/new_string replacement).
-    pub new_content: &'a str,
-    pub is_create: bool,
+    /// What to do to the document's content. The new content is computed by the
+    /// pipeline from the document as read under the lock — see [`DocChange`].
+    pub change: DocChange<'a>,
     pub message: Option<&'a str>,
     /// Verb for the default commit message, e.g. `"add"` or `"update"`.
     pub default_verb: &'a str,
@@ -318,40 +314,19 @@ pub struct WriteRequest<'a> {
     pub force_new: Option<bool>,
     /// Label for the `Operation:` git trailer, e.g. `"create_document"`.
     pub operation: &'a str,
-    /// Optional stale-read guard: reject the write if this does not match the
-    /// SHA-256 hex digest of `old_content`. `None` skips the check. Callers that
-    /// already perform this check themselves against the same `old_content` (as
-    /// `mcp.rs`'s `edit_document` does, ahead of applying a surgical replacement)
-    /// may safely pass `None` here — re-checking the same in-memory content a
-    /// second time can never disagree with the first check.
-    pub expected_hash: Option<&'a str>,
-    /// When `Some`, turns this call into a document MOVE instead of a create/edit:
-    /// `rel_path` is the move's SOURCE and this is its DESTINATION. The caller is
-    /// still responsible for computing `new_content` (this function never reads
-    /// `rel_path`'s content itself, move or not) — typically the source's current
-    /// content, possibly transformed.
-    ///
-    /// Both paths are subject to the same schema-file, eligibility
-    /// (include-pattern) and path-safety checks the non-move path applies to
-    /// `rel_path`. Frontmatter
-    /// validation, however, runs against the DESTINATION's resolved schema, not
-    /// the source's — that is the whole point of a move: the destination
-    /// directory may enforce different frontmatter than the source did. The
-    /// create-only dedup gate never runs for a move (it is not a create, and the
-    /// document's own pre-move content would trivially self-match).
-    ///
-    /// `is_create` must be `false` whenever this is `Some` — a create has no
-    /// source to move from, so combining the two is a caller bug, reported as
-    /// `WriteError::Internal` rather than any user-facing variant. `expected_hash`
-    /// IS applied to the move path: it guards against a stale read of the
-    /// SOURCE, checked against `old_content` before anything touches the
-    /// filesystem, with the same `WriteError::StaleHash` contract as the
-    /// non-move path. `force_new` remains meaningless for a move and is simply
-    /// ignored when `dest_path` is `Some` — there is no dedup gate to bypass.
-    ///
-    /// `None` (the default) is the existing create/edit behavior, byte-for-byte
-    /// unchanged — this field did not exist before, so every existing caller gets
-    /// `None` for free.
+    /// The document version (`document_version`) the caller based this change
+    /// on. Required for an absolute change to an existing document (a full
+    /// replace, and any move); optional for a relative one, which still applies
+    /// when it is stale: it then sharpens the refusal when an anchor no longer
+    /// matches, and marks a result that carries changes made since it as
+    /// [`WriteSuccess::merged`]. A create given one is refused as
+    /// [`WriteError::NotFound`]: the document it was read from is gone.
+    pub expected_version: Option<&'a str>,
+    /// When `Some`, turns this call into a document MOVE: `rel_path` is the move's
+    /// SOURCE and this is its DESTINATION. Both paths get the schema-file,
+    /// eligibility and path-safety checks; frontmatter is validated against the
+    /// DESTINATION's schema; the create-only dedup gate never runs. `change` must
+    /// not be a create (reported as `WriteError::Internal`).
     pub dest_path: Option<&'a str>,
 }
 
@@ -375,14 +350,10 @@ pub struct WriteSuccess {
     pub outcome: WriteOutcome,
     pub sha: String,
     pub rebased_paths: Vec<PathBuf>,
-    /// Unified diff of the change (empty for a no-op, which should not happen for
-    /// a real write).
+    /// Unified diff of the change. Empty when an edit left the document exactly
+    /// as it was — nothing is written or committed then, and `sha` is HEAD as
+    /// it stands.
     pub diff: String,
-    /// Present only when `outcome == CommittedPendingSync`: the redacted,
-    /// already-`{:#}`-formatted cause of the sync failure (fetch/rebase/push),
-    /// for a human-readable summary. `None` on a fully synced write.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sync_failure_cause: Option<String>,
     /// Repo-relative paths of OTHER documents whose link text to the move's
     /// SOURCE was rewritten to point at its new location, and which rode along
     /// in the same commit. Always empty for a create/edit/delete, and for a
@@ -402,6 +373,17 @@ pub struct WriteSuccess {
     /// caller with no access to server logs (the `warn!` #181 added) can still
     /// learn what it warned about and decide whether follow-up work is needed.
     pub referencing_paths: Vec<String>,
+    /// The written document had other concurrent changes that were merged with
+    /// this one (a three-way merge of a stale full replace, a relative edit
+    /// applied over changes made since its `expected_version`, or a clean rebase
+    /// over someone else's edit to the same file). Callers say so, so the agent
+    /// re-reads before editing further.
+    pub merged: bool,
+    /// The written document's new version (`document_version`), so a caller can
+    /// chain a further absolute change without re-reading. `None` for a delete,
+    /// and when a merge during sync means the on-disk bytes are not known here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Every structured failure mode of the write pipeline. Callers map these onto
@@ -410,7 +392,7 @@ pub struct WriteSuccess {
 /// `PostCommitPending` is not among them.
 #[derive(Debug)]
 pub enum WriteError {
-    /// `rel_path` names a `.kb-schema.yaml`. Schema files are not documents: a
+    /// `rel_path` names a schema file. Schema files are not documents: a
     /// direct write, delete or single-document move of one is refused whatever
     /// `indexing.include` says, because it would bypass the parse/validate/
     /// round-trip/size checks `update_schema` applies — and a schema file that is
@@ -445,10 +427,25 @@ pub enum WriteError {
     Internal { msg: String },
     /// Create was requested but `rel_path` already exists.
     AlreadyExists,
-    /// Edit or delete was requested but `rel_path` does not exist.
+    /// Edit or delete was requested but `rel_path` does not exist, or a create
+    /// carried an `expected_version`: the document it was read from is no longer
+    /// at `rel_path` (deleted or moved).
     NotFound,
-    /// `expected_hash` did not match the current content hash of `old_content`.
-    StaleHash { expected: String, actual: String },
+    /// The document changed since the caller read it and the change cannot be
+    /// carried over: a relative edit whose anchor no longer matches, a full
+    /// replace that conflicts with the other change (or that git could not
+    /// merge at all), a delete or move of a version that is no longer current,
+    /// or a remote that kept moving under every attempt. Caller-facing text:
+    /// [`EDITED_ELSEWHERE`].
+    EditedElsewhere,
+    /// An absolute change to an existing document (full replace, delete, move)
+    /// arrived without `expected_version`.
+    VersionRequired,
+    /// A relative edit does not apply to the document (an anchor that never
+    /// matched, a frontmatter patch of a field that is not there), or would grow
+    /// it past [`MAX_CONTENT_LEN`]. `msg` is built from the caller's own input and
+    /// the document, safe to relay.
+    InvalidEdit { msg: String },
     /// `git add`/`git commit` failed (HEAD never moved). `rolled_back = true`
     /// means the working tree and git index were successfully restored to their
     /// pre-call state — safe to retry. `rolled_back = false` means the rollback
@@ -667,16 +664,13 @@ fn check_include_pattern<E: QueryEmbedder, Q: RetrievalStore>(
 // ---------------------------------------------------------------------------
 // (#179) Content-mode helpers: frontmatter patch / append
 //
-// Both compute a full `new_content` string the same way `mcp.rs`'s
-// `apply_surgical` already does for old_string/new_string — a pure function
-// the caller (currently only `mcp.rs`'s `write_document_edit`) invokes BEFORE
-// building a `WriteRequest`, not a new field on `WriteRequest` itself. That
-// keeps `write_document`'s core pipeline (schema validation, the dedup gate,
-// the commit, the pre-commit rollback) completely unaware that a patch or an
-// append happened at all: by the time it sees `new_content`, a patch/append
-// write looks exactly like a full-replace write of that same content, so it
-// participates in schema validation, `expected_hash`, and rollback for free,
-// with no special-casing anywhere in the pipeline below this point.
+// Both compute a full `new_content` string from the current content, the same
+// way `mcp.rs`'s `apply_surgical` does for old_string/new_string — pure
+// functions that `mcp.rs` wraps in a `DocChange::Relative` closure, which
+// `write_document` runs on the content it reads under `GIT_LOCK`. That keeps
+// the core pipeline (schema validation, the dedup gate, the commit, the
+// pre-commit rollback) unaware of which kind of relative edit produced the new
+// content, with no special-casing anywhere below this point.
 // ---------------------------------------------------------------------------
 
 /// A single structured edit to a document's OWN frontmatter, applied by
@@ -803,7 +797,7 @@ fn remove_by_dotpath(frontmatter: &mut HashMap<String, serde_json::Value>, path:
 /// deterministic, minimal diff — at the cost of NOT preserving whatever key
 /// order (or comments) the document's own frontmatter happened to have,
 /// exactly the same trade-off this codebase already made for
-/// `.kb-schema.yaml` when `update_schema` rewrites one.
+/// schema file when `update_schema` rewrites one.
 fn render_frontmatter_block(
     frontmatter: &HashMap<String, serde_json::Value>,
     newline: &str,
@@ -999,17 +993,10 @@ fn detect_newline(content: &str) -> &'static str {
 /// frontmatter block by a blank line (unless the body is empty, in which case
 /// no trailing blank line is added either).
 ///
-/// `expected_hash` (checked by the caller, both before this runs and again
-/// under `GIT_LOCK` immediately before the write — see `write_document`'s
-/// step 1 and its re-check) still guards the WHOLE file, unchanged, and that
-/// is deliberate even though a patch only ever touches frontmatter: the body
-/// reattached here is whatever `old_content` happened to contain, so a stale
-/// read of the BODY must still be caught, or a patch computed against a
-/// stale `old_content` could silently commit a stale body over a concurrent
-/// body edit that landed in between. Since this function always derives the
-/// body from the exact `old_content` the hash was checked against, the
-/// existing whole-file guard already provides that protection for free — no
-/// patch-specific handling is needed here or in `write_document`.
+/// `write_document` calls this on the content it read under `GIT_LOCK`, after
+/// syncing to the remote, so the body reattached here is always the current
+/// one: a concurrent body edit is carried along rather than overwritten, and no
+/// patch-specific stale-read handling is needed.
 pub fn apply_frontmatter_patch(
     old_content: &str,
     edits: &[FrontmatterEdit],
@@ -1155,7 +1142,7 @@ pub fn apply_append(old_content: &str, text: &str) -> String {
 // create_document / edit_document core
 // ---------------------------------------------------------------------------
 
-/// Refuse `rel_path` when it names a `.kb-schema.yaml` — see
+/// Refuse `rel_path` when it names a schema file — see
 /// [`WriteError::SchemaFile`]. Checked first by every document write, delete and
 /// single-document move, independently of `indexing.include` (a widened include
 /// must not turn schema files into writable documents).
@@ -1168,43 +1155,490 @@ fn check_not_schema_file(rel_path: &str) -> Result<(), WriteError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Concurrent edits: version token, lock-then-sync, re-apply, three-way merge
+// ---------------------------------------------------------------------------
+//
+// Every read-modify-write runs under ONE `GitLock` acquisition that begins with a
+// fetch + fast-forward to the remote (`git::sync_to_remote`), then reads the
+// document, applies the change, validates, writes, commits and pushes. No
+// document content a write computes from is read outside that acquisition, so a
+// concurrent writer in this process (serialized by the lock) or on the remote
+// (pulled in by the sync) is never silently overwritten. Validation is the
+// exception: it uses the shared schema cache as it stands, and a schema file the
+// sync pulls in only queues a full reconcile (`mark_dirty`) whose worker rebuilds
+// the cache later — so a write racing someone else's schema push is validated
+// against the rules from before that push.
+//
+// - A relative change (surgical replace, frontmatter patch, append) is applied to
+//   the content read under the lock. If its anchor no longer matches, it is
+//   refused as edited-by-someone-else; if it applies over changes made since the
+//   caller's `expected_version`, it lands and is reported as merged.
+// - An absolute change to an existing document (full replace, delete, move)
+//   requires the caller's `expected_version`. A stale full replace is three-way
+//   merged against the caller's base version (`git merge-file`); a clean merge is
+//   written and reported, a conflict refused. A stale delete or move is refused.
+//   A create carrying an `expected_version` is refused as not found.
+// - An edit that leaves the document exactly as it is commits nothing and is
+//   reported as it stands.
+// - A push the remote rejects, or a rebase that conflicts, drops that attempt's
+//   own commit (`git::CommitSyncError::Conflict`; a commit an earlier outage left
+//   unpushed stays), syncs the clone with the remote again (`sync_clone`) and runs
+//   the whole attempt again against fresh content, up to `MAX_WRITE_ATTEMPTS`
+//   times; then the write is refused. A remote that is merely unreachable is not a
+//   conflict: the local commit stands and syncs with a later write
+//   (`CommitSyncError::PostCommit`), so an outage never blocks writes.
+
+/// The refusal for a change that no longer fits the document as it now is.
+pub const EDITED_ELSEWHERE: &str =
+    "the document was edited by someone else; re-read it and try again";
+
+/// How many times a write re-applies its change after the remote moved under it
+/// (a rejected push or a rebase conflict) before refusing.
+pub(crate) const MAX_WRITE_ATTEMPTS: usize = 3;
+
+/// The largest document a write may produce. The transport adapters refuse
+/// created or replaced content over it; [`apply_change`] refuses a relative edit
+/// whose result would grow a document past it, while still letting an edit shrink
+/// a document that is already larger.
+pub const MAX_CONTENT_LEN: usize = 512 * 1024;
+
+/// The caller-facing version of a document's bytes, as `get_document` reports it
+/// and `expected_version` echoes it back. Opaque to callers (it is the git blob
+/// id, which is also what lets a stale full replace find its merge base); distinct
+/// from the indexer's `content_hash`, which change detection keeps using.
+pub fn document_version(bytes: &[u8]) -> String {
+    git::blob_id(bytes)
+}
+
+/// A relative change: computes the new content from the current content, or
+/// explains why it cannot (an anchor that does not match).
+pub type RelativeEdit<'a> = dyn Fn(&str) -> Result<String, String> + Send + Sync + 'a;
+
+/// What a write does to a document's content. Relative changes are re-applied
+/// to whatever the document holds under the lock; absolute ones replace it and so
+/// need the caller's `expected_version` when the document exists.
+#[derive(Clone, Copy)]
+pub enum DocChange<'a> {
+    /// Create a new document with this content.
+    Create(&'a str),
+    /// Replace an existing document's whole content.
+    Replace(&'a str),
+    /// Surgical replace, frontmatter patch, append — applied to current content.
+    Relative(&'a RelativeEdit<'a>),
+    /// Keep the content as it is (a pure move).
+    Keep,
+}
+
+impl DocChange<'_> {
+    pub fn is_create(&self) -> bool {
+        matches!(self, DocChange::Create(_))
+    }
+
+    /// Whether this change overwrites an existing document wholesale and so
+    /// requires `expected_version`.
+    pub fn is_absolute(&self) -> bool {
+        matches!(self, DocChange::Replace(_) | DocChange::Keep)
+    }
+}
+
+/// New content computed under the lock, and whether it folds in someone else's
+/// concurrent change.
+struct Applied {
+    content: String,
+    merged: bool,
+}
+
+fn data_path_of<'a, E: QueryEmbedder, Q: RetrievalStore>(deps: &WriteDeps<'a, E, Q>) -> &'a str {
+    deps.canonical_data_path.to_str().unwrap_or_default()
+}
+
+/// Sync the clone to the remote (see `git::sync_to_remote`) and mark every path
+/// that changed since `since` (default: HEAD right now) dirty — the webhook that
+/// will follow those remote commits finds the clone already up to date and would
+/// mark nothing. Returns HEAD after the sync, the baseline for the next attempt.
+///
+/// A schema file among those paths queues a full reconcile; the shared schema
+/// cache is rebuilt by the worker, not here, so the write in flight still
+/// validates against the cache as it was.
+pub(crate) async fn sync_clone<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    lock: &git::GitLock,
+    since: Option<String>,
+) -> Option<String> {
+    let data_path = data_path_of(deps);
+    let before = match since {
+        Some(sha) => Some(sha),
+        None => git::head_if_repo(lock, data_path).await,
+    };
+    git::sync_to_remote(
+        lock,
+        deps.git_url,
+        deps.branch,
+        data_path,
+        deps.token,
+        deps.commit_author_name,
+        deps.commit_author_email,
+    )
+    .await;
+    let after = git::head_if_repo(lock, data_path).await;
+    if let (Some(b), Some(a)) = (&before, &after)
+        && b != a
+    {
+        match git::git_diff_name_status(lock, data_path, b, a).await {
+            Ok(paths) => mark_dirty(deps.queue, deps.indexing, paths),
+            Err(e) => {
+                warn!(
+                    "Could not diff the paths a pre-write sync pulled in; queuing a full reconcile: {e:#}"
+                );
+                deps.queue.mark_full();
+            }
+        }
+    }
+    after
+}
+
+/// Take `GIT_LOCK` and bring the clone up to date with the remote: the start of
+/// every read-modify-write. Returns the guard and HEAD after the sync.
+pub(crate) async fn lock_and_sync<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+) -> (git::GitLock, Option<String>) {
+    git::test_hook(git::HookPoint::BeforeLock).await;
+    let lock = git::lock_git().await;
+    let head = sync_clone(deps, &lock, None).await;
+    (lock, head)
+}
+
+fn versions_match(expected: &str, current: &str) -> bool {
+    expected
+        .trim()
+        .eq_ignore_ascii_case(&document_version(current.as_bytes()))
+}
+
+/// Compute the new content for `change` from `current`, the document as read
+/// under the lock. `pre_read` is the document as read before the lock, which tells
+/// a stale anchor (it matched then, the document changed since) from one that
+/// never matched.
+async fn apply_change(
+    lock: &git::GitLock,
+    data_path: &str,
+    change: DocChange<'_>,
+    current: &str,
+    expected_version: Option<&str>,
+    pre_read: Option<&str>,
+) -> Result<Applied, WriteError> {
+    let applied = |content: String| Applied {
+        content,
+        merged: false,
+    };
+    match change {
+        DocChange::Create(content) => Ok(applied(content.to_string())),
+        DocChange::Keep => match expected_version {
+            None => Err(WriteError::VersionRequired),
+            Some(e) if versions_match(e, current) => Ok(applied(current.to_string())),
+            Some(_) => Err(WriteError::EditedElsewhere),
+        },
+        DocChange::Replace(content) => match expected_version {
+            None => Err(WriteError::VersionRequired),
+            Some(e) if versions_match(e, current) => Ok(applied(content.to_string())),
+            Some(e) => {
+                // The cause (git stderr, which names the clone's own path) stays in
+                // the log; the caller re-reads and resubmits, as after a conflict.
+                let failed = |e: anyhow::Error| {
+                    warn!("Three-way merge failed: {e:#}");
+                    WriteError::EditedElsewhere
+                };
+                let base = git::cat_blob(lock, data_path, &e.trim().to_ascii_lowercase())
+                    .await
+                    .map_err(failed)?;
+                // A version the object store has never seen cannot be a base.
+                let Some(base) = base else {
+                    return Err(WriteError::EditedElsewhere);
+                };
+                match git::merge_text(
+                    lock,
+                    data_path,
+                    &base,
+                    current.as_bytes(),
+                    content.as_bytes(),
+                )
+                .await
+                .map_err(failed)?
+                {
+                    Some(merged) => Ok(Applied {
+                        content: merged,
+                        merged: true,
+                    }),
+                    None => Err(WriteError::EditedElsewhere),
+                }
+            }
+        },
+        DocChange::Relative(edit) => match edit(current) {
+            Ok(content) => {
+                if content.len() > MAX_CONTENT_LEN && content.len() > current.len() {
+                    return Err(WriteError::InvalidEdit {
+                        msg: format!(
+                            "the edited document would be too large ({} bytes); maximum is {} \
+                             bytes",
+                            content.len(),
+                            MAX_CONTENT_LEN
+                        ),
+                    });
+                }
+                Ok(Applied {
+                    content,
+                    // Applied to the content under the lock, a relative edit lands
+                    // even when `expected_version` is stale — and its result then
+                    // carries the changes made since that version as well.
+                    merged: expected_version.is_some_and(|e| !versions_match(e, current)),
+                })
+            }
+            Err(msg) => {
+                let stale = match expected_version {
+                    Some(e) => !versions_match(e, current),
+                    None => pre_read.is_some_and(|p| p != current && edit(p).is_ok()),
+                };
+                Err(if stale {
+                    WriteError::EditedElsewhere
+                } else {
+                    WriteError::InvalidEdit { msg }
+                })
+            }
+        },
+    }
+}
+
+/// Validate `content` against the schema governing `rel_path`.
+async fn validate_document<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    rel_path: &str,
+    content: &str,
+) -> Result<Option<validate::ValidatedFile>, WriteError> {
+    // The shared cache only ever holds a tree in which every schema file was
+    // valid: a runtime rebuild that hit an invalid one was refused and the last
+    // good cache kept (`schema::apply_rebuild`). It is the cache as it stands: a
+    // schema file this write's own pre-write sync pulled in only queues a full
+    // reconcile, whose worker swaps the rebuilt cache in later.
+    let schemas = crate::schema::load_shared(deps.schema_cache);
+    let schema = schemas.resolve_for(Path::new(rel_path));
+    let (mut result, validated) =
+        validate::validate_content(Path::new(rel_path), content, schema, deps.validation)
+            .await
+            .map_err(|e| {
+                error!("Validation error for '{}': {:#}", rel_path, e);
+                WriteError::Io {
+                    msg: format!("Failed to validate content: {}", e),
+                }
+            })?;
+    // A field ingest derives (`ingest::DERIVED_FIELDS`) would be silently
+    // overridden at index time, so authoring one is refused here rather than
+    // announced up front in the server instructions. Write path only: ingest
+    // and the CLI `validate` keep accepting existing documents that carry one.
+    // Judged on the frontmatter as written, before schema defaults (which never
+    // fill a derived field anyway), and whether or not other rules failed too.
+    if deps.validation.enabled
+        && let Some((field, message)) =
+            crate::ingest::authored_derived_field(&validate::parse_frontmatter_raw(content).0)
+    {
+        result.valid = false;
+        result.errors.push(message.clone());
+        result.field_errors.push(validate::FieldError {
+            field: field.to_string(),
+            rule: "derived".to_string(),
+            message,
+            got: None,
+            expected: None,
+            schema_origin: None,
+        });
+    }
+    if !result.valid {
+        return Err(WriteError::Validation { result });
+    }
+    Ok(validated)
+}
+
+/// The create-path dedup gate: refuse when an existing document is a near
+/// duplicate of `validated`. Runs before the lock — it embeds and queries
+/// Qdrant, which can take a while — and only for a create, whose content is fixed.
+async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    rel_path: &str,
+    validated: Option<&validate::ValidatedFile>,
+    force_new: Option<bool>,
+) -> Result<(), WriteError> {
+    let schemas = crate::schema::load_shared(deps.schema_cache);
+    let schema = schemas.resolve_for(Path::new(rel_path));
+    let (dedup_enabled, dedup_threshold) = effective_dedup(deps, schema);
+    if !dedup_enabled || matches!(force_new, Some(true)) {
+        return Ok(());
+    }
+    // The body already parsed during validation keeps the dedup query on exactly
+    // the frontmatter-stripped basis the indexer embeds.
+    let query_text = validated
+        .map(|v| {
+            let description = v.frontmatter.get("description").and_then(|d| d.as_str());
+            build_dedup_query(&v.body, description, deps.prepend_description)
+        })
+        .unwrap_or_default();
+    if query_text.trim().is_empty() {
+        warn!(
+            "Dedup gate skipped for '{}': no body text to compare",
+            rel_path
+        );
+        return Ok(());
+    }
+    // Detach the reranker: `dedup_threshold` is a cosine similarity, and a
+    // cross-encoder relevance score is not comparable to it.
+    let dedup_deps = RetrievalDeps {
+        embed_client: deps.retrieval.embed_client,
+        qdrant: deps.retrieval.qdrant,
+        collection: deps.retrieval.collection,
+        data_path: deps.retrieval.data_path,
+        include_patterns: deps.retrieval.include_patterns,
+        reranker: None,
+    };
+    match crate::retrieval::search(
+        &dedup_deps,
+        &query_text,
+        &SearchFilters::default(),
+        &dedup_search_opts(),
+    )
+    .await
+    {
+        Ok(results) => {
+            let top = results.into_iter().next().map(|r| {
+                let path = r
+                    .payload
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| crate::retrieval::relative_to_data(p, deps.canonical_data_path))
+                    .unwrap_or_default();
+                (path, r.score)
+            });
+            if let Some((path, score)) = top.as_ref() {
+                tracing::debug!(
+                    "Dedup gate for '{}': nearest '{}' at dense cosine {:.4} (threshold {:.2})",
+                    rel_path,
+                    path,
+                    score,
+                    dedup_threshold
+                );
+            }
+            if let Some(hit) = dedup_verdict(top, dedup_threshold) {
+                return Err(WriteError::DedupHit {
+                    duplicate_of: hit.file_path,
+                    similarity: hit.score,
+                    threshold: dedup_threshold,
+                });
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Dedup search failed for '{}' (proceeding with write): {:#?}",
+                rel_path, e
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Read a document, `None` when it does not exist.
+async fn read_if_exists(abs_path: &Path) -> Result<Option<String>, WriteError> {
+    match tokio::fs::read_to_string(abs_path).await {
+        Ok(c) => Ok(Some(c)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => {
+            error!("Failed to read '{}': {}", abs_path.display(), e);
+            Err(WriteError::Io {
+                msg: format!("Failed to read existing file: {}", e),
+            })
+        }
+    }
+}
+
+/// Write all of `bytes` to a file just opened for writing, then flush it.
+/// `tokio::fs::File` hands the bytes to a blocking task and reports that task's
+/// failure only on the next write or flush, so a file dropped straight after
+/// `write_all` loses its last write error, and may still be writing when the
+/// caller moves on to `git add`.
+async fn write_and_flush(file: &mut tokio::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    file.write_all(bytes).await?;
+    file.flush().await
+}
+
+/// Run `write`, a document's one filesystem write, and when it fails undo what it
+/// may have left behind before reporting the failure: put `previous` back over an
+/// existing document (`fs::write` truncates before it writes, so an ENOSPC or EIO
+/// part-way leaves it truncated), or remove a partly written new file (`previous`
+/// is `None`). Either leftover is an uncommitted change in the clone, and a dirty
+/// tracked file fails every later pre-write rebase. A failed undo is logged; the
+/// caller gets the write's own error.
+async fn write_or_undo(
+    abs_path: &Path,
+    previous: Option<&str>,
+    write: impl std::future::Future<Output = std::io::Result<()>>,
+) -> Result<(), WriteError> {
+    let Err(e) = write.await else {
+        return Ok(());
+    };
+    error!("Failed to write file '{}': {}", abs_path.display(), e);
+    let undone = match previous {
+        Some(previous) => tokio::fs::write(abs_path, previous.as_bytes()).await,
+        None => tokio::fs::remove_file(abs_path).await,
+    };
+    if let Err(undo_err) = undone {
+        error!(
+            "Failed to undo the failed write to '{}': {}. It is left as that write left it, \
+             uncommitted; this needs operator attention.",
+            abs_path.display(),
+            undo_err
+        );
+    }
+    Err(WriteError::Io {
+        msg: format!("Failed to write file: {}", e),
+    })
+}
+
+/// Whether the rebase in `commit_and_sync` folded someone else's change to one
+/// of this write's own paths into its commit (a clean, non-overlapping merge).
+fn rebase_touched(rebased: &[PathBuf], own: &[&str]) -> bool {
+    rebased
+        .iter()
+        .any(|p| own.iter().any(|o| Path::new(o) == p.as_path()))
+}
+
 /// Shared pipeline for a create or edit write.
 ///
-/// Handles the schema-file guard, stale-read guard, validation, optional dedup
-/// gating (create only), filesystem write, git commit, reindex queuing, and diff
-/// output. Callers are responsible for resolving `req.rel_path` and computing
-/// `req.new_content` (e.g. applying a surgical old_string/new_string replacement)
-/// before calling this.
+/// Handles the schema-file guard, validation, the create-only dedup gate, the
+/// lock-then-sync read-modify-write (see the section comment above), filesystem
+/// write, git commit, reindex queuing, and diff output. Callers resolve
+/// `req.rel_path` and describe the change; the new content is computed here,
+/// from the document as it is under the lock.
 ///
-/// The absolute path is deliberately re-resolved from `rel_path` immediately
-/// before each filesystem action rather than computed once up front, so a path
-/// validated earlier in this call cannot go stale across the awaits in between
-/// (schema load, an embedding call, a Qdrant dedup query).
+/// The absolute path is re-resolved from `rel_path` immediately before each
+/// filesystem action rather than computed once up front, so a path validated
+/// earlier in this call cannot go stale across the awaits in between.
 pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     req: WriteRequest<'_>,
 ) -> Result<WriteSuccess, WriteError> {
-    // A move is a different enough shape at nearly every step (two paths through
-    // schema-file/eligibility/safety checks, validation against the DESTINATION's
-    // schema rather than `rel_path`'s, a write-then-remove filesystem sequence, a
-    // two-path rollback) that folding it into the branches below would make both
-    // harder to follow — see `write_document_move`'s doc comment.
+    // A move touches two paths at nearly every step — see `write_document_move`.
     if req.dest_path.is_some() {
         return write_document_move(deps, req).await;
     }
 
     let WriteRequest {
         rel_path,
-        old_content,
-        new_content,
-        is_create,
+        change,
         message,
         default_verb,
         force_new,
         operation,
-        expected_hash,
+        expected_version,
         dest_path: _,
     } = req;
+    let is_create = change.is_create();
 
     // 0. Schema-file guard, then include-pattern eligibility guard: reject paths
     //    the indexer would not pick up, before anything else runs. See
@@ -1213,396 +1647,270 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     check_not_schema_file(rel_path)?;
     check_include_pattern(deps, rel_path)?;
 
-    // 0.5. Early path-safety check: reject traversal (or any other
-    // `resolve_safe_write_path` rejection) before ANY further processing,
-    // and in particular before `validate::validate_content` below, which —
-    // when `validation.lint_command` is configured — execs the configured
-    // lint program with the raw, caller-supplied `rel_path` as an argument
-    // and echoes its output back in the 422 body. `GlobSet::is_match` (the
-    // include-pattern check just above) accepts `..` segments as ordinary
-    // path characters — `**/*.md` matches `../../etc/cron.d/x.md` — so
-    // without this, a path that fails the traversal check could still reach
-    // the lint command first. The resolved `PathBuf` is intentionally
-    // discarded here: it is re-resolved again immediately before each
-    // filesystem mutation below (see the doc comment on that pattern), so
-    // reusing this one would not shrink the TOCTOU window any further, only
-    // remove one of the re-checks.
+    // 0.5. Early path-safety check, before validation: when
+    // `validation.lint_command` is configured it execs the lint program with
+    // `rel_path` as an argument, and `GlobSet::is_match` (the include check
+    // above) accepts `..` segments as ordinary path characters.
     safe_write_path(deps, rel_path)?;
 
-    // 1. Optional stale-read guard.
-    if let Some(expected) = expected_hash {
-        let actual = crate::ingest::compute_hash_from_bytes(old_content.as_bytes());
-        if !expected.trim().eq_ignore_ascii_case(&actual) {
-            return Err(WriteError::StaleHash {
-                expected: expected.trim().to_string(),
-                actual,
-            });
-        }
-    }
-
-    // 2. Validate new_content.
-    //
-    // The schema is resolved from the TARGET path's directory, so writing into a
-    // subdirectory is governed by that folder's rules regardless of where the
-    // caller has been reading. This reads the shared, caller-owned cache rather
-    // than rebuilding it — see `KbSearchServer::schema_cache`'s doc comment for
-    // why that is safe to read without staleness after `update_schema`. That cache
-    // only ever holds a tree in which every schema file was valid: a runtime
-    // rebuild that hit an invalid one was refused and the last good cache kept
-    // (`schema::apply_rebuild`).
-    let schemas = crate::schema::load_shared(deps.schema_cache);
-    let schema = schemas.resolve_for(Path::new(rel_path));
-
-    let (validation_result, validated) =
-        validate::validate_content(Path::new(rel_path), new_content, schema, deps.validation)
-            .await
-            .map_err(|e| {
-                error!("Validation error for '{}': {:#}", rel_path, e);
-                WriteError::Io {
-                    msg: format!("Failed to validate content: {}", e),
-                }
-            })?;
-
-    if !validation_result.valid {
-        return Err(WriteError::Validation {
-            result: validation_result,
+    if matches!(change, DocChange::Keep) {
+        return Err(WriteError::Internal {
+            msg: "write_document called with no content change and no destination".to_string(),
         });
     }
-
-    // 3. Dedup gate: on create paths, check for near-duplicate existing documents.
-    //    Gate runs only when: this is a create (not edit), dedup is enabled for
-    //    this path (schema `dedup:` override, else config), and the caller has
-    //    not set force_new = true.
-    let (dedup_enabled, dedup_threshold) = effective_dedup(deps, schema);
-    if is_create && dedup_enabled && !matches!(force_new, Some(true)) {
-        // Reuse the body already parsed during validation above rather than
-        // re-deriving it here: that keeps the dedup query on exactly the
-        // frontmatter-stripped basis the indexer embeds.
-        let query_text = validated
-            .as_ref()
-            .map(|v| {
-                let description = v.frontmatter.get("description").and_then(|d| d.as_str());
-                build_dedup_query(&v.body, description, deps.prepend_description)
-            })
-            .unwrap_or_default();
-
-        if query_text.trim().is_empty() {
-            warn!(
-                "Dedup gate skipped for '{}': no body text to compare",
-                rel_path
-            );
-        } else {
-            let empty_filters = SearchFilters::default();
-            // Detach the reranker: `dedup_threshold` is a cosine similarity, and a
-            // cross-encoder relevance score is not comparable to it.
-            let dedup_deps = RetrievalDeps {
-                embed_client: deps.retrieval.embed_client,
-                qdrant: deps.retrieval.qdrant,
-                collection: deps.retrieval.collection,
-                data_path: deps.retrieval.data_path,
-                include_patterns: deps.retrieval.include_patterns,
-                reranker: None,
-            };
-            match crate::retrieval::search(
-                &dedup_deps,
-                &query_text,
-                &empty_filters,
-                &dedup_search_opts(),
-            )
-            .await
-            {
-                Ok(results) => {
-                    let top = results.into_iter().next().map(|r| {
-                        let path = r
-                            .payload
-                            .get("file_path")
-                            .and_then(|v| v.as_str())
-                            .map(|p| {
-                                crate::retrieval::relative_to_data(p, deps.canonical_data_path)
-                            })
-                            .unwrap_or_default();
-                        (path, r.score)
-                    });
-                    if let Some((path, score)) = top.as_ref() {
-                        tracing::debug!(
-                            "Dedup gate for '{}': nearest '{}' at dense cosine {:.4} \
-                             (threshold {:.2})",
-                            rel_path,
-                            path,
-                            score,
-                            dedup_threshold
-                        );
-                    }
-                    if let Some(hit) = dedup_verdict(top, dedup_threshold) {
-                        return Err(WriteError::DedupHit {
-                            duplicate_of: hit.file_path,
-                            similarity: hit.score,
-                            threshold: dedup_threshold,
-                        });
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Dedup search failed for '{}' (proceeding with write): {:#?}",
-                        rel_path, e
-                    );
-                }
-            }
-        }
+    if change.is_absolute() && expected_version.is_none() {
+        return Err(WriteError::VersionRequired);
+    }
+    // A create carrying `expected_version` was meant for a document the caller
+    // read, which is no longer at `rel_path` (deleted or moved since, or never
+    // there): refused rather than silently created anew.
+    if is_create && expected_version.is_some() {
+        return Err(WriteError::NotFound);
     }
 
-    // 4. Validate the commit message BEFORE touching the filesystem. Rejecting it
-    //    afterwards would leave the file written but never committed, and the
-    //    index purge that follows a successful commit would never run.
+    // 1. A create's content is fixed, so it is validated and dedup-gated before
+    //    the lock: the gate's embedding call and Qdrant query are the one slow step
+    //    deliberately kept outside it. Every other change is validated under the
+    //    lock, against the content it actually computes there.
+    if let DocChange::Create(content) = change {
+        let validated = validate_document(deps, rel_path, content).await?;
+        dedup_gate(deps, rel_path, validated.as_ref(), force_new).await?;
+    }
+
+    // 2. Validate the commit message BEFORE touching the filesystem.
     validate_commit_message(message)?;
 
-    // 4.5. Acquire GIT_LOCK now and hold ONE guard across every remaining step —
-    // the final on-disk write, the commit, and any rollback — rather than
-    // acquiring it only just before the commit as this used to. That gap is
-    // exactly what let #142 reopen the `expected_hash` stale-read guard: step 1
-    // above checks `expected_hash` once, against the caller-supplied
-    // `old_content`, but schema validation and (for a create) the dedup gate's
-    // embedding+Qdrant round trip both run AFTER that check and can take a
-    // while — long enough for a webhook merge, which independently needs this
-    // same lock for its own fetch + `git merge --ff-only`, to change the file's
-    // on-disk content in between with nothing to detect it. Acquiring the lock
-    // here and re-verifying against LIVE content immediately before the write
-    // below (rather than only re-checking the now-stale `old_content` again)
-    // closes the window instead of just narrowing it: nothing else can touch
-    // the working tree for the rest of this call.
-    let git_lock = git::lock_git().await;
-
-    // Resolve fresh before creating directories too. The caller's resolution (if
-    // any) happened before schema validation and a Qdrant dedup query — a wide
-    // window in which a concurrent git sync could swap a component for a symlink,
-    // which would otherwise let create_dir_all materialize real directories
-    // outside the KB.
-    let abs_path = safe_write_path(deps, rel_path)?;
-
-    if let Some(parent) = abs_path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            error!(
-                "Failed to create parent directories for '{}': {}",
-                abs_path.display(),
-                e
-            );
-            WriteError::Io {
-                msg: format!("Failed to create parent directories: {}", e),
-            }
-        })?;
-    }
-
-    // Re-verify immediately before writing. The initial resolution could only
-    // canonicalize ancestors that existed at the time, and the work between then
-    // and here — schema validation, an embedding call, a Qdrant dedup query — is a
-    // wide window in which a concurrent git sync could swap a path component for a
-    // symlink. Checking afterwards would only report an escape that already
-    // happened; the freshly-verified path is what we write to.
-    let abs_path = safe_write_path(deps, rel_path)?;
-
-    if is_create {
-        use tokio::io::AsyncWriteExt as _;
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&abs_path)
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    WriteError::AlreadyExists
-                } else {
-                    error!("Failed to create file '{}': {}", abs_path.display(), e);
-                    WriteError::Io {
-                        msg: format!("Failed to create file: {}", e),
-                    }
-                }
-            })?;
-        file.write_all(new_content.as_bytes()).await.map_err(|e| {
-            error!("Failed to write file '{}': {}", abs_path.display(), e);
-            WriteError::Io {
-                msg: format!("Failed to write file: {}", e),
-            }
-        })?;
+    // 3. The document as it was before the lock — only to tell a stale anchor
+    //    from a wrong one (`apply_change`); never what the change is applied to.
+    let pre_read = if is_create {
+        None
     } else {
-        if !abs_path.exists() {
-            return Err(WriteError::NotFound);
-        }
+        read_if_exists(&safe_write_path(deps, rel_path)?).await?
+    };
 
-        // Re-verify the stale-read guard against the file's ACTUAL current
-        // content, immediately before the overwrite — this is the re-check
-        // #142 was filed over. Step 1's check ran against the caller-supplied
-        // `old_content`, which can go stale in the window between then and
-        // here (see the GIT_LOCK comment above); this one reads what is
-        // really on disk right now, under the lock, right before it gets
-        // clobbered. Skipped when the caller passed no `expected_hash`,
-        // matching that earlier check's own opt-in contract.
-        if let Some(expected) = expected_hash {
-            let live_content = tokio::fs::read(&abs_path).await.map_err(|e| {
+    let (git_lock, mut head) = lock_and_sync(deps).await;
+    let data_path_str = data_path_of(deps);
+
+    for attempt in 1..=MAX_WRITE_ATTEMPTS {
+        // Resolve fresh before creating directories: a concurrent git sync could
+        // have swapped a component for a symlink since the early check.
+        let abs_path = safe_write_path(deps, rel_path)?;
+        if let Some(parent) = abs_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 error!(
-                    "Failed to re-read '{}' for stale-hash re-check: {}",
+                    "Failed to create parent directories for '{}': {}",
                     abs_path.display(),
                     e
                 );
                 WriteError::Io {
-                    msg: format!("Failed to read file for stale-hash re-check: {}", e),
+                    msg: format!("Failed to create parent directories: {}", e),
                 }
             })?;
-            let actual = crate::ingest::compute_hash_from_bytes(&live_content);
-            if !expected.trim().eq_ignore_ascii_case(&actual) {
-                return Err(WriteError::StaleHash {
-                    expected: expected.trim().to_string(),
-                    actual,
+        }
+        let abs_path = safe_write_path(deps, rel_path)?;
+
+        let (old_content, applied) = if let DocChange::Create(content) = change {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&abs_path)
+                .await
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        WriteError::AlreadyExists
+                    } else {
+                        error!("Failed to create file '{}': {}", abs_path.display(), e);
+                        WriteError::Io {
+                            msg: format!("Failed to create file: {}", e),
+                        }
+                    }
+                })?;
+            write_or_undo(&abs_path, None, async move {
+                write_and_flush(&mut file, content.as_bytes()).await
+            })
+            .await?;
+            (
+                String::new(),
+                Applied {
+                    content: content.to_string(),
+                    merged: false,
+                },
+            )
+        } else {
+            let Some(current) = read_if_exists(&abs_path).await? else {
+                return Err(WriteError::NotFound);
+            };
+            let applied = apply_change(
+                &git_lock,
+                data_path_str,
+                change,
+                &current,
+                expected_version,
+                pre_read.as_deref(),
+            )
+            .await?;
+            validate_document(deps, rel_path, &applied.content).await?;
+            // An edit that leaves the document exactly as it is has nothing to
+            // commit (`git commit` refuses an empty change): the document already
+            // says what the caller asked for, so report it as it stands.
+            if applied.content == current {
+                return Ok(WriteSuccess {
+                    outcome: WriteOutcome::Synced,
+                    sha: head.unwrap_or_default(),
+                    rebased_paths: Vec::new(),
+                    diff: String::new(),
+                    rewritten_paths: Vec::new(),
+                    referencing_paths: Vec::new(),
+                    merged: applied.merged,
+                    version: Some(document_version(current.as_bytes())),
                 });
             }
-        }
+            write_or_undo(
+                &abs_path,
+                Some(&current),
+                tokio::fs::write(&abs_path, applied.content.as_bytes()),
+            )
+            .await?;
+            (current, applied)
+        };
 
-        tokio::fs::write(&abs_path, new_content.as_bytes())
-            .await
-            .map_err(|e| {
-                error!("Failed to write file '{}': {}", abs_path.display(), e);
-                WriteError::Io {
-                    msg: format!("Failed to write file: {}", e),
-                }
-            })?;
+        let commit_message = build_commit_message(
+            message,
+            &format!("docs: {} {}", default_verb, rel_path),
+            operation,
+        );
+
+        // `commit_and_sync` distinguishes WHERE it failed — see
+        // `git::CommitSyncError`. `PreCommit`: HEAD never moved, so the file write
+        // above is rolled back under this same acquisition (releasing in between
+        // would let another writer commit the half-staged entry). `PostCommit`:
+        // the commit is durable, left alone and reported as pending sync.
+        // `Conflict`: the remote moved underneath the commit, which is already
+        // dropped (the branch is back at its pre-commit HEAD, taking the file
+        // change with it); sync again, then run the attempt against the fresh
+        // content.
+        let commit_outcome = match git::commit_and_sync(
+            &git_lock,
+            deps.git_url,
+            deps.branch,
+            data_path_str,
+            deps.token,
+            &[rel_path],
+            &commit_message,
+            deps.commit_author_name,
+            deps.commit_author_email,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+
+            Err(git::CommitSyncError::PreCommit(source)) => {
+                error!(
+                    "commit_and_sync pre-commit failure for '{}', rolling back: {:#}",
+                    rel_path, source
+                );
+                // A create has no HEAD content to restore to — remove the file and
+                // unstage it. An edit restores HEAD's content (un-staging too).
+                let rollback = if is_create {
+                    match tokio::fs::remove_file(&abs_path).await {
+                        Ok(()) => git::unstage(&git_lock, data_path_str, rel_path).await,
+                        Err(e) => Err(anyhow::Error::new(e)
+                            .context("Failed to remove newly-written file during rollback")),
+                    }
+                } else {
+                    git::restore_from_head(&git_lock, data_path_str, rel_path).await
+                };
+                return match rollback {
+                    Ok(()) => Err(WriteError::PreCommitFailed {
+                        rolled_back: true,
+                        msg: format!("{:#}", source),
+                    }),
+                    Err(rollback_err) => {
+                        error!(
+                            "Rollback FAILED after a pre-commit git failure for '{}': {:#}. \
+                             Original cause: {:#}. Filesystem and git state may now be \
+                             inconsistent.",
+                            rel_path, rollback_err, source
+                        );
+                        Err(WriteError::PreCommitFailed {
+                            rolled_back: false,
+                            msg: format!(
+                                "Commit cause: {:#}. Rollback cause: {:#}",
+                                source, rollback_err
+                            ),
+                        })
+                    }
+                };
+            }
+
+            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+                warn!(
+                    "commit_and_sync post-commit (sync) failure for '{}', commit {} stands \
+                     uncorrected: {:#}",
+                    rel_path, sha, source
+                );
+                mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
+                return Ok(WriteSuccess {
+                    outcome: WriteOutcome::CommittedPendingSync,
+                    sha,
+                    rebased_paths: Vec::new(),
+                    diff: render_unified_diff(&old_content, &applied.content, rel_path),
+                    rewritten_paths: Vec::new(),
+                    referencing_paths: Vec::new(),
+                    merged: applied.merged,
+                    version: Some(document_version(applied.content.as_bytes())),
+                });
+            }
+
+            Err(git::CommitSyncError::Conflict { source }) => {
+                warn!(
+                    "Remote changed underneath the write to '{}' (attempt {}/{}), re-applying \
+                     against fresh content: {:#}",
+                    rel_path, attempt, MAX_WRITE_ATTEMPTS, source
+                );
+                head = sync_clone(deps, &git_lock, head).await;
+                continue;
+            }
+        };
+
+        // Mark this path — and anything the rebase pulled in — dirty and return
+        // immediately; the reindex worker does the embedding out of band.
+        mark_dirty(
+            deps.queue,
+            deps.indexing,
+            std::iter::once(PathBuf::from(rel_path))
+                .chain(commit_outcome.rebased_paths.iter().cloned())
+                .collect(),
+        );
+
+        // A clean rebase that touched this very file merged someone else's
+        // change into it, so the on-disk version differs from what was written.
+        let rebase_merged = rebase_touched(&commit_outcome.rebased_paths, &[rel_path]);
+        let version = if rebase_merged {
+            read_if_exists(&abs_path)
+                .await
+                .ok()
+                .flatten()
+                .map(|c| document_version(c.as_bytes()))
+        } else {
+            Some(document_version(applied.content.as_bytes()))
+        };
+        return Ok(WriteSuccess {
+            outcome: WriteOutcome::Synced,
+            sha: commit_outcome.sha,
+            diff: render_unified_diff(&old_content, &applied.content, rel_path),
+            rebased_paths: commit_outcome.rebased_paths,
+            rewritten_paths: Vec::new(),
+            referencing_paths: Vec::new(),
+            merged: applied.merged || rebase_merged,
+            version,
+        });
     }
 
-    let commit_message = build_commit_message(
-        message,
-        &format!("docs: {} {}", default_verb, rel_path),
-        operation,
-    );
-
-    let data_path_str = deps.canonical_data_path.to_str().unwrap_or_default();
-
-    // `commit_and_sync` distinguishes WHERE it failed — see `git::CommitSyncError`
-    // — and the two phases demand opposite handling. A `PreCommit` failure means
-    // HEAD never moved, so the file write above (already on disk, not yet
-    // committed) is rolled back and reported as "nothing changed". A `PostCommit`
-    // failure means the commit is a real, durable part of local history — rolling
-    // it back here would silently undo work that genuinely happened, so it is
-    // left alone and reported as "committed, sync pending" instead.
-    // `git_lock` was acquired back at step 4.5, before the stale-hash re-check
-    // and the write itself, and is held continuously through here and any
-    // rollback below — NOT re-acquired at this point as it used to be.
-    // Releasing and re-acquiring in between would let another writer see — and,
-    // since it stages its own path into the same index, commit — the
-    // half-staged entry this call is about to undo (and would reopen exactly
-    // the #142 race step 4.5 exists to close).
-    let commit_outcome = match git::commit_and_sync(
-        &git_lock,
-        deps.git_url,
-        deps.branch,
-        data_path_str,
-        deps.token,
-        &[rel_path],
-        &commit_message,
-        deps.commit_author_name,
-        deps.commit_author_email,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-
-        Err(git::CommitSyncError::PreCommit(source)) => {
-            error!(
-                "commit_and_sync pre-commit failure for '{}', rolling back: {:#}",
-                rel_path, source
-            );
-
-            // For a create, there is no HEAD content to restore to — undo the
-            // filesystem write directly and unstage whatever `git add` staged.
-            // For an edit, HEAD already has the previous content, so restore it
-            // (this also un-stages any partial `git add`, in one step).
-            let rollback = if is_create {
-                match tokio::fs::remove_file(&abs_path).await {
-                    Ok(()) => git::unstage(&git_lock, data_path_str, rel_path).await,
-                    Err(e) => Err(anyhow::Error::new(e)
-                        .context("Failed to remove newly-written file during rollback")),
-                }
-            } else {
-                git::restore_from_head(&git_lock, data_path_str, rel_path).await
-            };
-
-            return match rollback {
-                Ok(()) => Err(WriteError::PreCommitFailed {
-                    rolled_back: true,
-                    msg: format!("{:#}", source),
-                }),
-                // The rollback ITSELF failed — a third, worse state than either of
-                // the above. The file may now be gone/changed on disk with no
-                // corresponding commit, or the index may not match HEAD.
-                Err(rollback_err) => {
-                    error!(
-                        "Rollback FAILED after a pre-commit git failure for '{}': {:#}. \
-                         Original cause: {:#}. Filesystem and git state may now be \
-                         inconsistent.",
-                        rel_path, rollback_err, source
-                    );
-                    Err(WriteError::PreCommitFailed {
-                        rolled_back: false,
-                        msg: format!(
-                            "Commit cause: {:#}. Rollback cause: {:#}",
-                            source, rollback_err
-                        ),
-                    })
-                }
-            };
-        }
-
-        Err(git::CommitSyncError::PostCommit { sha, source }) => {
-            warn!(
-                "commit_and_sync post-commit (sync) failure for '{}', commit {} stands \
-                 uncorrected: {:#}",
-                rel_path, sha, source
-            );
-
-            // The local file already reflects the new content regardless of push
-            // status, so the local index should too. `rebased_paths` is empty
-            // here — the rebase never ran (fetch/rebase/push all happen after the
-            // commit, so any of them failing means we never got as far as a
-            // trustworthy rebase diff). Still filtered through `mark_dirty`
-            // (#278): this write's own target can match `include` and still be
-            // excluded, same as the success path below.
-            mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
-
-            return Ok(WriteSuccess {
-                outcome: WriteOutcome::CommittedPendingSync,
-                sha,
-                rebased_paths: Vec::new(),
-                diff: render_unified_diff(old_content, new_content, rel_path),
-                sync_failure_cause: Some(format!("{:#}", source)),
-                // Not a move — nothing else was rewritten.
-                rewritten_paths: Vec::new(),
-                // Not a delete — nothing else was checked for inbound links.
-                referencing_paths: Vec::new(),
-            });
-        }
-    };
-
-    // Mark this path — and anything the rebase pulled in from other commits —
-    // dirty and return immediately. The reindex worker (src/reindex.rs) does the
-    // actual chunk/embed/upsert work out of band; this call never blocks on it,
-    // which is the whole point — embedding is far slower than a caller's request
-    // timeout on a large document.
-    mark_dirty(
-        deps.queue,
-        deps.indexing,
-        std::iter::once(PathBuf::from(rel_path))
-            .chain(commit_outcome.rebased_paths.iter().cloned())
-            .collect(),
-    );
-
-    Ok(WriteSuccess {
-        outcome: WriteOutcome::Synced,
-        sha: commit_outcome.sha,
-        diff: render_unified_diff(old_content, new_content, rel_path),
-        rebased_paths: commit_outcome.rebased_paths,
-        sync_failure_cause: None,
-        // Not a move — nothing else was rewritten.
-        rewritten_paths: Vec::new(),
-        // Not a delete — nothing else was checked for inbound links.
-        referencing_paths: Vec::new(),
-    })
+    // The remote kept moving under every attempt. Each attempt's commit was
+    // dropped, and the clone synced with the remote again after the last, so
+    // nothing of this write is left behind.
+    Err(WriteError::EditedElsewhere)
 }
 
 // ---------------------------------------------------------------------------
@@ -1610,55 +1918,40 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
 // ---------------------------------------------------------------------------
 
 /// The MOVE branch of `write_document`, split out because a move touches TWO
-/// paths at every stage that the create/edit path only ever touches one:
-/// schema-file guard, eligibility, path-safety, the filesystem mutation itself, the
-/// commit, and — the part most worth keeping legible on its own — the rollback.
-/// Interleaving that with the single-path create/edit logic above would have
-/// made both harder to reason about; keeping it here means the non-move path
-/// reads exactly as it did before this existed, and this function's rollback is
-/// the only thing you need to hold in your head to convince yourself it is
-/// correct.
+/// paths at every stage the create/edit path touches one: schema-file guard,
+/// eligibility, path-safety, the filesystem mutation, the commit, and the
+/// rollback.
 ///
-/// Called only from `write_document` when `req.dest_path.is_some()`; implements
-/// that field's contract in the order documented there.
+/// A move is an absolute change to its source: `expected_version` is required
+/// and must match the source as read under the lock, or the move is refused. An
+/// accompanying content change (`req.change`) is then applied to that content.
 async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     req: WriteRequest<'_>,
 ) -> Result<WriteSuccess, WriteError> {
     let WriteRequest {
         rel_path: source_rel,
-        old_content,
-        new_content,
-        is_create,
+        change,
         message,
         default_verb: _,
         force_new: _,
         operation,
-        expected_hash,
+        expected_version,
         dest_path,
     } = req;
     let dest_rel = dest_path.expect("write_document_move called with req.dest_path == None");
 
-    // 1. A create with a dest_path is a caller bug, not a runtime condition: a
-    //    create has no prior file to move FROM. Reported as `Internal` — the same
-    //    variant this pipeline uses for other "this should never happen from a
-    //    well-behaved caller" states — rather than a user-facing variant.
-    if is_create {
+    // 1. A create with a dest_path is a caller bug: a create has nothing to move.
+    if change.is_create() {
         return Err(WriteError::Internal {
-            msg: "write_document called with is_create=true and dest_path set; a create \
-                  cannot also be a move"
+            msg: "write_document called with a create and dest_path set; a create cannot \
+                  also be a move"
                 .to_string(),
         });
     }
 
-    // 2. Eligibility + path-safety for BOTH paths, before anything else — mirrors
-    //    write_document's own "0" / "0.5" ordering (see its comments for why this
-    //    must run before validation, and in particular before a configured
-    //    validation.lint_command exec). A move that is safe to write TO but not
-    //    safe to remove FROM (or vice versa) must be rejected before either side
-    //    is touched. The resolved paths are discarded here, same as
-    //    write_document's early check — each is re-resolved immediately before
-    //    the filesystem action that uses it, below.
+    // 2. Eligibility + path-safety for BOTH paths, before anything else (and in
+    //    particular before a configured validation.lint_command exec).
     check_not_schema_file(source_rel)?;
     check_not_schema_file(dest_rel)?;
     check_include_pattern(deps, source_rel)?;
@@ -1666,568 +1959,371 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     safe_write_path(deps, source_rel)?;
     safe_write_path(deps, dest_rel)?;
 
-    // 3. Optional stale-read guard against the SOURCE, before anything touches
-    //    the filesystem — same contract as write_document's step 1 (see that
-    //    comment for the reasoning), just relocated ahead of the existence/
-    //    collision checks below so a stale read never even gets to observe
-    //    whether the destination is free. `old_content` is hashed exactly as
-    //    the non-move path hashes it: callers supply the freshly-read on-disk
-    //    SOURCE content, which is what makes the comparison meaningful.
-    if let Some(expected) = expected_hash {
-        let actual = crate::ingest::compute_hash_from_bytes(old_content.as_bytes());
-        if !expected.trim().eq_ignore_ascii_case(&actual) {
-            return Err(WriteError::StaleHash {
-                expected: expected.trim().to_string(),
-                actual,
-            });
-        }
-    }
-
-    // 4. Source must exist.
-    let abs_source = safe_write_path(deps, source_rel)?;
-    if !abs_source.exists() {
-        return Err(WriteError::NotFound);
-    }
-
-    // 5. Destination must NOT already exist — a move never overwrites.
-    let abs_dest = safe_write_path(deps, dest_rel)?;
-    if abs_dest.exists() {
-        return Err(WriteError::AlreadyExists);
-    }
-
-    let schemas = crate::schema::load_shared(deps.schema_cache);
-
-    // 6.5. Outbound-link re-relativization: EVERY relative link inside the
-    //    document being moved was authored against wherever it used to live
-    //    (`source_rel`'s directory) — not just a link back to itself. Moving
-    //    the document changes that base directory, so any such link whose
-    //    text doesn't change would silently repoint at a different file once
-    //    resolved from the new location (e.g. `../shared/doc.md` from
-    //    `old/a.md` means `shared/doc.md`; the same text from `new/deep/a.md`
-    //    means something else entirely). This is distinct from step 10.5
-    //    below, which rewrites OTHER documents that link INTO this one — this
-    //    step fixes the links this document itself contains, which point OUT.
-    //
-    //    `find_markdown_link_occurrences(new_content, source_rel)` resolves
-    //    every occurrence against `source_rel` — the document's OLD
-    //    location — which is the correct context regardless of what the link
-    //    points at, because that's the directory the link text was actually
-    //    written against. Each occurrence's true KB-root-relative target is
-    //    therefore `o.resolved`, with one exception: a link whose target IS
-    //    `source_rel` is a self-reference, and the document's true target is
-    //    no longer `source_rel` — it's `dest_rel`, since that's where the
-    //    document now lives. Every occurrence then gets re-relativized from
-    //    `dest_rel` (the document's NEW location) to its own target, which is
-    //    what keeps it resolving to the same file post-move.
-    let content_to_write = rewrite_outbound_links(new_content, source_rel, dest_rel, |resolved| {
-        (resolved == source_rel).then(|| dest_rel.to_string())
-    });
-
-    // 7. Frontmatter validation against the DESTINATION's resolved schema, NOT
-    //    the source's. This is the whole point of a move: the destination
-    //    directory may require different frontmatter than the source did.
-    //    Validated against `content_to_write` (the self-link rewrite above, if
-    //    any) since that is what actually lands at the destination — not the
-    //    caller's original `new_content`.
-    let schema = schemas.resolve_for(Path::new(dest_rel));
-    let (validation_result, _validated) = validate::validate_content(
-        Path::new(dest_rel),
-        &content_to_write,
-        schema,
-        deps.validation,
-    )
-    .await
-    .map_err(|e| {
-        error!(
-            "Validation error moving '{}' -> '{}': {:#}",
-            source_rel, dest_rel, e
-        );
-        WriteError::Io {
-            msg: format!("Failed to validate content: {}", e),
-        }
-    })?;
-
-    if !validation_result.valid {
-        return Err(WriteError::Validation {
-            result: validation_result,
-        });
-    }
-
-    // 8. No dedup gate: a move is not a create, and the document's own content
-    //    would trivially self-match its pre-move copy anyway.
-
-    // 9. Validate the commit message BEFORE touching the filesystem — same reason
-    //    as write_document/delete_document: rejecting it after a mutation would
-    //    leave that mutation uncommitted.
-    validate_commit_message(message)?;
-
-    // 9.5. Acquire GIT_LOCK now and hold ONE guard across every remaining
-    //    mutation of the clone below — the destination write, the source
-    //    removal, the referencing-document read-modify-write (step 10.5), the
-    //    commit, and any rollback — rather than acquiring it only just before
-    //    the commit as this used to. Two reasons, both load-bearing:
-    //
-    //    - Step 10.5 reads another document's CURRENT body, computes a
-    //      rewrite, and writes it back with no hash/staleness check of its
-    //      own (unlike a caller-driven edit, which can supply
-    //      `expected_hash`). Left unlocked, a concurrent writer to that same
-    //      referencing document can land its own write in the gap between
-    //      this read and this write and be silently clobbered with no
-    //      conflict reported to either side. Holding GIT_LOCK across the
-    //      whole read-modify-write serializes it against every other
-    //      operation that also mutates the clone through this lock,
-    //      including another concurrent move.
-    //    - The destination write and source removal immediately below are
-    //      themselves mutations of the clone, and the SAME reasoning that
-    //      motivates locking step 10.5 applies to them: leaving them outside
-    //      the acquisition would still let a concurrent webhook merge or
-    //      another write's commit interleave with an in-progress, not-yet-
-    //      committed move, and would reintroduce exactly the kind of
-    //      "acquire, release, re-acquire" gap CLAUDE.md's git-serialization
-    //      section warns against. Pulling them in also matches this
-    //      codebase's existing convention of one acquisition per logical
-    //      mutating sequence (see `write_document`'s and `delete_document`'s
-    //      identical single acquisition spanning their own commit+rollback).
-    //      Nothing between here and the commit below performs a SECOND
-    //      `lock_git()` call — every helper that used to acquire its own
-    //      (the `cleanup_lock` below, formerly a fresh acquisition) now takes
-    //      this same guard by reference instead, which is what keeps this
-    //      non-reentrant mutex from deadlocking against itself.
-    let git_lock = git::lock_git().await;
-
-    // 9.6. Re-verify the stale-read guard against the SOURCE's live on-disk
-    //    content, now that GIT_LOCK is held and nothing else can touch the
-    //    clone for the rest of this call. Step 3's check ran before
-    //    `validate::validate_content` above — which can exec an arbitrarily
-    //    slow `validation.lint_command` — and before this lock acquisition,
-    //    so a webhook merge (which independently needs this same lock for its
-    //    own fetch + `git merge --ff-only`) could have changed the source's
-    //    content in that window with nothing to detect it; re-checking the
-    //    already-stale `old_content` a second time could never catch that.
-    //    Reads `abs_source` resolved back at step 4 — nothing between there
-    //    and here can have made it unsafe, since no filesystem mutation of
-    //    the clone has happened yet. Skipped when the caller passed no
-    //    `expected_hash`, matching step 3's own opt-in contract.
-    if let Some(expected) = expected_hash {
-        let live_source = tokio::fs::read(&abs_source).await.map_err(|e| {
-            error!(
-                "Failed to re-read source '{}' for stale-hash re-check while moving to '{}': {}",
-                source_rel, dest_rel, e
-            );
-            WriteError::Io {
-                msg: format!("Failed to read source file for stale-hash re-check: {}", e),
-            }
-        })?;
-        let actual = crate::ingest::compute_hash_from_bytes(&live_source);
-        if !expected.trim().eq_ignore_ascii_case(&actual) {
-            return Err(WriteError::StaleHash {
-                expected: expected.trim().to_string(),
-                actual,
-            });
-        }
-    }
-
-    // 10. Filesystem: write the DESTINATION first (`create_new`, so this can never
-    //    silently clobber a file that appeared between the check above and now),
-    //    THEN remove the source. This order is load-bearing, not arbitrary:
-    //    - If the destination write fails, nothing has happened yet — the source
-    //      is exactly as it was.
-    //    - If the SOURCE removal fails afterward, the content still exists (at
-    //      the destination) — recoverable by deleting that destination copy and
-    //      reporting failure, which is exactly what happens below.
-    //    The reverse order (remove source, then write destination) has no such
-    //    recovery: a crash or failure between the two would delete the document
-    //    from disk with no copy anywhere, for real user content. Write-then-remove
-    //    is the only ordering where every failure point still has a path back to
-    //    "nothing lost".
-    let abs_dest = safe_write_path(deps, dest_rel)?;
-    if let Some(parent) = abs_dest.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            error!(
-                "Failed to create parent directories for '{}': {}",
-                abs_dest.display(),
-                e
-            );
-            WriteError::Io {
-                msg: format!("Failed to create parent directories: {}", e),
-            }
-        })?;
-    }
-
-    {
-        use tokio::io::AsyncWriteExt as _;
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&abs_dest)
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    WriteError::AlreadyExists
-                } else {
-                    error!("Failed to create file '{}': {}", abs_dest.display(), e);
-                    WriteError::Io {
-                        msg: format!("Failed to create file: {}", e),
-                    }
-                }
-            })?;
-        file.write_all(content_to_write.as_bytes())
-            .await
-            .map_err(|e| {
-                error!("Failed to write file '{}': {}", abs_dest.display(), e);
-                WriteError::Io {
-                    msg: format!("Failed to write file: {}", e),
-                }
-            })?;
-    }
-
-    // Re-verify the source immediately before removing it — same TOCTOU
-    // reasoning as write_document's own re-resolve-before-mutation pattern.
-    let abs_source = safe_write_path(deps, source_rel)?;
-    if let Err(e) = tokio::fs::remove_file(&abs_source).await {
-        error!(
-            "Failed to remove source '{}' while moving it to '{}'; deleting the destination \
-             copy so the move leaves nothing behind: {}",
-            source_rel, dest_rel, e
-        );
-        // The destination write above already landed on disk with no git change
-        // yet to make it durable — undo it fully rather than leave the document
-        // sitting at two paths at once.
-        if let Err(cleanup_err) = tokio::fs::remove_file(&abs_dest).await {
-            error!(
-                "Failed to clean up destination '{}' after a failed source removal during a \
-                 move: {}. The document now exists at BOTH '{}' and '{}' — this needs operator \
-                 attention.",
-                dest_rel, cleanup_err, source_rel, dest_rel
-            );
-        }
-        return Err(WriteError::Io {
-            msg: format!("Failed to remove source file during move: {}", e),
-        });
-    }
-
-    let data_path_str = deps.canonical_data_path.to_str().unwrap_or_default();
-
-    // 10.5. Rewrite OTHER documents whose body links to the SOURCE path, so
-    //    those links keep resolving after the move — riding along in the SAME
-    //    commit as the move itself (the path slice below includes every path
-    //    rewritten here). Runs after the destination/source filesystem work
-    //    above (the move is definitely proceeding by this point — every
-    //    validation gate has already passed) and before anything touches git,
-    //    so a failure partway through can still be undone by hand (see the
-    //    write failure branch below) rather than racing a rollback against a
-    //    half-committed state.
-    //
-    //    Best-effort against the reverse-link index itself: if there is no
-    //    `StateDb` (`deps.state == None` — see that field's doc comment) or the
-    //    query fails outright, link rewriting is simply skipped; the move still
-    //    proceeds. Every referencing document's `document_links` rows also
-    //    self-heal on that document's own next reindex regardless of what
-    //    happens here.
-    let mut rewritten_paths: Vec<String> = Vec::new();
-    if let Some(state) = deps.state {
-        match state.links_targeting(source_rel, "markdown").await {
-            Ok(referencing_paths) => {
-                for ref_path in referencing_paths {
-                    // The source linking to itself is the self-reference case
-                    // handled above as part of `content_to_write` — it is not a
-                    // separate file to rewrite, and must not be processed twice.
-                    if ref_path == source_rel {
-                        continue;
-                    }
-
-                    let abs_ref = match safe_write_path(deps, &ref_path) {
-                        Ok(p) => p,
-                        Err(_) => {
-                            warn!(
-                                "Skipping link rewrite in '{}' while moving '{}' -> '{}': the \
-                                 path no longer resolves safely (stale document_links row?)",
-                                ref_path, source_rel, dest_rel
-                            );
-                            continue;
-                        }
-                    };
-                    let body = match tokio::fs::read_to_string(&abs_ref).await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            // Stale `document_links` row: the referencing document no
-                            // longer exists on disk (or isn't readable). Not this
-                            // move's problem to fix — skip it rather than fail the
-                            // move over another document's already-broken state.
-                            warn!(
-                                "Skipping link rewrite in '{}' while moving '{}' -> '{}': \
-                                 failed to read it, likely a stale document_links row: {}",
-                                ref_path, source_rel, dest_rel, e
-                            );
-                            continue;
-                        }
-                    };
-                    let occurrences: Vec<_> =
-                        crate::ingest::find_markdown_link_occurrences(&body, &ref_path)
-                            .into_iter()
-                            .filter(|o| o.resolved.as_str() == source_rel)
-                            .collect();
-                    if occurrences.is_empty() {
-                        // Stale row again: `document_links` says this document links
-                        // to the source, but nothing in its CURRENT body actually
-                        // resolves there anymore. Skip — writing it back unchanged
-                        // would put a no-op entry in the move's commit.
-                        continue;
-                    }
-
-                    let replacement = crate::ingest::relativize_md_path(&ref_path, dest_rel);
-                    let new_body = apply_link_replacements(&body, &occurrences, &replacement);
-                    if let Err(e) = tokio::fs::write(&abs_ref, new_body.as_bytes()).await {
-                        error!(
-                            "Failed to rewrite links into '{}' while moving '{}' -> '{}': {}. \
-                             Undoing every filesystem change made for this move so far.",
-                            ref_path, source_rel, dest_rel, e
-                        );
-                        // Nothing has touched git yet at this point (no `git add`, no
-                        // commit) — every path involved is either still tracked at
-                        // HEAD (the source, and every referencing document already
-                        // rewritten this loop) or brand new and untracked (the
-                        // destination), so unwinding by hand is safe: restore the
-                        // tracked ones from HEAD, delete the untracked one. Reuses the
-                        // `git_lock` acquired in step 9.5 above rather than acquiring a
-                        // second guard — this non-reentrant mutex is already held for
-                        // this entire sequence, and a fresh `lock_git()` call here would
-                        // deadlock against it.
-                        for done in &rewritten_paths {
-                            if let Err(e) =
-                                git::restore_from_head(&git_lock, data_path_str, done).await
-                            {
-                                error!(
-                                    "Rollback: failed to restore rewritten referencing \
-                                     document '{}': {:#}. This needs operator attention.",
-                                    done, e
-                                );
-                            }
-                        }
-                        if let Err(e) =
-                            git::restore_from_head(&git_lock, data_path_str, source_rel).await
-                        {
-                            error!(
-                                "Rollback: failed to restore source '{}': {:#}. This needs \
-                                 operator attention.",
-                                source_rel, e
-                            );
-                        }
-                        if let Err(e) = tokio::fs::remove_file(&abs_dest).await {
-                            error!(
-                                "Rollback: failed to remove destination '{}': {}. This needs \
-                                 operator attention.",
-                                dest_rel, e
-                            );
-                        }
-                        return Err(WriteError::Io {
-                            msg: format!("Failed to rewrite links in '{}': {}", ref_path, e),
-                        });
-                    }
-                    rewritten_paths.push(ref_path);
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Skipping incoming-link rewrite while moving '{}' -> '{}': the \
-                     reverse-link query failed: {:#}",
-                    source_rel, dest_rel, e
-                );
-            }
-        }
-    }
-
-    let commit_message = build_commit_message(
-        message,
-        &format!("docs: move {} to {}", source_rel, dest_rel),
-        operation,
-    );
-
-    // 11. Commit the move AND every rewritten referencing document as ONE
-    //     atomic commit, under the SAME lock acquisition (step 9.5, above)
-    //     already held across the destination write, source removal, and
-    //     referencing-document rewrite — releasing it in between any of those
-    //     and the commit would let another writer stage into (and, since it
-    //     commits its own path, commit) the very half-staged state this call
-    //     is about to undo. See write_document's identical comment for the
-    //     full reasoning.
-    //     Deduplicated defensively even though `links_targeting` already
-    //     returns DISTINCT source paths and cannot return `source_rel`/
-    //     `dest_rel` themselves (dest_rel is guaranteed not to have existed as
-    //     a prior document, and source_rel is filtered out above).
-    let mut commit_paths: Vec<&str> = vec![source_rel, dest_rel];
-    for p in &rewritten_paths {
-        if !commit_paths.contains(&p.as_str()) {
-            commit_paths.push(p.as_str());
-        }
-    }
-
-    let commit_outcome = match git::commit_and_sync(
-        &git_lock,
-        deps.git_url,
-        deps.branch,
-        data_path_str,
-        deps.token,
-        &commit_paths,
-        &commit_message,
-        deps.commit_author_name,
-        deps.commit_author_email,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-
-        Err(git::CommitSyncError::PreCommit(source_err)) => {
-            error!(
-                "commit_and_sync pre-commit failure moving '{}' -> '{}', rolling back both \
-                 halves and {} rewritten referencing document(s): {:#}",
-                source_rel,
-                dest_rel,
-                rewritten_paths.len(),
-                source_err
-            );
-
-            // 12. Roll back EVERY part of this move — both halves of the move
-            //     itself, plus every referencing document rewritten above.
-            //     Each is independent of the others and ALL of them always run
-            //     unconditionally, so a failure in one never leaves a
-            //     recoverable part undone:
-            //     - the source was already tracked at HEAD before this call
-            //       (this is a move, not a create), so `restore_from_head` puts
-            //       its content — and un-stages whatever `git add`/removal
-            //       staged for it — back in one step, exactly like
-            //       write_document's edit rollback.
-            //     - the destination has no HEAD content (it is new), so it is
-            //       rolled back exactly like write_document's create rollback:
-            //       remove the file, then unstage whatever `git add` staged
-            //       for it.
-            //     - every rewritten referencing document is, like the source,
-            //       pre-existing and tracked at HEAD, so `restore_from_head`
-            //       reverts its link-text edit the same way it reverts the
-            //       source's content. Getting this third group right is the
-            //       whole point of this rollback being careful: a bug here
-            //       corrupts a user's OTHER, unrelated documents — not just
-            //       the one being moved — so `rolled_back` is true only if
-            //       ALL THREE groups succeed, not just the two the move
-            //       itself touches.
-            let source_restore = git::restore_from_head(&git_lock, data_path_str, source_rel).await;
-            let dest_rollback = match tokio::fs::remove_file(&abs_dest).await {
-                Ok(()) => git::unstage(&git_lock, data_path_str, dest_rel).await,
-                Err(e) => Err(anyhow::Error::new(e)
-                    .context("Failed to remove the new destination file during rollback")),
-            };
-            let mut rewrite_restore_failures: Vec<(String, anyhow::Error)> = Vec::new();
-            for path in &rewritten_paths {
-                if let Err(e) = git::restore_from_head(&git_lock, data_path_str, path).await {
-                    rewrite_restore_failures.push((path.clone(), e));
-                }
-            }
-
-            // All three groups must succeed for the rollback to be considered
-            // clean — if any failed, filesystem and git state are inconsistent
-            // with each other and with HEAD, which needs operator attention
-            // rather than a blind retry (mirrors `PreCommitFailed::rolled_back`'s
-            // contract on the non-move path).
-            let rolled_back = source_restore.is_ok()
-                && dest_rollback.is_ok()
-                && rewrite_restore_failures.is_empty();
-            if !rolled_back {
-                error!(
-                    "Rollback FAILED after a pre-commit git failure moving '{}' -> '{}'. Source \
-                     restore: {:?}. Destination rollback: {:?}. Rewritten-document restore \
-                     failures: {:?}. Original cause: {:#}. Filesystem and git state may now be \
-                     inconsistent.",
-                    source_rel,
-                    dest_rel,
-                    source_restore,
-                    dest_rollback,
-                    rewrite_restore_failures,
-                    source_err
-                );
-            }
-
-            let mut msg = format!("{:#}", source_err);
-            if let Err(e) = &source_restore {
-                msg.push_str(&format!(". Source restore cause: {:#}", e));
-            }
-            if let Err(e) = &dest_rollback {
-                msg.push_str(&format!(". Destination rollback cause: {:#}", e));
-            }
-            for (path, e) in &rewrite_restore_failures {
-                msg.push_str(&format!(". Restore of '{}' cause: {:#}", path, e));
-            }
-
-            return Err(WriteError::PreCommitFailed { rolled_back, msg });
-        }
-
-        Err(git::CommitSyncError::PostCommit {
-            sha,
-            source: source_err,
-        }) => {
-            warn!(
-                "commit_and_sync post-commit (sync) failure moving '{}' -> '{}', commit {} \
-                 stands uncorrected: {:#}",
-                source_rel, dest_rel, sha, source_err
-            );
-
-            // 13. The commit is real and durable — both halves of the move, and
-            //     every rewritten referencing document, already happened as far
-            //     as local git history is concerned, so this is left alone (not
-            //     rolled back) and reported as sync-pending, same as every other
-            //     post-commit failure in this pipeline. `rebased_paths` is empty
-            //     for the same reason as elsewhere: the rebase never ran. Still
-            //     filtered through `mark_dirty` (#278): the source/dest
-            //     path(s) can match `include` and still be excluded, same as the
-            //     success path below.
-            mark_dirty(
-                deps.queue,
-                deps.indexing,
-                [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
-                    .into_iter()
-                    .chain(rewritten_paths.iter().map(PathBuf::from))
-                    .collect(),
-            );
-
-            return Ok(WriteSuccess {
-                outcome: WriteOutcome::CommittedPendingSync,
-                sha,
-                rebased_paths: Vec::new(),
-                diff: render_unified_diff(old_content, &content_to_write, dest_rel),
-                sync_failure_cause: Some(format!("{:#}", source_err)),
-                rewritten_paths,
-                // Not a delete — nothing else was checked for inbound links.
-                referencing_paths: Vec::new(),
-            });
-        }
+    // 3. A move overwrites what is at the source wholesale.
+    let Some(expected_version) = expected_version else {
+        return Err(WriteError::VersionRequired);
     };
 
-    // 14. Mark the source, the destination, and every rewritten referencing
-    //     document dirty — plus anything the rebase pulled in — in the SAME
-    //     marking call. `ingest::index_paths` purges the now-missing source,
-    //     indexes the new destination, and re-chunks/re-embeds each rewritten
-    //     document (whose `document_links` rows self-heal from its new body in
-    //     the same pass); all of them need to be in the same worklist for the
-    //     worker to do that in one sweep.
-    mark_dirty(
-        deps.queue,
-        deps.indexing,
-        [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
-            .into_iter()
-            .chain(rewritten_paths.iter().map(PathBuf::from))
-            .chain(commit_outcome.rebased_paths.iter().cloned())
-            .collect(),
-    );
+    validate_commit_message(message)?;
 
-    Ok(WriteSuccess {
-        outcome: WriteOutcome::Synced,
-        sha: commit_outcome.sha,
-        diff: render_unified_diff(old_content, &content_to_write, dest_rel),
-        rebased_paths: commit_outcome.rebased_paths,
-        sync_failure_cause: None,
-        rewritten_paths,
-        // Not a delete — nothing else was checked for inbound links.
-        referencing_paths: Vec::new(),
-    })
+    let (git_lock, mut head) = lock_and_sync(deps).await;
+    let data_path_str = data_path_of(deps);
+
+    for attempt in 1..=MAX_WRITE_ATTEMPTS {
+        // 4. Source must exist and still be the version the caller read.
+        let abs_source = safe_write_path(deps, source_rel)?;
+        let Some(current) = read_if_exists(&abs_source).await? else {
+            return Err(WriteError::NotFound);
+        };
+        if !versions_match(expected_version, &current) {
+            return Err(WriteError::EditedElsewhere);
+        }
+
+        // 5. Destination must NOT already exist — a move never overwrites.
+        let abs_dest = safe_write_path(deps, dest_rel)?;
+        if abs_dest.exists() {
+            return Err(WriteError::AlreadyExists);
+        }
+
+        let applied = apply_change(
+            &git_lock,
+            data_path_str,
+            change,
+            &current,
+            Some(expected_version),
+            None,
+        )
+        .await?;
+
+        // 6. Outbound-link re-relativization: every relative link inside the
+        //    moved document was authored against its OLD directory; each is
+        //    re-relativized from `dest_rel` to its own target, a self-reference
+        //    mapping to `dest_rel`.
+        let content_to_write =
+            rewrite_outbound_links(&applied.content, source_rel, dest_rel, |resolved| {
+                (resolved == source_rel).then(|| dest_rel.to_string())
+            });
+
+        // 7. Validation against the DESTINATION's schema, not the source's.
+        validate_document(deps, dest_rel, &content_to_write).await?;
+
+        // 8. Filesystem: write the DESTINATION first (`create_new`), THEN remove
+        //    the source — the only order in which every failure point still has a
+        //    path back to "nothing lost".
+        if let Some(parent) = abs_dest.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                error!(
+                    "Failed to create parent directories for '{}': {}",
+                    abs_dest.display(),
+                    e
+                );
+                WriteError::Io {
+                    msg: format!("Failed to create parent directories: {}", e),
+                }
+            })?;
+        }
+        let abs_dest = safe_write_path(deps, dest_rel)?;
+        {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&abs_dest)
+                .await
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        WriteError::AlreadyExists
+                    } else {
+                        error!("Failed to create file '{}': {}", abs_dest.display(), e);
+                        WriteError::Io {
+                            msg: format!("Failed to create file: {}", e),
+                        }
+                    }
+                })?;
+            write_and_flush(&mut file, content_to_write.as_bytes())
+                .await
+                .map_err(|e| {
+                    error!("Failed to write file '{}': {}", abs_dest.display(), e);
+                    WriteError::Io {
+                        msg: format!("Failed to write file: {}", e),
+                    }
+                })?;
+        }
+
+        let abs_source = safe_write_path(deps, source_rel)?;
+        if let Err(e) = tokio::fs::remove_file(&abs_source).await {
+            error!(
+                "Failed to remove source '{}' while moving it to '{}'; deleting the \
+                 destination copy so the move leaves nothing behind: {}",
+                source_rel, dest_rel, e
+            );
+            if let Err(cleanup_err) = tokio::fs::remove_file(&abs_dest).await {
+                error!(
+                    "Failed to clean up destination '{}' after a failed source removal during \
+                     a move: {}. The document now exists at BOTH '{}' and '{}' — this needs \
+                     operator attention.",
+                    dest_rel, cleanup_err, source_rel, dest_rel
+                );
+            }
+            return Err(WriteError::Io {
+                msg: format!("Failed to remove source file during move: {}", e),
+            });
+        }
+
+        // 9. Rewrite OTHER documents whose body links to the SOURCE path, in the
+        //    same commit, reading each one's current body under the lock.
+        //    Best-effort against the reverse-link index: no `StateDb`, or a failed
+        //    query, skips it; the links self-heal on each document's next reindex.
+        let mut rewritten_paths: Vec<String> = Vec::new();
+        if let Some(state) = deps.state {
+            match state.links_targeting(source_rel, "markdown").await {
+                Ok(referencing_paths) => {
+                    for ref_path in referencing_paths {
+                        // A self-reference was handled in `content_to_write`.
+                        if ref_path == source_rel {
+                            continue;
+                        }
+                        let abs_ref = match safe_write_path(deps, &ref_path) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                warn!(
+                                    "Skipping link rewrite in '{}' while moving '{}' -> '{}': \
+                                     the path no longer resolves safely (stale document_links \
+                                     row?)",
+                                    ref_path, source_rel, dest_rel
+                                );
+                                continue;
+                            }
+                        };
+                        let body = match tokio::fs::read_to_string(&abs_ref).await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(
+                                    "Skipping link rewrite in '{}' while moving '{}' -> '{}': \
+                                     failed to read it, likely a stale document_links row: {}",
+                                    ref_path, source_rel, dest_rel, e
+                                );
+                                continue;
+                            }
+                        };
+                        let occurrences: Vec<_> =
+                            crate::ingest::find_markdown_link_occurrences(&body, &ref_path)
+                                .into_iter()
+                                .filter(|o| o.resolved.as_str() == source_rel)
+                                .collect();
+                        if occurrences.is_empty() {
+                            continue;
+                        }
+                        let replacement = crate::ingest::relativize_md_path(&ref_path, dest_rel);
+                        let new_body = apply_link_replacements(&body, &occurrences, &replacement);
+                        if let Err(e) = tokio::fs::write(&abs_ref, new_body.as_bytes()).await {
+                            error!(
+                                "Failed to rewrite links into '{}' while moving '{}' -> '{}': \
+                                 {}. Undoing every filesystem change made for this move so far.",
+                                ref_path, source_rel, dest_rel, e
+                            );
+                            // Nothing has touched git yet: restore the tracked paths
+                            // from HEAD and delete the untracked destination.
+                            for done in &rewritten_paths {
+                                if let Err(e) =
+                                    git::restore_from_head(&git_lock, data_path_str, done).await
+                                {
+                                    error!(
+                                        "Rollback: failed to restore rewritten referencing \
+                                         document '{}': {:#}. This needs operator attention.",
+                                        done, e
+                                    );
+                                }
+                            }
+                            if let Err(e) =
+                                git::restore_from_head(&git_lock, data_path_str, source_rel).await
+                            {
+                                error!(
+                                    "Rollback: failed to restore source '{}': {:#}. This needs \
+                                     operator attention.",
+                                    source_rel, e
+                                );
+                            }
+                            if let Err(e) = tokio::fs::remove_file(&abs_dest).await {
+                                error!(
+                                    "Rollback: failed to remove destination '{}': {}. This \
+                                     needs operator attention.",
+                                    dest_rel, e
+                                );
+                            }
+                            return Err(WriteError::Io {
+                                msg: format!("Failed to rewrite links in '{}': {}", ref_path, e),
+                            });
+                        }
+                        rewritten_paths.push(ref_path);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Skipping incoming-link rewrite while moving '{}' -> '{}': the \
+                         reverse-link query failed: {:#}",
+                        source_rel, dest_rel, e
+                    );
+                }
+            }
+        }
+
+        let commit_message = build_commit_message(
+            message,
+            &format!("docs: move {} to {}", source_rel, dest_rel),
+            operation,
+        );
+
+        // 10. Commit the move AND every rewritten referencing document as ONE
+        //     commit, under the same acquisition as everything above.
+        let mut commit_paths: Vec<&str> = vec![source_rel, dest_rel];
+        for p in &rewritten_paths {
+            if !commit_paths.contains(&p.as_str()) {
+                commit_paths.push(p.as_str());
+            }
+        }
+
+        let commit_outcome = match git::commit_and_sync(
+            &git_lock,
+            deps.git_url,
+            deps.branch,
+            data_path_str,
+            deps.token,
+            &commit_paths,
+            &commit_message,
+            deps.commit_author_name,
+            deps.commit_author_email,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+
+            Err(git::CommitSyncError::PreCommit(source_err)) => {
+                error!(
+                    "commit_and_sync pre-commit failure moving '{}' -> '{}', rolling back both \
+                     halves and {} rewritten referencing document(s): {:#}",
+                    source_rel,
+                    dest_rel,
+                    rewritten_paths.len(),
+                    source_err
+                );
+                // Roll back EVERY part: the source (tracked at HEAD) restored, the
+                // destination removed and unstaged, every rewritten referencing
+                // document restored. All run unconditionally; `rolled_back` only
+                // if all three groups succeed.
+                let source_restore =
+                    git::restore_from_head(&git_lock, data_path_str, source_rel).await;
+                let dest_rollback = match tokio::fs::remove_file(&abs_dest).await {
+                    Ok(()) => git::unstage(&git_lock, data_path_str, dest_rel).await,
+                    Err(e) => Err(anyhow::Error::new(e)
+                        .context("Failed to remove the new destination file during rollback")),
+                };
+                let mut rewrite_restore_failures: Vec<(String, anyhow::Error)> = Vec::new();
+                for path in &rewritten_paths {
+                    if let Err(e) = git::restore_from_head(&git_lock, data_path_str, path).await {
+                        rewrite_restore_failures.push((path.clone(), e));
+                    }
+                }
+                let rolled_back = source_restore.is_ok()
+                    && dest_rollback.is_ok()
+                    && rewrite_restore_failures.is_empty();
+                if !rolled_back {
+                    error!(
+                        "Rollback FAILED after a pre-commit git failure moving '{}' -> '{}'. \
+                         Source restore: {:?}. Destination rollback: {:?}. Rewritten-document \
+                         restore failures: {:?}. Original cause: {:#}. Filesystem and git \
+                         state may now be inconsistent.",
+                        source_rel,
+                        dest_rel,
+                        source_restore,
+                        dest_rollback,
+                        rewrite_restore_failures,
+                        source_err
+                    );
+                }
+                let mut msg = format!("{:#}", source_err);
+                if let Err(e) = &source_restore {
+                    msg.push_str(&format!(". Source restore cause: {:#}", e));
+                }
+                if let Err(e) = &dest_rollback {
+                    msg.push_str(&format!(". Destination rollback cause: {:#}", e));
+                }
+                for (path, e) in &rewrite_restore_failures {
+                    msg.push_str(&format!(". Restore of '{}' cause: {:#}", path, e));
+                }
+                return Err(WriteError::PreCommitFailed { rolled_back, msg });
+            }
+
+            Err(git::CommitSyncError::PostCommit {
+                sha,
+                source: source_err,
+            }) => {
+                warn!(
+                    "commit_and_sync post-commit (sync) failure moving '{}' -> '{}', commit {} \
+                     stands uncorrected: {:#}",
+                    source_rel, dest_rel, sha, source_err
+                );
+                mark_dirty(
+                    deps.queue,
+                    deps.indexing,
+                    [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
+                        .into_iter()
+                        .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .collect(),
+                );
+                return Ok(WriteSuccess {
+                    outcome: WriteOutcome::CommittedPendingSync,
+                    sha,
+                    rebased_paths: Vec::new(),
+                    diff: render_unified_diff(&current, &content_to_write, dest_rel),
+                    rewritten_paths,
+                    referencing_paths: Vec::new(),
+                    merged: applied.merged,
+                    version: Some(document_version(content_to_write.as_bytes())),
+                });
+            }
+
+            Err(git::CommitSyncError::Conflict { source }) => {
+                warn!(
+                    "Remote changed underneath the move '{}' -> '{}' (attempt {}/{}), \
+                     re-checking against fresh content: {:#}",
+                    source_rel, dest_rel, attempt, MAX_WRITE_ATTEMPTS, source
+                );
+                head = sync_clone(deps, &git_lock, head).await;
+                continue;
+            }
+        };
+
+        // 11. Mark the source, the destination, every rewritten referencing
+        //     document and anything the rebase pulled in dirty, in one call.
+        mark_dirty(
+            deps.queue,
+            deps.indexing,
+            [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
+                .into_iter()
+                .chain(rewritten_paths.iter().map(PathBuf::from))
+                .chain(commit_outcome.rebased_paths.iter().cloned())
+                .collect(),
+        );
+
+        // `merged` covers every document this call wrote, a rewritten referencing
+        // document included; the moved document's bytes differ from what was
+        // written — so its version is unknown here — only when the rebase merged
+        // into the destination itself.
+        let rebase_merged = rebase_touched(&commit_outcome.rebased_paths, &commit_paths);
+        let dest_merged = rebase_touched(&commit_outcome.rebased_paths, &[dest_rel]);
+        return Ok(WriteSuccess {
+            outcome: WriteOutcome::Synced,
+            sha: commit_outcome.sha,
+            diff: render_unified_diff(&current, &content_to_write, dest_rel),
+            rebased_paths: commit_outcome.rebased_paths,
+            rewritten_paths,
+            referencing_paths: Vec::new(),
+            merged: applied.merged || rebase_merged,
+            version: (!dest_merged).then(|| document_version(content_to_write.as_bytes())),
+        });
+    }
+
+    Err(WriteError::EditedElsewhere)
 }
 
 // ---------------------------------------------------------------------------
@@ -2376,38 +2472,23 @@ pub const MAX_BATCH_DOCUMENTS: usize = 25;
 
 /// One document's request within [`write_documents_batch`]. A deliberately
 /// narrower cousin of [`WriteRequest`]: no `dest_path` — a batch entry can
-/// create or fully replace a document, but cannot MOVE one. Moves are
-/// excluded from v1 of batch writes for two reasons: a move's rollback and
-/// commit-path scope already span two paths (source + destination) plus
-/// every other document whose links get rewritten alongside it (see
-/// `write_document_move`), and a batch containing several moves could name
-/// the same document as both a plain entry's `rel_path` and another entry's
-/// rewrite target, with no well-defined ordering. A caller that needs to
-/// relocate documents still has the single-document `write_document` (move)
-/// and `move_directory` paths for that. There is also no per-document
-/// `message`/`default_verb`/`operation` here — the whole batch lands as ONE
-/// commit with one message and one `Operation:` trailer, not N of them (see
-/// [`write_documents_batch`]'s `message` parameter).
+/// create or change a document, but cannot MOVE one (a move's commit scope spans
+/// the source, the destination and every document whose links get rewritten,
+/// and several moves in one batch could name the same document twice with no
+/// well-defined ordering). There is also no per-document
+/// `message`/`default_verb`/`operation` — the whole batch lands as ONE commit
+/// with one message.
 pub struct BatchWriteRequest<'a> {
     /// Repo-relative path, already resolved and validated by the caller —
     /// same contract as `WriteRequest::rel_path`.
     pub rel_path: &'a str,
-    /// Existing file bytes (empty string for a create) — same contract as
-    /// `WriteRequest::old_content`.
-    pub old_content: &'a str,
-    /// The content to write, already computed by the caller (e.g. after
-    /// applying a surgical old_string/new_string replacement, a frontmatter
-    /// patch, or an append) — same contract as `WriteRequest::new_content`.
-    pub new_content: &'a str,
-    pub is_create: bool,
+    /// Same contract as `WriteRequest::change`; never `DocChange::Keep`.
+    pub change: DocChange<'a>,
     /// When `Some(true)`, bypasses the dedup gate for THIS entry if it is a
-    /// create. Mirrors `WriteRequest::force_new` — dedup remains a
-    /// per-document decision even inside a batch, since two entries in the
-    /// same call can have entirely unrelated content.
+    /// create — dedup stays a per-document decision even inside a batch.
     pub force_new: Option<bool>,
-    /// Stale-read guard for this document specifically. Mirrors
-    /// `WriteRequest::expected_hash`.
-    pub expected_hash: Option<&'a str>,
+    /// Same contract as `WriteRequest::expected_version`, for this document.
+    pub expected_version: Option<&'a str>,
 }
 
 /// One document's outcome within a successful [`write_documents_batch`] call.
@@ -2418,88 +2499,76 @@ pub struct BatchDocumentResult {
     /// Unified diff of this document's own change — same rendering
     /// (`render_unified_diff`) `WriteSuccess::diff` uses for a single write.
     pub diff: String,
+    /// Same contract as `WriteSuccess::merged`, for this document.
+    pub merged: bool,
+    /// Same contract as `WriteSuccess::version`, for this document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
-/// A successful batch write: every document landed in ONE commit (`Synced`),
-/// or landed locally in that one commit with its push still pending
-/// (`CommittedPendingSync`). There is no partial-success shape — a batch
-/// commits every document or none of them; see [`write_documents_batch`]'s
-/// doc comment for why that is a consequence of "one commit", not a
-/// separate design choice layered on top of it.
+/// A successful batch write: every document landed in ONE commit, pushed or —
+/// when the push failed — committed locally with its push still pending (logged
+/// where it failed, not reported here: no caller relays it). There is no
+/// partial-success shape — a batch commits every document or none of them.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BatchWriteSuccess {
-    pub outcome: WriteOutcome,
-    pub sha: String,
-    pub rebased_paths: Vec<PathBuf>,
     /// Every document in the batch, in the order the caller supplied them.
     pub documents: Vec<BatchDocumentResult>,
-    /// Present only when `outcome == CommittedPendingSync` — same contract as
-    /// `WriteSuccess::sync_failure_cause`.
-    pub sync_failure_cause: Option<String>,
 }
 
 /// Every structured failure mode of [`write_documents_batch`]. Distinct from
 /// [`WriteError`] because most of what can go wrong at this level is
 /// BATCH-shaped (size, a duplicate path, the one shared commit) rather than
-/// document-shaped — but a per-document problem (a path that fails
-/// path-safety, frontmatter that fails validation, a dedup hit, a stale
-/// hash, create-on-existing, edit-on-missing) is exactly a [`WriteError`]
-/// already, so [`Documents`](Self::Documents) reuses that vocabulary rather
-/// than reinventing a parallel one.
+/// document-shaped — but a per-document problem is exactly a [`WriteError`]
+/// already, so [`Documents`](Self::Documents) reuses that vocabulary.
 #[derive(Debug)]
 pub enum BatchWriteError {
     /// The batch was empty — nothing to write.
     Empty,
     /// More documents than [`MAX_BATCH_DOCUMENTS`] were supplied.
     TooMany { count: usize, max: usize },
-    /// The same `rel_path` appeared more than once. A batch commit stages
-    /// every path exactly once; two entries targeting the same file has no
-    /// well-defined "which one wins" answer worth guessing at, so this is
-    /// rejected before anything is touched rather than silently letting
-    /// whichever entry is processed last clobber the other.
+    /// The same `rel_path` appeared more than once. Two entries targeting the
+    /// same file has no well-defined "which one wins" answer, so this is
+    /// rejected before anything is touched.
     DuplicatePath { rel_path: String },
-    /// One or more documents failed a pre-write check: path safety,
-    /// a schema-file path, frontmatter validation, the dedup gate, a stale
-    /// `expected_hash`, or — discovered only under `GIT_LOCK`, at the same
-    /// point `write_document` itself discovers it — create-on-existing or
-    /// edit-on-missing. Carries EVERY failing document from this phase, not
-    /// just the first — mirrors `DirectoryMoveError::Validation`'s
-    /// all-failures-at-once reporting, so a caller fixes the whole batch in
-    /// one round trip instead of one entry at a time. Validation failures
-    /// (discovered before `GIT_LOCK` is acquired) always leave the batch
-    /// with literally nothing written; a create/edit-existence failure
-    /// (discovered while writing, under the lock) leaves it with every
-    /// EARLIER document in this batch rolled back — see
-    /// [`write_documents_batch`]'s phase-2 doc comment.
+    /// One or more documents failed a check: path safety, a schema-file path,
+    /// frontmatter validation, the dedup gate, a missing or stale
+    /// `expected_version`, an anchor that no longer matches, create-on-existing
+    /// or edit-on-missing. Carries EVERY failing document of the phase that
+    /// found them, so a caller fixes the whole batch in one round trip. Every
+    /// such failure leaves the batch with nothing written: checks that need the
+    /// current content run under `GIT_LOCK` before the first write. A write
+    /// that fails is reported here too, alone, after every document written so
+    /// far is rolled back; its error names any the rollback could not restore.
     Documents { failures: Vec<(String, WriteError)> },
     /// The caller-supplied commit message would confuse git or the log.
     InvalidCommitMessage { reason: String },
     /// `git add`/`git commit` failed for the one shared commit. Mirrors
     /// `WriteError::PreCommitFailed`: `rolled_back` reports whether EVERY
     /// document this batch had written to disk was successfully restored to
-    /// its pre-call state — `false` means at least one could not be, and the
-    /// batch needs operator attention rather than a blind retry.
-    PreCommitFailed { rolled_back: bool, msg: String },
+    /// its pre-call state. The cause is logged here and deliberately not
+    /// carried: no caller relays it.
+    PreCommitFailed { rolled_back: bool },
+    /// The remote kept moving under every attempt (see `MAX_WRITE_ATTEMPTS`);
+    /// nothing was written: each attempt's commit was dropped, and the clone
+    /// synced with the remote again after the last.
+    EditedElsewhere,
 }
 
-/// Roll back every document in `written` to its pre-call state using plain
-/// filesystem operations — no git calls, because this is used only for a
-/// failure discovered BEFORE `git::commit_and_sync` (and therefore `git add`)
-/// has run for any of them: a create is undone by deleting the file, an edit
-/// is undone by writing its original content back. Returns the paths (if
-/// any) whose rollback itself failed, so the caller can decide how to report
-/// that (see the one call site's handling in [`write_documents_batch`]).
-///
-/// `written` and `originals` are parallel to each other in the sense that
-/// `originals` is queried by `rel_path`, not by position — a document's
-/// original content lives in the `BatchWriteRequest` the caller already has,
-/// looked up by path rather than threaded through as a second positional
-/// list, so this function cannot silently pair the wrong content with the
-/// wrong path if the two ever get out of step.
+/// Roll back every document in `written` to the content it had under the lock,
+/// before this batch wrote it, using plain filesystem operations — no git calls,
+/// because this runs only before `git::commit_and_sync` (and therefore `git
+/// add`) has run for any of them: a create is undone by deleting the file, an
+/// edit by writing its snapshot back. Snapshots are taken under the same lock
+/// acquisition as the writes, so a rollback can never revert another writer's
+/// change. `written` holds only files this batch created or started to
+/// overwrite (see the write loop in [`write_documents_batch`]), so a rollback
+/// never deletes a file it did not create. Returns the paths whose rollback
+/// itself failed.
 async fn rollback_batch_filesystem_writes(
     deps_data_path: &Path,
     written: &[(String, bool)],
-    originals: &HashMap<&str, &str>,
+    snapshots: &HashMap<&str, String>,
 ) -> Vec<String> {
     let mut failed = Vec::new();
     for (rel_path, is_create) in written {
@@ -2507,7 +2576,10 @@ async fn rollback_batch_filesystem_writes(
         let result = if *is_create {
             tokio::fs::remove_file(&abs).await
         } else {
-            let original = originals.get(rel_path.as_str()).copied().unwrap_or("");
+            let original = snapshots
+                .get(rel_path.as_str())
+                .map(String::as_str)
+                .unwrap_or("");
             tokio::fs::write(&abs, original.as_bytes()).await
         };
         if let Err(e) = result {
@@ -2521,54 +2593,71 @@ async fn rollback_batch_filesystem_writes(
     failed
 }
 
+/// `err`, the error a failed batch write reports, with one sentence appended
+/// naming every path its rollback ([`rollback_batch_filesystem_writes`]) could
+/// not restore: those may hold partial content, so the failure must not read as
+/// "nothing written". Names KB-relative paths only; the rollback logged each OS
+/// error where it happened.
+fn note_unrestored(err: WriteError, unrestored: &[String]) -> WriteError {
+    if unrestored.is_empty() {
+        return err;
+    }
+    let paths = unrestored
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let note = format!("Undoing the batch failed for {paths}, which may hold partial content");
+    match err {
+        WriteError::Io { msg } => WriteError::Io {
+            msg: format!("{msg}. {note}"),
+        },
+        WriteError::UnsafePath { msg } => WriteError::UnsafePath {
+            msg: format!("{msg}. {note}"),
+        },
+        WriteError::Internal { msg } => WriteError::Internal {
+            msg: format!("{msg}. {note}"),
+        },
+        // The write loop's one error without a message: a create whose path
+        // was taken after the batch planned it.
+        WriteError::AlreadyExists => WriteError::Io {
+            msg: format!("document already exists. {note}"),
+        },
+        // The write loop returns none of the rest.
+        other => other,
+    }
+}
+
 /// Write every document in `requests` and land them in ONE git commit, under
 /// ONE [`git::GitLock`] acquisition — the batched counterpart to
-/// [`write_document`] (`write_document` called once per document is what
-/// this replaces: see #180).
+/// [`write_document`] (#180).
 ///
 /// ## Phases
 ///
-/// 1. **Pre-flight, no lock, no filesystem mutation.** Every document is
-///    checked — schema-file guard, include-pattern eligibility, path safety,
-///    frontmatter validation, the create-path dedup gate (its embedding call
-///    and Qdrant query, same as a single create's) — and EVERY failure
-///    across the whole batch is collected before this function returns
-///    anything. A batch that is going to fail validation does so having
-///    touched nothing: no file written, no lock taken, matching the ordering
-///    the issue calls for explicitly. `validate_commit_message` also runs
-///    here, before any of the slow per-document work, since a message this
-///    codebase's git tooling can't handle makes the whole call pointless
-///    regardless of whether every document would otherwise have been fine.
-/// 2. **Under `GIT_LOCK`, filesystem writes only — no git yet.** Each
-///    document is written to disk in order (re-resolving its path fresh,
-///    exactly as `write_document` does, to close the TOCTOU window between
-///    phase 1's checks and this write; a create uses `create_new` so a
-///    concurrent create of the same path is still caught here even though
-///    [`Self::DuplicatePath`]-class collisions within THIS call were already
-///    rejected up front). If document K's write fails — an `AlreadyExists`/
-///    `NotFound` this phase discovers for the first time, a stale
-///    `expected_hash` re-check against LIVE content, or a plain I/O error —
-///    every document 1..K-1 already written in this call is rolled back via
-///    [`rollback_batch_filesystem_writes`] (no git calls: nothing has been
-///    `git add`ed yet, so a plain filesystem revert is both correct and
-///    sufficient) and this returns `Err(Documents { failures: vec![(K, err)] })`.
-/// 3. **One `git::commit_and_sync` call, all paths at once.** Exactly the
-///    multi-path shape `move_directory` already established for a
-///    move-shaped change — see that function's own commit-path construction
-///    — applied here to a set of otherwise-unrelated documents instead of a
-///    move's paired old/new paths. A `PreCommit` failure here means `git
-///    add`/`git commit` failed for the whole batch: every document is rolled
-///    back, this time via the git-aware `restore_from_head`
-///    (edits)/`unstage`+`remove_file` (creates) pair `write_document` itself
-///    uses, since `git add` may have partially staged some of them by the
-///    time `git commit` failed. A `PostCommit` failure (fetch/rebase/push)
-///    means the commit is real and durable — nothing is rolled back, exactly
-///    like a single `write_document` call, and the whole batch is reported
-///    `CommittedPendingSync`.
+/// 1. **Pre-flight, no lock, no filesystem mutation.** Every document is checked
+///    — schema-file guard, include-pattern eligibility, path safety, a missing
+///    `expected_version` on a full replace (or one on a create), and, for a
+///    create (whose content is fixed), frontmatter validation and the dedup gate
+///    — and EVERY failure across the batch is collected before anything else
+///    happens.
+/// 2. **Under `GIT_LOCK`, after syncing with the remote.** Every document's
+///    current content is read and its change applied and validated (see
+///    `apply_change`) — again collecting every failure, with nothing written
+///    yet. An edit that leaves its document exactly as it is is neither written
+///    nor committed (when every one does, the batch returns with no commit).
+///    Only then is each document written, snapshotting what it held first;
+///    a write failure restores every document written so far from those
+///    snapshots, the failing one included, and names any it could not restore.
+/// 3. **One `git::commit_and_sync` call, all paths at once.** `PreCommit`:
+///    every document is rolled back via `restore_from_head`
+///    (edits)/`unstage`+`remove_file` (creates). `PostCommit`: the commit is
+///    durable, so the batch succeeds and the failed sync is logged. `Conflict`:
+///    the remote moved underneath the commit, which is already dropped (the
+///    branch is back at its pre-commit HEAD); the clone syncs again and phase 2
+///    runs again.
 ///
 /// `message` is the whole batch's own commit subject (`None` gets a generated
-/// default naming the document count) — there is no per-document message,
-/// since N documents in one commit only makes sense with one subject line.
+/// default naming the document count).
 pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     requests: &[BatchWriteRequest<'_>],
@@ -2595,9 +2684,6 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
         }
     }
 
-    // Validate the commit message before any of the slower per-document work
-    // below — same "cheap, structural checks first" ordering `write_document`
-    // itself uses for this exact check (see its own step 4).
     validate_commit_message(message).map_err(|e| match e {
         WriteError::InvalidCommitMessage { reason } => {
             BatchWriteError::InvalidCommitMessage { reason }
@@ -2608,427 +2694,331 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
         ),
     })?;
 
-    // --- Phase 1: pre-flight checks for every document, no lock, nothing
-    // written. Mirrors `write_document`'s own steps 0/0.5/1/2/3, run once per
-    // document, with every failure collected rather than returned on the
-    // first one — see this function's own doc comment.
-    let schemas = crate::schema::load_shared(deps.schema_cache);
+    // --- Phase 1: pre-flight checks for every document, no lock, nothing written.
     let mut failures: Vec<(String, WriteError)> = Vec::new();
-
     for req in requests {
-        if let Err(e) = check_not_schema_file(req.rel_path)
-            .and_then(|()| check_include_pattern(deps, req.rel_path))
-        {
+        let checked = async {
+            check_not_schema_file(req.rel_path)?;
+            check_include_pattern(deps, req.rel_path)?;
+            safe_write_path(deps, req.rel_path)?;
+            if matches!(req.change, DocChange::Keep) {
+                return Err(WriteError::Internal {
+                    msg: "a batch entry must change the document".to_string(),
+                });
+            }
+            if req.change.is_absolute() && req.expected_version.is_none() {
+                return Err(WriteError::VersionRequired);
+            }
+            // Same as `write_document`: a create carrying `expected_version` was
+            // meant for a document that is no longer at this path.
+            if req.change.is_create() && req.expected_version.is_some() {
+                return Err(WriteError::NotFound);
+            }
+            if let DocChange::Create(content) = req.change {
+                let validated = validate_document(deps, req.rel_path, content).await?;
+                dedup_gate(deps, req.rel_path, validated.as_ref(), req.force_new).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = checked {
             failures.push((req.rel_path.to_string(), e));
-            continue;
-        }
-        if let Err(e) = safe_write_path(deps, req.rel_path) {
-            failures.push((req.rel_path.to_string(), e));
-            continue;
-        }
-        if let Some(expected) = req.expected_hash {
-            let actual = crate::ingest::compute_hash_from_bytes(req.old_content.as_bytes());
-            if !expected.trim().eq_ignore_ascii_case(&actual) {
-                failures.push((
-                    req.rel_path.to_string(),
-                    WriteError::StaleHash {
-                        expected: expected.trim().to_string(),
-                        actual,
-                    },
-                ));
-                continue;
-            }
-        }
-
-        let schema = schemas.resolve_for(Path::new(req.rel_path));
-
-        let (validation_result, validated) = match validate::validate_content(
-            Path::new(req.rel_path),
-            req.new_content,
-            schema,
-            deps.validation,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Validation error for '{}': {:#}", req.rel_path, e);
-                failures.push((
-                    req.rel_path.to_string(),
-                    WriteError::Io {
-                        msg: format!("Failed to validate content: {}", e),
-                    },
-                ));
-                continue;
-            }
-        };
-        if !validation_result.valid {
-            failures.push((
-                req.rel_path.to_string(),
-                WriteError::Validation {
-                    result: validation_result,
-                },
-            ));
-            continue;
-        }
-
-        let (dedup_enabled, dedup_threshold) = effective_dedup(deps, schema);
-        if req.is_create && dedup_enabled && !matches!(req.force_new, Some(true)) {
-            let query_text = validated
-                .as_ref()
-                .map(|v| {
-                    let description = v.frontmatter.get("description").and_then(|d| d.as_str());
-                    build_dedup_query(&v.body, description, deps.prepend_description)
-                })
-                .unwrap_or_default();
-
-            if query_text.trim().is_empty() {
-                warn!(
-                    "Dedup gate skipped for '{}' (batch): no body text to compare",
-                    req.rel_path
-                );
-            } else {
-                let empty_filters = SearchFilters::default();
-                let dedup_deps = RetrievalDeps {
-                    embed_client: deps.retrieval.embed_client,
-                    qdrant: deps.retrieval.qdrant,
-                    collection: deps.retrieval.collection,
-                    data_path: deps.retrieval.data_path,
-                    include_patterns: deps.retrieval.include_patterns,
-                    reranker: None,
-                };
-                match crate::retrieval::search(
-                    &dedup_deps,
-                    &query_text,
-                    &empty_filters,
-                    &dedup_search_opts(),
-                )
-                .await
-                {
-                    Ok(results) => {
-                        let top = results.into_iter().next().map(|r| {
-                            let path = r
-                                .payload
-                                .get("file_path")
-                                .and_then(|v| v.as_str())
-                                .map(|p| {
-                                    crate::retrieval::relative_to_data(p, deps.canonical_data_path)
-                                })
-                                .unwrap_or_default();
-                            (path, r.score)
-                        });
-                        if let Some(hit) = dedup_verdict(top, dedup_threshold) {
-                            failures.push((
-                                req.rel_path.to_string(),
-                                WriteError::DedupHit {
-                                    duplicate_of: hit.file_path,
-                                    similarity: hit.score,
-                                    threshold: dedup_threshold,
-                                },
-                            ));
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Dedup search failed for '{}' (batch, proceeding with write): {:#?}",
-                            req.rel_path, e
-                        );
-                    }
-                }
-            }
         }
     }
-
     if !failures.is_empty() {
         return Err(BatchWriteError::Documents { failures });
     }
 
-    // --- Phase 2: acquire GIT_LOCK once for the rest of this call — the
-    // writes below, the single commit, and any rollback all share this one
-    // acquisition, for the identical #142 reason `write_document` itself
-    // holds its own lock across that same span (see its step 4.5 comment):
-    // releasing in between would let a concurrent webhook merge or another
-    // writer observe a half-written batch.
-    let git_lock = git::lock_git().await;
-    let data_path_str = deps.canonical_data_path.to_str().unwrap_or_default();
-
-    let originals: HashMap<&str, &str> = requests
-        .iter()
-        .map(|r| (r.rel_path, r.old_content))
-        .collect();
-    let mut written: Vec<(String, bool)> = Vec::with_capacity(requests.len());
-
+    // Each edited document as it was before the lock, only to tell a stale
+    // anchor from a wrong one (see `apply_change`).
+    let mut pre_reads: HashMap<&str, String> = HashMap::new();
     for req in requests {
-        let abs_path = match safe_write_path(deps, req.rel_path) {
-            Ok(p) => p,
-            Err(e) => {
-                rollback_batch_filesystem_writes(deps.canonical_data_path, &written, &originals)
-                    .await;
-                return Err(BatchWriteError::Documents {
-                    failures: vec![(req.rel_path.to_string(), e)],
-                });
-            }
-        };
-        if let Some(parent) = abs_path.parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        if !req.change.is_create()
+            && let Ok(abs) = safe_write_path(deps, req.rel_path)
+            && let Ok(Some(content)) = read_if_exists(&abs).await
         {
-            error!(
-                "Failed to create parent directories for '{}' (batch): {}",
-                abs_path.display(),
-                e
-            );
-            rollback_batch_filesystem_writes(deps.canonical_data_path, &written, &originals).await;
-            return Err(BatchWriteError::Documents {
-                failures: vec![(
-                    req.rel_path.to_string(),
-                    WriteError::Io {
-                        msg: format!("Failed to create parent directories: {}", e),
-                    },
-                )],
-            });
+            pre_reads.insert(req.rel_path, content);
         }
-
-        if req.is_create {
-            use tokio::io::AsyncWriteExt as _;
-            let file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&abs_path)
-                .await;
-            let mut file = match file {
-                Ok(f) => f,
-                Err(e) => {
-                    let err = if e.kind() == std::io::ErrorKind::AlreadyExists {
-                        WriteError::AlreadyExists
-                    } else {
-                        error!(
-                            "Failed to create file '{}' (batch): {}",
-                            abs_path.display(),
-                            e
-                        );
-                        WriteError::Io {
-                            msg: format!("Failed to create file: {}", e),
-                        }
-                    };
-                    rollback_batch_filesystem_writes(
-                        deps.canonical_data_path,
-                        &written,
-                        &originals,
-                    )
-                    .await;
-                    return Err(BatchWriteError::Documents {
-                        failures: vec![(req.rel_path.to_string(), err)],
-                    });
-                }
-            };
-            if let Err(e) = file.write_all(req.new_content.as_bytes()).await {
-                error!(
-                    "Failed to write file '{}' (batch): {}",
-                    abs_path.display(),
-                    e
-                );
-                rollback_batch_filesystem_writes(deps.canonical_data_path, &written, &originals)
-                    .await;
-                return Err(BatchWriteError::Documents {
-                    failures: vec![(
-                        req.rel_path.to_string(),
-                        WriteError::Io {
-                            msg: format!("Failed to write file: {}", e),
-                        },
-                    )],
-                });
-            }
-        } else {
-            if !abs_path.exists() {
-                rollback_batch_filesystem_writes(deps.canonical_data_path, &written, &originals)
-                    .await;
-                return Err(BatchWriteError::Documents {
-                    failures: vec![(req.rel_path.to_string(), WriteError::NotFound)],
-                });
-            }
-            if let Some(expected) = req.expected_hash {
-                let live_content = match tokio::fs::read(&abs_path).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!(
-                            "Failed to re-read '{}' for stale-hash re-check (batch): {}",
-                            abs_path.display(),
-                            e
-                        );
-                        rollback_batch_filesystem_writes(
-                            deps.canonical_data_path,
-                            &written,
-                            &originals,
-                        )
-                        .await;
-                        return Err(BatchWriteError::Documents {
-                            failures: vec![(
-                                req.rel_path.to_string(),
-                                WriteError::Io {
-                                    msg: format!(
-                                        "Failed to read file for stale-hash re-check: {}",
-                                        e
-                                    ),
-                                },
-                            )],
-                        });
-                    }
-                };
-                let actual = crate::ingest::compute_hash_from_bytes(&live_content);
-                if !expected.trim().eq_ignore_ascii_case(&actual) {
-                    rollback_batch_filesystem_writes(
-                        deps.canonical_data_path,
-                        &written,
-                        &originals,
-                    )
-                    .await;
-                    return Err(BatchWriteError::Documents {
-                        failures: vec![(
-                            req.rel_path.to_string(),
-                            WriteError::StaleHash {
-                                expected: expected.trim().to_string(),
-                                actual,
-                            },
-                        )],
-                    });
-                }
-            }
-            if let Err(e) = tokio::fs::write(&abs_path, req.new_content.as_bytes()).await {
-                error!(
-                    "Failed to write file '{}' (batch): {}",
-                    abs_path.display(),
-                    e
-                );
-                rollback_batch_filesystem_writes(deps.canonical_data_path, &written, &originals)
-                    .await;
-                return Err(BatchWriteError::Documents {
-                    failures: vec![(
-                        req.rel_path.to_string(),
-                        WriteError::Io {
-                            msg: format!("Failed to write file: {}", e),
-                        },
-                    )],
-                });
-            }
-        }
-
-        written.push((req.rel_path.to_string(), req.is_create));
     }
 
-    // --- Phase 3: one commit for the whole batch.
-    let default_subject = format!("docs: batch update {} documents", requests.len());
-    let commit_message = build_commit_message(message, &default_subject, "write_document_batch");
-    let commit_paths: Vec<&str> = written.iter().map(|(p, _)| p.as_str()).collect();
+    // --- Phase 2 and 3, under one acquisition.
+    let (git_lock, mut head) = lock_and_sync(deps).await;
+    let data_path_str = data_path_of(deps);
 
-    let commit_outcome = match git::commit_and_sync(
-        &git_lock,
-        deps.git_url,
-        deps.branch,
-        data_path_str,
-        deps.token,
-        &commit_paths,
-        &commit_message,
-        deps.commit_author_name,
-        deps.commit_author_email,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-
-        Err(git::CommitSyncError::PreCommit(source)) => {
-            error!(
-                "write_documents_batch: commit_and_sync pre-commit failure, rolling back {} \
-                 document(s): {:#}",
-                written.len(),
-                source
-            );
-            let mut rolled_back = true;
-            for (rel_path, is_create) in &written {
-                let result = if *is_create {
-                    match tokio::fs::remove_file(deps.canonical_data_path.join(rel_path)).await {
-                        Ok(()) => git::unstage(&git_lock, data_path_str, rel_path).await,
-                        Err(e) => Err(anyhow::Error::new(e)
-                            .context("Failed to remove newly-written file during rollback")),
+    for attempt in 1..=MAX_WRITE_ATTEMPTS {
+        // 2a. Read, apply and validate every document; nothing written yet.
+        let mut snapshots: HashMap<&str, String> = HashMap::new();
+        let mut planned: Vec<(PathBuf, Applied)> = Vec::with_capacity(requests.len());
+        let mut failures: Vec<(String, WriteError)> = Vec::new();
+        // Edits that leave their document exactly as it is: nothing to write or
+        // commit for them (and `git commit` refuses a commit with no change).
+        let mut unchanged: HashSet<&str> = HashSet::new();
+        for req in requests {
+            let outcome = async {
+                let abs_path = safe_write_path(deps, req.rel_path)?;
+                let current = read_if_exists(&abs_path).await?;
+                let applied = match (req.change, current) {
+                    (DocChange::Create(_), Some(_)) => return Err(WriteError::AlreadyExists),
+                    (DocChange::Create(content), None) => Applied {
+                        content: content.to_string(),
+                        merged: false,
+                    },
+                    (_, None) => return Err(WriteError::NotFound),
+                    (change, Some(current)) => {
+                        let applied = apply_change(
+                            &git_lock,
+                            data_path_str,
+                            change,
+                            &current,
+                            req.expected_version,
+                            pre_reads.get(req.rel_path).map(String::as_str),
+                        )
+                        .await?;
+                        validate_document(deps, req.rel_path, &applied.content).await?;
+                        if applied.content == current {
+                            unchanged.insert(req.rel_path);
+                        }
+                        snapshots.insert(req.rel_path, current);
+                        applied
                     }
-                } else {
-                    git::restore_from_head(&git_lock, data_path_str, rel_path).await
                 };
-                if let Err(e) = result {
-                    rolled_back = false;
-                    error!(
-                        "write_documents_batch rollback: failed to restore '{}': {:#}. \
-                         Filesystem and git state may now be inconsistent for this path.",
-                        rel_path, e
-                    );
-                }
+                Ok((abs_path, applied))
             }
-            return Err(BatchWriteError::PreCommitFailed {
-                rolled_back,
-                msg: format!("{:#}", source),
-            });
+            .await;
+            match outcome {
+                Ok(p) => planned.push(p),
+                Err(e) => failures.push((req.rel_path.to_string(), e)),
+            }
         }
-
-        Err(git::CommitSyncError::PostCommit { sha, source }) => {
-            warn!(
-                "write_documents_batch: commit_and_sync post-commit (sync) failure, commit {} \
-                 stands uncorrected for {} document(s): {:#}",
-                sha,
-                written.len(),
-                source
-            );
-            // Still filtered through `mark_dirty` (#278): a written path
-            // can match `include` and still be excluded, same as the success
-            // path below.
-            mark_dirty(
-                deps.queue,
-                deps.indexing,
-                written.iter().map(|(p, _)| PathBuf::from(p)).collect(),
-            );
-            let documents = requests
-                .iter()
-                .map(|req| BatchDocumentResult {
-                    rel_path: req.rel_path.to_string(),
-                    is_create: req.is_create,
-                    diff: render_unified_diff(req.old_content, req.new_content, req.rel_path),
-                })
-                .collect();
+        if !failures.is_empty() {
+            return Err(BatchWriteError::Documents { failures });
+        }
+        // Every document already says what the batch asked for: report each as
+        // it stands, with no commit.
+        if unchanged.len() == requests.len() {
             return Ok(BatchWriteSuccess {
-                outcome: WriteOutcome::CommittedPendingSync,
-                sha,
-                rebased_paths: Vec::new(),
-                documents,
-                sync_failure_cause: Some(format!("{:#}", source)),
+                documents: requests
+                    .iter()
+                    .zip(&planned)
+                    .map(|(req, (_, applied))| BatchDocumentResult {
+                        rel_path: req.rel_path.to_string(),
+                        is_create: false,
+                        diff: String::new(),
+                        merged: applied.merged,
+                        version: Some(document_version(applied.content.as_bytes())),
+                    })
+                    .collect(),
             });
         }
-    };
 
-    mark_dirty(
-        deps.queue,
-        deps.indexing,
-        written
-            .iter()
-            .map(|(p, _)| PathBuf::from(p))
-            .chain(commit_outcome.rebased_paths.iter().cloned())
-            .collect(),
-    );
+        // 2b. Write every document; a failure rolls back every one written so
+        // far, the failing one included.
+        let mut written: Vec<(String, bool)> = Vec::with_capacity(requests.len());
+        for (req, (abs_path, applied)) in requests.iter().zip(&planned) {
+            // Neither written nor committed; still reported, with an empty diff.
+            if unchanged.contains(req.rel_path) {
+                continue;
+            }
+            let is_create = req.change.is_create();
+            // Set once this document's file may no longer hold what it held
+            // under the lock — a create once `create_new` has made it (never on
+            // `AlreadyExists`: that file is not this batch's to remove), an edit
+            // once its truncating write starts. Only such a file is rolled back.
+            let mut touched = false;
+            let result: Result<(), WriteError> = async {
+                if let Some(parent) = abs_path.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        error!(
+                            "Failed to create parent directories for '{}' (batch): {}",
+                            abs_path.display(),
+                            e
+                        );
+                        WriteError::Io {
+                            msg: format!("Failed to create parent directories: {}", e),
+                        }
+                    })?;
+                }
+                let abs_path = safe_write_path(deps, req.rel_path)?;
+                if is_create {
+                    let mut file = tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&abs_path)
+                        .await
+                        .map_err(|e| {
+                            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                                WriteError::AlreadyExists
+                            } else {
+                                error!(
+                                    "Failed to create file '{}' (batch): {}",
+                                    abs_path.display(),
+                                    e
+                                );
+                                WriteError::Io {
+                                    msg: format!("Failed to create file: {}", e),
+                                }
+                            }
+                        })?;
+                    touched = true;
+                    write_and_flush(&mut file, applied.content.as_bytes())
+                        .await
+                        .map_err(|e| WriteError::Io {
+                            msg: format!("Failed to write file: {}", e),
+                        })?;
+                } else {
+                    touched = true;
+                    tokio::fs::write(&abs_path, applied.content.as_bytes())
+                        .await
+                        .map_err(|e| {
+                            error!(
+                                "Failed to write file '{}' (batch): {}",
+                                abs_path.display(),
+                                e
+                            );
+                            WriteError::Io {
+                                msg: format!("Failed to write file: {}", e),
+                            }
+                        })?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                if touched {
+                    written.push((req.rel_path.to_string(), is_create));
+                }
+                let unrestored = rollback_batch_filesystem_writes(
+                    deps.canonical_data_path,
+                    &written,
+                    &snapshots,
+                )
+                .await;
+                return Err(BatchWriteError::Documents {
+                    failures: vec![(req.rel_path.to_string(), note_unrestored(e, &unrestored))],
+                });
+            }
+            written.push((req.rel_path.to_string(), is_create));
+        }
 
-    let documents = requests
-        .iter()
-        .map(|req| BatchDocumentResult {
-            rel_path: req.rel_path.to_string(),
-            is_create: req.is_create,
-            diff: render_unified_diff(req.old_content, req.new_content, req.rel_path),
-        })
-        .collect();
+        // --- Phase 3: one commit for the whole batch.
+        let default_subject = format!("docs: batch update {} documents", requests.len());
+        let commit_message =
+            build_commit_message(message, &default_subject, "write_document_batch");
+        let commit_paths: Vec<&str> = written.iter().map(|(p, _)| p.as_str()).collect();
 
-    Ok(BatchWriteSuccess {
-        outcome: WriteOutcome::Synced,
-        sha: commit_outcome.sha,
-        rebased_paths: commit_outcome.rebased_paths,
-        documents,
-        sync_failure_cause: None,
-    })
+        let documents = |rebased: &[PathBuf]| -> Vec<BatchDocumentResult> {
+            requests
+                .iter()
+                .zip(&planned)
+                .map(|(req, (_, applied))| {
+                    let rebase_merged = rebase_touched(rebased, &[req.rel_path]);
+                    let old = snapshots
+                        .get(req.rel_path)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    BatchDocumentResult {
+                        rel_path: req.rel_path.to_string(),
+                        is_create: req.change.is_create(),
+                        diff: render_unified_diff(old, &applied.content, req.rel_path),
+                        merged: applied.merged || rebase_merged,
+                        version: (!rebase_merged)
+                            .then(|| document_version(applied.content.as_bytes())),
+                    }
+                })
+                .collect()
+        };
+
+        let commit_outcome = match git::commit_and_sync(
+            &git_lock,
+            deps.git_url,
+            deps.branch,
+            data_path_str,
+            deps.token,
+            &commit_paths,
+            &commit_message,
+            deps.commit_author_name,
+            deps.commit_author_email,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+
+            Err(git::CommitSyncError::PreCommit(source)) => {
+                error!(
+                    "write_documents_batch: commit_and_sync pre-commit failure, rolling back {} \
+                     document(s): {:#}",
+                    written.len(),
+                    source
+                );
+                let mut rolled_back = true;
+                for (rel_path, is_create) in &written {
+                    let result = if *is_create {
+                        match tokio::fs::remove_file(deps.canonical_data_path.join(rel_path)).await
+                        {
+                            Ok(()) => git::unstage(&git_lock, data_path_str, rel_path).await,
+                            Err(e) => Err(anyhow::Error::new(e)
+                                .context("Failed to remove newly-written file during rollback")),
+                        }
+                    } else {
+                        git::restore_from_head(&git_lock, data_path_str, rel_path).await
+                    };
+                    if let Err(e) = result {
+                        rolled_back = false;
+                        error!(
+                            "write_documents_batch rollback: failed to restore '{}': {:#}. \
+                             Filesystem and git state may now be inconsistent for this path.",
+                            rel_path, e
+                        );
+                    }
+                }
+                return Err(BatchWriteError::PreCommitFailed { rolled_back });
+            }
+
+            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+                warn!(
+                    "write_documents_batch: commit_and_sync post-commit (sync) failure, commit {} \
+                     stands uncorrected for {} document(s): {:#}",
+                    sha,
+                    written.len(),
+                    source
+                );
+                mark_dirty(
+                    deps.queue,
+                    deps.indexing,
+                    written.iter().map(|(p, _)| PathBuf::from(p)).collect(),
+                );
+                return Ok(BatchWriteSuccess {
+                    documents: documents(&[]),
+                });
+            }
+
+            Err(git::CommitSyncError::Conflict { source }) => {
+                warn!(
+                    "Remote changed underneath a batch write (attempt {}/{}), re-applying \
+                     against fresh content: {:#}",
+                    attempt, MAX_WRITE_ATTEMPTS, source
+                );
+                head = sync_clone(deps, &git_lock, head).await;
+                continue;
+            }
+        };
+
+        mark_dirty(
+            deps.queue,
+            deps.indexing,
+            written
+                .iter()
+                .map(|(p, _)| PathBuf::from(p))
+                .chain(commit_outcome.rebased_paths.iter().cloned())
+                .collect(),
+        );
+
+        return Ok(BatchWriteSuccess {
+            documents: documents(&commit_outcome.rebased_paths),
+        });
+    }
+
+    Err(BatchWriteError::EditedElsewhere)
 }
 
 // ---------------------------------------------------------------------------
@@ -3038,11 +3028,8 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
 /// A successful [`move_directory`] call.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DirectoryMoveSuccess {
-    pub outcome: WriteOutcome,
-    pub sha: String,
-    pub rebased_paths: Vec<PathBuf>,
     /// `(old_rel, new_rel)` for every document AND schema file moved (a
-    /// `.kb-schema.yaml` found under the source subtree moves along with the
+    /// schema file found under the source subtree moves along with the
     /// documents it governs, and the move queues a full reconcile so the worker
     /// rebuilds the shared schema cache), sorted by `old_rel`.
     pub moved: Vec<(String, String)>,
@@ -3052,10 +3039,10 @@ pub struct DirectoryMoveSuccess {
     /// reported in `moved` instead. Empty when `WriteDeps::state` is `None` or
     /// nothing outside the subtree referenced it.
     pub rewritten_paths: Vec<String>,
-    /// Present only when `outcome == CommittedPendingSync`: see
-    /// `WriteSuccess::sync_failure_cause`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sync_failure_cause: Option<String>,
+    /// A clean rebase folded someone else's concurrent change to a moved or
+    /// rewritten document into this commit — same contract as
+    /// `WriteSuccess::merged`.
+    pub merged: bool,
 }
 
 /// Every structured failure mode of [`move_directory`]. Mirrors
@@ -3078,7 +3065,7 @@ pub enum DirectoryMoveError {
     /// checked first.
     Validation {
         failures: Vec<(String, ValidationResult)>,
-        /// `(old_rel, new_rel)` for every `.kb-schema.yaml` this move is
+        /// `(old_rel, new_rel)` for every schema file this move is
         /// relocating — empty when the source subtree carries no schema file
         /// of its own. Non-empty means the destination cascade these failures
         /// were checked against is not just "whatever already governed the
@@ -3088,11 +3075,13 @@ pub enum DirectoryMoveError {
         /// that was valid moments ago looking like an unexplained failure.
         moved_schema_files: Vec<(String, String)>,
     },
-    /// A `.kb-schema.yaml` under the source subtree is invalid on disk (#272).
+    /// A schema file under the source subtree is invalid on disk (#272).
     /// The shared cache keeps the last good schema while a file on disk is
     /// invalid, so it may still hold that directory's previous rules — the move
     /// would validate against those, then carry the broken file to the
-    /// destination. Refused until the file is fixed or reverted in git. `path` is
+    /// destination. A file in a hidden or excluded directory, which no cache
+    /// ever read, is refused the same way when the move would bring it into the
+    /// schema tree. Refused until the file is fixed or reverted in git. `path` is
     /// the first such file (by path), KB-relative; `reason` is why it is invalid.
     InvalidSchemaInSource {
         path: String,
@@ -3111,14 +3100,19 @@ pub enum DirectoryMoveError {
     /// comment for the `rolled_back` contract — identical here, just scaled to
     /// every path this move touched: `true` only if every document's source
     /// restore, every document's destination removal, and every rewritten
-    /// referencing document's restore all succeeded.
+    /// referencing document's restore all succeeded. The cause is logged here
+    /// and deliberately not carried: no caller relays it.
     PreCommitFailed {
         rolled_back: bool,
-        msg: String,
     },
     Io {
         msg: String,
     },
+    /// Something under the source (or the destination prefix) changed between
+    /// the pre-lock scan and the re-check under the lock — a document edited,
+    /// added or removed — or the remote kept moving under every attempt. Nothing
+    /// was moved; the caller re-reads and tries again.
+    EditedElsewhere,
 }
 
 /// Maps [`safe_write_path`]/[`check_include_pattern`]/[`validate_commit_message`]
@@ -3152,7 +3146,7 @@ impl From<WriteError> for DirectoryMoveError {
 ///
 /// Unfiltered: returns every file, not just indexable documents. `move_directory`
 /// uses this both for the source-subtree scan (filtered to indexable documents,
-/// and scanned for `.kb-schema.yaml` files to carry along, by the caller) and the
+/// and scanned for schema files to carry along, by the caller) and the
 /// destination-prefix collision check (deliberately left UNFILTERED there, since
 /// ANY file under the destination — indexable or not — means the prefix is not
 /// free).
@@ -3322,6 +3316,26 @@ async fn rollback_directory_move_filesystem(
     }
 }
 
+/// `raw`, a [`move_directory`] prefix, in canonical `a/b` form: a leading `/`
+/// (the knowledge-base root, as in every path a tool takes) and every `.`
+/// component or empty segment are dropped, so `./notes/`, `/./notes` and
+/// `notes//.` all read as `notes`, and the root itself, however spelled, comes
+/// back empty. A `..` component is kept for [`safe_write_path`] to refuse. Every
+/// path a move derives from its prefixes — each moved file's old and new path,
+/// the commit's paths, the paths it marks dirty — is built on this form, never
+/// on the caller's spelling.
+fn normalize_dir_prefix(raw: &str) -> String {
+    use std::path::Component;
+    Path::new(raw)
+        .components()
+        .filter_map(|c| match c {
+            Component::CurDir | Component::RootDir => None,
+            other => Some(other.as_os_str().to_string_lossy()),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Relocate every document under `source_dir` to the same relative path under
 /// `dest_dir`, as ONE atomic commit — the directory-move counterpart to
 /// [`write_document_move`]'s single-document move, sharing its path-safety,
@@ -3334,7 +3348,7 @@ async fn rollback_directory_move_filesystem(
 ///    [`DirectoryMoveError::SourceEmpty`].
 /// 2. No file may already live anywhere under `dest_dir`
 ///    ([`DirectoryMoveError::AlreadyExists`]) — a directory move never merges.
-/// 3. A `.kb-schema.yaml` under the source subtree is not a blocker: it moves
+/// 3. A schema file under the source subtree is not a blocker: it moves
 ///    WITH the documents it governs (as a raw copy — schema files are never
 ///    frontmatter-validated or link-rewritten), and every moved document is
 ///    validated against a cascade rebuilt with that schema file's governing
@@ -3345,8 +3359,9 @@ async fn rollback_directory_move_filesystem(
 ///    cache only ever holds schema files that were valid when it was built, so
 ///    the remapped cascade is built from validated content — but it may be the
 ///    last good content of a file that is invalid on disk now, so every schema
-///    file under the source that is part of the schema tree is re-read, parsed
-///    and self-validated first, and an invalid one refuses the move
+///    file under the source that is part of the schema tree at its source or at
+///    its destination is re-read, parsed and self-validated first, and an
+///    invalid one refuses the move
 ///    ([`DirectoryMoveError::InvalidSchemaInSource`], #272). Relocating a schema
 ///    file is a genuine semantic change — a document valid under the source's
 ///    cascade can fail under the destination's — and that is exactly what guard
@@ -3411,8 +3426,16 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     dest_dir: &str,
     message: Option<&str>,
 ) -> Result<DirectoryMoveSuccess, DirectoryMoveError> {
-    let source_dir = crate::retrieval::kb_root_relative(source_dir).trim_end_matches('/');
-    let dest_dir = crate::retrieval::kb_root_relative(dest_dir).trim_end_matches('/');
+    let source_dir = normalize_dir_prefix(source_dir);
+    let dest_dir = normalize_dir_prefix(dest_dir);
+    if source_dir.is_empty() {
+        return Err(DirectoryMoveError::UnsafePath {
+            msg: "Invalid path: a directory move needs a directory under the knowledge base \
+                  root, not the root itself"
+                .to_string(),
+        });
+    }
+    let (source_dir, dest_dir) = (source_dir.as_str(), dest_dir.as_str());
 
     // Guard 5 (path safety) against the two prefixes themselves, ahead of
     // walking either one.
@@ -3426,7 +3449,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     }
 
     // Guard 1: walk the whole source subtree once, collecting both the indexable
-    // documents (guard 1) and any `.kb-schema.yaml` living anywhere underneath —
+    // documents (guard 1) and any schema file living anywhere underneath —
     // one filesystem walk answers both. A schema file no longer blocks the move
     // (guard 3, checked further below, once `deps.schema_cache` is loaded) — it
     // travels WITH the subtree instead, see this function's doc comment.
@@ -3435,6 +3458,10 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         .map_err(|e| DirectoryMoveError::Io {
             msg: format!("Failed to scan source directory '{}': {}", source_dir, e),
         })?;
+
+    // Everything under the source as this pre-lock scan saw it; re-checked under
+    // the lock before anything moves.
+    let source_snapshot = source_files.clone();
 
     let schema_files_in_source: Vec<String> = source_files
         .iter()
@@ -3481,15 +3508,20 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // subtree. `documents` is already sorted (`walk_subtree_files` sorts), so
     // `moves` is too.
     let source_prefix = format!("{}/", source_dir);
-    let moves: Vec<(String, String)> = documents
-        .iter()
-        .map(|old_rel| {
-            let suffix = old_rel
+    // `source_dir` is normalized, so every file the walk found carries this
+    // prefix; one that somehow does not is an error, never a panic.
+    let relocate = |old_rel: &String| -> Result<(String, String), DirectoryMoveError> {
+        let suffix =
+            old_rel
                 .strip_prefix(&source_prefix)
-                .expect("every scanned document falls under its own source prefix");
-            (old_rel.clone(), format!("{}/{}", dest_dir, suffix))
-        })
-        .collect();
+                .ok_or_else(|| DirectoryMoveError::Internal {
+                    msg: format!(
+                        "'{old_rel}' is not under the directory being moved, '{source_dir}'"
+                    ),
+                })?;
+        Ok((old_rel.clone(), format!("{}/{}", dest_dir, suffix)))
+    };
+    let moves: Vec<(String, String)> = documents.iter().map(&relocate).collect::<Result<_, _>>()?;
     let moving: HashMap<&str, &str> = moves
         .iter()
         .map(|(old, new)| (old.as_str(), new.as_str()))
@@ -3497,20 +3529,15 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
 
     // Every schema file's new path, same prefix substitution as `moves` above.
     // These move as raw copies alongside the documents they govern: never
-    // through frontmatter validation (a `.kb-schema.yaml` has no frontmatter of
+    // through frontmatter validation (a schema file has no frontmatter of
     // its own) and never through link rewriting (nothing in one is a markdown
     // link). Deliberately excluded from `moving`/`moves` above — those drive the
     // markdown link-rewrite passes, which a schema file relocation has nothing
     // to do with.
     let schema_moves: Vec<(String, String)> = schema_files_in_source
         .iter()
-        .map(|old_rel| {
-            let suffix = old_rel
-                .strip_prefix(&source_prefix)
-                .expect("every scanned schema file falls under its own source prefix");
-            (old_rel.clone(), format!("{}/{}", dest_dir, suffix))
-        })
-        .collect();
+        .map(&relocate)
+        .collect::<Result<_, _>>()?;
     // Every path this move touches, documents and schema files alike — used for
     // commit staging, dirty-marking, rollback, and the success report. `moves`/
     // `moving` above stay document-only: a schema file is never a markdown link
@@ -3560,6 +3587,8 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // and independent enough per document, to run concurrently.
     // (old_rel, new_rel, content_to_write)
     let mut contents: Vec<(String, String, String)> = Vec::new();
+    // (old_rel, content as read) — the snapshot the under-lock check compares.
+    let mut originals: Vec<(String, String)> = Vec::new();
 
     for (old_rel, new_rel) in &moves {
         check_include_pattern(deps, old_rel)?;
@@ -3584,11 +3613,12 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         });
 
         contents.push((old_rel.clone(), new_rel.clone(), content_to_write));
+        originals.push((old_rel.clone(), old_content));
     }
 
     // Read every schema file's raw content too — same path-safety (guard 5) as
     // any other moved file, but deliberately NOT `check_include_pattern` (a
-    // `.kb-schema.yaml` never matches the markdown include patterns, so that
+    // schema file never matches the markdown include patterns, so that
     // check would always reject it) and no `rewrite_outbound_links` (schema
     // files hold no markdown links). These ride along in the same physical
     // write/remove phases as `contents` below, chained rather than merged into
@@ -3609,14 +3639,25 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // DISK. A runtime rebuild that finds one invalid keeps the last good cache,
     // so `schemas` (and `remapped_schemas`) may still hold that directory's old
     // rules: validating against them and then relocating the broken file would
-    // move it out from under the very check that should have stopped it. Only
-    // files in the schema tree are checked — one in a hidden or wholly excluded
-    // directory is never read by a rebuild (`schema::SchemaWalkFilter`), so it
-    // does not govern anything and moves as an inert raw copy.
+    // move it out from under the very check that should have stopped it. A file
+    // is checked when it is in the schema tree (`schema::SchemaWalkFilter`) at
+    // its source or at its destination — the rebuild this move queues reads it
+    // there, and one coming out of a hidden or wholly excluded directory was
+    // never read, so no cache vouches for it. Only a file outside the schema
+    // tree at both ends moves unchecked: no rebuild reads it.
     let walk = crate::schema::SchemaWalkFilter::from_config(deps.indexing);
-    for (old_rel, _, raw) in &schema_contents {
-        if !walk.governs(Path::new(old_rel)) {
+    let mut governed_dirs: HashSet<&Path> = HashSet::new();
+    for (old_rel, new_rel, raw) in &schema_contents {
+        if !walk.governs(Path::new(new_rel)) && !walk.governs(Path::new(old_rel)) {
             continue;
+        }
+        // Both schema file names in one directory is invalid for a rebuild too
+        // (`schema::BOTH_NAMES_REASON`), whichever name each one carries.
+        if !governed_dirs.insert(Path::new(new_rel).parent().unwrap_or(Path::new(""))) {
+            return Err(DirectoryMoveError::InvalidSchemaInSource {
+                path: old_rel.clone(),
+                reason: crate::schema::BOTH_NAMES_REASON.to_string(),
+            });
         }
         if let Err(reason) = crate::schema::parse_schema_text(raw) {
             return Err(DirectoryMoveError::InvalidSchemaInSource {
@@ -3721,101 +3762,85 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
 
     let data_path_str = deps.canonical_data_path.to_str().unwrap_or_default();
 
-    // Acquire GIT_LOCK now and hold ONE guard across every remaining mutation
-    // of the clone below — phase 1 (destination writes), phase 2 (source
-    // removals), phase 3 (outside referencing-document rewrites), the commit,
-    // and any rollback — rather than only around the commit as this used to.
-    // Same reasoning as `write_document_move`'s identical hoist: phase 3 is an
-    // unlocked read-modify-write of documents OUTSIDE this move's own path
-    // set, with no staleness check of its own, so a concurrent writer to one
-    // of those documents can land its write in the gap between this read and
-    // this write and be silently clobbered. Phases 1 and 2 are pulled in too
-    // for the same reason `write_document_move` pulls in its own destination
-    // write/source removal: they are themselves clone mutations, and holding
-    // one guard across the whole sequence (rather than acquire/release/
-    // re-acquire) is both this codebase's existing convention and what keeps
-    // an in-progress, not-yet-committed move from interleaving with another
-    // writer's commit or a concurrent webhook merge. Every helper reachable
-    // from here that used to acquire its own `GitLock` —
-    // `rollback_directory_move_filesystem`, called from every failure branch
-    // in phases 1-3 — now takes this same guard by reference instead, which
-    // is what keeps this non-reentrant mutex from deadlocking against itself.
-    let git_lock = git::lock_git().await;
+    // Take GIT_LOCK, sync with the remote, and hold ONE guard across every
+    // remaining step — the re-check below, phase 1 (destination writes), phase 2
+    // (source removals), phase 3 (outside referencing-document rewrites), the
+    // commit, and any rollback. Every helper reachable from here takes this same
+    // guard by reference, which keeps the non-reentrant mutex from deadlocking.
+    let (git_lock, mut head) = lock_and_sync(deps).await;
 
-    // Filesystem mutation, phase 1: write every DESTINATION first (`create_new`,
-    // same non-clobbering guarantee `write_document_move` relies on), before
-    // touching a single source — the same write-then-remove ordering that
-    // function uses, batched: if any destination write fails partway through,
-    // no source has been touched at all, so recovery is just deleting whatever
-    // destinations already landed. Chained with `schema_contents` so every
-    // schema file under the subtree gets the same treatment as any other moved
-    // file — `rollback_directory_move_filesystem` below is always handed
-    // `all_moves` (documents AND schema files), never the document-only `moves`.
-    let mut written_dest: Vec<PathBuf> = Vec::new();
-    for (_old_rel, new_rel, content_to_write) in contents.iter().chain(schema_contents.iter()) {
-        let abs_dest = match safe_write_path(deps, new_rel) {
-            Ok(p) => p,
-            Err(e) => {
-                rollback_directory_move_filesystem(
-                    &git_lock,
-                    data_path_str,
-                    &all_moves,
-                    &abs_dest_dir,
-                    &written_dest,
-                    &[],
-                )
-                .await;
-                return Err(e.into());
+    for attempt in 1..=MAX_WRITE_ATTEMPTS {
+        // Everything above read and validated the subtree before the lock. Under it,
+        // re-walk the source and compare every file with that snapshot — a document
+        // edited, added or removed in between (locally, or pulled in by the sync)
+        // refuses the move rather than moving content nobody validated or leaving a
+        // new file behind. The destination prefix must still be free, too; a
+        // destination that filled up meanwhile is the same `AlreadyExists` the
+        // pre-check reports.
+        let source_unchanged = async {
+            let now = walk_subtree_files_async(deps.canonical_data_path, &abs_source_dir)
+                .await
+                .ok()?;
+            if now != source_snapshot {
+                return Some(false);
             }
-        };
-        if let Some(parent) = abs_dest.parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await
-        {
-            rollback_directory_move_filesystem(
-                &git_lock,
-                data_path_str,
-                &all_moves,
-                &abs_dest_dir,
-                &written_dest,
-                &[],
-            )
-            .await;
-            return Err(DirectoryMoveError::Io {
-                msg: format!(
-                    "Failed to create parent directories for '{}': {}",
-                    new_rel, e
-                ),
-            });
-        }
-
-        let write_outcome: std::io::Result<()> = async {
-            use tokio::io::AsyncWriteExt as _;
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&abs_dest)
-                .await?;
-            file.write_all(content_to_write.as_bytes()).await
+            let schema_originals = schema_contents
+                .iter()
+                .map(|(old_rel, _, raw)| (old_rel, raw));
+            for (old_rel, before) in originals
+                .iter()
+                .map(|(o, c)| (o, c))
+                .chain(schema_originals)
+            {
+                let abs = safe_write_path(deps, old_rel).ok()?;
+                if tokio::fs::read_to_string(&abs).await.ok()? != *before {
+                    return Some(false);
+                }
+            }
+            Some(true)
         }
         .await;
+        if source_unchanged != Some(true) {
+            return Err(DirectoryMoveError::EditedElsewhere);
+        }
+        let dest_occupied = abs_dest_dir.is_file()
+            || (abs_dest_dir.is_dir()
+                && walk_subtree_files_async(deps.canonical_data_path, &abs_dest_dir)
+                    .await
+                    .map_or(true, |files| !files.is_empty()));
+        if dest_occupied {
+            return Err(DirectoryMoveError::AlreadyExists);
+        }
 
-        match write_outcome {
-            Ok(()) => written_dest.push(abs_dest),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // TOCTOU collision: guard 2 above walked the destination prefix
-                // and found it clear, but something has landed at this exact
-                // computed destination since then. This is the same benign,
-                // retryable race `write_document_move`'s equivalent
-                // `create_new` open maps to `WriteError::AlreadyExists` — map
-                // it identically here rather than letting it fall into the
-                // generic `Io` arm below, which `move_directory_error_to_mcp_error`
-                // reports as an opaque internal error instead of a clear
-                // "already exists" the caller can act on.
-                error!(
-                    "Destination '{}' already exists (TOCTOU collision) while moving directory \
-                     '{}' -> '{}'. Undoing every filesystem change made so far.",
-                    new_rel, source_dir, dest_dir
-                );
+        // Filesystem mutation, phase 1: write every DESTINATION first (`create_new`,
+        // same non-clobbering guarantee `write_document_move` relies on), before
+        // touching a single source — the same write-then-remove ordering that
+        // function uses, batched: if any destination write fails partway through,
+        // no source has been touched at all, so recovery is just deleting whatever
+        // destinations already landed. Chained with `schema_contents` so every
+        // schema file under the subtree gets the same treatment as any other moved
+        // file — `rollback_directory_move_filesystem` below is always handed
+        // `all_moves` (documents AND schema files), never the document-only `moves`.
+        let mut written_dest: Vec<PathBuf> = Vec::new();
+        for (_old_rel, new_rel, content_to_write) in contents.iter().chain(schema_contents.iter()) {
+            let abs_dest = match safe_write_path(deps, new_rel) {
+                Ok(p) => p,
+                Err(e) => {
+                    rollback_directory_move_filesystem(
+                        &git_lock,
+                        data_path_str,
+                        &all_moves,
+                        &abs_dest_dir,
+                        &written_dest,
+                        &[],
+                    )
+                    .await;
+                    return Err(e.into());
+                }
+            };
+            if let Some(parent) = abs_dest.parent()
+                && let Err(e) = tokio::fs::create_dir_all(parent).await
+            {
                 rollback_directory_move_filesystem(
                     &git_lock,
                     data_path_str,
@@ -3825,13 +3850,107 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                     &[],
                 )
                 .await;
-                return Err(DirectoryMoveError::AlreadyExists);
+                return Err(DirectoryMoveError::Io {
+                    msg: format!(
+                        "Failed to create parent directories for '{}': {}",
+                        new_rel, e
+                    ),
+                });
             }
-            Err(e) => {
-                error!(
-                    "Failed to write destination '{}' while moving directory '{}' -> '{}': {}. \
+
+            let write_outcome: std::io::Result<()> = async {
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&abs_dest)
+                    .await?;
+                write_and_flush(&mut file, content_to_write.as_bytes()).await
+            }
+            .await;
+
+            match write_outcome {
+                Ok(()) => written_dest.push(abs_dest),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // TOCTOU collision: guard 2 above walked the destination prefix
+                    // and found it clear, but something has landed at this exact
+                    // computed destination since then. This is the same benign,
+                    // retryable race `write_document_move`'s equivalent
+                    // `create_new` open maps to `WriteError::AlreadyExists` — map
+                    // it identically here rather than letting it fall into the
+                    // generic `Io` arm below, which `move_directory_error_to_mcp_error`
+                    // reports as an opaque internal error instead of a clear
+                    // "already exists" the caller can act on.
+                    error!(
+                        "Destination '{}' already exists (TOCTOU collision) while moving directory \
+                     '{}' -> '{}'. Undoing every filesystem change made so far.",
+                        new_rel, source_dir, dest_dir
+                    );
+                    rollback_directory_move_filesystem(
+                        &git_lock,
+                        data_path_str,
+                        &all_moves,
+                        &abs_dest_dir,
+                        &written_dest,
+                        &[],
+                    )
+                    .await;
+                    return Err(DirectoryMoveError::AlreadyExists);
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to write destination '{}' while moving directory '{}' -> '{}': {}. \
                      Undoing every filesystem change made so far.",
-                    new_rel, source_dir, dest_dir, e
+                        new_rel, source_dir, dest_dir, e
+                    );
+                    rollback_directory_move_filesystem(
+                        &git_lock,
+                        data_path_str,
+                        &all_moves,
+                        &abs_dest_dir,
+                        &written_dest,
+                        &[],
+                    )
+                    .await;
+                    return Err(DirectoryMoveError::Io {
+                        msg: format!(
+                            "Failed to write destination '{}' during directory move: {}",
+                            new_rel, e
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Filesystem mutation, phase 2: remove every SOURCE, now that every
+        // destination is confirmed written. A failure partway through is recovered
+        // by restoring every source from HEAD and deleting every destination
+        // written in phase 1 — nothing has touched git yet, so this is a pure
+        // filesystem undo (see `rollback_directory_move_filesystem`'s doc comment
+        // for why restoring the FULL source list, not just the ones already
+        // removed, is safe). Chained with `schema_contents`, same reasoning as
+        // phase 1 above.
+        for (old_rel, _new_rel, _content_to_write) in contents.iter().chain(schema_contents.iter())
+        {
+            let abs_source = match safe_write_path(deps, old_rel) {
+                Ok(p) => p,
+                Err(e) => {
+                    rollback_directory_move_filesystem(
+                        &git_lock,
+                        data_path_str,
+                        &all_moves,
+                        &abs_dest_dir,
+                        &written_dest,
+                        &[],
+                    )
+                    .await;
+                    return Err(e.into());
+                }
+            };
+            if let Err(e) = tokio::fs::remove_file(&abs_source).await {
+                error!(
+                    "Failed to remove source '{}' while moving directory '{}' -> '{}': {}. \
+                 Restoring every source and deleting every written destination.",
+                    old_rel, source_dir, dest_dir, e
                 );
                 rollback_directory_move_filesystem(
                     &git_lock,
@@ -3844,363 +3963,325 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 .await;
                 return Err(DirectoryMoveError::Io {
                     msg: format!(
-                        "Failed to write destination '{}' during directory move: {}",
-                        new_rel, e
+                        "Failed to remove source '{}' during directory move: {}",
+                        old_rel, e
                     ),
                 });
             }
         }
-    }
 
-    // Filesystem mutation, phase 2: remove every SOURCE, now that every
-    // destination is confirmed written. A failure partway through is recovered
-    // by restoring every source from HEAD and deleting every destination
-    // written in phase 1 — nothing has touched git yet, so this is a pure
-    // filesystem undo (see `rollback_directory_move_filesystem`'s doc comment
-    // for why restoring the FULL source list, not just the ones already
-    // removed, is safe). Chained with `schema_contents`, same reasoning as
-    // phase 1 above.
-    for (old_rel, _new_rel, _content_to_write) in contents.iter().chain(schema_contents.iter()) {
-        let abs_source = match safe_write_path(deps, old_rel) {
-            Ok(p) => p,
-            Err(e) => {
+        // Every document under `source_dir` is gone; tidy up any subdirectory (and
+        // `source_dir` itself) that removing them left empty, best-effort — see
+        // `remove_empty_dirs_best_effort`'s doc comment. Git does not track empty
+        // directories, so this has no bearing on the commit below; it just keeps
+        // the old prefix from lingering as an empty husk on disk.
+        remove_empty_dirs_best_effort_async(&abs_source_dir).await;
+
+        // Phase 3: rewrite documents OUTSIDE the moved subtree that link INTO it, so
+        // those links keep resolving after the move — riding along in the SAME
+        // commit as the move itself. Sources INSIDE the subtree are handled by the
+        // outbound pass above and must never be processed again here.
+        //
+        // One batched `links_targeting_many` call over every moved path rather than
+        // a `links_targeting` call per document: for a large subtree that was
+        // hundreds of independent SQLite round-trips in a plain for-loop. The
+        // per-source aggregation below is unchanged — a referencing document that
+        // links to several moved targets still gets exactly one `outside_refs`
+        // entry, with every target it references collected onto it.
+        let mut outside_refs: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        if let Some(state) = deps.state {
+            let target_paths: Vec<String> =
+                moves.iter().map(|(old_rel, _)| old_rel.clone()).collect();
+            match state.links_targeting_many(&target_paths, "markdown").await {
+                Ok(by_target) => {
+                    for (old_rel, new_rel) in &moves {
+                        let Some(referencing_paths) = by_target.get(old_rel.as_str()) else {
+                            continue;
+                        };
+                        for ref_path in referencing_paths {
+                            if moving.contains_key(ref_path.as_str()) {
+                                // Inside the subtree — handled by the outbound
+                                // rewrite above; processing it again here would
+                                // double-edit it.
+                                continue;
+                            }
+                            outside_refs
+                                .entry(ref_path.clone())
+                                .or_default()
+                                .push((old_rel.clone(), new_rel.clone()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Skipping incoming-link rewrite for every moved document while moving \
+                     directory '{}' -> '{}': the batched reverse-link query failed: {:#}",
+                        source_dir, dest_dir, e
+                    );
+                }
+            }
+        }
+
+        let mut rewritten_paths: Vec<String> = Vec::new();
+        for (ref_path, targets) in &outside_refs {
+            let abs_ref = match safe_write_path(deps, ref_path) {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!(
+                        "Skipping link rewrite in '{}' while moving directory '{}' -> '{}': the \
+                     path no longer resolves safely (stale document_links row?)",
+                        ref_path, source_dir, dest_dir
+                    );
+                    continue;
+                }
+            };
+            let body = match tokio::fs::read_to_string(&abs_ref).await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        "Skipping link rewrite in '{}' while moving directory '{}' -> '{}': failed \
+                     to read it, likely a stale document_links row: {}",
+                        ref_path, source_dir, dest_dir, e
+                    );
+                    continue;
+                }
+            };
+
+            let mut replacements: Vec<(crate::ingest::LinkOccurrence, String)> = Vec::new();
+            for (old_rel, new_rel) in targets {
+                let replacement = crate::ingest::relativize_md_path(ref_path, new_rel);
+                for occurrence in crate::ingest::find_markdown_link_occurrences(&body, ref_path)
+                    .into_iter()
+                    .filter(|o| &o.resolved == old_rel)
+                {
+                    replacements.push((occurrence, replacement.clone()));
+                }
+            }
+            if replacements.is_empty() {
+                // Stale document_links row(s): nothing in the CURRENT body actually
+                // resolves to any moved target anymore.
+                continue;
+            }
+
+            let new_body = apply_link_replacements_each(&body, &replacements);
+            if let Err(e) = tokio::fs::write(&abs_ref, new_body.as_bytes()).await {
+                error!(
+                    "Failed to rewrite links into '{}' while moving directory '{}' -> '{}': {}. \
+                 Undoing every filesystem change made for this move so far.",
+                    ref_path, source_dir, dest_dir, e
+                );
                 rollback_directory_move_filesystem(
                     &git_lock,
                     data_path_str,
                     &all_moves,
                     &abs_dest_dir,
                     &written_dest,
-                    &[],
+                    &rewritten_paths,
                 )
                 .await;
-                return Err(e.into());
+                return Err(DirectoryMoveError::Io {
+                    msg: format!("Failed to rewrite links in '{}': {}", ref_path, e),
+                });
             }
-        };
-        if let Err(e) = tokio::fs::remove_file(&abs_source).await {
-            error!(
-                "Failed to remove source '{}' while moving directory '{}' -> '{}': {}. \
-                 Restoring every source and deleting every written destination.",
-                old_rel, source_dir, dest_dir, e
-            );
-            rollback_directory_move_filesystem(
-                &git_lock,
-                data_path_str,
-                &all_moves,
-                &abs_dest_dir,
-                &written_dest,
-                &[],
-            )
-            .await;
-            return Err(DirectoryMoveError::Io {
-                msg: format!(
-                    "Failed to remove source '{}' during directory move: {}",
-                    old_rel, e
-                ),
-            });
+            rewritten_paths.push(ref_path.clone());
         }
-    }
 
-    // Every document under `source_dir` is gone; tidy up any subdirectory (and
-    // `source_dir` itself) that removing them left empty, best-effort — see
-    // `remove_empty_dirs_best_effort`'s doc comment. Git does not track empty
-    // directories, so this has no bearing on the commit below; it just keeps
-    // the old prefix from lingering as an empty husk on disk.
-    remove_empty_dirs_best_effort_async(&abs_source_dir).await;
+        // Commit the move AND every rewritten referencing document as ONE atomic
+        // commit, under the SAME lock acquisition (above) already held across
+        // phases 1-3 — releasing it in between any of those and the commit would
+        // let another writer stage into (and, since it commits its own path,
+        // commit) the very half-staged state this call is about to undo. See
+        // `write_document_move`'s identical comment for the full reasoning.
+        let commit_message = build_commit_message(
+            message,
+            &format!("docs: move {} to {}", source_dir, dest_dir),
+            "move_directory",
+        );
 
-    // Phase 3: rewrite documents OUTSIDE the moved subtree that link INTO it, so
-    // those links keep resolving after the move — riding along in the SAME
-    // commit as the move itself. Sources INSIDE the subtree are handled by the
-    // outbound pass above and must never be processed again here.
-    //
-    // One batched `links_targeting_many` call over every moved path rather than
-    // a `links_targeting` call per document: for a large subtree that was
-    // hundreds of independent SQLite round-trips in a plain for-loop. The
-    // per-source aggregation below is unchanged — a referencing document that
-    // links to several moved targets still gets exactly one `outside_refs`
-    // entry, with every target it references collected onto it.
-    let mut outside_refs: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    if let Some(state) = deps.state {
-        let target_paths: Vec<String> = moves.iter().map(|(old_rel, _)| old_rel.clone()).collect();
-        match state.links_targeting_many(&target_paths, "markdown").await {
-            Ok(by_target) => {
-                for (old_rel, new_rel) in &moves {
-                    let Some(referencing_paths) = by_target.get(old_rel.as_str()) else {
-                        continue;
-                    };
-                    for ref_path in referencing_paths {
-                        if moving.contains_key(ref_path.as_str()) {
-                            // Inside the subtree — handled by the outbound
-                            // rewrite above; processing it again here would
-                            // double-edit it.
-                            continue;
-                        }
-                        outside_refs
-                            .entry(ref_path.clone())
-                            .or_default()
-                            .push((old_rel.clone(), new_rel.clone()));
+        let mut commit_paths: Vec<&str> = Vec::new();
+        for (old_rel, new_rel) in &all_moves {
+            commit_paths.push(old_rel.as_str());
+            commit_paths.push(new_rel.as_str());
+        }
+        for ref_path in &rewritten_paths {
+            if !commit_paths.contains(&ref_path.as_str()) {
+                commit_paths.push(ref_path.as_str());
+            }
+        }
+
+        let commit_outcome = match git::commit_and_sync(
+            &git_lock,
+            deps.git_url,
+            deps.branch,
+            data_path_str,
+            deps.token,
+            &commit_paths,
+            &commit_message,
+            deps.commit_author_name,
+            deps.commit_author_email,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+
+            Err(git::CommitSyncError::PreCommit(source_err)) => {
+                error!(
+                    "commit_and_sync pre-commit failure moving directory '{}' -> '{}', rolling \
+                 back {} document(s) and {} rewritten referencing document(s): {:#}",
+                    source_dir,
+                    dest_dir,
+                    all_moves.len(),
+                    rewritten_paths.len(),
+                    source_err
+                );
+
+                // Roll back EVERY part of this move — every source, every
+                // destination, plus every referencing document rewritten above.
+                // Each group is independent of the others and ALL of them always
+                // run unconditionally, so a failure in one never leaves a
+                // recoverable part undone. `rolled_back` is true only if every
+                // single one of these succeeds.
+                let mut rolled_back = true;
+                for (old_rel, _new_rel) in &all_moves {
+                    if let Err(e) = git::restore_from_head(&git_lock, data_path_str, old_rel).await
+                    {
+                        rolled_back = false;
+                        error!(
+                            "move_directory rollback: failed to restore source '{}': {:#}. This \
+                         needs operator attention.",
+                            old_rel, e
+                        );
                     }
                 }
-            }
-            Err(e) => {
-                warn!(
-                    "Skipping incoming-link rewrite for every moved document while moving \
-                     directory '{}' -> '{}': the batched reverse-link query failed: {:#}",
-                    source_dir, dest_dir, e
-                );
-            }
-        }
-    }
-
-    let mut rewritten_paths: Vec<String> = Vec::new();
-    for (ref_path, targets) in &outside_refs {
-        let abs_ref = match safe_write_path(deps, ref_path) {
-            Ok(p) => p,
-            Err(_) => {
-                warn!(
-                    "Skipping link rewrite in '{}' while moving directory '{}' -> '{}': the \
-                     path no longer resolves safely (stale document_links row?)",
-                    ref_path, source_dir, dest_dir
-                );
-                continue;
-            }
-        };
-        let body = match tokio::fs::read_to_string(&abs_ref).await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(
-                    "Skipping link rewrite in '{}' while moving directory '{}' -> '{}': failed \
-                     to read it, likely a stale document_links row: {}",
-                    ref_path, source_dir, dest_dir, e
-                );
-                continue;
-            }
-        };
-
-        let mut replacements: Vec<(crate::ingest::LinkOccurrence, String)> = Vec::new();
-        for (old_rel, new_rel) in targets {
-            let replacement = crate::ingest::relativize_md_path(ref_path, new_rel);
-            for occurrence in crate::ingest::find_markdown_link_occurrences(&body, ref_path)
-                .into_iter()
-                .filter(|o| &o.resolved == old_rel)
-            {
-                replacements.push((occurrence, replacement.clone()));
-            }
-        }
-        if replacements.is_empty() {
-            // Stale document_links row(s): nothing in the CURRENT body actually
-            // resolves to any moved target anymore.
-            continue;
-        }
-
-        let new_body = apply_link_replacements_each(&body, &replacements);
-        if let Err(e) = tokio::fs::write(&abs_ref, new_body.as_bytes()).await {
-            error!(
-                "Failed to rewrite links into '{}' while moving directory '{}' -> '{}': {}. \
-                 Undoing every filesystem change made for this move so far.",
-                ref_path, source_dir, dest_dir, e
-            );
-            rollback_directory_move_filesystem(
-                &git_lock,
-                data_path_str,
-                &all_moves,
-                &abs_dest_dir,
-                &written_dest,
-                &rewritten_paths,
-            )
-            .await;
-            return Err(DirectoryMoveError::Io {
-                msg: format!("Failed to rewrite links in '{}': {}", ref_path, e),
-            });
-        }
-        rewritten_paths.push(ref_path.clone());
-    }
-
-    // Commit the move AND every rewritten referencing document as ONE atomic
-    // commit, under the SAME lock acquisition (above) already held across
-    // phases 1-3 — releasing it in between any of those and the commit would
-    // let another writer stage into (and, since it commits its own path,
-    // commit) the very half-staged state this call is about to undo. See
-    // `write_document_move`'s identical comment for the full reasoning.
-    let commit_message = build_commit_message(
-        message,
-        &format!("docs: move {} to {}", source_dir, dest_dir),
-        "move_directory",
-    );
-
-    let mut commit_paths: Vec<&str> = Vec::new();
-    for (old_rel, new_rel) in &all_moves {
-        commit_paths.push(old_rel.as_str());
-        commit_paths.push(new_rel.as_str());
-    }
-    for ref_path in &rewritten_paths {
-        if !commit_paths.contains(&ref_path.as_str()) {
-            commit_paths.push(ref_path.as_str());
-        }
-    }
-
-    let commit_outcome = match git::commit_and_sync(
-        &git_lock,
-        deps.git_url,
-        deps.branch,
-        data_path_str,
-        deps.token,
-        &commit_paths,
-        &commit_message,
-        deps.commit_author_name,
-        deps.commit_author_email,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-
-        Err(git::CommitSyncError::PreCommit(source_err)) => {
-            error!(
-                "commit_and_sync pre-commit failure moving directory '{}' -> '{}', rolling \
-                 back {} document(s) and {} rewritten referencing document(s): {:#}",
-                source_dir,
-                dest_dir,
-                all_moves.len(),
-                rewritten_paths.len(),
-                source_err
-            );
-
-            // Roll back EVERY part of this move — every source, every
-            // destination, plus every referencing document rewritten above.
-            // Each group is independent of the others and ALL of them always
-            // run unconditionally, so a failure in one never leaves a
-            // recoverable part undone. `rolled_back` is true only if every
-            // single one of these succeeds.
-            let mut rolled_back = true;
-            for (old_rel, _new_rel) in &all_moves {
-                if let Err(e) = git::restore_from_head(&git_lock, data_path_str, old_rel).await {
-                    rolled_back = false;
-                    error!(
-                        "move_directory rollback: failed to restore source '{}': {:#}. This \
-                         needs operator attention.",
-                        old_rel, e
-                    );
-                }
-            }
-            for (_old_rel, new_rel) in &all_moves {
-                let result = match safe_write_path(deps, new_rel) {
-                    Ok(abs) => match tokio::fs::remove_file(&abs).await {
-                        Ok(()) => git::unstage(&git_lock, data_path_str, new_rel).await,
-                        Err(e) => Err(anyhow::Error::new(e)
-                            .context("Failed to remove the new destination file during rollback")),
-                    },
-                    Err(e) => Err(anyhow::anyhow!(
-                        "destination '{}' no longer resolves safely during rollback: {:?}",
-                        new_rel,
-                        e
-                    )),
-                };
-                if let Err(e) = result {
-                    rolled_back = false;
-                    error!(
-                        "move_directory rollback: failed to remove destination '{}': {:#}. \
+                for (_old_rel, new_rel) in &all_moves {
+                    let result = match safe_write_path(deps, new_rel) {
+                        Ok(abs) => match tokio::fs::remove_file(&abs).await {
+                            Ok(()) => git::unstage(&git_lock, data_path_str, new_rel).await,
+                            Err(e) => Err(anyhow::Error::new(e).context(
+                                "Failed to remove the new destination file during rollback",
+                            )),
+                        },
+                        Err(e) => Err(anyhow::anyhow!(
+                            "destination '{}' no longer resolves safely during rollback: {:?}",
+                            new_rel,
+                            e
+                        )),
+                    };
+                    if let Err(e) = result {
+                        rolled_back = false;
+                        error!(
+                            "move_directory rollback: failed to remove destination '{}': {:#}. \
                          This needs operator attention.",
-                        new_rel, e
-                    );
+                            new_rel, e
+                        );
+                    }
                 }
-            }
-            // Best-effort: tidy up any destination directory left empty by the
-            // removals above — see `remove_empty_dirs_best_effort`'s doc comment.
-            remove_empty_dirs_best_effort_async(&abs_dest_dir).await;
-            for ref_path in &rewritten_paths {
-                if let Err(e) = git::restore_from_head(&git_lock, data_path_str, ref_path).await {
-                    rolled_back = false;
-                    error!(
-                        "move_directory rollback: failed to restore referencing document \
+                // Best-effort: tidy up any destination directory left empty by the
+                // removals above — see `remove_empty_dirs_best_effort`'s doc comment.
+                remove_empty_dirs_best_effort_async(&abs_dest_dir).await;
+                for ref_path in &rewritten_paths {
+                    if let Err(e) = git::restore_from_head(&git_lock, data_path_str, ref_path).await
+                    {
+                        rolled_back = false;
+                        error!(
+                            "move_directory rollback: failed to restore referencing document \
                          '{}': {:#}. This needs operator attention.",
-                        ref_path, e
-                    );
+                            ref_path, e
+                        );
+                    }
                 }
-            }
 
-            if !rolled_back {
-                error!(
-                    "Rollback FAILED after a pre-commit git failure moving directory '{}' -> \
+                if !rolled_back {
+                    error!(
+                        "Rollback FAILED after a pre-commit git failure moving directory '{}' -> \
                      '{}'. Filesystem and git state may now be inconsistent. Original cause: \
                      {:#}",
-                    source_dir, dest_dir, source_err
-                );
+                        source_dir, dest_dir, source_err
+                    );
+                }
+
+                return Err(DirectoryMoveError::PreCommitFailed { rolled_back });
             }
 
-            return Err(DirectoryMoveError::PreCommitFailed {
-                rolled_back,
-                msg: format!("{:#}", source_err),
-            });
-        }
-
-        Err(git::CommitSyncError::PostCommit {
-            sha,
-            source: source_err,
-        }) => {
-            warn!(
-                "commit_and_sync post-commit (sync) failure moving directory '{}' -> '{}', \
-                 commit {} stands uncorrected: {:#}",
-                source_dir, dest_dir, sha, source_err
-            );
-
-            // Still filtered through `mark_dirty` (#278): a moved path can
-            // match `include` and still be excluded, same as the success path
-            // below.
-            mark_dirty(
-                deps.queue,
-                deps.indexing,
-                all_moves
-                    .iter()
-                    .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
-                    .chain(rewritten_paths.iter().map(PathBuf::from))
-                    .collect(),
-            );
-
-            return Ok(DirectoryMoveSuccess {
-                outcome: WriteOutcome::CommittedPendingSync,
+            Err(git::CommitSyncError::PostCommit {
                 sha,
-                rebased_paths: Vec::new(),
-                moved: all_moves,
-                rewritten_paths,
-                sync_failure_cause: Some(format!("{:#}", source_err)),
-            });
-        }
-    };
+                source: source_err,
+            }) => {
+                warn!(
+                    "commit_and_sync post-commit (sync) failure moving directory '{}' -> '{}', \
+                 commit {} stands uncorrected: {:#}",
+                    source_dir, dest_dir, sha, source_err
+                );
 
-    // Mark the source, the destination, and every rewritten referencing
-    // document dirty — plus anything the rebase pulled in — in the SAME
-    // marking call, same reasoning as `write_document_move`'s identical final
-    // step. `all_moves` includes any relocated schema file alongside every
-    // document, which is exactly what makes `reindex::unit_touches_schema`
-    // force the shared `SchemaCache` to rebuild before this unit is next
-    // indexed — see that function's doc comment; nothing further is needed
-    // here for the post-commit self-correction this move depends on.
-    mark_dirty(
-        deps.queue,
-        deps.indexing,
-        all_moves
-            .iter()
-            .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
-            .chain(rewritten_paths.iter().map(PathBuf::from))
-            .chain(commit_outcome.rebased_paths.iter().cloned())
-            .collect(),
-    );
+                // Still filtered through `mark_dirty` (#278): a moved path can
+                // match `include` and still be excluded, same as the success path
+                // below.
+                mark_dirty(
+                    deps.queue,
+                    deps.indexing,
+                    all_moves
+                        .iter()
+                        .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
+                        .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .collect(),
+                );
 
-    Ok(DirectoryMoveSuccess {
-        outcome: WriteOutcome::Synced,
-        sha: commit_outcome.sha,
-        rebased_paths: commit_outcome.rebased_paths,
-        moved: all_moves,
-        rewritten_paths,
-        sync_failure_cause: None,
-    })
+                return Ok(DirectoryMoveSuccess {
+                    moved: all_moves,
+                    rewritten_paths,
+                    merged: false,
+                });
+            }
+
+            Err(git::CommitSyncError::Conflict { source }) => {
+                warn!(
+                    "Remote changed underneath the directory move '{}' -> '{}' (attempt {}/{}), \
+                 re-checking against fresh content: {:#}",
+                    source_dir, dest_dir, attempt, MAX_WRITE_ATTEMPTS, source
+                );
+                head = sync_clone(deps, &git_lock, head).await;
+                continue;
+            }
+        };
+
+        let merged = rebase_touched(&commit_outcome.rebased_paths, &commit_paths);
+
+        // Mark the source, the destination, and every rewritten referencing
+        // document dirty — plus anything the rebase pulled in — in the SAME
+        // marking call, same reasoning as `write_document_move`'s identical final
+        // step. `all_moves` includes any relocated schema file alongside every
+        // document, which is exactly what makes `reindex::unit_touches_schema`
+        // force the shared `SchemaCache` to rebuild before this unit is next
+        // indexed — see that function's doc comment; nothing further is needed
+        // here for the post-commit self-correction this move depends on.
+        mark_dirty(
+            deps.queue,
+            deps.indexing,
+            all_moves
+                .iter()
+                .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
+                .chain(rewritten_paths.iter().map(PathBuf::from))
+                .chain(commit_outcome.rebased_paths.iter().cloned())
+                .collect(),
+        );
+
+        return Ok(DirectoryMoveSuccess {
+            moved: all_moves,
+            rewritten_paths,
+            merged,
+        });
+    }
+
+    Err(DirectoryMoveError::EditedElsewhere)
 }
 
 // ---------------------------------------------------------------------------
 // delete_document core
 // ---------------------------------------------------------------------------
 
-/// Delete `rel_path`: read it (for the diff), remove it from disk, commit the
-/// deletion to git, and queue reindex cleanup on success.
+/// Delete `rel_path`: under the lock, after syncing with the remote, check it is
+/// still the version the caller read (`expected_version`, required), remove it,
+/// commit the deletion, and queue reindex cleanup on success.
 ///
 /// `rel_path` must already have been resolved by the caller against the KB root
 /// (this function re-resolves and re-verifies it itself immediately before each
@@ -4209,67 +4290,32 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     rel_path: &str,
     message: Option<&str>,
+    expected_version: Option<&str>,
 ) -> Result<WriteSuccess, WriteError> {
-    // Schema-file guard, then include-pattern eligibility guard, ahead of
-    // everything else — see `check_include_pattern`'s doc comment for why this
-    // must live here rather than in each caller.
+    // Schema-file guard, then include-pattern eligibility guard, then the early
+    // path-safety check, ahead of everything else — see `write_document`.
     check_not_schema_file(rel_path)?;
     check_include_pattern(deps, rel_path)?;
-
-    // Early path-safety check, ahead of everything else below — mirrors
-    // `write_document`'s identical early check (see its comment for why this
-    // must run before any further processing, not just before the filesystem
-    // mutation). `delete_document` has no `validate_content` step to race
-    // ahead of, but this keeps both halves of the pipeline consistent and
-    // fails a traversal path before it can be reported by the wrong error
-    // (`InvalidCommitMessage`) or after wasted work. The resolved `PathBuf` is
-    // discarded — see that comment for why it is not reused.
     safe_write_path(deps, rel_path)?;
 
-    // Validate the commit message BEFORE deleting anything. Rejecting it after
-    // the removal would leave the file gone from disk but never committed, with
-    // the Qdrant and state-DB purge — which only runs after a successful commit —
-    // skipped too, so search would keep returning a document that no longer
-    // exists.
+    // Validate the commit message BEFORE deleting anything: rejecting it after
+    // the removal would leave the file gone from disk but never committed.
     validate_commit_message(message)?;
 
-    let abs_path = safe_write_path(deps, rel_path)?;
-    if !abs_path.exists() {
+    if !safe_write_path(deps, rel_path)?.exists() {
         return Err(WriteError::NotFound);
     }
-
-    let old_content = tokio::fs::read_to_string(&abs_path).await.map_err(|e| {
-        error!("Failed to read '{}': {}", abs_path.display(), e);
-        WriteError::Io {
-            msg: format!("Failed to read file before deletion: {}", e),
-        }
-    })?;
+    let Some(expected_version) = expected_version else {
+        return Err(WriteError::VersionRequired);
+    };
 
     // Best-effort: warn if anything else in the KB still links to the document
     // about to be deleted (#181), and (#229) carry the same paths through to
-    // `WriteSuccess::referencing_paths` — a `warn!` reaches an operator tailing
-    // the server, not the caller (usually an agent with no log access), which
-    // is the party actually deciding whether the delete was a good idea.
-    // `StateDb::links_targeting` is the exact same reverse-link query
-    // `write_document_move`'s step 10.5 already runs to find documents whose
-    // body needs rewriting — reused here purely to look, not to touch anything.
-    //
-    // Deliberately WARN/report, not refuse: this codebase's established stance
-    // on a stale/dangling link is "self-heal, don't block" — `write_document_move`
-    // and `move_directory` both skip a referencing document outright rather
-    // than fail the whole operation when a `document_links` row turns out to
-    // be stale, and a referencing document's OWN next reindex rebuilds its
-    // links from whatever its current on-disk body actually resolves to,
-    // silently dropping the edge that no longer exists. A delete leaving a
-    // dangling link behaves no differently from that already-accepted case.
-    // Refusing outright would also need a `force` escape hatch threaded
-    // through every caller's request shape — the MCP tool's parameter schema
-    // and the HTTP API's request body — which is a cross-cutting change this
-    // transport-agnostic pipeline should not decide unilaterally (see #229).
-    // `deps.state` is `None` for callers with no `StateDb` wired up (see that
-    // field's doc comment on `WriteDeps`); this is skipped silently in that
-    // case, same as the move path's own reverse-link query — `referencing_paths`
-    // then stays empty, indistinguishable from "checked, found nothing".
+    // `WriteSuccess::referencing_paths` — a `warn!` reaches an operator, not the
+    // caller deciding whether the delete was a good idea. Deliberately
+    // WARN/report, not refuse: a dangling link self-heals to a dropped edge on
+    // the referencing document's own next reindex, same as any stale
+    // `document_links` row. A read of the index, so it runs before the lock.
     let mut referencing_paths: Vec<String> = Vec::new();
     if let Some(state) = deps.state {
         match state.links_targeting(rel_path, "markdown").await {
@@ -4296,142 +4342,134 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
         }
     }
 
-    // Re-verify immediately before removing — see `write_document`'s doc comment
-    // for why this is re-resolved rather than reusing the path from above.
-    let abs_path = safe_write_path(deps, rel_path)?;
-    tokio::fs::remove_file(&abs_path).await.map_err(|e| {
-        error!("Failed to remove '{}': {}", abs_path.display(), e);
-        WriteError::Io {
-            msg: format!("Failed to remove file: {}", e),
-        }
-    })?;
-
     let commit_message = build_commit_message(
         message,
         &format!("docs: delete {}", rel_path),
         "delete_document",
     );
 
-    let data_path_str = deps.canonical_data_path.to_str().unwrap_or_default();
+    let (git_lock, mut head) = lock_and_sync(deps).await;
+    let data_path_str = data_path_of(deps);
 
-    // `commit_and_sync` distinguishes WHERE it failed — see `git::CommitSyncError`
-    // — which matters a great deal here, since the file is already gone from disk
-    // by this point:
-    //
-    // - `PreCommit` (add/commit failed): HEAD never recorded the deletion, so the
-    //   file's absence from disk is the ONLY trace of this call. Restore it from
-    //   HEAD so the caller sees "nothing changed" and can safely retry.
-    // - `PostCommit` (fetch/rebase/push failed): the deletion IS a real local
-    //   commit — HEAD already reflects the file being gone. Restoring it here
-    //   would resurrect a document that, as far as local git history is
-    //   concerned, was legitimately deleted. Leave it deleted and report the sync
-    //   as pending instead.
-    // Held across the commit AND the restore below, for the same reason as on the
-    // write path: a rollback that runs outside the acquisition that produced the
-    // failure is racing every other writer.
-    let git_lock = git::lock_git().await;
+    for attempt in 1..=MAX_WRITE_ATTEMPTS {
+        let abs_path = safe_write_path(deps, rel_path)?;
+        let Some(old_content) = read_if_exists(&abs_path).await? else {
+            return Err(WriteError::NotFound);
+        };
+        if !versions_match(expected_version, &old_content) {
+            return Err(WriteError::EditedElsewhere);
+        }
 
-    let commit_outcome = match git::commit_and_sync(
-        &git_lock,
-        deps.git_url,
-        deps.branch,
-        data_path_str,
-        deps.token,
-        &[rel_path],
-        &commit_message,
-        deps.commit_author_name,
-        deps.commit_author_email,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
+        tokio::fs::remove_file(&abs_path).await.map_err(|e| {
+            error!("Failed to remove '{}': {}", abs_path.display(), e);
+            WriteError::Io {
+                msg: format!("Failed to remove file: {}", e),
+            }
+        })?;
 
-        Err(git::CommitSyncError::PreCommit(source)) => {
-            error!(
-                "commit_and_sync pre-commit failure deleting '{}', restoring from HEAD: {:#}",
-                rel_path, source
-            );
+        // `PreCommit`: HEAD never recorded the deletion — restore the file from
+        // HEAD so the caller sees "nothing changed". `PostCommit`: the deletion is
+        // a real local commit; leave it and report the sync as pending.
+        // `Conflict`: the deletion commit is already dropped (the branch is back at
+        // its pre-commit HEAD, which restores the file); sync again, then check
+        // the document against what the remote now holds.
+        let commit_outcome = match git::commit_and_sync(
+            &git_lock,
+            deps.git_url,
+            deps.branch,
+            data_path_str,
+            deps.token,
+            &[rel_path],
+            &commit_message,
+            deps.commit_author_name,
+            deps.commit_author_email,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
 
-            match git::restore_from_head(&git_lock, data_path_str, rel_path).await {
-                Ok(()) => {
-                    return Err(WriteError::PreCommitFailed {
+            Err(git::CommitSyncError::PreCommit(source)) => {
+                error!(
+                    "commit_and_sync pre-commit failure deleting '{}', restoring from HEAD: {:#}",
+                    rel_path, source
+                );
+                return match git::restore_from_head(&git_lock, data_path_str, rel_path).await {
+                    Ok(()) => Err(WriteError::PreCommitFailed {
                         rolled_back: true,
                         msg: format!("{:#}", source),
-                    });
-                }
-                // The restore ITSELF failed — a third, worse state than either a
-                // clean delete or a clean no-op: the file is gone from disk with
-                // no corresponding commit.
-                Err(restore_err) => {
-                    error!(
-                        "Restore FAILED after a pre-commit git failure deleting '{}': {:#}. \
-                         Original cause: {:#}. The file is gone from disk and NOT \
-                         committed — filesystem and git are now inconsistent.",
-                        rel_path, restore_err, source
-                    );
-                    return Err(WriteError::PreCommitFailed {
-                        rolled_back: false,
-                        msg: format!(
-                            "Commit cause: {:#}. Restore cause: {:#}",
-                            source, restore_err
-                        ),
-                    });
-                }
+                    }),
+                    Err(restore_err) => {
+                        error!(
+                            "Restore FAILED after a pre-commit git failure deleting '{}': {:#}. \
+                             Original cause: {:#}. The file is gone from disk and NOT \
+                             committed — filesystem and git are now inconsistent.",
+                            rel_path, restore_err, source
+                        );
+                        Err(WriteError::PreCommitFailed {
+                            rolled_back: false,
+                            msg: format!(
+                                "Commit cause: {:#}. Restore cause: {:#}",
+                                source, restore_err
+                            ),
+                        })
+                    }
+                };
             }
-        }
 
-        Err(git::CommitSyncError::PostCommit { sha, source }) => {
-            warn!(
-                "commit_and_sync post-commit (sync) failure deleting '{}', deletion commit \
-                 {} stands uncorrected: {:#}",
-                rel_path, sha, source
-            );
+            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+                warn!(
+                    "commit_and_sync post-commit (sync) failure deleting '{}', deletion commit \
+                     {} stands uncorrected: {:#}",
+                    rel_path, sha, source
+                );
+                mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
+                return Ok(WriteSuccess {
+                    outcome: WriteOutcome::CommittedPendingSync,
+                    sha,
+                    rebased_paths: Vec::new(),
+                    diff: render_unified_diff(&old_content, "", rel_path),
+                    rewritten_paths: Vec::new(),
+                    referencing_paths,
+                    merged: false,
+                    version: None,
+                });
+            }
 
-            // The file is already gone from local disk regardless of push status,
-            // so the local index should reflect that regardless too. Still
-            // filtered through `mark_dirty` (#278): an excluded path was
-            // never indexed, so there is nothing to purge for it either.
-            mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
+            Err(git::CommitSyncError::Conflict { source }) => {
+                warn!(
+                    "Remote changed underneath the delete of '{}' (attempt {}/{}), re-checking \
+                     against fresh content: {:#}",
+                    rel_path, attempt, MAX_WRITE_ATTEMPTS, source
+                );
+                head = sync_clone(deps, &git_lock, head).await;
+                continue;
+            }
+        };
 
-            return Ok(WriteSuccess {
-                outcome: WriteOutcome::CommittedPendingSync,
-                sha,
-                rebased_paths: Vec::new(),
-                diff: render_unified_diff(&old_content, "", rel_path),
-                sync_failure_cause: Some(format!("{:#}", source)),
-                // Deletes never rewrite other documents' links — a dangling
-                // link to a deleted document self-heals to a dropped edge on
-                // the referencing document's own next reindex, same as any
-                // other stale `document_links` row.
-                rewritten_paths: Vec::new(),
-                referencing_paths,
-            });
-        }
-    };
+        // Mark this path — and anything the rebase pulled in — dirty. The worker's
+        // scoped indexer purges a path's points and state rows itself once it finds
+        // the file gone.
+        mark_dirty(
+            deps.queue,
+            deps.indexing,
+            std::iter::once(PathBuf::from(rel_path))
+                .chain(commit_outcome.rebased_paths.iter().cloned())
+                .collect(),
+        );
 
-    // Mark this path — and anything the rebase pulled in — dirty and return
-    // immediately. The worker's scoped indexer purges a path's Qdrant points and
-    // state rows itself once it re-checks and finds the file gone (the
-    // missing-file branch of `ingest::index_paths`), so there is no separate
-    // purge to do here — this is "one reindex path" applied to deletes too, not a
-    // special case.
-    mark_dirty(
-        deps.queue,
-        deps.indexing,
-        std::iter::once(PathBuf::from(rel_path))
-            .chain(commit_outcome.rebased_paths.iter().cloned())
-            .collect(),
-    );
+        return Ok(WriteSuccess {
+            outcome: WriteOutcome::Synced,
+            sha: commit_outcome.sha,
+            diff: render_unified_diff(&old_content, "", rel_path),
+            rebased_paths: commit_outcome.rebased_paths,
+            rewritten_paths: Vec::new(),
+            referencing_paths,
+            merged: false,
+            version: None,
+        });
+    }
 
-    Ok(WriteSuccess {
-        outcome: WriteOutcome::Synced,
-        sha: commit_outcome.sha,
-        diff: render_unified_diff(&old_content, "", rel_path),
-        rebased_paths: commit_outcome.rebased_paths,
-        sync_failure_cause: None,
-        rewritten_paths: Vec::new(),
-        referencing_paths,
-    })
+    Err(WriteError::EditedElsewhere)
 }
 
 // ---------------------------------------------------------------------------
@@ -5142,6 +5180,14 @@ mod tests {
     }
 
     impl Harness {
+        /// The current version of `rel_path` under this harness's root, as a
+        /// caller would have read it; `None` when it does not exist.
+        fn version_of(&self, rel_path: &str) -> Option<&'static str> {
+            std::fs::read(self.canonical_data_path.join(rel_path))
+                .ok()
+                .map(|bytes| leak(document_version(&bytes)))
+        }
+
         fn new(tmp: &tempfile::TempDir, config: Arc<ResolvedConfig>) -> Self {
             let (embed, qdrant) = test_embed_and_qdrant();
             let canonical_data_path = tmp.path().canonicalize().unwrap();
@@ -5209,21 +5255,38 @@ mod tests {
         }
     }
 
+    /// A whole-content change that ignores what is on disk: a relative edit whose
+    /// result is always `new_content`, so it needs no `expected_version`. Stands in
+    /// for the blind overwrites these tests were written against.
+    fn overwrite<'a>(new_content: &'a str) -> DocChange<'a> {
+        let edit: &'a RelativeEdit<'a> =
+            Box::leak(Box::new(move |_: &str| Ok(new_content.to_string())));
+        DocChange::Relative(edit)
+    }
+
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
     fn make_req<'a>(rel_path: &'a str, new_content: &'a str, is_create: bool) -> WriteRequest<'a> {
         WriteRequest {
             rel_path,
-            old_content: "",
-            new_content,
-            is_create,
+            change: if is_create {
+                DocChange::Create(new_content)
+            } else {
+                overwrite(new_content)
+            },
             message: None,
             default_verb: if is_create { "add" } else { "update" },
             force_new: Some(true),
             operation: "test",
-            expected_hash: None,
+            expected_version: None,
             dest_path: None,
         }
     }
 
+    /// A move of a source whose current content is `old_content` (its version is
+    /// passed as `expected_version`), writing `new_content` at the destination.
     fn make_move_req<'a>(
         source_rel: &'a str,
         dest_rel: &'a str,
@@ -5232,14 +5295,12 @@ mod tests {
     ) -> WriteRequest<'a> {
         WriteRequest {
             rel_path: source_rel,
-            old_content,
-            new_content,
-            is_create: false,
+            change: overwrite(new_content),
             message: None,
             default_verb: "update",
             force_new: Some(true),
             operation: "test",
-            expected_hash: None,
+            expected_version: Some(leak(document_version(old_content.as_bytes()))),
             dest_path: Some(dest_rel),
         }
     }
@@ -5289,47 +5350,52 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn stale_expected_hash_is_rejected_before_touching_the_file() {
+    async fn full_replace_without_expected_version_is_refused_before_touching_the_file() {
         let tmp = tempfile::tempdir().unwrap();
         let config = crate::mcp::make_test_resolved_config(tmp.path());
         let harness = Harness::new(&tmp, config);
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        let old = "---\ntitle: Old\n---\n# Old";
+        std::fs::write(tmp.path().join("docs/edit-me.md"), old).unwrap();
 
-        let stale_hash = crate::ingest::compute_hash_from_bytes(b"not the current content");
         let mut req = make_req("docs/edit-me.md", "---\ntitle: New\n---\n# New", false);
-        req.old_content = "---\ntitle: Old\n---\n# Old";
-        req.expected_hash = Some(&stale_hash);
-
-        let err = write_document(&harness.deps(), req)
-            .await
-            .expect_err("stale hash must be rejected");
-        match err {
-            WriteError::StaleHash { expected, actual } => {
-                assert_eq!(expected, stale_hash);
-                assert_ne!(actual, stale_hash);
-            }
-            other => panic!("expected StaleHash, got {other:?}"),
-        }
+        req.change = DocChange::Replace("---\ntitle: New\n---\n# New");
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        assert!(matches!(err, WriteError::VersionRequired), "{err:?}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("docs/edit-me.md")).unwrap(),
+            old
+        );
     }
 
     #[tokio::test]
-    async fn matching_expected_hash_proceeds_past_the_guard() {
+    async fn stale_version_with_no_merge_base_is_refused_and_mutates_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let config = crate::mcp::make_test_resolved_config(tmp.path());
         let harness = Harness::new(&tmp, config);
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        let old = "---\ntitle: Old\n---\n# Old";
+        std::fs::write(tmp.path().join("docs/edit-me.md"), old).unwrap();
 
-        let old_content = "---\ntitle: Old\n---\n# Old";
-        let correct_hash = crate::ingest::compute_hash_from_bytes(old_content.as_bytes());
+        // A version the object store has never seen cannot be a merge base.
+        let stale = document_version(b"not the current content");
         let mut req = make_req("docs/edit-me.md", "---\ntitle: New\n---\n# New", false);
-        req.old_content = old_content;
-        req.expected_hash = Some(&correct_hash);
-
-        // No git repo under `tmp`, so this will fail later in the pipeline (at
-        // the commit step, or NotFound since the file was never created on disk)
-        // — the point of this test is only that it does NOT fail with StaleHash.
+        req.change = DocChange::Replace("---\ntitle: New\n---\n# New");
+        req.expected_version = Some(&stale);
         let err = write_document(&harness.deps(), req).await.unwrap_err();
-        assert!(
-            !matches!(err, WriteError::StaleHash { .. }),
-            "a correct expected_hash must not be treated as stale, got {err:?}"
+        assert!(matches!(err, WriteError::EditedElsewhere), "{err:?}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("docs/edit-me.md")).unwrap(),
+            old
+        );
+    }
+
+    #[test]
+    fn document_version_is_the_git_blob_id() {
+        // `git hash-object` of "hello\n".
+        assert_eq!(
+            document_version(b"hello\n"),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
         );
     }
 
@@ -5352,8 +5418,7 @@ mod tests {
         let schema_rel = "notes/.kb-schema.yaml";
         let is_refused = |err: &WriteError| matches!(err, WriteError::SchemaFile { rel_path } if rel_path == schema_rel);
 
-        let mut edit = make_req(schema_rel, "fields: {}\n", false);
-        edit.old_content = schema_text;
+        let edit = make_req(schema_rel, "fields: {}\n", false);
         let err = write_document(&harness.deps(), edit).await.unwrap_err();
         assert!(is_refused(&err), "edit: {err:?}");
 
@@ -5362,9 +5427,14 @@ mod tests {
             .unwrap_err();
         assert!(is_refused(&err), "create: {err:?}");
 
-        let err = delete_document(&harness.deps(), schema_rel, None)
-            .await
-            .unwrap_err();
+        let err = delete_document(
+            &harness.deps(),
+            schema_rel,
+            None,
+            harness.version_of(schema_rel),
+        )
+        .await
+        .unwrap_err();
         assert!(is_refused(&err), "delete: {err:?}");
 
         let err = write_document(
@@ -5387,13 +5457,21 @@ mod tests {
             "move onto: {err:?}"
         );
 
+        // The canonical name is refused exactly like the legacy one.
+        let canonical = "notes/.schema.yaml";
+        let err = write_document(&harness.deps(), make_req(canonical, "fields: {}\n", false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WriteError::SchemaFile { rel_path } if rel_path == canonical),
+            "canonical edit: {err:?}"
+        );
+
         let batch = [BatchWriteRequest {
             rel_path: schema_rel,
-            old_content: schema_text,
-            new_content: "fields: {}\n",
-            is_create: false,
+            change: overwrite("fields: {}\n"),
             force_new: Some(true),
-            expected_hash: None,
+            expected_version: None,
         }];
         match write_documents_batch(&harness.deps(), &batch, None).await {
             Err(BatchWriteError::Documents { failures }) => {
@@ -5506,8 +5584,7 @@ mod tests {
         let config = crate::mcp::make_test_resolved_config(tmp.path());
         let harness = Harness::new(&tmp, config);
 
-        let mut req = make_req("notes.txt", "new text", false);
-        req.old_content = "old text";
+        let req = make_req("notes.txt", "new text", false);
         let err = write_document(&harness.deps(), req).await.unwrap_err();
         assert!(matches!(err, WriteError::UnsafePath { .. }), "got {err:?}");
         assert_eq!(
@@ -5524,9 +5601,14 @@ mod tests {
         let config = crate::mcp::make_test_resolved_config(tmp.path());
         let harness = Harness::new(&tmp, config);
 
-        let err = delete_document(&harness.deps(), "notes.txt", None)
-            .await
-            .unwrap_err();
+        let err = delete_document(
+            &harness.deps(),
+            "notes.txt",
+            None,
+            harness.version_of("notes.txt"),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, WriteError::UnsafePath { .. }), "got {err:?}");
         assert!(
             tmp.path().join("notes.txt").exists(),
@@ -5551,9 +5633,14 @@ mod tests {
         let config = crate::mcp::make_test_resolved_config(tmp.path());
         let harness = Harness::new(&tmp, config);
 
-        let err = delete_document(&harness.deps(), "docs/nonexistent.md", None)
-            .await
-            .unwrap_err();
+        let err = delete_document(
+            &harness.deps(),
+            "docs/nonexistent.md",
+            None,
+            harness.version_of("docs/nonexistent.md"),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, WriteError::NotFound), "got {err:?}");
     }
 
@@ -5567,9 +5654,14 @@ mod tests {
         let config = crate::mcp::make_test_resolved_config(tmp.path());
         let harness = Harness::new(&tmp, config);
 
-        let err = delete_document(&harness.deps(), "docs/del-me.md", Some("bad\nmessage"))
-            .await
-            .unwrap_err();
+        let err = delete_document(
+            &harness.deps(),
+            "docs/del-me.md",
+            Some("bad\nmessage"),
+            harness.version_of("docs/del-me.md"),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, WriteError::InvalidCommitMessage { .. }),
             "got {err:?}"
@@ -5710,10 +5802,22 @@ mod tests {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
 
-        // Lands in the remote AFTER `work` was cloned, so this write's own
-        // commit_and_sync must fetch + rebase to pull it in. `README.md` is in
-        // the default `indexing.exclude_files`.
-        push_file_from_a_fresh_clone(bare.path(), "master", "README.md", "readme");
+        // Lands in the remote after this write's pre-write sync but before its
+        // commit_and_sync, which must therefore fetch + rebase to pull it in.
+        // `README.md` is in the default `indexing.exclude_files`.
+        let bare_path = bare.path().to_path_buf();
+        let pushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook: crate::git::TestHook = Arc::new(move |point| {
+            let bare_path = bare_path.clone();
+            let pushed = Arc::clone(&pushed);
+            Box::pin(async move {
+                if point == crate::git::HookPoint::BeforeSync
+                    && !pushed.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    push_file_from_a_fresh_clone(&bare_path, "master", "README.md", "readme");
+                }
+            })
+        });
 
         let mut config = crate::mcp::make_test_resolved_config(work.path());
         {
@@ -5727,7 +5831,11 @@ mod tests {
             "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n",
             true,
         );
-        let success = write_document(&harness.deps(), req).await.unwrap();
+        let deps = harness.deps();
+        let success = crate::git::TEST_HOOK
+            .scope(hook, write_document(&deps, req))
+            .await
+            .unwrap();
         assert_eq!(success.outcome, WriteOutcome::Synced);
 
         // The rebase really did pull README.md in — `rebased_paths` still
@@ -5747,6 +5855,49 @@ mod tests {
             !pending.contains(&std::path::PathBuf::from("README.md")),
             "README.md is in the default exclude_files list and must not be marked \
              dirty, even though the rebase pulled it in"
+        );
+    }
+
+    /// The sync at the start of a write pulls in remote commits the webhook will
+    /// then find nothing new in, so the write itself marks those paths dirty —
+    /// through the same include/exclude filter (#278).
+    #[tokio::test]
+    async fn write_document_marks_paths_its_pre_write_sync_pulled_in() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        push_file_from_a_fresh_clone(bare.path(), "master", "README.md", "readme");
+        push_file_from_a_fresh_clone(
+            bare.path(),
+            "master",
+            "docs/remote.md",
+            "---\ntitle: R\n---\n# R\n",
+        );
+
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        {
+            let c = Arc::get_mut(&mut config).unwrap();
+            c.write.dedup_enabled = false;
+            c.source.git_url = Some(format!("file://{}", bare.path().to_str().unwrap()));
+        }
+        let harness = Harness::new(&work, config);
+        let req = make_req(
+            "docs/new.md",
+            "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n",
+            true,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(work.path().join("docs/remote.md").exists());
+
+        crate::reindex::test_support::assert_marked_dirty(
+            &harness.reindex_queue,
+            &["docs/new.md", "docs/remote.md"],
+        );
+        assert!(
+            !harness
+                .reindex_queue
+                .snapshot_paths()
+                .contains(&std::path::PathBuf::from("README.md"))
         );
     }
 
@@ -5815,12 +5966,11 @@ mod tests {
         force_git_commit_to_fail(&work);
         let harness = git_backed_harness(&work);
 
-        let mut req = make_req(
+        let req = make_req(
             "edit-me.md",
             "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n",
             false,
         );
-        req.old_content = original;
         let err = write_document(&harness.deps(), req).await.unwrap_err();
         match err {
             WriteError::PreCommitFailed { rolled_back, .. } => assert!(rolled_back),
@@ -5862,8 +6012,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut req = make_req("log.md", &new_content, false);
-        req.old_content = original;
+        let req = make_req("log.md", &new_content, false);
         let success = write_document(&harness.deps(), req).await.unwrap();
         assert_eq!(success.outcome, WriteOutcome::Synced);
 
@@ -5898,8 +6047,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut req = make_req("log.md", &new_content, false);
-        req.old_content = original;
+        let req = make_req("log.md", &new_content, false);
         let err = write_document(&harness.deps(), req).await.unwrap_err();
         match err {
             WriteError::Validation { result } => {
@@ -5935,8 +6083,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut req = make_req("log.md", &new_content, false);
-        req.old_content = original;
+        let req = make_req("log.md", &new_content, false);
         let err = write_document(&harness.deps(), req).await.unwrap_err();
         match err {
             WriteError::PreCommitFailed { rolled_back, .. } => assert!(rolled_back),
@@ -5962,8 +6109,7 @@ mod tests {
         let harness = git_backed_harness(&work);
         let new_content = apply_append(original, "- entry two");
 
-        let mut req = make_req("log.md", &new_content, false);
-        req.old_content = original;
+        let req = make_req("log.md", &new_content, false);
         let success = write_document(&harness.deps(), req).await.unwrap();
         assert_eq!(success.outcome, WriteOutcome::Synced);
 
@@ -5986,8 +6132,7 @@ mod tests {
         let harness = git_backed_harness(&work);
         let new_content = apply_append(original, "- entry two");
 
-        let mut req = make_req("log.md", &new_content, false);
-        req.old_content = original;
+        let req = make_req("log.md", &new_content, false);
         let err = write_document(&harness.deps(), req).await.unwrap_err();
         match err {
             WriteError::PreCommitFailed { rolled_back, .. } => assert!(rolled_back),
@@ -6074,64 +6219,35 @@ mod tests {
         );
     }
 
-    /// #142 regression: `expected_hash` must be re-verified against the file's
-    /// LIVE on-disk content immediately before the overwrite, not just once,
-    /// early, against the caller-supplied `old_content`. Simulates the failure
-    /// scenario from the issue: a caller reads `original`, and by the time its
-    /// write finally reaches the filesystem, something else (a webhook merge, in
-    /// production) has already changed the working-tree content — here modeled
-    /// directly as a second on-disk write between request construction and the
-    /// call, with `expected_hash` still computed from the ORIGINAL content the
-    /// caller actually read. Before the fix there is only the early check
-    /// (which the caller's own stale `old_content` trivially satisfies), so the
-    /// write silently clobbers the concurrent change; after the fix the
-    /// re-check catches the live mismatch and the file is left untouched.
+    /// #142, with versions: a full replace based on `original` must not clobber a
+    /// concurrent change that landed after the caller read it. Here the two
+    /// changes overlap, so the three-way merge conflicts and the write is refused,
+    /// leaving the concurrent change untouched.
     #[tokio::test]
-    async fn stale_hash_re_check_catches_a_change_made_after_the_first_check() {
+    async fn stale_full_replace_overlapping_a_concurrent_change_is_refused() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         let original =
             "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
         std::fs::write(work.path().join("edit-me.md"), original).unwrap();
         git_commit_all(&work, "edit-me.md", "add edit-me.md");
-        let head_before = head_sha(&work);
 
         let harness = git_backed_harness(&work);
+        let expected_version = document_version(original.as_bytes());
 
-        // The hash the caller computed when it read `original` — still valid
-        // against `old_content` below, which is why the FIRST check (step 1)
-        // lets this through.
-        let expected_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
-
-        // Something else changes the file on disk after the caller read
-        // `original` but before this write reaches the filesystem — a webhook
-        // merge landing mid-flight, in production.
         let concurrent = "---\ntitle: Concurrent\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Concurrent body\n";
         std::fs::write(work.path().join("edit-me.md"), concurrent).unwrap();
+        git_commit_all(&work, "edit-me.md", "concurrent change");
+        let head_before = head_sha(&work);
 
-        let mut req = make_req(
-            "edit-me.md",
+        let mut req = make_req("edit-me.md", "", false);
+        req.change = DocChange::Replace(
             "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n",
-            false,
         );
-        req.old_content = original;
-        req.expected_hash = Some(&expected_hash);
+        req.expected_version = Some(&expected_version);
 
         let err = write_document(&harness.deps(), req).await.unwrap_err();
-        match err {
-            WriteError::StaleHash { expected, actual } => {
-                assert_eq!(expected, expected_hash);
-                assert_eq!(
-                    actual,
-                    crate::ingest::compute_hash_from_bytes(concurrent.as_bytes()),
-                    "the re-check must hash the LIVE on-disk content, not `old_content` again"
-                );
-            }
-            other => panic!("expected StaleHash, got {other:?}"),
-        }
-
-        // The concurrent write must survive untouched — that's the whole point:
-        // it must not be silently clobbered by the stale caller's edit.
+        assert!(matches!(err, WriteError::EditedElsewhere), "{err:?}");
         assert_eq!(
             std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
             concurrent
@@ -6139,14 +6255,421 @@ mod tests {
         assert_eq!(head_before, head_sha(&work), "no commit must be made");
     }
 
-    /// Same #142 regression, for `write_document_move`'s SOURCE: the stale-read
-    /// guard at step 3 runs before `validate::validate_content` (which can exec
-    /// an arbitrarily slow `lint_command`) and before GIT_LOCK is acquired, so a
-    /// concurrent change to the source's on-disk content in that window must
-    /// still be caught before the move writes the destination or removes the
-    /// source — not silently carried through as if the stale read were current.
+    /// A stale full replace git cannot merge at all (content with a NUL byte,
+    /// which `git merge-file` refuses as binary) is refused like a conflict, and
+    /// none of git's output — which names the clone's own path — reaches the
+    /// error.
     #[tokio::test]
-    async fn move_stale_hash_re_check_catches_a_change_made_after_the_first_check() {
+    async fn a_stale_full_replace_git_cannot_merge_is_refused_without_git_output() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original =
+            "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
+        std::fs::write(work.path().join("edit-me.md"), original).unwrap();
+        git_commit_all(&work, "edit-me.md", "add edit-me.md");
+        let expected_version = document_version(original.as_bytes());
+        let concurrent = original.replace("# Old body", "# Concurrent body");
+        std::fs::write(work.path().join("edit-me.md"), &concurrent).unwrap();
+        git_commit_all(&work, "edit-me.md", "concurrent change");
+        let head_before = head_sha(&work);
+        let harness = git_backed_harness(&work);
+
+        let content = original.replace("title: Old", "title: New\u{0}");
+        let mut req = make_req("edit-me.md", "", false);
+        req.change = DocChange::Replace(&content);
+        req.expected_version = Some(&expected_version);
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+
+        assert!(matches!(err, WriteError::EditedElsewhere), "{err:?}");
+        let text = format!("{err:?}");
+        for leaked in [
+            ".git",
+            "merge-file",
+            harness.canonical_data_path.to_str().unwrap(),
+        ] {
+            assert!(!text.contains(leaked), "'{leaked}' leaked: {text}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
+            concurrent
+        );
+        assert_eq!(head_before, head_sha(&work), "no commit must be made");
+    }
+
+    /// A relative edit applies to the document as it is under the lock even
+    /// when its `expected_version` is stale — and then reports that its result
+    /// carries the changes made since, so the caller does not chain a full
+    /// replace from its stale copy with the returned version.
+    #[tokio::test]
+    async fn a_relative_edit_over_a_stale_expected_version_is_reported_as_merged() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original = "---\ntitle: Log\n---\n\n# Log\n- one\n";
+        std::fs::write(work.path().join("log.md"), original).unwrap();
+        git_commit_all(&work, "log.md", "add log.md");
+        let harness = git_backed_harness(&work);
+        let append = |entry: &'static str| -> DocChange<'static> {
+            let edit: &'static RelativeEdit<'static> = Box::leak(Box::new(move |current: &str| {
+                Ok(apply_append(current, entry))
+            }));
+            DocChange::Relative(edit)
+        };
+
+        // The version of the document before someone else added "- one".
+        let stale = document_version(b"---\ntitle: Log\n---\n\n# Log\n");
+        let mut req = make_req("log.md", "", false);
+        req.change = append("- two");
+        req.expected_version = Some(&stale);
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert!(
+            success.merged,
+            "applied over changes made since its version"
+        );
+        let on_disk = std::fs::read(work.path().join("log.md")).unwrap();
+        assert_eq!(
+            success.version.as_deref(),
+            Some(document_version(&on_disk).as_str())
+        );
+
+        let mut req = make_req("log.md", "", false);
+        req.change = append("- three");
+        req.expected_version = harness.version_of("log.md");
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert!(!success.merged, "a current version folds nothing else in");
+
+        let mut req = make_req("log.md", "", false);
+        req.change = append("- four");
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert!(!success.merged, "no version, nothing to compare against");
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("log.md")).unwrap(),
+            "---\ntitle: Log\n---\n\n# Log\n- one\n- two\n- three\n- four\n"
+        );
+    }
+
+    /// A relative edit may not grow a document past `MAX_CONTENT_LEN` — the cap
+    /// content sent whole already has — but may still shrink one that is over it.
+    #[tokio::test]
+    async fn a_relative_edit_may_not_grow_a_document_past_the_size_cap() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let near_cap = format!(
+            "---\ntitle: Big\n---\n\n{}\n",
+            "x".repeat(MAX_CONTENT_LEN - 100)
+        );
+        std::fs::write(work.path().join("big.md"), &near_cap).unwrap();
+        git_commit_all(&work, "big.md", "add big.md");
+        let head_before = head_sha(&work);
+        let harness = git_backed_harness(&work);
+
+        let grown = apply_append(&near_cap, &"y".repeat(200));
+        let err = write_document(&harness.deps(), make_req("big.md", &grown, false))
+            .await
+            .unwrap_err();
+        match &err {
+            WriteError::InvalidEdit { msg } => assert!(msg.contains("too large"), "{msg}"),
+            other => panic!("expected InvalidEdit, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("big.md")).unwrap(),
+            near_cap
+        );
+        assert_eq!(head_sha(&work), head_before, "no commit must be made");
+
+        // Grown past the cap some other way, it can still be edited down.
+        let over_cap = format!("{near_cap}{}\n", "z".repeat(1000));
+        std::fs::write(work.path().join("big.md"), &over_cap).unwrap();
+        git_commit_all(&work, "big.md", "grow big.md outside the tools");
+        let shrunk = over_cap.replacen(&"z".repeat(500), "", 1);
+        assert!(shrunk.len() > MAX_CONTENT_LEN);
+        let success = write_document(&harness.deps(), make_req("big.md", &shrunk, false))
+            .await
+            .unwrap();
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("big.md")).unwrap(),
+            shrunk
+        );
+    }
+
+    /// An edit whose result is exactly the current document has nothing to
+    /// commit: it succeeds without one, reporting the document as it stands —
+    /// whether it was a stale full replace that merges to the current text, an
+    /// identical full replace, or a relative edit that changes nothing.
+    #[tokio::test]
+    async fn an_edit_that_changes_nothing_succeeds_without_a_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original =
+            "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
+        std::fs::write(work.path().join("edit-me.md"), original).unwrap();
+        git_commit_all(&work, "edit-me.md", "add edit-me.md");
+        let base = document_version(original.as_bytes());
+        let concurrent = original.replace("# Old body", "# Concurrent body");
+        std::fs::write(work.path().join("edit-me.md"), &concurrent).unwrap();
+        git_commit_all(&work, "edit-me.md", "concurrent change");
+        let current_version = document_version(concurrent.as_bytes());
+        let head_before = head_sha(&work);
+        let harness = git_backed_harness(&work);
+
+        let assert_unchanged = |success: &WriteSuccess, merged: bool| {
+            assert_eq!(success.outcome, WriteOutcome::Synced);
+            assert_eq!(success.sha, head_before);
+            assert!(success.diff.is_empty(), "{}", success.diff);
+            assert!(success.rebased_paths.is_empty());
+            assert_eq!(success.merged, merged);
+            assert_eq!(success.version.as_deref(), Some(current_version.as_str()));
+        };
+
+        // A stale full replace making the very change someone else already made.
+        let mut req = make_req("edit-me.md", "", false);
+        req.change = DocChange::Replace(&concurrent);
+        req.expected_version = Some(&base);
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_unchanged(&success, true);
+
+        // An identical full replace of the current version.
+        let mut req = make_req("edit-me.md", "", false);
+        req.change = DocChange::Replace(&concurrent);
+        req.expected_version = Some(&current_version);
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_unchanged(&success, false);
+
+        // A relative edit that changes nothing.
+        let success = write_document(&harness.deps(), make_req("edit-me.md", &concurrent, false))
+            .await
+            .unwrap();
+        assert_unchanged(&success, false);
+
+        assert_eq!(head_sha(&work), head_before, "no commit must be made");
+        assert_eq!(git_status(&work), "");
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
+            concurrent
+        );
+        assert!(harness.reindex_queue.snapshot_paths().is_empty());
+    }
+
+    /// A create carrying `expected_version` was meant for a document that is no
+    /// longer there (deleted, moved, or never at this path): refused as not
+    /// found — single and batched alike — never created anew.
+    #[tokio::test]
+    async fn a_create_with_expected_version_is_refused_as_not_found() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let head_before = head_sha(&work);
+        let harness = git_backed_harness(&work);
+        let content = "---\ntitle: Gone\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        let version = document_version(content.as_bytes());
+
+        let mut req = make_req("docs/gone.md", content, true);
+        req.expected_version = Some(&version);
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        assert!(matches!(err, WriteError::NotFound), "{err:?}");
+        assert!(!work.path().join("docs/gone.md").exists());
+
+        let requests = [BatchWriteRequest {
+            rel_path: "docs/gone.md",
+            change: DocChange::Create(content),
+            force_new: Some(true),
+            expected_version: Some(&version),
+        }];
+        match write_documents_batch(&harness.deps(), &requests, None).await {
+            Err(BatchWriteError::Documents { failures }) => {
+                assert_eq!(failures.len(), 1);
+                assert!(
+                    matches!(failures[0].1, WriteError::NotFound),
+                    "{:?}",
+                    failures[0].1
+                );
+            }
+            other => panic!("expected a per-document NotFound, got {other:?}"),
+        }
+        assert!(!work.path().join("docs/gone.md").exists());
+        assert_eq!(head_sha(&work), head_before, "no commit must be made");
+        assert_eq!(git_status(&work), "");
+
+        // Without `expected_version`, the same create goes through.
+        write_document(&harness.deps(), make_req("docs/gone.md", content, true))
+            .await
+            .unwrap();
+        assert!(work.path().join("docs/gone.md").exists());
+    }
+
+    /// `domain` is derived from the folder: a schema `default:` for it is not the
+    /// author writing it, and `required` on it is never asked of the author. Only
+    /// a `domain` the author actually wrote is refused — also when other rules
+    /// fail alongside it.
+    #[tokio::test]
+    async fn a_default_or_required_derived_field_does_not_block_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with_default = {
+            let mut config = crate::mcp::make_test_resolved_config(tmp.path());
+            Arc::get_mut(&mut config)
+                .unwrap()
+                .frontmatter
+                .defaults
+                .insert("domain".into(), "x".into());
+            Harness::new(&tmp, config)
+        };
+        let with_required = {
+            let mut config = crate::mcp::make_test_resolved_config(tmp.path());
+            Arc::get_mut(&mut config).unwrap().frontmatter.required =
+                vec!["title".into(), "domain".into()];
+            Harness::new(&tmp, config)
+        };
+
+        for harness in [&with_default, &with_required] {
+            let deps = harness.deps();
+            validate_document(&deps, "docs/a.md", "---\ntitle: A\n---\n# A\n")
+                .await
+                .expect("no domain written: accepted");
+        }
+
+        let err = validate_document(
+            &with_required.deps(),
+            "docs/a.md",
+            "---\ndomain: docs\n---\n# A\n",
+        )
+        .await
+        .unwrap_err();
+        match err {
+            WriteError::Validation { result } => {
+                let rules: Vec<(&str, &str)> = result
+                    .field_errors
+                    .iter()
+                    .map(|e| (e.field.as_str(), e.rule.as_str()))
+                    .collect();
+                assert!(rules.contains(&("domain", "derived")), "{rules:?}");
+                assert!(rules.contains(&("title", "required")), "{rules:?}");
+                assert!(!rules.contains(&("domain", "required")), "{rules:?}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// A document write that fails part-way is undone before the error is
+    /// returned: an overwrite gets its previous content back, a new file is
+    /// removed — never a truncated or partial file left uncommitted in the clone.
+    #[tokio::test]
+    async fn a_failed_document_write_is_undone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.md");
+        std::fs::write(&path, "previous\n").unwrap();
+
+        // What an ENOSPC part-way through `fs::write` leaves: truncated, then
+        // partly written.
+        let err = write_or_undo(&path, Some("previous\n"), async {
+            std::fs::write(&path, "new co")?;
+            Err(std::io::Error::other("No space left on device"))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, WriteError::Io { .. }), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous\n");
+
+        let fresh = tmp.path().join("fresh.md");
+        let err = write_or_undo(&fresh, None, async {
+            std::fs::write(&fresh, "par")?;
+            Err(std::io::Error::other("No space left on device"))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, WriteError::Io { .. }), "{err:?}");
+        assert!(!fresh.exists(), "a partly written new file is removed");
+
+        // A write that succeeds is left as it is.
+        write_or_undo(&path, Some("previous\n"), async {
+            std::fs::write(&path, "new content\n")
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content\n");
+    }
+
+    /// A new document's bytes are flushed before `git add` can see the file, and
+    /// a write error that only the flush reports is not lost: `/dev/full` accepts
+    /// the buffered write and fails it in the background (ENOSPC).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn write_and_flush_reports_a_failure_only_the_flush_sees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.md");
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+            .unwrap();
+        write_and_flush(&mut file, b"content\n").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "content\n");
+
+        let mut full = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .await
+            .unwrap();
+        let err = write_and_flush(&mut full, b"content\n").await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull, "{err:?}");
+    }
+
+    /// A batch skips every edit that leaves its document exactly as it is: none
+    /// of them is written, committed or marked dirty, and a batch of nothing
+    /// but such edits succeeds with no commit at all.
+    #[tokio::test]
+    async fn write_documents_batch_skips_documents_it_leaves_unchanged() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let a = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# A\n";
+        let b = "---\ntitle: B\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# B\n";
+        std::fs::write(work.path().join("a.md"), a).unwrap();
+        std::fs::write(work.path().join("b.md"), b).unwrap();
+        git_commit_paths(&work, &["a.md", "b.md"], "add a.md and b.md");
+        let head_before = head_sha(&work);
+        let harness = git_backed_harness(&work);
+
+        let requests = vec![
+            make_batch_req("a.md", "", a, false),
+            make_batch_req("b.md", "", b, false),
+        ];
+        let success = write_documents_batch(&harness.deps(), &requests, None)
+            .await
+            .expect("a batch that changes nothing succeeds");
+        assert_eq!(success.documents.len(), 2);
+        for (doc, content) in success.documents.iter().zip([a, b]) {
+            assert!(doc.diff.is_empty() && !doc.is_create && !doc.merged);
+            assert_eq!(
+                doc.version.as_deref(),
+                Some(document_version(content.as_bytes()).as_str())
+            );
+        }
+        assert_eq!(head_sha(&work), head_before, "no commit must be made");
+
+        let a_new = a.replace("# A", "# A, edited");
+        let requests = vec![
+            make_batch_req("a.md", "", &a_new, false),
+            make_batch_req("b.md", "", b, false),
+        ];
+        let success = write_documents_batch(&harness.deps(), &requests, None)
+            .await
+            .unwrap();
+        assert!(success.documents[0].diff.contains("+# A, edited"));
+        assert!(success.documents[1].diff.is_empty());
+        let show = std::process::Command::new("git")
+            .args(["show", "--name-only", "--format=", "HEAD"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&show.stdout).trim(), "a.md");
+        let pending = harness.reindex_queue.snapshot_paths();
+        assert!(pending.contains(&PathBuf::from("a.md")));
+        assert!(!pending.contains(&PathBuf::from("b.md")), "{pending:?}");
+    }
+
+    /// A move is an absolute change to its source: a source that changed since
+    /// the caller read it refuses the move before anything is written.
+    #[tokio::test]
+    async fn move_of_a_stale_source_version_is_refused() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         std::fs::create_dir_all(work.path().join("old")).unwrap();
@@ -6157,44 +6680,23 @@ mod tests {
 
         let harness = git_backed_harness(&work);
 
-        let expected_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
-
-        // Concurrent change to the SOURCE after the caller's read but before the
-        // move's filesystem work runs — committed, same as a real webhook merge
-        // would (see `webhook.rs`), so the working tree is clean afterward and
-        // `git_status` below actually exercises the move's own rollback rather
-        // than an artifact of this test's own setup.
         let concurrent =
             "---\ntitle: Concurrent\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Concurrent\n";
         std::fs::write(work.path().join("old/loc.md"), concurrent).unwrap();
         git_commit_all(&work, "old/loc.md", "concurrent change to old/loc.md");
         let head_before = head_sha(&work);
 
-        let mut req = make_move_req("old/loc.md", "new/loc.md", original, original);
-        req.expected_hash = Some(&expected_hash);
-
+        // `make_move_req` passes the version of `original`, the stale read.
+        let req = make_move_req("old/loc.md", "new/loc.md", original, original);
         let err = write_document(&harness.deps(), req).await.unwrap_err();
-        match err {
-            WriteError::StaleHash { expected, actual } => {
-                assert_eq!(expected, expected_hash);
-                assert_eq!(
-                    actual,
-                    crate::ingest::compute_hash_from_bytes(concurrent.as_bytes()),
-                    "the re-check must hash the LIVE on-disk source, not `old_content` again"
-                );
-            }
-            other => panic!("expected StaleHash, got {other:?}"),
-        }
+        assert!(matches!(err, WriteError::EditedElsewhere), "{err:?}");
 
         assert_eq!(
             std::fs::read_to_string(work.path().join("old/loc.md")).unwrap(),
             concurrent,
             "source must be left exactly as the concurrent writer left it"
         );
-        assert!(
-            !work.path().join("new/loc.md").exists(),
-            "destination must never be created when the re-check catches a stale source"
-        );
+        assert!(!work.path().join("new/loc.md").exists());
         assert_eq!(head_before, head_sha(&work), "no commit must be made");
         assert_eq!(git_status(&work), "");
     }
@@ -6291,9 +6793,14 @@ mod tests {
         force_git_commit_to_fail(&work);
         let harness = git_backed_harness(&work);
 
-        let err = delete_document(&harness.deps(), "doomed.md", None)
-            .await
-            .unwrap_err();
+        let err = delete_document(
+            &harness.deps(),
+            "doomed.md",
+            None,
+            harness.version_of("doomed.md"),
+        )
+        .await
+        .unwrap_err();
         match err {
             WriteError::PreCommitFailed { rolled_back, .. } => assert!(rolled_back),
             other => panic!("expected PreCommitFailed, got {other:?}"),
@@ -6321,9 +6828,14 @@ mod tests {
         let config = crate::mcp::make_test_resolved_config(tmp.path());
         let harness = Harness::new(&tmp, config);
 
-        let err = delete_document(&harness.deps(), "docs/delete-me.md", None)
-            .await
-            .unwrap_err();
+        let err = delete_document(
+            &harness.deps(),
+            "docs/delete-me.md",
+            None,
+            harness.version_of("docs/delete-me.md"),
+        )
+        .await
+        .unwrap_err();
         match err {
             WriteError::PreCommitFailed { rolled_back, .. } => assert!(!rolled_back),
             other => panic!("expected PreCommitFailed{{rolled_back: false}}, got {other:?}"),
@@ -6352,12 +6864,27 @@ mod tests {
         }
         let harness = Harness::new(&work, config);
 
-        let success = delete_document(&harness.deps(), "doomed.md", None)
-            .await
-            .unwrap();
+        let (captured, guard) = capture_warnings();
+        let success = delete_document(
+            &harness.deps(),
+            "doomed.md",
+            None,
+            harness.version_of("doomed.md"),
+        )
+        .await
+        .unwrap();
+        drop(guard);
         assert_eq!(success.outcome, WriteOutcome::CommittedPendingSync);
-        assert!(success.sync_failure_cause.is_some());
         assert!(!work.path().join("doomed.md").exists());
+        // The sync failure's cause is not on the result: it is logged next to the
+        // commit that stands.
+        let log = captured.text();
+        let marker = format!("deletion commit {} stands uncorrected: ", head_sha(&work));
+        assert!(
+            log.split_once(&marker)
+                .is_some_and(|(_, cause)| !cause.trim().is_empty()),
+            "expected the sync failure and its cause in the log, got: {log:?}"
+        );
 
         // #150: this is the ONLY trigger for the reindex worker to purge the
         // deleted document's Qdrant points and state rows (see
@@ -6385,9 +6912,14 @@ mod tests {
 
         let harness = git_backed_harness(&work);
 
-        let success = delete_document(&harness.deps(), "doomed-synced.md", None)
-            .await
-            .unwrap();
+        let success = delete_document(
+            &harness.deps(),
+            "doomed-synced.md",
+            None,
+            harness.version_of("doomed-synced.md"),
+        )
+        .await
+        .unwrap();
         assert_eq!(success.outcome, WriteOutcome::Synced);
         assert!(!work.path().join("doomed-synced.md").exists());
 
@@ -6479,9 +7011,14 @@ mod tests {
             .unwrap();
 
         let (captured, guard) = capture_warnings();
-        let success = delete_document(&harness.deps(), "linked.md", None)
-            .await
-            .expect("an inbound link must WARN, not refuse the delete — see #181's PR notes");
+        let success = delete_document(
+            &harness.deps(),
+            "linked.md",
+            None,
+            harness.version_of("linked.md"),
+        )
+        .await
+        .expect("an inbound link must WARN, not refuse the delete — see #181's PR notes");
         drop(guard);
 
         assert_eq!(
@@ -6522,9 +7059,14 @@ mod tests {
         let harness = git_backed_harness_with_state_db(&work).await;
 
         let (captured, guard) = capture_warnings();
-        let success = delete_document(&harness.deps(), "unlinked.md", None)
-            .await
-            .unwrap();
+        let success = delete_document(
+            &harness.deps(),
+            "unlinked.md",
+            None,
+            harness.version_of("unlinked.md"),
+        )
+        .await
+        .unwrap();
         drop(guard);
 
         assert!(
@@ -6556,9 +7098,14 @@ mod tests {
         let harness = git_backed_harness(&work);
 
         let (captured, guard) = capture_warnings();
-        let success = delete_document(&harness.deps(), "no-state-db.md", None)
-            .await
-            .unwrap();
+        let success = delete_document(
+            &harness.deps(),
+            "no-state-db.md",
+            None,
+            harness.version_of("no-state-db.md"),
+        )
+        .await
+        .unwrap();
         drop(guard);
 
         assert_eq!(success.outcome, WriteOutcome::Synced);
@@ -6620,9 +7167,14 @@ mod tests {
         // An invalid commit message (a newline) would normally be reported as
         // `InvalidCommitMessage` — but a traversal path must be rejected ahead
         // of that check, mirroring `write_document`'s ordering.
-        let err = delete_document(&harness.deps(), "../escape.md", Some("bad\nmessage"))
-            .await
-            .unwrap_err();
+        let err = delete_document(
+            &harness.deps(),
+            "../escape.md",
+            Some("bad\nmessage"),
+            harness.version_of("../escape.md"),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, WriteError::UnsafePath { .. }),
             "expected UnsafePath ahead of commit-message validation, got {err:?}"
@@ -6716,7 +7268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn move_with_a_stale_expected_hash_is_rejected_and_mutates_nothing() {
+    async fn move_with_a_stale_expected_version_is_rejected_and_mutates_nothing() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         std::fs::create_dir_all(work.path().join("old")).unwrap();
@@ -6728,21 +7280,15 @@ mod tests {
 
         let harness = git_backed_harness(&work);
 
-        let stale_hash = crate::ingest::compute_hash_from_bytes(b"not the current content");
+        let stale = document_version(b"not the current content");
         let mut req = make_move_req("old/loc.md", "new/loc.md", original, original);
-        req.expected_hash = Some(&stale_hash);
+        req.expected_version = Some(&stale);
 
         let err = write_document(&harness.deps(), req).await.unwrap_err();
-        match err {
-            WriteError::StaleHash { expected, actual } => {
-                assert_eq!(expected, stale_hash);
-                assert_ne!(actual, stale_hash);
-            }
-            other => panic!("expected StaleHash, got {other:?}"),
-        }
+        assert!(matches!(err, WriteError::EditedElsewhere), "{err:?}");
         assert!(
             work.path().join("old/loc.md").exists(),
-            "source must be untouched when the expected_hash is stale"
+            "source must be untouched when the expected_version is stale"
         );
         assert_eq!(
             std::fs::read_to_string(work.path().join("old/loc.md")).unwrap(),
@@ -6750,14 +7296,14 @@ mod tests {
         );
         assert!(
             !work.path().join("new/loc.md").exists(),
-            "destination must never be created when the expected_hash is stale"
+            "destination must never be created when the expected_version is stale"
         );
         assert_eq!(head_before, head_sha(&work), "no commit must be made");
         assert_eq!(git_status(&work), "");
     }
 
     #[tokio::test]
-    async fn move_with_a_matching_expected_hash_proceeds_normally() {
+    async fn move_with_a_matching_expected_version_proceeds_normally() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         std::fs::create_dir_all(work.path().join("old")).unwrap();
@@ -6768,14 +7314,13 @@ mod tests {
 
         let harness = git_backed_harness(&work);
 
-        let correct_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
-        let mut req = make_move_req(
+        // `make_move_req` passes `original`'s version, the current one.
+        let req = make_move_req(
             "old/loc.md",
             "new/loc-matching-hash-test.md",
             original,
             original,
         );
-        req.expected_hash = Some(&correct_hash);
 
         let success = write_document(&harness.deps(), req).await.unwrap();
         assert_eq!(success.outcome, WriteOutcome::Synced);
@@ -7088,6 +7633,94 @@ mod tests {
         assert_eq!(git_status(&work), "");
         assert_ne!(head_before, head_sha(&work));
         assert_eq!(success.sha, head_sha(&work));
+    }
+
+    /// A rebase that merged someone else's change into a rewritten referencing
+    /// document — not into the moved one — reports the move as merged, but keeps
+    /// the moved document's version: its bytes are exactly what was written.
+    #[tokio::test]
+    async fn a_move_whose_rebase_merged_only_a_referencing_document_keeps_its_version() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source = "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source).unwrap();
+        let referencing = "---\ntitle: Referencer\ndescription: d\ntype: guide\ntags: [t]\n---\n\n\
+             See [the moved doc](old/loc.md) for more.\n\none\ntwo\nthree\nlast line\n";
+        std::fs::write(work.path().join("referencing.md"), referencing).unwrap();
+        git_commit_paths(&work, &["old/loc.md", "referencing.md"], "seed");
+        std::process::Command::new("git")
+            .args(["push", "origin", "master"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+
+        // Lands after the move's own commit and before its fetch + rebase: a
+        // change to the referencing document well away from the link the move
+        // rewrites, so the rebase merges it cleanly.
+        let bare_path = bare.path().to_path_buf();
+        let peer = referencing.replace("last line", "last line, edited by a peer");
+        let pushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook: crate::git::TestHook = Arc::new(move |point| {
+            let bare_path = bare_path.clone();
+            let peer = peer.clone();
+            let pushed = Arc::clone(&pushed);
+            Box::pin(async move {
+                if point == crate::git::HookPoint::BeforeSync
+                    && !pushed.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    push_file_from_a_fresh_clone(&bare_path, "master", "referencing.md", &peer);
+                }
+            })
+        });
+
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        {
+            let c = Arc::get_mut(&mut config).unwrap();
+            c.write.dedup_enabled = false;
+            c.source.git_url = Some(format!("file://{}", bare.path().to_str().unwrap()));
+        }
+        let harness = Harness::new(&work, config).with_state_db().await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing.md",
+                "markdown",
+                &[("old/loc.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let deps = harness.deps();
+        let req = make_move_req("old/loc.md", "new/loc.md", source, source);
+        let success = crate::git::TEST_HOOK
+            .scope(hook, write_document(&deps, req))
+            .await
+            .unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+        assert_eq!(
+            success.rebased_paths,
+            vec![PathBuf::from("referencing.md")],
+            "the rebase merged the peer's change into the referencing document"
+        );
+        assert!(success.merged, "a document this move wrote was merged");
+        let moved = std::fs::read(work.path().join("new/loc.md")).unwrap();
+        assert_eq!(
+            success.version.as_deref(),
+            Some(document_version(&moved).as_str()),
+            "the moved document is exactly what was written"
+        );
+        let referencing_after =
+            std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert!(
+            referencing_after.contains("(new/loc.md)")
+                && referencing_after.contains("edited by a peer"),
+            "{referencing_after}"
+        );
     }
 
     #[tokio::test]
@@ -8179,17 +8812,19 @@ mod tests {
 
     fn make_batch_req<'a>(
         rel_path: &'a str,
-        old_content: &'a str,
+        _old_content: &'a str,
         new_content: &'a str,
         is_create: bool,
     ) -> BatchWriteRequest<'a> {
         BatchWriteRequest {
             rel_path,
-            old_content,
-            new_content,
-            is_create,
+            change: if is_create {
+                DocChange::Create(new_content)
+            } else {
+                overwrite(new_content)
+            },
             force_new: Some(true),
-            expected_hash: None,
+            expected_version: None,
         }
     }
 
@@ -8219,8 +8854,6 @@ mod tests {
             .await
             .expect("batch write should succeed");
 
-        assert_eq!(success.outcome, WriteOutcome::Synced);
-        assert!(!success.sha.is_empty());
         assert_eq!(success.documents.len(), 2);
         assert_eq!(success.documents[0].rel_path, "docs/batch-one.md");
         assert!(success.documents[0].is_create);
@@ -8394,6 +9027,89 @@ mod tests {
         );
     }
 
+    /// A rolled-back batch restores what it read under `GIT_LOCK`, so a change
+    /// another writer landed before the lock (pulled in by the pre-write sync)
+    /// survives the rollback rather than being reverted to an older snapshot.
+    #[tokio::test]
+    async fn write_documents_batch_rollback_keeps_another_writers_change() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original = "---\ntitle: X\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# X\n";
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        std::fs::write(work.path().join("docs/x.md"), original).unwrap();
+        git_commit_all(&work, "docs/x.md", "add docs/x.md");
+        std::process::Command::new("git")
+            .args(["push", "origin", "master"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+
+        let others =
+            "---\ntitle: X\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# X by someone else\n";
+        let bare_path = bare.path().to_path_buf();
+        let pushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook: crate::git::TestHook = Arc::new(move |point| {
+            let bare_path = bare_path.clone();
+            let pushed = Arc::clone(&pushed);
+            Box::pin(async move {
+                if point == crate::git::HookPoint::BeforeLock
+                    && !pushed.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    push_file_from_a_fresh_clone(&bare_path, "master", "docs/x.md", others);
+                }
+            })
+        });
+
+        force_git_commit_to_fail(&work);
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        {
+            let c = Arc::get_mut(&mut config).unwrap();
+            c.write.dedup_enabled = false;
+            c.source.git_url = Some(format!("file://{}", bare.path().to_str().unwrap()));
+        }
+        let harness = Harness::new(&work, config);
+
+        let append: &'static RelativeEdit<'static> =
+            Box::leak(Box::new(|current: &str| Ok(format!("{current}\nmine\n"))));
+        let requests = vec![
+            BatchWriteRequest {
+                rel_path: "docs/x.md",
+                change: DocChange::Relative(append),
+                force_new: Some(true),
+                expected_version: None,
+            },
+            make_batch_req(
+                "docs/new.md",
+                "",
+                "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New\n",
+                true,
+            ),
+        ];
+
+        let deps = harness.deps();
+        let err = crate::git::TEST_HOOK
+            .scope(hook, write_documents_batch(&deps, &requests, None))
+            .await
+            .expect_err("a forced commit failure must be reported as an error");
+        assert!(
+            matches!(
+                err,
+                BatchWriteError::PreCommitFailed {
+                    rolled_back: true,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("docs/x.md")).unwrap(),
+            others,
+            "the rollback must restore the other writer's version, not the older one"
+        );
+        assert!(!work.path().join("docs/new.md").exists());
+        assert_eq!(git_status(&work), "");
+    }
+
     /// A `git commit` failure for the batch's single shared commit must roll
     /// back EVERY document this call had written to disk — mirrors
     /// `move_directory_precommit_failure_rolls_back_every_document_and_referencing_document`'s
@@ -8457,6 +9173,183 @@ mod tests {
         );
     }
 
+    /// A create whose target is taken by the time the batch writes it — here a
+    /// dangling symlink, which reads as missing but makes `create_new` fail —
+    /// fails the batch, and the rollback leaves that entry alone: only files
+    /// this batch created are removed.
+    #[tokio::test]
+    async fn write_documents_batch_create_collision_does_not_remove_the_existing_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        let link = tmp.path().join("docs/link.md");
+        std::os::unix::fs::symlink("nowhere.md", &link).unwrap();
+        let mut config = crate::mcp::make_test_resolved_config(tmp.path());
+        Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
+        let harness = Harness::new(&tmp, config);
+
+        let requests = vec![
+            make_batch_req(
+                "docs/first.md",
+                "",
+                "---\ntitle: First\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# First\n",
+                true,
+            ),
+            make_batch_req(
+                "docs/link.md",
+                "",
+                "---\ntitle: Link\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Link\n",
+                true,
+            ),
+        ];
+        let err = write_documents_batch(&harness.deps(), &requests, None)
+            .await
+            .expect_err("a create onto an existing entry must fail the batch");
+        match err {
+            BatchWriteError::Documents { failures } => {
+                assert_eq!(failures.len(), 1, "{failures:?}");
+                assert_eq!(failures[0].0, "docs/link.md");
+                assert!(
+                    matches!(failures[0].1, WriteError::AlreadyExists),
+                    "{:?}",
+                    failures[0].1
+                );
+            }
+            other => panic!("expected Documents, got {other:?}"),
+        }
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()),
+            "the rollback must not remove an entry this batch did not create"
+        );
+        assert!(
+            !tmp.path().join("docs/first.md").exists(),
+            "the earlier create is rolled back"
+        );
+    }
+
+    /// A failed write is rolled back with every document before it, and a
+    /// document the rollback cannot restore is named in the error. The failing
+    /// write is a read-only file, so its own restore fails too — which shows the
+    /// failing document is rolled back, not just the earlier ones.
+    #[tokio::test]
+    async fn write_documents_batch_write_failure_names_a_document_it_could_not_restore() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        let first_original =
+            "---\ntitle: First\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# First\n";
+        let locked_original =
+            "---\ntitle: Locked\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Locked\n";
+        std::fs::write(tmp.path().join("docs/first.md"), first_original).unwrap();
+        let locked = tmp.path().join("docs/locked.md");
+        std::fs::write(&locked, locked_original).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // Same probe as
+        // `move_link_rewrite_write_failure_rolls_back_the_move_and_every_already_rewritten_document`:
+        // a privileged process writes through 0o444, so the failure cannot be
+        // injected. `rollback_batch_filesystem_writes_restores_a_failed_edit_and_names_the_rest`
+        // covers the rollback itself either way.
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&locked)
+            .is_ok()
+        {
+            eprintln!(
+                "SKIP write_documents_batch_write_failure_names_a_document_it_could_not_restore: \
+                 this process can write through a 0o444 file (running as root or with \
+                 CAP_DAC_OVERRIDE), so the write failure this test injects cannot be produced."
+            );
+            return;
+        }
+        let mut config = crate::mcp::make_test_resolved_config(tmp.path());
+        Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
+        let harness = Harness::new(&tmp, config);
+
+        let requests = vec![
+            make_batch_req(
+                "docs/first.md",
+                "",
+                "---\ntitle: First\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Edited\n",
+                false,
+            ),
+            make_batch_req(
+                "docs/locked.md",
+                "",
+                "---\ntitle: Locked\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Edited\n",
+                false,
+            ),
+        ];
+        let err = write_documents_batch(&harness.deps(), &requests, None)
+            .await
+            .expect_err("a failed write must fail the batch");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        match err {
+            BatchWriteError::Documents { failures } => {
+                assert_eq!(failures.len(), 1, "{failures:?}");
+                assert_eq!(failures[0].0, "docs/locked.md");
+                match &failures[0].1 {
+                    WriteError::Io { msg } => assert!(
+                        msg.contains("'docs/locked.md'") && msg.contains("partial content"),
+                        "the error must name the document the rollback could not restore: {msg}"
+                    ),
+                    other => panic!("expected Io, got {other:?}"),
+                }
+            }
+            other => panic!("expected Documents, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("docs/first.md")).unwrap(),
+            first_original,
+            "the earlier edit is rolled back"
+        );
+        assert_eq!(std::fs::read_to_string(&locked).unwrap(), locked_original);
+    }
+
+    /// The failing edit's own entry is restored from its snapshot (here, a file
+    /// its write left truncated), a path whose restore fails is returned, and
+    /// `note_unrestored` names exactly those paths in the batch's error.
+    #[tokio::test]
+    async fn rollback_batch_filesystem_writes_restores_a_failed_edit_and_names_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("cut.md"), "the first half of the new con").unwrap();
+        // A regular file where the rollback needs a directory: its write fails
+        // whatever the process's privileges.
+        std::fs::write(root.join("blocked"), "not a directory").unwrap();
+        let snapshots: HashMap<&str, String> = HashMap::from([
+            ("cut.md", "the original\n".to_string()),
+            ("blocked/doc.md", "unreachable\n".to_string()),
+        ]);
+        let written = vec![
+            ("cut.md".to_string(), false),
+            ("blocked/doc.md".to_string(), false),
+        ];
+
+        let unrestored = rollback_batch_filesystem_writes(root, &written, &snapshots).await;
+        assert_eq!(
+            std::fs::read_to_string(root.join("cut.md")).unwrap(),
+            "the original\n"
+        );
+        assert_eq!(unrestored, vec!["blocked/doc.md".to_string()]);
+
+        let err = WriteError::Io {
+            msg: "Failed to write file: disk full".to_string(),
+        };
+        match note_unrestored(err, &unrestored) {
+            WriteError::Io { msg } => assert_eq!(
+                msg,
+                "Failed to write file: disk full. Undoing the batch failed for \
+                 'blocked/doc.md', which may hold partial content"
+            ),
+            other => panic!("expected Io, got {other:?}"),
+        }
+        assert!(matches!(
+            note_unrestored(WriteError::AlreadyExists, &[]),
+            WriteError::AlreadyExists
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // move_directory: atomic directory move
     // -----------------------------------------------------------------------
@@ -8486,7 +9379,8 @@ mod tests {
 
         assert_eq!(success.moved.len(), 3);
         assert_ne!(
-            success.sha, head_before,
+            head_sha(&work),
+            head_before,
             "the move must produce a new commit"
         );
         assert!(
@@ -8881,6 +9775,49 @@ mod tests {
         assert_eq!(git_status(&work), "");
     }
 
+    /// A legacy-named schema moves under its own name; a source directory holding
+    /// both names is refused like any other invalid schema file.
+    #[tokio::test]
+    async fn move_directory_carries_a_legacy_schema_and_refuses_both_names() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let source = work.path().join("src12");
+        std::fs::create_dir_all(&source).unwrap();
+        let legacy_rel = format!("src12/{}", crate::schema::LEGACY_SCHEMA_FILE_NAME);
+        let canonical_rel = format!("src12/{}", crate::schema::SCHEMA_FILE_NAME);
+        let schema = "fields:\n  status:\n    required: true\n";
+        std::fs::write(work.path().join(&legacy_rel), schema).unwrap();
+        std::fs::write(source.join("a.md"), "---\nstatus: draft\n---\n# A").unwrap();
+        git_commit_paths(&work, &[&legacy_rel, "src12/a.md"], "add src12");
+
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
+        let harness = Harness::new(&work, config);
+
+        std::fs::write(work.path().join(&canonical_rel), schema).unwrap();
+        let err = move_directory(&harness.deps(), "src12", "dest12", None)
+            .await
+            .expect_err("both names in one directory must block the move");
+        match err {
+            DirectoryMoveError::InvalidSchemaInSource { reason, .. } => {
+                assert_eq!(reason, crate::schema::BOTH_NAMES_REASON);
+            }
+            other => panic!("expected InvalidSchemaInSource, got {other:?}"),
+        }
+        assert!(!work.path().join("dest12").exists(), "nothing moved");
+
+        std::fs::remove_file(work.path().join(&canonical_rel)).unwrap();
+        move_directory(&harness.deps(), "src12", "dest12", None)
+            .await
+            .expect("a legacy-only schema moves with its directory");
+        assert!(
+            work.path()
+                .join("dest12")
+                .join(crate::schema::LEGACY_SCHEMA_FILE_NAME)
+                .exists()
+        );
+    }
+
     /// #272: the shared cache keeps the last good schema while a file on disk is
     /// invalid, so the move re-reads every schema file it would carry and refuses
     /// on an invalid one — nothing moves. Once the file is valid on disk again the
@@ -8940,6 +9877,142 @@ mod tests {
         assert_eq!(git_status(&work), "");
     }
 
+    /// Commits `source/a.md` with an invalid schema file beside it, `source`
+    /// being outside the schema tree (`exclude` added to `indexing.exclude`, or
+    /// a hidden directory), and moves it to `dest`, inside the schema tree. No
+    /// cache ever read that schema file, so the move checks it where it would
+    /// land: refused with nothing moved while it is invalid or sits beside the
+    /// legacy name, moved once it is valid.
+    async fn assert_a_schema_file_entering_the_schema_tree_is_checked(
+        source: &str,
+        dest: &str,
+        exclude: Option<&str>,
+    ) {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join(source)).unwrap();
+        let doc_rel = format!("{source}/a.md");
+        let schema_rel = format!("{source}/{}", crate::schema::SCHEMA_FILE_NAME);
+        std::fs::write(work.path().join(&doc_rel), "---\ntitle: A\n---\n# A").unwrap();
+        std::fs::write(work.path().join(&schema_rel), "fields: [broken\n").unwrap();
+        git_commit_paths(&work, &[&doc_rel, &schema_rel], "add the source");
+
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        {
+            let cfg = Arc::get_mut(&mut config).unwrap();
+            cfg.write.dedup_enabled = false;
+            cfg.indexing.exclude.extend(exclude.map(str::to_string));
+        }
+        let harness = Harness::new(&work, config);
+
+        let err = move_directory(&harness.deps(), source, dest, None)
+            .await
+            .expect_err("an invalid schema file entering the schema tree must block the move");
+        match err {
+            DirectoryMoveError::InvalidSchemaInSource { path, reason } => {
+                assert_eq!(path, schema_rel);
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected InvalidSchemaInSource, got {other:?}"),
+        }
+        assert!(work.path().join(&doc_rel).exists());
+        assert!(!work.path().join(dest).exists(), "nothing moved");
+
+        let valid = "fields:\n  title:\n    required: true\n";
+        let legacy_rel = format!("{source}/{}", crate::schema::LEGACY_SCHEMA_FILE_NAME);
+        std::fs::write(work.path().join(&schema_rel), valid).unwrap();
+        std::fs::write(work.path().join(&legacy_rel), valid).unwrap();
+        let err = move_directory(&harness.deps(), source, dest, None)
+            .await
+            .expect_err("both schema file names in one directory must block the move");
+        match err {
+            DirectoryMoveError::InvalidSchemaInSource { reason, .. } => {
+                assert_eq!(reason, crate::schema::BOTH_NAMES_REASON);
+            }
+            other => panic!("expected InvalidSchemaInSource, got {other:?}"),
+        }
+        assert!(!work.path().join(dest).exists(), "nothing moved");
+
+        std::fs::remove_file(work.path().join(&legacy_rel)).unwrap();
+        let success = move_directory(&harness.deps(), source, dest, None)
+            .await
+            .expect("a valid schema file moves with its directory");
+        assert_eq!(success.moved.len(), 2, "{:?}", success.moved);
+        assert!(
+            work.path()
+                .join(dest)
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists()
+        );
+        assert!(work.path().join(dest).join("a.md").exists());
+        assert_eq!(git_status(&work), "");
+    }
+
+    #[tokio::test]
+    async fn move_directory_checks_a_schema_file_moving_out_of_a_hidden_directory() {
+        assert_a_schema_file_entering_the_schema_tree_is_checked(
+            ".templates/proj",
+            "notes/proj",
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn move_directory_checks_a_schema_file_moving_out_of_an_excluded_directory() {
+        assert_a_schema_file_entering_the_schema_tree_is_checked(
+            "drafts/proj",
+            "notes/proj",
+            Some("drafts/**"),
+        )
+        .await;
+    }
+
+    /// A `./` or `/` spelling of a directory moves it as if written plainly, and
+    /// a `./` destination reads the same way, so no moved path or path marked
+    /// dirty carries `./`. The root itself, however spelled, is refused with an
+    /// error rather than walked.
+    #[tokio::test]
+    async fn move_directory_normalizes_dot_and_slash_spellings_and_refuses_the_root() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("notes")).unwrap();
+        std::fs::write(work.path().join("notes/a.md"), "---\ntitle: A\n---\n# A").unwrap();
+        git_commit_paths(&work, &["notes/a.md"], "add notes");
+        let harness = git_backed_harness(&work);
+
+        for root in [".", "./", "/", "//", "/."] {
+            let err = move_directory(&harness.deps(), root, "elsewhere", None)
+                .await
+                .expect_err(root);
+            assert!(
+                matches!(err, DirectoryMoveError::UnsafePath { .. }),
+                "{root}: {err:?}"
+            );
+        }
+        assert!(work.path().join("notes/a.md").exists());
+        assert!(!work.path().join("elsewhere").exists());
+
+        for (source, dest, from, to) in [
+            ("./notes", "./x1", "notes/a.md", "x1/a.md"),
+            ("./x1/", "x2", "x1/a.md", "x2/a.md"),
+            ("/./x2", "/./x3/", "x2/a.md", "x3/a.md"),
+        ] {
+            let success = move_directory(&harness.deps(), source, dest, None)
+                .await
+                .unwrap_or_else(|e| panic!("{source} -> {dest}: {e:?}"));
+            assert_eq!(success.moved, vec![(from.to_string(), to.to_string())]);
+        }
+        assert!(work.path().join("x3/a.md").exists());
+        assert_eq!(git_status(&work), "");
+        let marked = harness.reindex_queue.snapshot_paths();
+        assert!(
+            marked.iter().all(|p| !p.to_string_lossy().contains("./")),
+            "{marked:?}"
+        );
+        assert!(marked.contains(Path::new("x3/a.md")), "{marked:?}");
+    }
+
     /// A widened `indexing.include` (`**/*`) admits `.kb-schema.yaml` as a path, but
     /// the move carries it through `schema_moves` only: it is neither validated as a
     /// document nor listed a second time.
@@ -8972,7 +10045,7 @@ mod tests {
         let schema_arrivals = success
             .moved
             .iter()
-            .filter(|m| format!("{m:?}").contains(".kb-schema.yaml"))
+            .filter(|m| format!("{m:?}").contains(crate::schema::SCHEMA_FILE_NAME))
             .count();
         assert_eq!(schema_arrivals, 1, "{:?}", success.moved);
         assert_eq!(success.moved.len(), 2, "{:?}", success.moved);
@@ -9156,8 +10229,9 @@ mod tests {
     #[tokio::test]
     async fn move_directory_toctou_destination_collision_reports_already_exists_not_io() {
         // A collision that appears AFTER the batch pre-check (guard 2) and the
-        // per-document defensive re-check, but before the per-document
-        // `create_new` write in phase 1, must surface as `AlreadyExists` (a
+        // per-document defensive re-check — caught by the re-check under
+        // `GIT_LOCK`, or failing that by phase 1's `create_new` — must surface as
+        // `AlreadyExists` (a
         // benign, retryable race), not the generic `Io` arm. `Io` maps to
         // `McpError::internal_error`, which would misreport a completely
         // ordinary race as a server fault.

@@ -30,7 +30,7 @@ use tracing::{error, warn};
 use crate::config::{ResolvedConfig, SharedConfig};
 use crate::embed::{EmbedClient, QueryEmbedder};
 use crate::git;
-use crate::qdrant::{CHUNK_TEXT_KEY, QdrantStore, RetrievalStore, SearchResult};
+use crate::qdrant::{QdrantStore, RetrievalStore, SearchResult};
 use crate::rerank::RerankClient;
 use crate::retrieval::{self, RetrievalDeps, SearchFilters, SearchOptions};
 use crate::schema::{self, SharedSchemaCache};
@@ -46,11 +46,11 @@ const MAX_SEARCH_QUERY_LEN: usize = 4096;
 const MAX_SEARCH_FILTER_LEN: usize = 256;
 /// Cap on how many comma-separated tags a single search request may filter on.
 const MAX_SEARCH_TAGS: usize = 20;
-/// Cap on the `content` field of a `POST /api/doc/{*path}` body, mirroring
-/// `mcp::MAX_CONTENT_LEN` (private to that module) — this is a content-shape
-/// guard distinct from the router's 10 MB `DefaultBodyLimit`, which only bounds
-/// the raw request body.
-const MAX_WRITE_CONTENT_LEN: usize = 512 * 1024; // 512 KB
+/// Cap on the `content` field of a `POST /api/doc/{*path}` body: the write
+/// pipeline's own `write::MAX_CONTENT_LEN`, which the MCP write tools apply too —
+/// a content-shape guard distinct from the router's 10 MB `DefaultBodyLimit`,
+/// which only bounds the raw request body.
+const MAX_WRITE_CONTENT_LEN: usize = write::MAX_CONTENT_LEN;
 /// The `DefaultBodyLimit` applied to the `/api/doc/{*path}` write routes, matching
 /// `mcp_router`'s limit in `server.rs` (see the API contract's fixed spec).
 const MAX_WRITE_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB
@@ -677,12 +677,7 @@ fn to_api_result(r: &SearchResult, data_path: &Path) -> ApiSearchResult {
             .and_then(|v| v.as_str())
             .unwrap_or("(untitled)")
             .to_string(),
-        text: r
-            .payload
-            .get(CHUNK_TEXT_KEY)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        text: crate::qdrant::chunk_body_text(&r.payload).to_string(),
         line_start: r.payload.get("line_start").and_then(|v| v.as_i64()),
         line_end: r.payload.get("line_end").and_then(|v| v.as_i64()),
         chunk_index: r.payload.get("chunk_index").and_then(|v| v.as_i64()),
@@ -962,9 +957,9 @@ async fn get_doc_handler(
     match retrieval::get_document(&state.deps(), index, &raw_path).await {
         Ok(doc) => {
             // Always over the whole file, never a slice/section: this is the
-            // hash the editor sends back as `expected_hash` on POST, which
-            // guards the document on disk. Same contract as the MCP tool.
-            let content_hash = crate::ingest::compute_hash_from_bytes(doc.content.as_bytes());
+            // version the editor sends back as `expected_version` on POST and
+            // DELETE. Same contract as the MCP tool.
+            let version = crate::write::document_version(doc.content.as_bytes());
             let rel = retrieval::relative_to_data(
                 &doc.path.to_string_lossy(),
                 &state.canonical_data_path,
@@ -977,7 +972,7 @@ async fn get_doc_handler(
                     // only the envelope is added here.
                     let mut body = retrieval::document_view_json(&view);
                     body.insert("path".to_string(), serde_json::json!(rel));
-                    body.insert("content_hash".to_string(), serde_json::json!(content_hash));
+                    body.insert("version".to_string(), serde_json::json!(version));
                     (StatusCode::OK, Json(serde_json::Value::Object(body))).into_response()
                 }
                 Err(retrieval::DocumentViewError::Range(e)) => (
@@ -1263,7 +1258,7 @@ struct WriteDocBody {
     #[serde(default)]
     create: bool,
     #[serde(default)]
-    expected_hash: Option<String>,
+    expected_version: Option<String>,
     /// When present, turns this POST into an atomic MOVE: the URL path is the
     /// move's source, this is its destination — see
     /// `write::WriteRequest::dest_path`. `content` is still required and is
@@ -1279,6 +1274,9 @@ struct WriteDocBody {
 struct DeleteDocBody {
     #[serde(default)]
     commit_message: Option<String>,
+    /// The `version` from the GET this delete is based on; required.
+    #[serde(default)]
+    expected_version: Option<String>,
 }
 
 fn bad_request(msg: impl Into<String>) -> Response {
@@ -1357,6 +1355,8 @@ fn write_success_response(success: WriteSuccess) -> Response {
             "rebased_paths": rebased_paths,
             "rewritten_paths": success.rewritten_paths,
             "referencing_paths": success.referencing_paths,
+            "version": success.version,
+            "merged_with_other_changes": success.merged,
         })),
     )
         .into_response()
@@ -1367,10 +1367,13 @@ fn write_success_response(success: WriteSuccess) -> Response {
 ///
 /// - 422 `{"outcome": "failed_no_change", "field_errors": [...]}}` — frontmatter
 ///   validation failed.
-/// - 409 — `expected_hash` mismatch, create-on-existing, edit/delete-on-missing,
+/// - 409 — the document changed since it was read and the change cannot be
+///   carried over (`EditedElsewhere`, whose body carries `edited_elsewhere: true`),
+///   create-on-existing, edit/delete-on-missing,
 ///   or a near-duplicate document blocking a create (`DedupHit`).
-/// - 400 — an unsafe path, a `.kb-schema.yaml` path (`SchemaFile`), or a commit
-///   message git/the log would mangle.
+/// - 400 — an unsafe path, a schema file path (`SchemaFile`), a missing
+///   `expected_version` (`VersionRequired`), an edit that does not apply
+///   (`InvalidEdit`), or a commit message git/the log would mangle.
 /// - 500 `{"outcome": "failed_inconsistent_state"}` — the pre-commit rollback
 ///   itself failed; filesystem and git state may disagree.
 /// - 500 `{"outcome": "failed_no_change"}` — any other pre-commit failure
@@ -1386,10 +1389,8 @@ fn write_success_response(success: WriteSuccess) -> Response {
 fn write_error_response(err: &WriteError, dest_path: Option<&str>) -> Response {
     match err {
         WriteError::SchemaFile { rel_path } => bad_request(format!(
-            "'{rel_path}' is a {} file, not a document: schema files cannot be written, \
-             moved or deleted here. Use the update_schema MCP tool to change a \
-             directory's schema.",
-            schema::SCHEMA_FILE_NAME
+            "'{rel_path}' is a schema file; change schemas with the update_schema MCP \
+             tool. It cannot be written, moved or deleted here."
         )),
         WriteError::Validation { result } => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1409,8 +1410,8 @@ fn write_error_response(err: &WriteError, dest_path: Option<&str>) -> Response {
                 "outcome": "failed_no_change",
                 "error": "a similar document already exists",
                 "duplicate_of": duplicate_of,
-                "similarity": similarity,
-                "threshold": threshold,
+                "similarity": crate::mcp::round_score(f64::from(*similarity)),
+                "threshold": crate::mcp::round_score(f64::from(*threshold)),
             })),
         )
             .into_response(),
@@ -1466,16 +1467,21 @@ fn write_error_response(err: &WriteError, dest_path: Option<&str>) -> Response {
             })),
         )
             .into_response(),
-        WriteError::StaleHash { expected, actual } => (
+        WriteError::EditedElsewhere => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "outcome": "failed_no_change",
-                "error": "document has changed since it was read",
-                "expected_hash": expected,
-                "actual_hash": actual,
+                "error": write::EDITED_ELSEWHERE,
+                // What `assets/ui/edit.js` keys on to tell a stale read (reload
+                // and retry) from a name collision (pick another path), both 409.
+                "edited_elsewhere": true,
             })),
         )
             .into_response(),
+        WriteError::VersionRequired => bad_request(
+            "expected_version is required to replace, move or delete an existing document",
+        ),
+        WriteError::InvalidEdit { msg } => bad_request(msg.clone()),
         WriteError::PreCommitFailed {
             rolled_back: true,
             msg,
@@ -1567,14 +1573,13 @@ async fn post_doc_handler(
     // local code-execution primitive) — before `commit_and_sync` ever runs `git
     // add`/`commit` against that same repo.
     //
-    // For an edit, this doubles as reading the current on-disk content: it is
-    // both the base the diff/`expected_hash` check compares against and (for a
-    // create) simply empty, since there is nothing on disk yet.
-    let (old_content, rel_path) = if body.create {
+    // Nothing is read here: the pipeline reads the document under the lock and
+    // checks it against `expected_version` there.
+    let rel_path = if body.create {
         if !state.include_patterns.is_match(&rel_path) {
             return forbidden("file type not permitted");
         }
-        (String::new(), rel_path)
+        rel_path
     } else {
         let canonical = match retrieval::resolve_within_data(
             &rel_path,
@@ -1584,71 +1589,94 @@ async fn post_doc_handler(
             Ok(c) => c,
             Err(e) => return resolve_write_target_error_response(e),
         };
-        let rel_path = canonical
+        canonical
             .strip_prefix(&state.canonical_data_path)
             .unwrap_or(&canonical)
             .to_string_lossy()
-            .into_owned();
-        match tokio::fs::read_to_string(&canonical).await {
-            Ok(s) => (s, rel_path),
+            .into_owned()
+    };
+
+    detached(async move {
+        let config = state.config();
+        let token = match state.git_token(&config) {
+            Ok(token) => token,
             Err(e) => {
-                error!("post_doc: failed to read '{}': {}", canonical.display(), e);
-                return write_error_response(&WriteError::Io { msg: e.to_string() }, None);
+                error!("token lookup failed: {e}");
+                return write_error_response(&WriteError::Internal { msg: e.to_string() }, None);
             }
-        }
-    };
-
-    let config = state.config();
-    let token = match state.git_token(&config) {
-        Ok(token) => token,
-        Err(e) => {
-            error!("token lookup failed: {e}");
-            return write_error_response(&WriteError::Internal { msg: e.to_string() }, None);
-        }
-    };
-    // Only opened for a MOVE — see `UiState::write_deps`'s doc comment on
-    // `state_db` for why a plain create/edit skips this entirely. Best-effort:
-    // a state DB that fails to open degrades the move to "without link
-    // rewriting" rather than failing the request.
-    let state_db = if dest_rel.is_some() {
-        state.state_db().await.ok()
-    } else {
-        None
-    };
-    let deps = state.write_deps(&config, &token, state_db);
-
-    let req = WriteRequest {
-        rel_path: &rel_path,
-        old_content: &old_content,
-        new_content: &body.content,
-        is_create: body.create,
-        message: body.commit_message.as_deref(),
-        default_verb: if body.create { "add" } else { "update" },
-        // No HTTP-level dedup bypass in the fixed API contract — the create-path
-        // dedup gate (when `write.dedup_enabled`) always applies.
-        force_new: None,
-        operation: if body.create {
-            "create_document (web ui)"
-        } else if dest_rel.is_some() {
-            "edit_document (web ui, move)"
+        };
+        // Only opened for a MOVE — see `UiState::write_deps`'s doc comment on
+        // `state_db` for why a plain create/edit skips this entirely. Best-effort:
+        // a state DB that fails to open degrades the move to "without link
+        // rewriting" rather than failing the request.
+        let state_db = if dest_rel.is_some() {
+            state.state_db().await.ok()
         } else {
-            "edit_document (web ui, full replace)"
-        },
-        expected_hash: body.expected_hash.as_deref(),
-        dest_path: dest_rel.as_deref(),
-    };
+            None
+        };
+        let deps = state.write_deps(&config, &token, state_db);
 
-    match write::write_document(&deps, req).await {
-        Ok(success) => write_success_response(success),
-        // `WriteError::AlreadyExists` carries no path of its own (see its doc
-        // comment in write.rs) — for a plain create that's unambiguous (there
-        // is only one path in play), but for a move the collision is always on
-        // the DESTINATION (`write_document_move` checks source-exists before
-        // dest-exists, so this variant can only mean the destination).
-        // `write_error_response`'s `dest_path` parameter names it explicitly in
-        // that case, so the message never reads as though `rel_path` (the
-        // document the caller is editing) were the problem.
-        Err(err) => write_error_response(&err, dest_rel.as_deref()),
+        let req = WriteRequest {
+            rel_path: &rel_path,
+            // The editor always sends the whole document: a full replace (a move
+            // with unchanged content included), which needs `expected_version`.
+            change: if body.create {
+                write::DocChange::Create(&body.content)
+            } else {
+                write::DocChange::Replace(&body.content)
+            },
+            message: body.commit_message.as_deref(),
+            default_verb: if body.create { "add" } else { "update" },
+            // No HTTP-level dedup bypass in the fixed API contract — the create-path
+            // dedup gate (when `write.dedup_enabled`) always applies.
+            force_new: None,
+            operation: if body.create {
+                "create_document (web ui)"
+            } else if dest_rel.is_some() {
+                "edit_document (web ui, move)"
+            } else {
+                "edit_document (web ui, full replace)"
+            },
+            expected_version: body.expected_version.as_deref(),
+            dest_path: dest_rel.as_deref(),
+        };
+
+        match write::write_document(&deps, req).await {
+            Ok(success) => write_success_response(success),
+            // `WriteError::AlreadyExists` carries no path of its own (see its doc
+            // comment in write.rs) — for a plain create that's unambiguous (there
+            // is only one path in play), but for a move the collision is always on
+            // the DESTINATION (`write_document_move` checks source-exists before
+            // dest-exists, so this variant can only mean the destination).
+            // `write_error_response`'s `dest_path` parameter names it explicitly in
+            // that case, so the message never reads as though `rel_path` (the
+            // document the caller is editing) were the problem.
+            Err(err) => write_error_response(&err, dest_rel.as_deref()),
+        }
+    })
+    .await
+}
+
+/// Run a write route's pipeline call on its own task. axum drops a handler's
+/// future when the client disconnects, and a write dropped between its
+/// filesystem change and its commit would leave an uncommitted change in the
+/// clone — which fails every later pre-write rebase. On its own task the write
+/// always runs to the end. A panic there leaves the write's outcome unknown,
+/// and is answered as such.
+async fn detached(write: impl std::future::Future<Output = Response> + Send + 'static) -> Response {
+    match tokio::spawn(write).await {
+        Ok(response) => response,
+        Err(e) => {
+            error!("write task failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "outcome": "failed_inconsistent_state",
+                    "error": "internal error",
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1667,7 +1695,7 @@ async fn delete_doc_handler(
     // branch — `write::delete_document` only re-verifies traversal safety, never
     // file-type eligibility, so this MUST happen here: without it, an
     // unauthenticated `DELETE /api/doc/.git/config` (or `.gitignore`,
-    // `.kb-schema.yaml`, or any other tracked/untracked path the include
+    // schema file, or any other tracked/untracked path the include
     // globset would never index) would delete and commit/push the deletion of
     // that file with no content required at all.
     let canonical = match retrieval::resolve_within_data(
@@ -1684,27 +1712,37 @@ async fn delete_doc_handler(
         .to_string_lossy()
         .into_owned();
 
-    let config = state.config();
-    let token = match state.git_token(&config) {
-        Ok(token) => token,
-        Err(e) => {
-            error!("token lookup failed: {e}");
-            return write_error_response(&WriteError::Internal { msg: e.to_string() }, None);
-        }
-    };
-    // (#229) Best-effort, same as `post_doc_handler`'s own lazy state-DB open
-    // for a MOVE: a state DB that fails to open degrades `delete_document`'s
-    // inbound-link check to "skip it" (see `UiState::write_deps`'s doc comment
-    // on `state_db`), not a failed delete. Without this, `write::delete_document`
-    // never sees a `StateDb` at all, and `referencing_paths` would always come
-    // back empty regardless of what actually links to the document being deleted.
-    let state_db = state.state_db().await.ok();
-    let deps = state.write_deps(&config, &token, state_db);
+    detached(async move {
+        let config = state.config();
+        let token = match state.git_token(&config) {
+            Ok(token) => token,
+            Err(e) => {
+                error!("token lookup failed: {e}");
+                return write_error_response(&WriteError::Internal { msg: e.to_string() }, None);
+            }
+        };
+        // (#229) Best-effort, same as `post_doc_handler`'s own lazy state-DB open
+        // for a MOVE: a state DB that fails to open degrades `delete_document`'s
+        // inbound-link check to "skip it" (see `UiState::write_deps`'s doc comment
+        // on `state_db`), not a failed delete. Without this, `write::delete_document`
+        // never sees a `StateDb` at all, and `referencing_paths` would always come
+        // back empty regardless of what actually links to the document being deleted.
+        let state_db = state.state_db().await.ok();
+        let deps = state.write_deps(&config, &token, state_db);
 
-    match write::delete_document(&deps, &rel_path, body.commit_message.as_deref()).await {
-        Ok(success) => write_success_response(success),
-        Err(err) => write_error_response(&err, None),
-    }
+        match write::delete_document(
+            &deps,
+            &rel_path,
+            body.commit_message.as_deref(),
+            body.expected_version.as_deref(),
+        )
+        .await
+        {
+            Ok(success) => write_success_response(success),
+            Err(err) => write_error_response(&err, None),
+        }
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2690,7 +2728,7 @@ mod tests {
         let json = body_json(resp).await;
         assert_eq!(json["path"], "a.md");
         assert!(json["content"].as_str().unwrap().contains("body"));
-        assert!(!json["content_hash"].as_str().unwrap().is_empty());
+        assert!(!json["version"].as_str().unwrap().is_empty());
     }
 
     /// `?start_line=1` against a 0-byte document must succeed (#298, regression
@@ -2711,10 +2749,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         assert_eq!(json["content"], "");
-        assert_eq!(json["start_line"], 1);
-        assert_eq!(json["end_line"], 0);
         assert_eq!(json["total_lines"], 0);
-        assert_eq!(json["partial"], false);
+        assert!(json.get("partial").is_none(), "{json}");
     }
 
     /// Numbered lines so a failed assertion names the line it actually got.
@@ -2742,12 +2778,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["content"], RANGE_DOC);
-        assert_eq!(json["start_line"], 1);
-        assert_eq!(json["end_line"], 5);
         assert_eq!(json["total_lines"], 5);
-        assert_eq!(
-            json["partial"], false,
-            "the UI's existing unranged fetch must keep reporting a full document"
+        assert!(
+            json.get("partial").is_none() && json.get("truncated").is_none(),
+            "the UI's unranged fetch reads a full document as one: {json}"
         );
     }
 
@@ -2787,16 +2821,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_doc_handler_hashes_the_whole_document_even_for_a_partial_read() {
+    async fn get_doc_handler_versions_the_whole_document_even_for_a_partial_read() {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
 
         let (_, full) = get_doc_range(&canonical, "").await;
         let (_, partial) = get_doc_range(&canonical, "?start_line=2&end_line=3").await;
 
+        assert!(full["version"].is_string(), "{full}");
         assert_eq!(
-            partial["content_hash"], full["content_hash"],
-            "content_hash is the editor's expected_hash: it must describe the file on \
+            partial["version"], full["version"],
+            "version is the editor's expected_version: it must describe the file on \
              disk, not the slice served"
         );
     }
@@ -3020,7 +3055,7 @@ mod tests {
             serde_json::json!(["Guide", "Alpha", "Alpha Sub"])
         );
         assert_eq!(json["section"]["level"], 3);
-        assert_eq!(json["outline_only"], false);
+        assert!(json.get("outline_only").is_none(), "{json}");
         assert!(
             json["content"]
                 .as_str()
@@ -3175,7 +3210,7 @@ mod tests {
         // (mcp.rs has the mirror test).
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
-        let hash = crate::ingest::compute_hash_from_bytes(SECTION_DOC.as_bytes());
+        let hash = crate::write::document_version(SECTION_DOC.as_bytes());
         for (cap, query, request) in [
             (
                 16000,
@@ -3245,7 +3280,7 @@ mod tests {
                 retrieval::resolve_document_view(SECTION_DOC, &request.unwrap(), cap).unwrap();
             let mut expected = retrieval::document_view_json(&view);
             expected.insert("path".into(), serde_json::json!("section_doc.md"));
-            expected.insert("content_hash".into(), serde_json::json!(hash));
+            expected.insert("version".into(), serde_json::json!(hash));
             assert_eq!(json, serde_json::Value::Object(expected), "{query}");
         }
     }
@@ -3258,7 +3293,7 @@ mod tests {
         let (status, json) = get_doc_section(&canonical, 10, "?heading_path=Beta").await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["outline_only"], false);
+        assert!(json.get("outline_only").is_none(), "{json}");
         // Nothing smaller to narrow into, so text comes back — bounded by the
         // cap, flagged, and reporting where it stops (#290).
         assert_eq!(json["oversized"], true);
@@ -3318,7 +3353,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["content"], SECTION_DOC);
-        assert_eq!(json["partial"], false);
+        assert!(json.get("partial").is_none(), "{json}");
         assert!(json.get("truncated").is_none(), "{json}");
         assert!(json.get("outline_only").is_none(), "{json}");
     }
@@ -3352,8 +3387,8 @@ mod tests {
         let outline = json["outline"].as_array().unwrap();
         assert_eq!(outline.len(), 4);
         assert_eq!(outline[0]["heading_path"], serde_json::json!(["Guide"]));
-        assert_eq!(json["total_entries"], 4);
-        assert_eq!(json["truncated"], false);
+        assert!(json.get("total_entries").is_none(), "{json}");
+        assert!(json.get("truncated").is_none(), "{json}");
     }
 
     #[tokio::test]
@@ -3382,7 +3417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_doc_handler_section_content_hash_matches_range_mode() {
+    async fn get_doc_handler_section_version_matches_range_mode() {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
 
@@ -3390,8 +3425,8 @@ mod tests {
         let (_, section) = get_doc_section(&canonical, 16000, "?line=7").await;
 
         assert_eq!(
-            whole["content_hash"], section["content_hash"],
-            "content_hash must always describe the whole file, matching the MCP tool"
+            whole["version"], section["version"],
+            "version must always describe the whole file, matching the MCP tool"
         );
     }
 
@@ -3519,6 +3554,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_error_response_dedup_hit_reports_scores_without_f32_widening_noise() {
+        let resp = write_error_response(
+            &WriteError::DedupHit {
+                duplicate_of: "docs/existing.md".into(),
+                similarity: 0.93,
+                threshold: 0.95,
+            },
+            None,
+        );
+        let json = body_json(resp).await;
+        // `json!(0.93_f32)` would widen to 0.9300000071525574.
+        assert_eq!(json["similarity"], serde_json::json!(0.93));
+        assert_eq!(json["threshold"], serde_json::json!(0.95));
+    }
+
+    #[tokio::test]
     async fn write_error_response_already_exists_is_409() {
         let resp = write_error_response(&WriteError::AlreadyExists, None);
         assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -3526,13 +3577,13 @@ mod tests {
         assert_eq!(json["error"], "document already exists");
         // The frontend (`assets/ui/edit.js`) discriminates a name-collision 409
         // from a stale-read 409 purely by whether the body carries
-        // `expected_hash` — see `write_error_response_stale_hash_is_409` for the
-        // shape that must, conversely, always carry it. If a collision response
-        // ever grew this field, an edit conflict would silently get "reload the
-        // page" advice instead of "pick a different name/path".
+        // `edited_elsewhere` — see `write_error_response_edited_elsewhere_is_409`
+        // for the shape that must, conversely, always carry it. If a collision
+        // response ever grew this field, a name collision would silently get
+        // "reload the page" advice instead of "pick a different name/path".
         assert!(
-            json.get("expected_hash").is_none(),
-            "an AlreadyExists response must never carry expected_hash: {json}"
+            json.get("edited_elsewhere").is_none(),
+            "an AlreadyExists response must never carry edited_elsewhere: {json}"
         );
     }
 
@@ -3549,7 +3600,7 @@ mod tests {
             msg.contains("moved.md") && msg.to_lowercase().contains("destination"),
             "expected the destination path named as the collision, got: {msg}"
         );
-        assert!(json.get("expected_hash").is_none());
+        assert!(json.get("edited_elsewhere").is_none());
     }
 
     #[tokio::test]
@@ -3559,18 +3610,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_error_response_stale_hash_is_409() {
-        let resp = write_error_response(
-            &WriteError::StaleHash {
-                expected: "aaa".into(),
-                actual: "bbb".into(),
-            },
-            None,
-        );
+    async fn write_error_response_edited_elsewhere_is_409() {
+        let resp = write_error_response(&WriteError::EditedElsewhere, None);
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let json = body_json(resp).await;
-        assert_eq!(json["expected_hash"], "aaa");
-        assert_eq!(json["actual_hash"], "bbb");
+        assert_eq!(json["error"], write::EDITED_ELSEWHERE);
+        assert_eq!(json["edited_elsewhere"], true);
+    }
+
+    #[tokio::test]
+    async fn write_error_response_version_required_is_400() {
+        let resp = write_error_response(&WriteError::VersionRequired, None);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -3669,8 +3720,9 @@ mod tests {
             rebased_paths: vec![PathBuf::from("other.md")],
             diff: "+line".into(),
             rewritten_paths: Vec::new(),
-            sync_failure_cause: None,
             referencing_paths: vec!["referencer.md".to_string()],
+            merged: false,
+            version: None,
         };
         let resp = write_success_response(success);
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3698,6 +3750,11 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             Arc::new(crate::reindex::ReindexQueue::new()),
         )
+    }
+
+    /// The current version of `rel` under `work`, as `GET /api/doc` reports it.
+    fn version_of(work: &tempfile::TempDir, rel: &str) -> String {
+        write::document_version(&std::fs::read(work.path().join(rel)).unwrap())
     }
 
     fn post_doc_request(path: &str, body: serde_json::Value) -> Request<Body> {
@@ -3755,6 +3812,7 @@ mod tests {
                 "content": "---\ntitle: Updated\n---\n\n# New body\n",
                 "commit_message": "docs: update new.md",
                 "create": false,
+                "expected_version": version_of(&work, "new.md"),
             }),
         );
         let resp = app.oneshot(req).await.unwrap();
@@ -3780,8 +3838,56 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
+    /// A client that disconnects mid-write does not cancel the write: the
+    /// pipeline runs on its own task, so it is never dropped between its
+    /// filesystem change and its commit.
     #[tokio::test]
-    async fn post_doc_stale_expected_hash_is_409() {
+    async fn post_doc_write_completes_after_the_client_disconnects() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let state = git_backed_ui_state(&work);
+        let content = "---\ntitle: Detached\n---\n\n# Body\n";
+
+        // Park the write on the git lock, then drop the request the way axum
+        // drops a handler whose client went away.
+        let held = crate::git::lock_git().await;
+        let mut request = Box::pin(ui_router(state).oneshot(post_doc_request(
+            "detached.md",
+            serde_json::json!({"content": content, "create": true}),
+        )));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut request)
+                .await
+                .is_err(),
+            "the write waits for the git lock"
+        );
+        drop(request);
+        drop(held);
+
+        let committed = || {
+            let out = std::process::Command::new("git")
+                .args(["log", "-1", "--format=%H", "--", "detached.md"])
+                .current_dir(work.path())
+                .output()
+                .unwrap();
+            !out.stdout.is_empty()
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !committed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the write was dropped with its request"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("detached.md")).unwrap(),
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn post_doc_stale_expected_version_is_409() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         std::fs::write(
@@ -3815,14 +3921,55 @@ mod tests {
             serde_json::json!({
                 "content": "---\ntitle: New\n---\n\n# New\n",
                 "create": false,
-                "expected_hash": "not-the-real-hash",
+                "expected_version": write::document_version(b"some earlier content"),
             }),
         );
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let json = body_json(resp).await;
         assert_eq!(json["outcome"], "failed_no_change");
-        assert!(json["actual_hash"].as_str().is_some());
+        assert_eq!(json["edited_elsewhere"], true);
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
+            "---\ntitle: Old\n---\n\n# Old\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_doc_edit_without_expected_version_is_400() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(work.path().join("edit-me.md"), "---\ntitle: Old\n---\n").unwrap();
+        for args in [
+            vec!["add", "--", "edit-me.md"],
+            vec![
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add edit-me.md",
+            ],
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(work.path())
+                .output()
+                .unwrap();
+        }
+
+        let app = ui_router(git_backed_ui_state(&work));
+        let req = post_doc_request(
+            "edit-me.md",
+            serde_json::json!({"content": "---\ntitle: New\n---\n", "create": false}),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
+            "---\ntitle: Old\n---\n"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -3866,6 +4013,7 @@ mod tests {
                 "commit_message": "docs: move orig.md to moved.md",
                 "create": false,
                 "new_path": "moved.md",
+                "expected_version": version_of(&work, "orig.md"),
             }),
         );
         let resp = app.oneshot(req).await.unwrap();
@@ -3923,6 +4071,7 @@ mod tests {
                 "content": "---\ntitle: Source\n---\n\n# Source\n",
                 "create": false,
                 "new_path": "taken.md",
+                "expected_version": version_of(&work, "source.md"),
             }),
         );
         let resp = app.oneshot(req).await.unwrap();
@@ -3946,7 +4095,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_doc_move_with_stale_expected_hash_is_409() {
+    async fn post_doc_move_with_stale_expected_version_is_409() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         std::fs::write(
@@ -3981,19 +4130,17 @@ mod tests {
                 "content": "---\ntitle: Source\n---\n\n# Source\n",
                 "create": false,
                 "new_path": "moved.md",
-                "expected_hash": "not-the-real-hash",
+                "expected_version": write::document_version(b"some earlier content"),
             }),
         );
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let json = body_json(resp).await;
         assert_eq!(json["outcome"], "failed_no_change");
-        // Must carry the stale-hash shape (an `expected_hash`/`actual_hash` pair),
-        // not the destination-collision shape from
-        // `post_doc_move_onto_existing_destination_is_409` — a stale read must
-        // never be reported as though the destination path were taken.
-        assert_eq!(json["expected_hash"], "not-the-real-hash");
-        assert!(json["actual_hash"].as_str().is_some());
+        // Must carry the stale-read shape, not the destination-collision shape
+        // from `post_doc_move_onto_existing_destination_is_409` — a stale read
+        // must never be reported as though the destination path were taken.
+        assert_eq!(json["edited_elsewhere"], true);
         // Nothing moved: the source is untouched, the destination never created.
         assert!(work.path().join("source.md").exists());
         assert!(!work.path().join("moved.md").exists());
@@ -4296,7 +4443,11 @@ mod tests {
             .uri("/api/doc/doomed.md")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                serde_json::json!({"commit_message": "docs: delete doomed.md"}).to_string(),
+                serde_json::json!({
+                    "commit_message": "docs: delete doomed.md",
+                    "expected_version": version_of(&work, "doomed.md"),
+                })
+                .to_string(),
             ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -4362,7 +4513,9 @@ mod tests {
             .method("DELETE")
             .uri("/api/doc/linked.md")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::json!({}).to_string()))
+            .body(Body::from(
+                serde_json::json!({"expected_version": version_of(&work, "linked.md")}).to_string(),
+            ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

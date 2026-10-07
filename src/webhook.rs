@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{SharedConfig, WebhookProvider};
 use crate::git::GIT_TIMEOUT;
-use crate::git::{inject_token_into_url, redact_url};
+use crate::git::{authenticated_url, redact_url};
 #[cfg(test)]
 use crate::reindex;
 
@@ -141,10 +141,7 @@ pub async fn handle_webhook(
         let branch = &config.source.branch;
 
         // Build fetch URL with optional token injection
-        let fetch_url = match &state.git_token {
-            Some(token) => inject_token_into_url(git_url, token),
-            None => git_url.clone(),
-        };
+        let fetch_url = authenticated_url(git_url, state.git_token.as_deref());
 
         // One acquisition for the whole rev-parse → fetch → merge → rev-parse →
         // diff sequence. Per-command locking would be worse than useless here: a
@@ -304,7 +301,7 @@ pub async fn handle_webhook(
         // fails open on a glob-build error rather than 500ing an otherwise-
         // successful pull.
         //
-        // A changed `.kb-schema.yaml` is never indexable, so the filter drops it;
+        // A changed schema file is never indexable, so the filter drops it;
         // checked first so the push still rebuilds the shared schema cache (and
         // re-validates every document it governs) via a full reconcile — or, when
         // the pushed schema is invalid, gets refused loudly by that rebuild.
@@ -312,7 +309,7 @@ pub async fn handle_webhook(
             .reindex_queue
             .mark_schema_changes(&config.indexing, &changed)
         {
-            info!("Webhook push changed a .kb-schema.yaml; queued a full reconcile");
+            info!("Webhook push changed a schema file; queued a full reconcile");
         }
         let (indexable, filtered_out) =
             crate::ingest::partition_indexable(&config.indexing, changed);

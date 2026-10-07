@@ -28,8 +28,9 @@ pub const FUZZY_SUGGESTION_COUNT: usize = 3;
 /// truncated ride alongside it (`LinkPage::total`/`has_more`) rather than silently
 /// dropping the tail, matching this codebase's `total`/`has_more` convention
 /// everywhere else it caps a list (`search`, `list_documents`, the schema-update
-/// casualty list).
-pub const MAX_LINKS_PER_DIRECTION: u64 = 100;
+/// casualty list). Kept small because a link list rides on every whole-document
+/// read the model makes, and a hub document's full fan-in is rarely what it needs.
+pub const MAX_LINKS_PER_DIRECTION: u64 = 20;
 
 /// Dependencies needed by the shared retrieval functions.
 /// Dependencies for document listing.
@@ -892,10 +893,10 @@ pub fn outline(content: &str) -> Vec<OutlineEntry> {
 /// `get_document` tool and the `/api/doc` HTTP endpoint's mirror of it (#286),
 /// so the two transports can't drift on field names for something
 /// that appears in three different places (top-level `outline`, a section's
-/// `outline` fallback, and an `Ambiguous` error's `candidates`).
+/// `outline` fallback, and an `Ambiguous` error's `candidates`). No separate
+/// `heading`: it is always the last element of `heading_path`.
 pub fn outline_entry_json(entry: &OutlineEntry) -> serde_json::Value {
     serde_json::json!({
-        "heading": entry.heading,
         "heading_path": entry.heading_path,
         "level": entry.level,
         "line_start": entry.line_start,
@@ -1860,25 +1861,26 @@ pub fn resolve_document_view(
 }
 
 /// The view-specific JSON fields of a `get_document` response — everything
-/// but the per-transport envelope (`path`, `content_hash`, and MCP's link
+/// but the per-transport envelope (`path`, `version`, and MCP's link
 /// graph). The one place those fields are named, so the MCP tool's
 /// `structured_content` and `/api/doc`'s body cannot drift apart (#286).
 ///
-/// - Range: `content`, `start_line`, `end_line`, `total_lines`, `partial`,
-///   plus `truncated: true` when a whole-document read was cut at
-///   `section_max_bytes` (#290).
-/// - Outline: `outline`, `total_entries`, `truncated`, `total_lines`, plus
-///   `section` when scoped to one, and `hint` when truncated. A whole-document
-///   read that degraded to an outline adds `outline_only: true` and `intro`
-///   (an entry or `null`) (#290).
-/// - Section with text: `section`, `outline_only: false`, `oversized`,
-///   `content`, `total_lines`, `partial`, plus `truncated: true` and
-///   `end_line` (the last line of `content`) when the text was cut (#290).
-/// - Section as outline: `section`, `outline_only: true`, the outline fields
-///   above, `intro` (an entry or `null`), `total_lines`, `partial`.
+/// A key whose value would be `false`, `null` or a default is left out rather
+/// than sent, so every read pays only for what applies to it:
 ///
-/// The #290 keys appear only on responses that could not exist before it, so
-/// every shape that predates it is unchanged byte for byte.
+/// - Range: `content`, `total_lines`; when the slice is not the whole file,
+///   also `start_line`, `end_line` and `partial: true`; `truncated: true` when
+///   a whole-document read was cut at `section_max_bytes` (#290).
+/// - Outline: `outline`, `total_lines`, plus `section` when scoped to one, and
+///   `truncated: true`/`total_entries`/`hint` when the outline was capped. A
+///   whole-document read that degraded to an outline adds `outline_only: true`
+///   and, when the document has text above its first heading, `intro` (#290).
+/// - Section with text: `section`, `content`, `total_lines`, `partial: true`
+///   (unless the section is the whole file), `oversized: true` when the section
+///   exceeded the limit, plus `truncated: true` and `end_line` (the last line of
+///   `content`) when the text was cut (#290).
+/// - Section as outline: `section`, `outline_only: true`, the outline fields
+///   above, `intro` when there is one, `total_lines`, `partial`.
 pub fn document_view_json(view: &DocumentView) -> serde_json::Map<String, serde_json::Value> {
     use serde_json::{Value, json};
     let mut map = serde_json::Map::new();
@@ -1890,8 +1892,10 @@ pub fn document_view_json(view: &DocumentView) -> serde_json::Map<String, serde_
             "outline",
             Value::Array(view.entries.iter().map(outline_entry_json).collect()),
         );
-        put("total_entries", json!(view.total_entries));
-        put("truncated", json!(view.truncated));
+        if view.truncated {
+            put("truncated", json!(true));
+            put("total_entries", json!(view.total_entries));
+        }
         if let Some(hint) = &view.hint {
             put("hint", json!(hint));
         }
@@ -1899,10 +1903,12 @@ pub fn document_view_json(view: &DocumentView) -> serde_json::Map<String, serde_
     match view {
         DocumentView::Range(slice) => {
             put("content", json!(slice.content));
-            put("start_line", json!(slice.start_line));
-            put("end_line", json!(slice.end_line));
+            if slice.partial() {
+                put("start_line", json!(slice.start_line));
+                put("end_line", json!(slice.end_line));
+                put("partial", json!(true));
+            }
             put("total_lines", json!(slice.total_lines));
-            put("partial", json!(slice.partial()));
             if slice.truncated {
                 put("truncated", json!(true));
             }
@@ -1915,33 +1921,29 @@ pub fn document_view_json(view: &DocumentView) -> serde_json::Map<String, serde_
                 put("outline_only", json!(true));
             }
             outline_fields(outline, &mut put);
-            if outline.document_oversized {
-                put(
-                    "intro",
-                    outline
-                        .intro
-                        .as_ref()
-                        .map_or(Value::Null, outline_entry_json),
-                );
+            if outline.document_oversized
+                && let Some(intro) = &outline.intro
+            {
+                put("intro", outline_entry_json(intro));
             }
             put("total_lines", json!(outline.total_lines));
         }
         DocumentView::Section(section) => {
             put("section", outline_entry_json(&section.entry));
-            put("outline_only", json!(section.outline_only));
+            if section.outline_only {
+                put("outline_only", json!(true));
+            }
             match &section.outline {
                 Some(outline) => {
                     outline_fields(outline, &mut put);
-                    put(
-                        "intro",
-                        section
-                            .intro
-                            .as_ref()
-                            .map_or(Value::Null, outline_entry_json),
-                    );
+                    if let Some(intro) = &section.intro {
+                        put("intro", outline_entry_json(intro));
+                    }
                 }
                 None => {
-                    put("oversized", json!(section.oversized));
+                    if section.oversized {
+                        put("oversized", json!(true));
+                    }
                     put("content", json!(section.content));
                     if section.truncated {
                         put("truncated", json!(true));
@@ -1950,7 +1952,9 @@ pub fn document_view_json(view: &DocumentView) -> serde_json::Map<String, serde_
                 }
             }
             put("total_lines", json!(section.total_lines));
-            put("partial", json!(section.partial));
+            if section.partial {
+                put("partial", json!(true));
+            }
         }
     }
     map
@@ -1996,35 +2000,104 @@ impl From<crate::git::CommitInfo> for CommitJson {
     }
 }
 
-/// The one JSON shape for a commit listing, shared by `get_document`'s
-/// `history` (#257) and `/api/history` so the two cannot drift: `available`,
-/// `path` (`null` for the whole repository), `commits`, `limit`, `returned`,
-/// `truncated`. `limit` is clamped to `1..=MAX_HISTORY_LIMIT`. A data
-/// directory that is not a git working copy yields `available: false` and no
-/// commits rather than an error (#185). Read-only, so it takes no `GitLock`.
-pub async fn history_json(
+/// The commits a history listing reports, and the `limit` they were read at.
+struct HistoryPage {
+    commits: Vec<crate::git::CommitInfo>,
+    truncated: bool,
+    /// The caller's limit clamped to `1..=MAX_HISTORY_LIMIT`.
+    limit: usize,
+}
+
+/// What [`history_json`] and [`document_changes_json`] share before they project
+/// the commits differently: clamp `limit` to `1..=MAX_HISTORY_LIMIT`, then read
+/// that many commits — those touching `rel_path`, or the whole repository's with
+/// `None`. `None` back means `data_path` is not a git working copy (#185): a state
+/// the caller reports, not an error. Read-only, so it takes no `GitLock`.
+async fn read_history(
     data_path: &str,
     rel_path: Option<&str>,
     limit: usize,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<Option<HistoryPage>> {
     let limit = limit.clamp(1, MAX_HISTORY_LIMIT);
     if !crate::git::is_git_repo(data_path) {
-        return Ok(serde_json::json!({"available": false, "path": rel_path, "commits": []}));
+        return Ok(None);
     }
     let (commits, truncated) = match rel_path {
         Some(p) => crate::git::document_history(data_path, p, limit).await?,
         None => crate::git::recent_commits(data_path, limit).await?,
     };
-    let returned = commits.len();
-    let commits: Vec<CommitJson> = commits.into_iter().map(CommitJson::from).collect();
+    Ok(Some(HistoryPage {
+        commits,
+        truncated,
+        limit,
+    }))
+}
+
+/// The JSON shape of `/api/history`'s commit listing (`web.rs`): `available`,
+/// `path` (`null` for the whole repository), `commits`, `limit`, `returned`,
+/// `truncated`. `limit` is clamped to `1..=MAX_HISTORY_LIMIT`. A data directory
+/// that is not a git working copy yields `available: false` and no commits
+/// rather than an error (#185). Read-only, so it takes no `GitLock`.
+/// `get_document`'s `history` is a different projection of the same commits,
+/// [`document_changes_json`].
+pub async fn history_json(
+    data_path: &str,
+    rel_path: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<serde_json::Value> {
+    let Some(page) = read_history(data_path, rel_path, limit).await? else {
+        return Ok(serde_json::json!({"available": false, "path": rel_path, "commits": []}));
+    };
+    let returned = page.commits.len();
+    let commits: Vec<CommitJson> = page.commits.into_iter().map(CommitJson::from).collect();
     Ok(serde_json::json!({
         "available": true,
         "path": rel_path,
         "commits": commits,
-        "limit": limit,
+        "limit": page.limit,
         "returned": returned,
-        "truncated": truncated,
+        "truncated": page.truncated,
     }))
+}
+
+/// `get_document`'s `history` (#257), the model-facing projection of one
+/// document's change listing: `changes`, newest first, each `{date, author,
+/// subject}` plus `operation` when this server made the change, and
+/// `truncated: true` when older changes were left out. A knowledge base with no
+/// version history yields `{"available": false}`. Unlike [`history_json`] (the
+/// web UI's listing, which needs revision ids to fetch diffs) it carries no
+/// revision id, email or provenance trailer: nothing a tool accepts, and
+/// implementation detail the model has no use for.
+pub async fn document_changes_json(
+    data_path: &str,
+    rel_path: &str,
+    limit: usize,
+) -> anyhow::Result<serde_json::Value> {
+    let Some(page) = read_history(data_path, Some(rel_path), limit).await? else {
+        return Ok(serde_json::json!({ "available": false }));
+    };
+    let changes: Vec<serde_json::Value> = page
+        .commits
+        .into_iter()
+        .map(|c| {
+            let date = chrono::DateTime::from_timestamp(c.timestamp, 0)
+                .map_or_else(String::new, |d| d.format("%Y-%m-%dT%H:%MZ").to_string());
+            let mut entry = serde_json::json!({
+                "date": date,
+                "author": c.author_name,
+                "subject": c.subject,
+            });
+            if let Some(op) = c.operation {
+                entry["operation"] = serde_json::json!(op);
+            }
+            entry
+        })
+        .collect();
+    let mut out = serde_json::json!({ "changes": changes });
+    if page.truncated {
+        out["truncated"] = serde_json::json!(true);
+    }
+    Ok(out)
 }
 
 /// Structured errors from `search`, distinguishing the failing stage so callers
@@ -8220,7 +8293,11 @@ mod tests {
             view.intro.is_none(),
             "a document opening on its first heading has nothing above it to read"
         );
-        assert!(document_view_json(&DocumentView::Outline(view))["intro"].is_null());
+        assert!(
+            document_view_json(&DocumentView::Outline(view))
+                .get("intro")
+                .is_none()
+        );
     }
 
     #[test]
@@ -8280,12 +8357,9 @@ mod tests {
             serde_json::Value::Object(document_view_json(&DocumentView::Range(slice))),
             serde_json::json!({
                 "content": content,
-                "start_line": 1,
-                "end_line": 3,
                 "total_lines": 3,
-                "partial": false,
             }),
-            "an in-budget read's JSON must be byte-for-byte what it always was"
+            "a whole read carries no range or partial flag"
         );
     }
 
@@ -8671,18 +8745,9 @@ mod tests {
                 .unwrap();
         assert_eq!(
             keys(outline_only),
-            [
-                "intro",
-                "outline",
-                "outline_only",
-                "partial",
-                "section",
-                "total_entries",
-                "total_lines",
-                "truncated"
-            ]
-            .map(String::from)
-            .to_vec()
+            ["intro", "outline", "outline_only", "section", "total_lines"]
+                .map(String::from)
+                .to_vec()
         );
         let text = resolve_document_view(
             &content,
@@ -8692,16 +8757,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             keys(text),
-            [
-                "content",
-                "outline_only",
-                "oversized",
-                "partial",
-                "section",
-                "total_lines"
-            ]
-            .map(String::from)
-            .to_vec()
+            ["content", "partial", "section", "total_lines"]
+                .map(String::from)
+                .to_vec()
         );
         let whole =
             resolve_document_view(&content, &DocumentViewRequest::Outline(None), 1).unwrap();
@@ -8721,15 +8779,7 @@ mod tests {
             resolve_document_view(&content, &DocumentViewRequest::Range(None), 100_000).unwrap();
         assert_eq!(
             keys(range),
-            [
-                "content",
-                "end_line",
-                "partial",
-                "start_line",
-                "total_lines"
-            ]
-            .map(String::from)
-            .to_vec()
+            ["content", "total_lines"].map(String::from).to_vec()
         );
         // The #290 shapes: a degraded whole-document read, a truncated
         // heading-less one, and a truncated childless section.
@@ -8739,7 +8789,6 @@ mod tests {
             keys(degraded),
             [
                 "hint",
-                "intro",
                 "outline",
                 "outline_only",
                 "total_entries",
@@ -8773,7 +8822,6 @@ mod tests {
             [
                 "content",
                 "end_line",
-                "outline_only",
                 "oversized",
                 "partial",
                 "section",
