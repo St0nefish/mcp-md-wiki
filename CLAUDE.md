@@ -84,7 +84,7 @@ no direct pushes and is protected by a repo **ruleset** (not classic branch
 protection): direct push disabled, status checks required.
 
 - Work on a branch and open a PR against `master`. Opening an owner PR arms
-  squash auto-merge (`auto-merge.yml`, as the GitHub App, owner-authored PRs
+  merge-commit auto-merge (`auto-merge.yml`, as the GitHub App, owner-authored PRs
   only), and **an armed PR is a queued PR**. Arming fires `train-trigger.yml`
   (`pull_request_target`, which only runs `gh workflow run train.yml --ref
   master`), and so does a push to an armed PR. A contributor's PR is never
@@ -100,7 +100,7 @@ protection): direct push disabled, status checks required.
   slow tier runs in parallel (`checks.yml` `qdrant-integration`, and
   `build-image.yml`, which builds the `linux/amd64` image, smoke-tests it and tags
   it `:tree-<tree hash>`) and `ci-slow` is posted. GitHub's auto-merge then
-  squash-merges the PR, and the train waits for that before dispatching the
+  merges the PR (merge commit), and the train waits for that before dispatching the
   next run. Every status the train posts carries the run as its target URL and
   a `train:` description. A conflict with `master`, a failure, a cancellation
   or a merge that does not happen within 10 minutes turns both statuses
@@ -122,8 +122,8 @@ protection): direct push disabled, status checks required.
   fast tier on GitHub-hosted runners, as the non-required `pr-fast` check — an
   unreviewed PR's code never runs on the self-hosted runners, and it cannot
   start the slow tier.
-- Merges are **squash only** (`allow_merge_commit: false`,
-  `allow_rebase_merge: false`), titled `<PR title> (#<number>)`.
+- Merges are **merge commits only** (`allow_squash_merge: false`,
+  `allow_rebase_merge: false`), titled `Merge pull request #<number> from <branch>`; read history with `git log --first-parent`.
 - **Auto-merge is the workflow, not an escalation.** An owner PR landing on
   green CI without a human reading the diff first is the intended, configured
   behavior — CI is the gate. Do not disable auto-merge on a PR, do not open
@@ -145,8 +145,8 @@ protection): direct push disabled, status checks required.
   merge commit — no build, no tests: it looks up `:tree-<the commit's tree>`
   and adds `:sha-<commit>` and `:<x.y.z>-dev.<n>` to that digest, and moves
   `:dev` if the commit is still master's tip. A code-path merge with no
-  `:tree-` image (one that bypassed the train, or a server-side squash that
-  differs from git's) gets a warning and the fallback: full `checks.yml`, then
+  `:tree-` image (one that bypassed the train, or a server-side merge that
+  differs from the train's) gets a warning and the fallback: full `checks.yml`, then
   `build-image.yml` on the commit. A docs-only or version-roll merge gets no
   image, and `:dev` stays where it is. **A merge deploys nothing:** it never
   touches `:latest` or Watchtower.
@@ -218,7 +218,7 @@ per tested tree):
 |---|---|---|
 | `:tree-<tree hash>` | `train.yml` (`build-image.yml`) | The build of a tested squash, after its smoke test; labels: `revision` = the tree hash, `version` = `Cargo.toml`'s version |
 | `:sha-<full commit sha>` | `master.yml` | Immutable; the merge commit's image; what `release.yml` resolves |
-| `:<x.y.z>-dev.<n>` | `master.yml` | Immutable; x.y.z = `Cargo.toml`'s version (the next release), n = commits since the latest release tag |
+| `:<x.y.z>-dev.<n>` | `master.yml` | Immutable; x.y.z = `Cargo.toml`'s version (the next release), n = first-parent commits (one per merged PR) since the latest release tag |
 | `:dev` | `master.yml` | Newest master commit that has an image (only master's tip moves it) |
 | `:latest` | `release.yml` | Most recent release; the only tag Watchtower deploys |
 | `:vX.Y.Z` | `release.yml` | Pins one release |

@@ -4,7 +4,7 @@ name: Master
 # :latest or Watchtower: a merge deploys nothing, only a release does (release.yml).
 #
 # The merge train (train.yml) built and tested the image BEFORE the merge, from the local
-# squash of the PR onto master, and tagged it `:tree-<tree hash>`. GitHub's squash merge
+# squash of the PR onto master, and tagged it `:tree-<tree hash>`. GitHub's merge commit
 # reproduces that tree exactly, so for a merge commit:
 #
 #   1. `:sha-<commit>` already exists        a re-run or dispatch: re-apply the tags below
@@ -14,8 +14,8 @@ name: Master
 #                                            `:<x.y.z>-dev.<n>` to that digest and move
 #                                            `:dev` if the commit is still master's tip
 #   3. neither, and code paths changed        FALLBACK: the merged tree is not one the
-#      (.github/scripts/code-paths.sh)        train tested (a server-side squash that
-#                                            differs from git's, a merge that bypassed the
+#      (.github/scripts/code-paths.sh)        train tested (a server-side merge whose tree
+#                                            differs from the train's, a merge that bypassed the
 #                                            train), so run the full checks.yml and
 #                                            build-image.yml on the commit, then tag as in
 #                                            2 — and warn
@@ -29,7 +29,7 @@ name: Master
 #                             the tree hash, version = Cargo.toml's version)
 #   :sha-<full commit sha>    immutable; what release.yml resolves
 #   :<x.y.z>-dev.<n>          immutable; x.y.z = Cargo.toml's version (on master, the next
-#                             release), n = commits since the latest release tag
+#                             release), n = first-parent commits (one per merged PR) since the latest release tag
 #                             (.github/scripts/dev-version.sh)
 #   :dev                      moves to the newest master commit that has an image
 #   :build-<tag>, :buildcache-<arch>   staging and layer cache, not images to run
@@ -79,7 +79,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.sha || github.sha }}
-          # dev-version.sh counts commits since the latest release tag.
+          # dev-version.sh counts first-parent commits (one per merged PR) since the latest release tag.
           fetch-depth: 0
 
       - name: Refuse a commit that is not on master

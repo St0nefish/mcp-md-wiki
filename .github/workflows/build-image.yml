@@ -5,7 +5,7 @@ name: Build image
 # arch in `BUILD_ARCHES` below and in release.yml's binary extraction). Callers:
 #   - train.yml, on the squash of a PR onto master, tagged `:tree-<tree hash>` — the
 #     train cannot name a build after the merge commit, which does not exist until after
-#     the build, so it names it after what it tested: the tree, which the squash merge
+#     the build, so it names it after what it tested: the tree, which the merge commit
 #     reproduces exactly. master.yml later finds the build by the merge commit's tree.
 #   - master.yml's fallback, on a merge commit whose tree the train did not build,
 #     tagged `:sha-<commit>`.

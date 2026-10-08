@@ -6,7 +6,7 @@
 # reproducible, not just the tree: two runs on the same <base> and <head> produce the
 # same commit SHA, so jobs on different runners provably test the same thing.
 #
-# What lands on master is GitHub's squash merge of the PR, whose TREE equals the tree of
+# What lands on master is GitHub's merge commit of the PR, whose TREE equals the tree of
 # this local `git merge --squash` onto the same master (verified live; see the knowledge
 # base's dev/tools/merge-train-pattern.md). The commit SHA differs (GitHub's author,
 # dates and message), which is why images are named after the tree, never the commit.

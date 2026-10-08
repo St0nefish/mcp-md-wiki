@@ -19,15 +19,15 @@ is required before a PR can merge. Concretely:
    code path (`.github/scripts/code-paths.sh` has the list; a docs-only PR skips it).
    It is feedback, not the merge gate.
 3. **Merge.** Once the maintainer has reviewed the PR, they arm GitHub's auto-merge
-   (squash) on it, which queues it for the merge train (`.github/workflows/train.yml`):
+   (merge commit) on it, which queues it for the merge train (`.github/workflows/train.yml`):
    the train squashes the PR onto current `master`, runs the full suite and image
    build on exactly that tree, and posts the `ci-fast` and `ci-slow` statuses that
    let GitHub merge it. If the train reports a conflict or a failure on the PR, push
    a fix — the new head re-queues automatically.
 4. **Closing issues.** Include `fix #N` (or `Fixes #N`, `Closes #N` — GitHub's usual
-   set of magic words) in the PR body or the squash commit message to auto-close the
-   corresponding issue when the PR merges. Squash means the *PR's* commit message is
-   what GitHub actually reads for this, not any individual commit within it.
+   set of magic words) in the PR body to auto-close the
+   corresponding issue when the PR merges. The commits land on `master` as they are, so
+   a keyword in one of their messages closes the issue too.
 5. **Cleanup.** Branches auto-delete on merge — no need to clean up your own feature
    branch afterward.
 

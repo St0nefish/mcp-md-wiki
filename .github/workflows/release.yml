@@ -122,9 +122,9 @@ jobs:
                      | .config.Labels["org.opencontainers.image.revision"] // empty')
             case "$(git cat-file -t "$revision" 2>/dev/null || true)" in
               tree)
-                # The newest master commit with exactly that tree (several can share
+                # The newest master commit (first-parent: merge commits, never a PR's own commits) with exactly that tree (several can share
                 # one, e.g. a revert of a revert; the newest is the natural pick).
-                commit=$(git log --format='%H %T' origin/master | awk -v t="$revision" '$2 == t { print $1; exit }')
+                commit=$(git log --first-parent --format='%H %T' origin/master | awk -v t="$revision" '$2 == t { print $1; exit }')
                 ;;
               commit) commit=$revision ;;
               *) commit="" ;;
@@ -610,6 +610,6 @@ jobs:
             echo "::warning::#${pr} left unarmed: CHANGELOG.md needs reconciling by hand (see the PR body)."
             exit 0
           fi
-          gh pr merge "$pr" --auto --squash --repo "$GITHUB_REPOSITORY"
+          gh pr merge "$pr" --auto --merge --repo "$GITHUB_REPOSITORY"
           # Arming fires train-trigger.yml too; dispatching here does not depend on it.
           GH_TOKEN=$DISPATCH_TOKEN gh workflow run train.yml --ref master --repo "$GITHUB_REPOSITORY"
