@@ -3,7 +3,7 @@ name: Merge train
 # Serialized, test-once PR merging. Design (and the platform behavior it relies on, verified
 # live): the knowledge base's dev/tools/merge-train-pattern.md.
 #
-# A PR joins the queue by having squash auto-merge armed (auto-merge.yml arms the owner's
+# A PR joins the queue by having merge-commit auto-merge armed (auto-merge.yml arms the owner's
 # PRs on open; the owner arming anyone else's PR is the approval). Each run of this
 # workflow takes ONE PR — the oldest armed PR whose current head carries no train status —
 # pins its head and current master, squashes the head onto master locally
@@ -16,7 +16,7 @@ name: Merge train
 #   slow-integration  checks.yml live-Qdrant suite on the squash      } in parallel, only
 #   slow-image        build-image.yml: build, smoke test, `:tree-<tree>` } after `fast`
 #   land              if the head did not move meanwhile, `ci-slow` success; then wait for
-#                     GitHub's auto-merge to squash-merge the PR
+#                     GitHub's auto-merge to merge the PR
 #   finish            on any failure or cancellation, both statuses to `failure` plus a PR
 #                     comment (unless the head moved — that is benign); then dispatch the
 #                     next run if another armed PR has an untested head
@@ -266,7 +266,7 @@ jobs:
       integration: true
 
   # Named after the tree, not a commit: the merge commit does not exist until GitHub
-  # squash-merges the PR, and its tree is this one. master.yml finds the image by it.
+  # merges the PR, and its tree is this one. master.yml finds the image by it.
   slow-image:
     needs: [select, fast]
     if: needs.fast.result == 'success'

@@ -43,9 +43,9 @@ if tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' "$comm
     echo "::warning::Cargo.toml at ${commit} names ${base}, not later than the latest release ${tag}; the version roll has not landed yet, so this build is labelled ${next}."
     base=$next
   fi
-  count=$(git rev-list --count "${tag}..${commit}")
+  count=$(git rev-list --first-parent --count "${tag}..${commit}")
 else
-  count=$(git rev-list --count "$commit")
+  count=$(git rev-list --first-parent --count "$commit")
 fi
 
 {

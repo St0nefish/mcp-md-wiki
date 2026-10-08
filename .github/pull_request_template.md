@@ -1,8 +1,8 @@
 ## Summary
 
 What changed and why. Link the issue(s) this addresses — use `Fixes #N` (or `fix #N`)
-for each one you want auto-closed when this merges; squash merge means it's this PR's
-title/description GitHub reads for that, not any individual commit.
+for each one you want auto-closed when this merges; commit messages inside the PR
+land on master as they are, so a keyword there closes the issue too.
 
 ## Test plan
 
