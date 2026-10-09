@@ -1,29 +1,28 @@
 name: Build image
 
-# Builds, smoke-tests and tags one image (an image index holding linux/amd64 only — the
-# deployment runs on x86; adding a platform is one more `build` matrix entry, plus its
-# arch in `BUILD_ARCHES` below and in release.yml's binary extraction). Callers:
-#   - train.yml, on the squash of a PR onto master, tagged `:tree-<tree hash>` — the
-#     train cannot name a build after the merge commit, which does not exist until after
-#     the build, so it names it after what it tested: the tree, which the merge commit
-#     reproduces exactly. master.yml later finds the build by the merge commit's tree.
-#   - master.yml's fallback, on a merge commit whose tree the train did not build,
-#     tagged `:sha-<commit>`.
+# Builds, smoke-tests and tags ONE tree's image as `:tree-<tree hash>` (an image index
+# holding linux/amd64 only — the deployment runs on x86; adding a platform is one more
+# `build` matrix entry, plus its arch in `BUILD_ARCHES` below and in release.yml's binary
+# extraction). Callers:
+#   - slow.yml, on the merge of an armed PR's head onto the pinned master (merge mode).
+#     Named after the tree, not a commit: the merge commit does not exist until GitHub
+#     merges the PR, and its tree is this one. master.yml then adds `:sha-<commit>`.
+#   - master.yml, on a merge commit (ref mode): reuses the tree's image when ci-slow built
+#     it, or builds it after the fallback tests passed.
 #
-# The build is pushed under a staging tag (`:build-<tag>`, nothing reads it) and gets
-# `<tag>` only after the smoke test passes, so a build that fails, or fails its smoke test,
-# never carries the tag anything resolves. When `<tag>` already exists — the train
-# re-testing a tree it already built (a re-dispatch after a flaky failure, or a PR
-# re-pushed with the same content) — nothing is rebuilt and the existing digest is the
-# output: tags are immutable here, and an image that carries `<tag>` was smoke-tested.
+# The build is pushed by digest, joined into an index under a staging tag
+# (`:build-tree-<tree>`, nothing reads it) and gets `:tree-<tree>` only after the smoke
+# test passes, so a build that fails, or fails its smoke test, never carries the tag
+# anything resolves. When `:tree-<tree>` already exists nothing is rebuilt and the
+# existing digest is the output: tags are immutable here, and an image that carries one
+# was smoke-tested.
 #
-# Labels: org.opencontainers.image.revision = `revision` (the tree hash, for both callers —
-# release.yml maps it back to a master commit), org.opencontainers.image.version =
-# `version`. Nothing here touches :dev, :latest or Watchtower.
+# Labels: org.opencontainers.image.revision = the tree hash (release.yml checks it),
+# org.opencontainers.image.version = Cargo.toml's version in that tree. Nothing here
+# touches :sha-, :dev, :latest or Watchtower.
 #
-# Squash mode / ref mode as in checks.yml: with base-sha + head-sha + expected-tree every
-# job rebuilds the train's squash (.github/scripts/train-squash.sh) and refuses a
-# different tree; with `ref` it is a plain checkout.
+# Every pipeline script runs as the caller's (master's) copy, kept aside before the merge:
+# the PR's code is built and run, but never its scripts with registry credentials in reach.
 
 on:
   workflow_call:
@@ -34,30 +33,17 @@ on:
         required: false
         default: ""
       base-sha:
-        description: "Squash mode: the master commit the train pinned"
+        description: "Merge mode: the pinned master commit"
         type: string
         required: false
         default: ""
       head-sha:
-        description: "Squash mode: the PR head commit the train pinned"
+        description: "Merge mode: the pinned PR head"
         type: string
         required: false
         default: ""
-      expected-tree:
-        description: "Squash mode: the tree of the squash; a job whose squash differs fails"
-        type: string
-        required: false
-        default: ""
-      tag:
-        description: "Tag the smoke-tested image gets, e.g. tree-<tree> or sha-<commit>"
-        type: string
-        required: true
-      revision:
-        description: "org.opencontainers.image.revision label (the tree hash)"
-        type: string
-        required: true
-      version:
-        description: "org.opencontainers.image.version label"
+      tree:
+        description: "The tree being built; a job whose checkout differs fails"
         type: string
         required: true
     outputs:
@@ -65,7 +51,7 @@ on:
         description: "ghcr.io/<owner>/<repo>, lowercased"
         value: ${{ jobs.prepare.outputs.image }}
       digest:
-        description: "Image-index digest that carries `tag`"
+        description: "Image-index digest that carries `:tree-<tree>`"
         value: ${{ jobs.merge.outputs.digest || jobs.prepare.outputs.existing_digest }}
 
 permissions:
@@ -82,22 +68,27 @@ jobs:
     outputs:
       image: ${{ steps.image.outputs.name }}
       rust_version: ${{ steps.rust_version.outputs.version }}
+      version: ${{ steps.version.outputs.version }}
       exists: ${{ steps.existing.outputs.exists }}
       existing_digest: ${{ steps.existing.outputs.digest }}
     steps:
-      - name: Require exactly one of squash mode and ref mode
+      - name: Require exactly one of merge mode and ref mode
         env:
           REF: ${{ inputs.ref }}
           BASE_SHA: ${{ inputs.base-sha }}
           HEAD_SHA: ${{ inputs.head-sha }}
-          EXPECTED_TREE: ${{ inputs.expected-tree }}
+          TREE: ${{ inputs.tree }}
         run: |
-          if [[ -n "$EXPECTED_TREE" && -n "$BASE_SHA" && -n "$HEAD_SHA" && -z "$REF" ]]; then
-            echo "squash mode: ${HEAD_SHA} onto ${BASE_SHA}, tree ${EXPECTED_TREE}"
-          elif [[ -n "$REF" && -z "$EXPECTED_TREE$BASE_SHA$HEAD_SHA" ]]; then
-            echo "ref mode: ${REF}"
+          if [[ ! "$TREE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::tree must be a full tree hash, got '${TREE}'"
+            exit 1
+          fi
+          if [[ -n "$BASE_SHA" && -n "$HEAD_SHA" && -z "$REF" ]]; then
+            echo "merge mode: ${HEAD_SHA} onto ${BASE_SHA}, tree ${TREE}"
+          elif [[ -n "$REF" && -z "$BASE_SHA$HEAD_SHA" ]]; then
+            echo "ref mode: ${REF}, tree ${TREE}"
           else
-            echo "::error::pass either base-sha + head-sha + expected-tree, or ref"
+            echo "::error::pass either base-sha + head-sha, or ref"
             exit 1
           fi
 
@@ -105,19 +96,45 @@ jobs:
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
+          # merge-tree.sh may fetch the PR head, then drops the credentials.
+          persist-credentials: ${{ inputs.head-sha != '' }}
 
-      # The toolchain pin comes from the tree being built: a PR may move it.
-      - name: Squash the PR onto the pinned master
-        if: inputs.expected-tree != ''
+      # The caller's (master's) copy, before the merge can rewrite the checkout.
+      - name: Keep the pipeline scripts aside
+        run: rm -rf "${RUNNER_TEMP}/ci-scripts" && cp -R .github/scripts "${RUNNER_TEMP}/ci-scripts"
+
+      - name: Merge the PR onto the pinned master
+        if: inputs.head-sha != ''
         env:
           BASE_SHA: ${{ inputs.base-sha }}
           HEAD_SHA: ${{ inputs.head-sha }}
-          EXPECTED_TREE: ${{ inputs.expected-tree }}
-        run: .github/scripts/train-squash.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+          TREE: ${{ inputs.tree }}
+        run: '"${RUNNER_TEMP}/ci-scripts/merge-tree.sh" "$BASE_SHA" "$HEAD_SHA" "$TREE"'
 
+      - name: Require the expected tree
+        env:
+          TREE: ${{ inputs.tree }}
+        run: |
+          got=$(git rev-parse 'HEAD^{tree}')
+          [[ "$got" == "$TREE" ]] || { echo "::error::checkout tree ${got}, expected ${TREE}"; exit 1; }
+
+      # The toolchain pin and the version label come from the tree being built.
       - name: Read pinned Rust toolchain version
         id: rust_version
-        run: .github/scripts/rust-version.sh
+        run: '"${RUNNER_TEMP}/ci-scripts/rust-version.sh"'
+
+      - name: Read the version label
+        id: version
+        run: |
+          version=$(awk '
+            /^\[/ { in_package = ($0 == "[package]") }
+            in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }
+          ' Cargo.toml)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::could not read a valid [package] version from Cargo.toml (got '${version}')"
+            exit 1
+          fi
+          echo "version=${version}" | tee -a "$GITHUB_OUTPUT"
 
       - name: Set image name
         id: image
@@ -132,26 +149,19 @@ jobs:
 
       # A registry error is not "not found" — fail rather than rebuild over a tag that
       # might exist.
-      - name: Skip a build that already exists
+      - name: Reuse an existing build of this tree
         id: existing
         env:
           IMAGE: ${{ steps.image.outputs.name }}
-          TAG: ${{ inputs.tag }}
+          TREE: ${{ inputs.tree }}
         run: |
-          if out=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest}}' 2>&1); then
-            digest=$(jq -r '.digest' <<<"${out}")
-            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::${IMAGE}:${TAG} resolved to no usable digest: ${out}"
-              exit 1
-            fi
-            echo "${IMAGE}:${TAG} already exists (${digest}); not rebuilding."
+          digest=$("${RUNNER_TEMP}/ci-scripts/image-digest.sh" "${IMAGE}:tree-${TREE}")
+          if [[ -n "$digest" ]]; then
+            echo "${IMAGE}:tree-${TREE} already exists (${digest}); not rebuilding."
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          elif grep -qiE 'not found|manifest unknown' <<<"${out}"; then
-            echo "exists=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::Cannot inspect ${IMAGE}:${TAG}: ${out}"
-            exit 1
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
   # One native build per architecture (amd64 only, on the self-hosted runners; a native
@@ -178,14 +188,26 @@ jobs:
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
+          # merge-tree.sh may fetch the PR head, then drops the credentials.
+          persist-credentials: ${{ inputs.head-sha != '' }}
 
-      - name: Squash the PR onto the pinned master
-        if: inputs.expected-tree != ''
+      - name: Keep the pipeline scripts aside
+        run: rm -rf "${RUNNER_TEMP}/ci-scripts" && cp -R .github/scripts "${RUNNER_TEMP}/ci-scripts"
+
+      - name: Merge the PR onto the pinned master
+        if: inputs.head-sha != ''
         env:
           BASE_SHA: ${{ inputs.base-sha }}
           HEAD_SHA: ${{ inputs.head-sha }}
-          EXPECTED_TREE: ${{ inputs.expected-tree }}
-        run: .github/scripts/train-squash.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+          TREE: ${{ inputs.tree }}
+        run: '"${RUNNER_TEMP}/ci-scripts/merge-tree.sh" "$BASE_SHA" "$HEAD_SHA" "$TREE"'
+
+      - name: Require the expected tree
+        env:
+          TREE: ${{ inputs.tree }}
+        run: |
+          got=$(git rev-parse 'HEAD^{tree}')
+          [[ "$got" == "$TREE" ]] || { echo "::error::checkout tree ${got}, expected ${TREE}"; exit 1; }
 
       # A docker-container builder: the default docker driver can neither push by
       # digest nor export a registry cache.
@@ -203,8 +225,8 @@ jobs:
       # per-arch push a single image manifest, so the index `merge` builds holds exactly
       # the platform images and no unknown/unknown attestation entries. The layer cache
       # is per architecture: builds for different platforms share no layers, and one ref
-      # would have them overwrite each other's cache on every run. `context: .` builds the checked
-      # out working tree — the squash, in squash mode — not a fresh git fetch.
+      # would have them overwrite each other's cache on every run. `context: .` builds the
+      # checked out working tree — the merge, in merge mode — not a fresh git fetch.
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
@@ -214,8 +236,8 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           build-args: |
             RUST_VERSION=${{ needs.prepare.outputs.rust_version }}
-            VERSION=${{ inputs.version }}
-            REVISION=${{ inputs.revision }}
+            VERSION=${{ needs.prepare.outputs.version }}
+            REVISION=${{ inputs.tree }}
           provenance: false
           outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.arch }}
@@ -241,8 +263,8 @@ jobs:
           retention-days: 1
 
   # Joins the per-arch digests into one image index, smoke-tests it, and only then gives
-  # it `tag`. Self-hosted, because that is an amd64 host with Docker where the smoke test
-  # can run the image (it pulls the amd64 entry of the index).
+  # it `:tree-<tree>`. Self-hosted, because that is an amd64 host with Docker where the
+  # smoke test can run the image (it pulls the amd64 entry of the index).
   merge:
     needs: [prepare, build]
     runs-on: self-hosted
@@ -253,20 +275,32 @@ jobs:
     outputs:
       digest: ${{ steps.index.outputs.digest }}
     steps:
-      # The smoke test and the Qdrant pin it reads (docker-compose.yml) come from the
-      # tree under test.
+      # The Qdrant pin the smoke test reads (docker-compose.yml) comes from the tree under
+      # test; the smoke test script itself is master's copy.
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
+          # merge-tree.sh may fetch the PR head, then drops the credentials.
+          persist-credentials: ${{ inputs.head-sha != '' }}
 
-      - name: Squash the PR onto the pinned master
-        if: inputs.expected-tree != ''
+      - name: Keep the pipeline scripts aside
+        run: rm -rf "${RUNNER_TEMP}/ci-scripts" && cp -R .github/scripts "${RUNNER_TEMP}/ci-scripts"
+
+      - name: Merge the PR onto the pinned master
+        if: inputs.head-sha != ''
         env:
           BASE_SHA: ${{ inputs.base-sha }}
           HEAD_SHA: ${{ inputs.head-sha }}
-          EXPECTED_TREE: ${{ inputs.expected-tree }}
-        run: .github/scripts/train-squash.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+          TREE: ${{ inputs.tree }}
+        run: '"${RUNNER_TEMP}/ci-scripts/merge-tree.sh" "$BASE_SHA" "$HEAD_SHA" "$TREE"'
+
+      - name: Require the expected tree
+        env:
+          TREE: ${{ inputs.tree }}
+        run: |
+          got=$(git rev-parse 'HEAD^{tree}')
+          [[ "$got" == "$TREE" ]] || { echo "::error::checkout tree ${got}, expected ${TREE}"; exit 1; }
 
       - name: Download digests
         uses: actions/download-artifact@v4
@@ -287,7 +321,7 @@ jobs:
         id: index
         env:
           IMAGE: ${{ needs.prepare.outputs.image }}
-          TAG: ${{ inputs.tag }}
+          TAG: tree-${{ inputs.tree }}
           # Must match the `build` matrix.
           BUILD_ARCHES: amd64
         run: |
@@ -310,19 +344,19 @@ jobs:
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Smoke test the build
-        run: .github/scripts/smoke-test-image.sh "${{ needs.prepare.outputs.image }}@${{ steps.index.outputs.digest }}"
+        env:
+          REF: ${{ needs.prepare.outputs.image }}@${{ steps.index.outputs.digest }}
+        run: '"${RUNNER_TEMP}/ci-scripts/smoke-test-image.sh" "$REF"'
 
       # Only now does the build get the tag anything reads. The source is a single image
       # index with no annotations, which `imagetools create` copies verbatim, so the tag
-      # names the smoke-tested index digest rather than a new index. (--prefer-index=false
-      # is for a single-MANIFEST source, where the default would wrap it in a new index;
-      # an index source is copied either way.) The digest check proves it rather than
-      # trusting it.
+      # names the smoke-tested index digest rather than a new index. The digest check
+      # proves it rather than trusting it.
       - name: Tag the tested build
         env:
           IMAGE: ${{ needs.prepare.outputs.image }}
           DIGEST: ${{ steps.index.outputs.digest }}
-          TAG: ${{ inputs.tag }}
+          TAG: tree-${{ inputs.tree }}
         run: |
           docker buildx imagetools create --tag "${IMAGE}:${TAG}" "${IMAGE}@${DIGEST}"
           got=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest}}' | jq -r '.digest')
@@ -330,4 +364,4 @@ jobs:
             echo "::error::${IMAGE}:${TAG} is ${got} after the retag, expected ${DIGEST}."
             exit 1
           fi
-          echo "${IMAGE}:${TAG} -> ${DIGEST}"
+          echo "${IMAGE}:${TAG} -> ${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"

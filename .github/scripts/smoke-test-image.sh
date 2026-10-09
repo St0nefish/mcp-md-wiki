@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Smoke-tests an mcp-md-wiki image. build-image.yml runs it on every build (the merge
-# train's, and master.yml's fallback) before tagging it; release.yml runs it again on the
-# exact image it is about to promote.
+# Smoke-tests an mcp-md-wiki image. build-image.yml runs it on every build (ci-slow's,
+# and master.yml's fallback) before tagging it; release.yml runs it again on the exact
+# image it is about to promote.
 #
 # `mcp-md-wiki serve` needs (src/config.rs resolve_inner, src/server.rs run_server):
 #   - EMBEDDING_BASE_URL, EMBEDDING_MODEL, QDRANT_URL: required env, no defaults.

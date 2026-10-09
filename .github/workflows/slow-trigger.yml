@@ -1,0 +1,30 @@
+name: CI slow trigger
+
+# Starts slow.yml for a PR when it is armed for auto-merge (`auto_merge_enabled`), or
+# when an armed PR gets a new head (`synchronize`, `reopened`).
+#
+# pull_request_target, and nothing but a dispatch: pull_request_target runs MASTER's copy
+# of this file, and the dispatch names `--ref master`, so a PR cannot change how its slow
+# tier is started or what it runs. NEVER check out or run PR code here — this event's
+# token can write to the repo even for a fork's PR. A workflow_dispatch made with
+# GITHUB_TOKEN is the one GITHUB_TOKEN event that does start a run.
+
+on:
+  pull_request_target:
+    branches: [master]
+    types: [auto_merge_enabled, synchronize, reopened]
+
+permissions:
+  actions: write
+
+jobs:
+  dispatch:
+    if: github.event.action == 'auto_merge_enabled' || github.event.pull_request.auto_merge != null
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch slow.yml on master for this PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh workflow run slow.yml --ref master --repo "$GITHUB_REPOSITORY" -f pr="$PR"

@@ -1,42 +1,39 @@
 name: Master
 
-# Attaches a tested image to every master commit that needs one. Nothing here touches
-# :latest or Watchtower: a merge deploys nothing, only a release does (release.yml).
+# Runs on every master commit. Attaches the commit's tested image and proves its tree was
+# tested; a merge ships nothing durable (no :latest, no version tag, no Watchtower — the
+# owner releases by hand, release.yml).
 #
-# The merge train (train.yml) built and tested the image BEFORE the merge, from the local
-# squash of the PR onto master, and tagged it `:tree-<tree hash>`. GitHub's merge commit
-# reproduces that tree exactly, so for a merge commit:
-#
-#   1. `:sha-<commit>` already exists        a re-run or dispatch: re-apply the tags below
-#                                            to THAT digest (never a different one — the
-#                                            sha- and -dev. tags are immutable)
-#   2. `:tree-<its tree>` exists             no build, no tests: add `:sha-<commit>` and
-#                                            `:<x.y.z>-dev.<n>` to that digest and move
-#                                            `:dev` if the commit is still master's tip
-#   3. neither, and code paths changed        FALLBACK: the merged tree is not one the
-#      (.github/scripts/code-paths.sh)        train tested (a server-side merge whose tree
-#                                            differs from the train's, a merge that bypassed the
-#                                            train), so run the full checks.yml and
-#                                            build-image.yml on the commit, then tag as in
-#                                            2 — and warn
-#   4. neither, no code paths changed         nothing: docs-only and version-roll merges
-#                                            have no image, and `:dev` stays put (a release
-#                                            targets a commit that has one)
+#   prepare   classify the commit:
+#     tested    a code change whose exact tree passed `ci-slow` (the PR head's ci-slow
+#               status names this commit's tree) — nothing re-runs
+#     fallback  a code change whose tree nobody tested (another PR landed between this
+#               PR's ci-slow and its merge, or a merge bypassed the gate): run both tiers
+#               on the commit first
+#     inherit   no code path changed and the version is the parent's (docs): the commit
+#               takes its first parent's image, so master's tip stays releasable
+#     none      no code path changed but the version moved (the roll PR, a hand bump):
+#               nothing — that version names a build that does not exist yet
+#   fallback  checks.yml, both tiers, on the commit                     (fallback only)
+#   build     build-image.yml: reuses `:tree-<tree>` (ci-slow built it), or builds it
+#   image     `:sha-<commit>` + `:<x.y.z>-dev.<n>` on the tested digest (inherit: the
+#             parent's `:sha-` digest); `:dev` moves only if the commit is still tip
+#   verified  commit status `verified` = this tree was tested (tested, fallback passed,
+#             or inherited from a verified parent). release.yml requires it.
+#   rolls     closes roll PRs this commit made obsolete (a hand minor/major bump landed)
 #
 # Tags (ghcr.io/<owner>/<repo>), all naming one image-index digest per tree (linux/amd64;
 # see build-image.yml):
-#   :tree-<tree hash>         train.yml; the build of a tested squash (labels: revision =
-#                             the tree hash, version = Cargo.toml's version)
-#   :sha-<full commit sha>    immutable; what release.yml resolves
+#   :tree-<tree hash>         build-image.yml; the smoke-tested build of a tree
+#   :sha-<full commit sha>    immutable; what release.yml promotes
 #   :<x.y.z>-dev.<n>          immutable; x.y.z = Cargo.toml's version (on master, the next
-#                             release), n = first-parent commits (one per merged PR) since the latest release tag
-#                             (.github/scripts/dev-version.sh)
+#                             release), n = first-parent commits since the latest release
+#                             tag (.github/scripts/dev-version.sh)
 #   :dev                      moves to the newest master commit that has an image
-#   :build-<tag>, :buildcache-<arch>   staging and layer cache, not images to run
+#   :build-tree-<tree>, :buildcache-<arch>   staging and layer cache, not images to run
 #
-# workflow_dispatch with `sha` re-processes one master commit (a cancelled or failed run):
-# `gh workflow run master.yml --ref master -f sha=<commit>`. It refuses a commit that is
-# not on master.
+# Re-process one commit (a failed or cancelled run):
+#   gh workflow run master.yml --ref master -f sha=<commit>
 
 on:
   push:
@@ -49,10 +46,9 @@ on:
         required: false
         default: ""
 
-# Keyed by commit: different commits run side by side (the :dev guard keeps a slower,
-# older run from moving :dev backwards), while a re-run or dispatch of the same commit
-# queues behind the in-flight one instead of racing it to the same tags. Never cancelled —
-# a cancelled run leaves a commit with no image to release.
+# Per commit, never cancelled: a cancelled run leaves a commit with nothing to release.
+# Different commits run side by side (the :dev guard keeps a slower, older run from moving
+# :dev backwards).
 concurrency:
   group: master-${{ inputs.sha || github.sha }}
   cancel-in-progress: false
@@ -66,40 +62,35 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      packages: read
+      statuses: read
     outputs:
       image: ${{ steps.image.outputs.name }}
       commit: ${{ steps.version.outputs.commit }}
+      parent: ${{ steps.plan.outputs.parent }}
       tree: ${{ steps.plan.outputs.tree }}
-      version: ${{ steps.version.outputs.version }}
-      sha_tag: ${{ steps.version.outputs.sha_tag }}
       mode: ${{ steps.plan.outputs.mode }}
-      digest: ${{ steps.plan.outputs.digest }}
+      dev_version: ${{ steps.version.outputs.version }}
+      sha_tag: ${{ steps.version.outputs.sha_tag }}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.sha || github.sha }}
-          # dev-version.sh counts first-parent commits (one per merged PR) since the latest release tag.
+          # dev-version.sh counts first-parent commits since the latest release tag.
           fetch-depth: 0
+          persist-credentials: false
 
+      # fetch-depth: 0 fetched every branch, master included.
       - name: Refuse a commit that is not on master
         run: |
-          git fetch --quiet --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
           status=0
           git merge-base --is-ancestor HEAD origin/master || status=$?
           case "$status" in
             0) ;;
-            1)
-              echo "::error::$(git rev-parse HEAD) is not on master; master images are attached to master commits only."
-              exit 1
-              ;;
-            *)
-              echo "::error::git merge-base failed (exit ${status}); cannot tell whether $(git rev-parse HEAD) is on master."
-              exit 1
-              ;;
+            1) echo "::error::$(git rev-parse HEAD) is not on master."; exit 1 ;;
+            *) echo "::error::git merge-base failed (exit ${status})."; exit 1 ;;
           esac
 
-      - name: Compute version and tags
+      - name: Compute the dev version and tags
         id: version
         run: .github/scripts/dev-version.sh
 
@@ -107,71 +98,54 @@ jobs:
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # A registry error is not "not found" — fail rather than rebuild over, or skip, a
-      # tag that might exist.
-      - name: Decide what this commit needs
+      - name: Classify the commit
         id: plan
         env:
-          IMAGE: ${{ steps.image.outputs.name }}
-          SHA_TAG: ${{ steps.version.outputs.sha_tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Prints the digest <ref> names, nothing when it does not exist; fails on any
-          # other registry error.
-          digest_of() {
-            local out
-            if out=$(docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>&1); then
-              jq -r '.digest' <<<"$out"
-            elif ! grep -qiE 'not found|manifest unknown' <<<"$out"; then
-              echo "::error::Cannot inspect $1: ${out}" >&2
-              return 1
-            fi
-          }
+          # shellcheck source=/dev/null
+          . .github/scripts/status-lib.sh
+          out() { echo "$1=$2" | tee -a "$GITHUB_OUTPUT"; }
           tree=$(git rev-parse 'HEAD^{tree}')
-          echo "tree=${tree}" >> "$GITHUB_OUTPUT"
-          sha_digest=$(digest_of "${IMAGE}:${SHA_TAG}")
-          tree_digest=$(digest_of "${IMAGE}:tree-${tree}")
+          out tree "$tree"
+          parent=$(git rev-parse --verify --quiet 'HEAD^1' || true)
+          out parent "$parent"
+          if [[ -z "$parent" ]]; then
+            code=true
+          elif ! code=$(.github/scripts/code-paths.sh HEAD^1 HEAD); then
+            code=true
+          fi
 
-          # An existing sha- tag wins and is only re-applied (same digest, so nothing
-          # changes): that finishes a run that died before moving :dev.
-          if [[ -n "$sha_digest" ]]; then
-            echo "${IMAGE}:${SHA_TAG} already exists (${sha_digest}); re-applying its tags to that digest."
-            digest=$sha_digest
-            mode=tag
-          elif [[ -n "$tree_digest" ]]; then
-            echo "${IMAGE}:tree-${tree} (${tree_digest}) is the train's tested build of this tree."
-            digest=$tree_digest
-            mode=tag
-          else
-            digest=""
-            if git rev-parse --verify --quiet 'HEAD^' >/dev/null; then
-              code=$(.github/scripts/code-paths.sh 'HEAD^' HEAD)
+          if [[ "$code" == true ]]; then
+            # The PR head is the merge commit's second parent; its ci-slow names the tree.
+            head=$(git rev-parse --verify --quiet 'HEAD^2' || true)
+            if [[ -n "$head" ]] && tested_tree "$head" "$tree"; then
+              echo "tree ${tree} passed ci-slow on PR head ${head}."
+              mode=tested
             else
-              code=true
+              echo "::warning::tree ${tree} was not tested before the merge (master moved after ci-slow, or the gate was bypassed); running both tiers on the commit."
+              mode=fallback
             fi
-            if [[ "$code" == true ]]; then
-              echo "::warning::No train-built image for tree ${tree}: this merge's tree is not one the merge train tested. Running the full checks and build on the commit."
-              mode=build
+          else
+            ver() { git show "${1}:Cargo.toml" | awk '
+              /^\[/ { in_package = ($0 == "[package]") }
+              in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }'; }
+            if [[ "$(ver HEAD)" == "$(ver HEAD^1)" ]]; then
+              echo "no code path changed and the version is unchanged: inheriting ${parent}'s image."
+              mode=inherit
             else
-              echo "No code paths changed and no image for this tree; nothing to attach, :dev stays where it is."
+              echo "the version moved without a code change: no image for this commit."
               mode=none
             fi
           fi
-          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          out mode "$mode"
           echo "### $(git rev-parse HEAD): ${mode}" >> "$GITHUB_STEP_SUMMARY"
 
   # Fallback only. The full suite first, then the build, so a fallback image is never
   # tagged `sha-` (releasable) before the commit's tests passed.
-  checks:
+  fallback:
     needs: [prepare]
-    if: needs.prepare.outputs.mode == 'build'
+    if: needs.prepare.outputs.mode == 'fallback'
     permissions:
       contents: read
     uses: ./.github/workflows/checks.yml
@@ -181,30 +155,42 @@ jobs:
       integration: true
 
   build:
-    needs: [prepare, checks]
-    if: needs.prepare.outputs.mode == 'build'
+    needs: [prepare, fallback]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' &&
+      (needs.prepare.outputs.mode == 'tested' ||
+       (needs.prepare.outputs.mode == 'fallback' && needs.fallback.result == 'success'))
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/build-image.yml
     with:
       ref: ${{ needs.prepare.outputs.commit }}
-      tag: ${{ needs.prepare.outputs.sha_tag }}
-      revision: ${{ needs.prepare.outputs.tree }}
-      version: ${{ needs.prepare.outputs.version }}
+      tree: ${{ needs.prepare.outputs.tree }}
 
-  tag:
+  image:
     needs: [prepare, build]
     if: >-
       !cancelled() && needs.prepare.result == 'success' &&
-      (needs.prepare.outputs.mode == 'tag' ||
-       (needs.prepare.outputs.mode == 'build' && needs.build.result == 'success'))
+      (needs.prepare.outputs.mode == 'inherit' || needs.build.result == 'success')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
+      actions: read
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      COMMIT: ${{ needs.prepare.outputs.commit }}
+      SHA_TAG: ${{ needs.prepare.outputs.sha_tag }}
+      DEV_VERSION: ${{ needs.prepare.outputs.dev_version }}
     steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -212,59 +198,154 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # An existing :sha- wins (a re-run re-applies the same digest; the tag is immutable).
+      - name: Pick the digest
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+          BUILT: ${{ needs.build.outputs.digest }}
+          PARENT: ${{ needs.prepare.outputs.parent }}
+        run: |
+          d=$(.github/scripts/image-digest.sh "${IMAGE}:${SHA_TAG}")
+          if [[ -n "$d" ]]; then
+            echo "${IMAGE}:${SHA_TAG} already exists (${d}); re-applying its tags."
+          elif [[ "$MODE" == inherit ]]; then
+            d=$(.github/scripts/wait-image.sh "$IMAGE" "$PARENT")
+            if [[ -z "$d" ]]; then
+              echo "::notice::the parent ${PARENT} has no :sha- image; nothing to inherit."
+            else
+              echo "inheriting ${IMAGE}:sha-${PARENT} (${d})"
+            fi
+          else
+            d=$BUILT
+          fi
+          echo "digest=${d}" >> "$GITHUB_OUTPUT"
+
       # The source is a single image index with no annotations, which `imagetools create`
       # copies verbatim, so the new tags name the tested index digest rather than a new
-      # index. (--prefer-index=false is for a single-MANIFEST source, where the default
-      # would wrap it in a new index; an index source is copied either way.) The digest
-      # check below proves it rather than trusting it.
-      - name: Tag the tested build for this commit
+      # index. The read-back proves it rather than trusting it.
+      - name: Tag the tested digest for this commit
+        if: steps.pick.outputs.digest != ''
         env:
-          IMAGE: ${{ needs.prepare.outputs.image }}
-          DIGEST: ${{ needs.prepare.outputs.digest || needs.build.outputs.digest }}
-          SHA_TAG: ${{ needs.prepare.outputs.sha_tag }}
-          VERSION: ${{ needs.prepare.outputs.version }}
+          DIGEST: ${{ steps.pick.outputs.digest }}
         run: |
-          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::no usable digest to tag: '${DIGEST}'"
-            exit 1
-          fi
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no usable digest: '${DIGEST}'"; exit 1; }
           docker buildx imagetools create \
-            --tag "${IMAGE}:${SHA_TAG}" \
-            --tag "${IMAGE}:${VERSION}" \
-            "${IMAGE}@${DIGEST}"
-          for tag in "${SHA_TAG}" "${VERSION}"; do
-            got=$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{json .Manifest}}' | jq -r '.digest')
-            if [ "${got}" != "${DIGEST}" ]; then
-              echo "::error::${IMAGE}:${tag} is ${got} after the retag, expected ${DIGEST}."
-              exit 1
-            fi
-            echo "${IMAGE}:${tag} -> ${DIGEST}"
+            --tag "${IMAGE}:${SHA_TAG}" --tag "${IMAGE}:${DEV_VERSION}" "${IMAGE}@${DIGEST}"
+          for t in "$SHA_TAG" "$DEV_VERSION"; do
+            got=$(.github/scripts/image-digest.sh "${IMAGE}:${t}")
+            [[ "$got" == "$DIGEST" ]] || { echo "::error::${IMAGE}:${t} is '${got}', expected ${DIGEST}"; exit 1; }
+            echo "${IMAGE}:${t} -> ${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
           done
 
-      # Only the commit that is master's tip moves :dev, so a slower run for an older
-      # commit never moves it backwards. If this commit is no longer the tip, the newer
-      # commit's run moves it — or, when the newer commits are docs-only, :dev correctly
-      # stays on this build.
+      # Only master's tip moves :dev, so a slower run for an older commit never moves it
+      # backwards. If this commit is no longer the tip, the newer commit's run moves it.
       - name: Move :dev
+        if: steps.pick.outputs.digest != ''
         env:
-          IMAGE: ${{ needs.prepare.outputs.image }}
-          DIGEST: ${{ needs.prepare.outputs.digest || needs.build.outputs.digest }}
-          COMMIT: ${{ needs.prepare.outputs.commit }}
           GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.pick.outputs.digest }}
         run: |
-          tip=$(gh api "repos/${GITHUB_REPOSITORY}/commits/master" --jq '.sha')
-          if [ -z "${tip}" ]; then
-            echo "::error::could not read master's tip; leaving :dev alone."
-            exit 1
-          fi
-          if [ "${tip}" != "${COMMIT}" ]; then
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/commits/master" --jq .sha)
+          [[ -n "$tip" ]] || { echo "::error::could not read master's tip"; exit 1; }
+          if [[ "$tip" != "$COMMIT" ]]; then
             echo "::notice::${COMMIT} is no longer master's tip (${tip}); leaving :dev alone."
             exit 0
           fi
           docker buildx imagetools create --tag "${IMAGE}:dev" "${IMAGE}@${DIGEST}"
-          got=$(docker buildx imagetools inspect "${IMAGE}:dev" --format '{{json .Manifest}}' | jq -r '.digest')
-          if [ "${got}" != "${DIGEST}" ]; then
-            echo "::error::${IMAGE}:dev is ${got} after the retag, expected ${DIGEST}."
-            exit 1
-          fi
-          echo "${IMAGE}:dev -> ${DIGEST}"
+          got=$(.github/scripts/image-digest.sh "${IMAGE}:dev")
+          [[ "$got" == "$DIGEST" ]] || { echo "::error::${IMAGE}:dev is '${got}', expected ${DIGEST}"; exit 1; }
+          echo "${IMAGE}:dev -> ${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  verified:
+    needs: [prepare, fallback]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.mode != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      statuses: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Post the verified status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+          FALLBACK: ${{ needs.fallback.result }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          PARENT: ${{ needs.prepare.outputs.parent }}
+          TREE: ${{ needs.prepare.outputs.tree }}
+        run: |
+          # shellcheck source=/dev/null
+          . .github/scripts/status-lib.sh
+          case "$MODE" in
+            tested) post_status "$COMMIT" verified success "tree ${TREE} passed ci-slow before the merge" ;;
+            fallback)
+              if [[ "$FALLBACK" == success ]]; then
+                post_status "$COMMIT" verified success "tree ${TREE} passed both tiers after the merge"
+              else
+                post_status "$COMMIT" verified failure "post-merge tests: ${FALLBACK}"
+                exit 1
+              fi
+              ;;
+            inherit)
+              # Wait (bounded) for the parent's own run to post its status.
+              deadline=$((SECONDS + 1200))
+              while :; do
+                st=$(latest_status "$PARENT" verified)
+                if [[ "$st" == success* ]]; then
+                  post_status "$COMMIT" verified success "no code change; inherits ${PARENT:0:7}"
+                  break
+                fi
+                running=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow master.yml --commit "$PARENT" \
+                  --json status --jq '[.[] | select(.status != "completed")] | length')
+                if [[ "$running" == 0 || $SECONDS -ge $deadline ]]; then
+                  echo "::notice::parent ${PARENT} is not verified (${st:-no status}); ${COMMIT} has nothing to inherit."
+                  break
+                fi
+                sleep 20
+              done
+              ;;
+          esac
+
+  rolls:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # --delete-branch
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+
+      # A roll PR (release/roll-v<next>) is obsolete once master's version reaches
+      # <next> some other way — typically a hand minor/major bump, which also makes the
+      # roll conflict. Close it rather than leave it red.
+      - name: Close obsolete roll PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current=$(awk '
+            /^\[/ { in_package = ($0 == "[package]") }
+            in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }' Cargo.toml)
+          gh pr list --repo "$GITHUB_REPOSITORY" --base master --state open --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("release/roll-v")) | "\(.number) \(.headRefName)"' |
+            while read -r num ref; do
+              target=${ref#release/roll-v}
+              if [[ "$(printf '%s\n' "$target" "$current" | sort -V | tail -n1)" == "$current" ]]; then
+                echo "closing #${num}: master is at ${current}, the roll targets ${target}"
+                gh pr close "$num" --repo "$GITHUB_REPOSITORY" --delete-branch \
+                  --comment "Closed automatically: master's version is already ${current}, so rolling to ${target} is obsolete (a version bump landed by hand)."
+              fi
+            done
