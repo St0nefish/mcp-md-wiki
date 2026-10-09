@@ -10,8 +10,8 @@ name: arm64 image
 #
 # Built natively on GitHub's hosted arm64 runner (free for a public repo; no QEMU) and
 # smoke-tested there with the same script every amd64 build passes. It is otherwise NOT
-# merge-train tested: the commit's amd64 image went through the train, but this arm64
-# build of it is checked only by the smoke test.
+# tested: the commit's amd64 image passed ci-slow (or master.yml's fallback), but this
+# arm64 build of it is checked only by the smoke test.
 #
 # Tags are single-platform and separate from the amd64 tags — never added to `:latest`,
 # `:dev` or `:sha-<commit>`, because rewriting those indexes would change their digests

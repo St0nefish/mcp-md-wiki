@@ -1,0 +1,227 @@
+name: CI slow
+run-name: CI slow (PR #${{ inputs.pr }})
+
+# The slow tier for ONE armed PR, reported as the `ci-slow` commit status (a required
+# check). Dispatched by slow-trigger.yml (`--ref master`) when the PR is armed for
+# auto-merge or an armed PR gets a new head. Re-test a head by hand (a flaky failure, or
+# a `ci-fast` re-run that went green after this failed on it):
+#   gh workflow run slow.yml --ref master -f pr=<n>
+#
+#   prepare      refuse any ref but master; the PR must be open, into master and armed;
+#                pin its head; skip a head that already has `ci-slow` success; WAIT for
+#                `ci-fast` on that head (red -> `ci-slow` failure, nothing built); pin
+#                master and merge the head onto it (.github/scripts/merge-tree.sh — the
+#                tree GitHub's merge commit will have); post `ci-slow` pending
+#   integration  checks.yml `qdrant-integration` on that merge } only when a code path
+#   image        build-image.yml: build, smoke test, `:tree-<tree>` } changed
+#   report       the head did not move -> `ci-slow` success "... tree <tree>" (master.yml
+#                reads the tree from it) or failure plus a PR comment
+#
+# A status, not a job check: a skipped required job counts as passing, and this way only
+# master's copy of this workflow can satisfy `ci-slow`. Not serialized: each PR is tested
+# on master as of its test; master.yml's fallback covers a tree nobody tested.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number"
+        type: string
+        required: true
+
+# One run per PR; a newer dispatch waits, replacing only an older pending one (each run
+# reads the PR when it starts, so nothing is lost). Never cancelled mid-run.
+concurrency:
+  group: slow-${{ inputs.pr }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CI_FAST_TIMEOUT: "1800"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
+      checks: read
+    outputs:
+      found: ${{ steps.pin.outputs.found }}
+      head: ${{ steps.pin.outputs.head }}
+      base: ${{ steps.pin.outputs.base }}
+      tree: ${{ steps.pin.outputs.tree }}
+      code: ${{ steps.pin.outputs.code }}
+    steps:
+      - name: Refuse to run from anything but master
+        if: github.ref != 'refs/heads/master'
+        run: |
+          echo "::error::slow.yml runs only from master (this run: ${GITHUB_REF})."
+          exit 1
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Pin the PR, wait for ci-fast, merge onto master
+        id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+        run: |
+          # The merge below rewrites this checkout (a PR may edit the scripts): keep
+          # master's copies.
+          scripts="${RUNNER_TEMP}/ci-scripts"
+          cp -R .github/scripts "$scripts"
+          # shellcheck source=/dev/null
+          . "$scripts/status-lib.sh"
+          out() { echo "$1=$2" | tee -a "$GITHUB_OUTPUT"; }
+          out found false
+
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "::error::pr must be a number, got '${PR}'"; exit 1; }
+          pr_json() { gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}"; }
+          pr=$(pr_json)
+          if [[ "$(jq -r '.state' <<<"$pr")" != open || "$(jq -r '.base.ref' <<<"$pr")" != master ]]; then
+            echo "::notice::#${PR} is not an open PR into master; nothing to test."
+            exit 0
+          fi
+          if [[ "$(jq -r '.auto_merge != null' <<<"$pr")" != true ]]; then
+            echo "::notice::#${PR} is not armed for auto-merge; ci-slow runs only on armed PRs."
+            exit 0
+          fi
+          head=$(jq -r '.head.sha' <<<"$pr")
+          if [[ "$(latest_status "$head" ci-slow)" == success* ]]; then
+            echo "::notice::${head} already has ci-slow success; nothing to do."
+            exit 0
+          fi
+
+          # ci-fast first: no slow run on a head that fails the fast tier.
+          deadline=$((SECONDS + CI_FAST_TIMEOUT))
+          while :; do
+            run=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head}/check-runs?check_name=ci-fast&filter=latest" \
+              --jq '[.check_runs[] | select(.app.slug == "github-actions")] | sort_by(.started_at) | last // empty
+                    | "\(.status) \(.conclusion)"')
+            case "$run" in
+              "completed success") echo "ci-fast passed on ${head}"; break ;;
+              completed*)
+                post_status "$head" ci-slow failure "ci-fast ${run#completed } on ${head:0:7}; slow tier not run"
+                echo "::error::ci-fast is '${run#completed }' on ${head}."
+                exit 1
+                ;;
+            esac
+            if ((SECONDS >= deadline)); then
+              post_status "$head" ci-slow failure "ci-fast did not finish on ${head:0:7} within ${CI_FAST_TIMEOUT}s"
+              exit 1
+            fi
+            if [[ "$(pr_json | jq -r '.head.sha')" != "$head" ]]; then
+              echo "::notice::#${PR} moved off ${head}; the new head has its own run."
+              exit 0
+            fi
+            echo "waiting for ci-fast on ${head} (${run:-not started})"
+            sleep 15
+          done
+
+          git fetch --quiet --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
+          base=$(git rev-parse origin/master)
+          rc=0
+          tree=$("$scripts/merge-tree.sh" "$base" "$head") || rc=$?
+          if ((rc == 2)); then
+            post_status "$head" ci-slow failure "conflicts with master ${base:0:7}; merge master in and push"
+            comment "$PR" "ci-slow: ${head:0:7} conflicts with master (${base:0:7}). Merge master into the branch (or rebase) and push; the new head is re-tested automatically. ([run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}))"
+            exit 1
+          elif ((rc != 0)); then
+            exit "$rc"
+          fi
+          code=$("$scripts/code-paths.sh" "$base" HEAD)
+
+          post_status "$head" ci-slow pending "testing merge of ${head:0:7} onto ${base:0:7}"
+          out head "$head"
+          out base "$base"
+          out tree "$tree"
+          out code "$code"
+          out found true
+          {
+            echo "### PR #${PR}"
+            echo "merge of \`${head}\` onto master \`${base}\`, tree \`${tree}\`; code paths changed: ${code}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  integration:
+    needs: [prepare]
+    if: needs.prepare.outputs.found == 'true' && needs.prepare.outputs.code == 'true'
+    uses: ./.github/workflows/checks.yml
+    with:
+      base-sha: ${{ needs.prepare.outputs.base }}
+      head-sha: ${{ needs.prepare.outputs.head }}
+      expected-tree: ${{ needs.prepare.outputs.tree }}
+      fast: false
+      integration: true
+
+  image:
+    needs: [prepare]
+    if: needs.prepare.outputs.found == 'true' && needs.prepare.outputs.code == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-image.yml
+    with:
+      base-sha: ${{ needs.prepare.outputs.base }}
+      head-sha: ${{ needs.prepare.outputs.head }}
+      tree: ${{ needs.prepare.outputs.tree }}
+
+  report:
+    needs:
+      - prepare
+      - integration
+      - image
+    if: always() && needs.prepare.outputs.found == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Post ci-slow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          NEEDS: ${{ toJSON(needs) }}
+          HEAD_SHA: ${{ needs.prepare.outputs.head }}
+          BASE_SHA: ${{ needs.prepare.outputs.base }}
+          TREE: ${{ needs.prepare.outputs.tree }}
+          CODE: ${{ needs.prepare.outputs.code }}
+        run: |
+          # shellcheck source=/dev/null
+          . .github/scripts/status-lib.sh
+          # Every job but prepare must have succeeded (or been skipped because no code
+          # path changed). Explicit, never a wildcard over needs.
+          failed=$(jq -r --arg code "$CODE" '
+            to_entries[] | select(.key != "prepare")
+            | select(if $code == "true" then .value.result != "success" else .value.result != "skipped" end)
+            | "\(.key) (\(.value.result))"' <<<"$NEEDS" | paste -sd, -)
+
+          now=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" --jq '.head.sha')
+          if [[ "$now" != "$HEAD_SHA" ]]; then
+            echo "::notice::#${PR} moved from ${HEAD_SHA} to ${now} during the run; posting nothing."
+            exit 0
+          fi
+          what="merge of ${HEAD_SHA:0:7} onto ${BASE_SHA:0:7}; tree ${TREE}"
+          if [[ -n "$failed" ]]; then
+            post_status "$HEAD_SHA" ci-slow failure "failed: ${failed}"
+            comment "$PR" "ci-slow failed on ${HEAD_SHA:0:7}: ${failed} ([run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})). Push a fix, or re-test this head with \`gh workflow run slow.yml --ref master -f pr=${PR}\`."
+            exit 1
+          fi
+          if [[ "$CODE" == true ]]; then
+            post_status "$HEAD_SHA" ci-slow success "passed: ${what}"
+          else
+            post_status "$HEAD_SHA" ci-slow success "no code paths: ${what}"
+          fi

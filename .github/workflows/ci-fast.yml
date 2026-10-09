@@ -1,0 +1,108 @@
+name: CI fast
+
+# The fast tier, on every PR open and push. Its fan-in job `ci-fast` is one of the two
+# required checks (the other, `ci-slow`, is a commit status slow.yml posts once the PR is
+# armed for auto-merge, and only after `ci-fast` passed on the same head).
+#
+#   changes  did the PR touch a code path? (.github/scripts/code-paths.sh)
+#   lint     always: actionlint (pinned, checksum-verified), shellcheck of the CI
+#            scripts (.github/scripts, scripts)
+#   checks   checks.yml fast tier (fmt, clippy, cargo audit, cargo test), only when a
+#            code path changed — a docs-only or version-only PR still gets `ci-fast`
+#   ci-fast  the required check; never skipped, every needed job named explicitly
+#
+# Runs the PR's own copy of this file. The owner's same-repo PRs run the cargo checks on
+# the self-hosted runners; everyone else's (contributors, bots) on GitHub-hosted ones, so
+# an unreviewed PR's code never runs on the self-hosted runners.
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ci-fast-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      # GitHub's test merge of the PR: first parent is master, so HEAD^1..HEAD is the PR.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Did the PR change a code path?
+        id: diff
+        run: |
+          if ! code=$(.github/scripts/code-paths.sh HEAD^1 HEAD); then
+            echo "::warning::could not classify the change; running every check."
+            code=true
+          fi
+          echo "code=${code}" | tee -a "$GITHUB_OUTPUT"
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          git ls-files -z '.github/scripts/*.sh' 'scripts/*.sh' | xargs -0 shellcheck -x
+
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          tmp=$(mktemp -d)
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "${tmp}/${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${tmp}/${archive}" | sha256sum -c -
+          tar -xzf "${tmp}/${archive}" -C "${tmp}" actionlint
+          "${tmp}/actionlint" -version
+          "${tmp}/actionlint"
+
+  checks:
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/checks.yml
+    with:
+      fast: true
+      integration: false
+      runner: ${{ (github.event.pull_request.user.login == 'St0nefish' && github.event.pull_request.head.repo.full_name == github.repository) && 'self-hosted' || 'ubuntu-latest' }}
+
+  ci-fast:
+    needs: [changes, lint, checks]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to have passed
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          LINT: ${{ needs.lint.result }}
+          CHECKS: ${{ needs.checks.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+        run: |
+          [[ "$CHANGES" == success ]] || { echo "::error::changes: ${CHANGES}"; exit 1; }
+          [[ "$LINT" == success ]] || { echo "::error::lint: ${LINT}"; exit 1; }
+          if [[ "$CODE" == true ]]; then
+            [[ "$CHECKS" == success ]] || { echo "::error::checks: ${CHECKS}"; exit 1; }
+          else
+            [[ "$CHECKS" == skipped ]] || { echo "::error::checks: ${CHECKS} with no code change"; exit 1; }
+          fi
+          echo "ci-fast passed (code paths changed: ${CODE})"

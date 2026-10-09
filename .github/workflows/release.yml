@@ -1,365 +1,307 @@
 name: Release
 
-# A release is a decision, not a side effect of a merge: the owner starts it by hand,
-#   gh workflow run release.yml --ref master                    # releases what :dev names
-#   gh workflow run release.yml --ref master -f sha=<commit>    # or one master commit
-# (add `-f full_tests=true` to re-run the whole checks.yml first). It never builds: it
-# promotes an image the merge train already built and tested (train.yml, `:tree-<tree>`,
-# attached to the merge commit as `:sha-<commit>` by master.yml).
+# A release is the owner's act, never a side effect of a merge or a version change:
+#   gh release create vX.Y.Z --target <full master sha> --title vX.Y.Z --notes ""
+# X.Y.Z is Cargo.toml's version at that commit (on master, always the NEXT release). Pass
+# the full sha: `master` as a target would carry along any PR merged in the meantime. An
+# empty body gets CHANGELOG.md's [Unreleased] section as the notes (`notes`); a body the
+# owner wrote, or `--generate-notes`, is kept.
 #
-# The version lives only in Cargo.toml, which on master always holds the NEXT release:
-# after every release the `roll` job opens a PR bumping the patch, and a change that
-# warrants a minor or major bump raises the version itself in its own PR before it
-# merges. Because the version is compiled in (CARGO_PKG_VERSION), it is right before the
-# build, and the tag is derived from it, never typed.
+# Runs from the TAGGED commit's copy of this file and its scripts. It never builds: it
+# promotes the image master.yml attached to the commit (`:sha-<commit>`).
 #
-#   resolve   pins the commit and the digest. With no `sha`: the digest :dev names now,
-#             and the newest master commit whose tree is that image's revision label (the
-#             tree hash); with `sha`: that commit's `:sha-<commit>` digest. Either way
-#             `:sha-<commit>` must name the pinned digest. Every later job uses the pin,
-#             so :dev moving mid-release changes nothing.
-#   check     fails closed unless the owner started the run; the commit is on master;
-#             v<version> (Cargo.toml at the commit) is absent and would be the highest
-#             stable v* tag, OR already points at this commit (a resumed release — a tag
-#             at another commit fails); CHANGELOG.md's [Unreleased] section at the commit
-#             is non-empty (it becomes the release notes).
-#   verify    smoke-tests the pinned digest; with full_tests, checks.yml on the commit too.
-#             The full suite is not the default: the train built and tested this exact
-#             tree, so a re-run only tests flakiness and drift in external services.
-#   release   (environment `release`, holds WATCHTOWER_ATLAS_TOKEN) creates the tag and
-#             the release at the commit as the GitHub App (a bypass actor on the `v*` tag
-#             ruleset; GITHUB_TOKEN cannot create a `v*` tag), sets the notes, attaches
-#             the binaries copied out of the tested image, then — guarded again so an
-#             older release can never move :latest backwards — retags the digest
-#             `:vX.Y.Z` and `:latest` and triggers Watchtower.
-#   roll      opens and arms the version-roll PR (patch bump + a fresh [Unreleased]) as
-#             the App, unless master's version already moved past the release. It merges
-#             through the train like any other PR (a version-only change runs no pipeline).
+#   check     read-only, fails closed unless: the sender is in RELEASE_SENDERS; not a
+#             draft or prerelease; the tag is vX.Y.Z == Cargo.toml's version at the
+#             tagged commit, which is this run's commit and on master; the tag is the
+#             highest stable v* tag; CHANGELOG.md's [Unreleased] section is non-empty;
+#             `:sha-<commit>` exists; the commit carries master.yml's `verified` status.
+#             A docs-only commit has both by inheriting its parent's; a version-only
+#             commit (the roll PR, a hand bump) has neither, so releasing it fails —
+#             there is nothing new to release.
+#   image     (environment `release`) smoke-test the pinned digest, re-check highest-tag,
+#             retag it :vX.Y.Z + :latest (same digest), read back
+#   binaries  (environment `release`) mcp-md-wiki-linux-amd64 copied out of the tested
+#             image + SHA256SUMS, uploaded to the release
+#   notes     an empty release body gets CHANGELOG.md's [Unreleased] section (or
+#             GitHub's generated notes, if that is empty)
+#   deploy    (environment `release`, holds WATCHTOWER_ATLAS_TOKEN) Watchtower on atlas
+#             pulls the new :latest
+#   arm64     dispatches arm64-image.yml for the released commit (a separate run)
+#   roll      as the App: open and arm the PR moving master's version to the next patch,
+#             unless master's version already moved
 #
-# Why the check's tag rule makes the train's no-pipeline roll PR safe: until a code
-# change lands after the roll, :dev still names the released commit's build, whose version
-# is already tagged at that commit — a release of it resumes (re-promotes the same digest),
-# never publishes something new.
-#
-# Every step is idempotent: a failed release is re-run (`gh run rerun <id> --failed`, or
-# dispatch again with the same `sha`), never repaired by hand. If the commit is genuinely
-# broken, merge the fix and release that instead.
+# Recovery: a transient failure -> `gh run rerun <id> --failed` (every job is idempotent).
+# A broken commit: as the owner `gh release delete vX.Y.Z --cleanup-tag`, merge the fix
+# (master still holds X.Y.Z, since `roll` runs only after everything shipped), release
+# again.
 
 on:
-  workflow_dispatch:
-    inputs:
-      sha:
-        description: "Master commit to release (default: the commit :dev names)"
-        type: string
-        required: false
-        default: ""
-      full_tests:
-        description: "Also run the full checks.yml on the commit before promoting"
-        type: boolean
-        required: false
-        default: false
+  release:
+    types: [published]
 
-# One release at a time, never cancelled. A second dispatch waits (GitHub keeps one
-# pending run per group, replacing an older pending one — two releases started back to
-# back would resolve the same :dev anyway).
+# One run per tag, never cancelled.
 concurrency:
-  group: release
+  group: release-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
+env:
+  # Logins whose published release may ship (space-separated). The owner only: no bot
+  # creates releases.
+  RELEASE_SENDERS: "St0nefish"
+
 jobs:
-  resolve:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: read
-    outputs:
-      image: ${{ steps.pin.outputs.image }}
-      commit: ${{ steps.pin.outputs.commit }}
-      digest: ${{ steps.pin.outputs.digest }}
-      version: ${{ steps.pin.outputs.version }}
-      tag: ${{ steps.pin.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: master
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pin the commit and the digest
-        id: pin
-        env:
-          SHA: ${{ inputs.sha }}
-        run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          digest_of() {
-            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null |
-              jq -r '.digest // empty' || true
-          }
-          git fetch --quiet --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
-
-          if [[ -z "$SHA" ]]; then
-            digest=$(digest_of "${image}:dev")
-            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::${image}:dev resolved to no usable digest ('${digest}')."
-              exit 1
-            fi
-            # The revision label: the tree hash for every build since the merge train
-            # (build-image.yml); a commit sha for the builds before it. Both platform
-            # images carry the same labels; read amd64's.
-            revision=$(docker buildx imagetools inspect "${image}@${digest}" --format '{{json .Image}}' |
-              jq -r 'if has("linux/amd64") then .["linux/amd64"] else . end
-                     | .config.Labels["org.opencontainers.image.revision"] // empty')
-            case "$(git cat-file -t "$revision" 2>/dev/null || true)" in
-              tree)
-                # The newest master commit (first-parent: merge commits, never a PR's own commits) with exactly that tree (several can share
-                # one, e.g. a revert of a revert; the newest is the natural pick).
-                commit=$(git log --first-parent --format='%H %T' origin/master | awk -v t="$revision" '$2 == t { print $1; exit }')
-                ;;
-              commit) commit=$revision ;;
-              *) commit="" ;;
-            esac
-            if [[ -z "$commit" ]]; then
-              echo "::error::${image}:dev (${digest}) has revision label '${revision}', which names no tree or commit on master."
-              exit 1
-            fi
-            echo "${image}:dev is ${digest}, built from master commit ${commit}"
-          else
-            if ! commit=$(git rev-parse --verify --quiet "${SHA}^{commit}"); then
-              echo "::error::'${SHA}' is not a commit in this repository."
-              exit 1
-            fi
-            digest=$(digest_of "${image}:sha-${commit}")
-            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::${commit} has no ${image}:sha-${commit} image, so there is nothing tested to promote. A docs-only or version-roll commit has none; release the commit :dev names, or a commit with code changes."
-              exit 1
-            fi
-          fi
-
-          # Whichever way the commit was found, its own sha- tag must name the pinned
-          # digest: that is the image master.yml attached to this commit.
-          sha_digest=$(digest_of "${image}:sha-${commit}")
-          if [[ "$sha_digest" != "$digest" ]]; then
-            echo "::error::${image}:sha-${commit} is '${sha_digest}', not the pinned ${digest}."
-            exit 1
-          fi
-
-          # The `version` key of the `[package]` table at the commit.
-          version=$(git show "${commit}:Cargo.toml" | awk '
-            /^\[/ { in_package = ($0 == "[package]") }
-            in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }
-          ')
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::could not read a valid version from Cargo.toml at ${commit} (got '${version}')"
-            exit 1
-          fi
-          {
-            echo "image=${image}"
-            echo "commit=${commit}"
-            echo "digest=${digest}"
-            echo "version=${version}"
-            echo "tag=v${version}"
-          } | tee -a "$GITHUB_OUTPUT"
-          echo "### Releasing v${version}: ${commit} (${digest})" >> "$GITHUB_STEP_SUMMARY"
-
   check:
-    needs: [resolve]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      resume: ${{ steps.tag.outputs.resume }}
-    steps:
-      # A release is the owner's decision. triggering_actor, not actor: a re-run is
-      # attributed to whoever re-ran it.
-      - name: Require the owner to have started the run
-        env:
-          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
-        run: |
-          if [[ "$TRIGGERING_ACTOR" != "St0nefish" ]]; then
-            echo "::error::this release was started by '${TRIGGERING_ACTOR}'; only the repository owner may release."
-            exit 1
-          fi
-
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.resolve.outputs.commit }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Require the commit to be on master
-        env:
-          COMMIT: ${{ needs.resolve.outputs.commit }}
-        run: |
-          git fetch --quiet --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
-          status=0
-          git merge-base --is-ancestor "$COMMIT" origin/master || status=$?
-          case "$status" in
-            0) echo "${COMMIT} is on master" ;;
-            1)
-              echo "::error::${COMMIT} is not an ancestor of master. Release only a commit that has merged to master."
-              exit 1
-              ;;
-            *)
-              echo "::error::git merge-base failed (exit ${status}); cannot tell whether ${COMMIT} is on master."
-              exit 1
-              ;;
-          esac
-
-      - name: Require a new highest tag, or this release already tagged here
-        id: tag
-        env:
-          COMMIT: ${{ needs.resolve.outputs.commit }}
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          stable='^v[0-9]+\.[0-9]+\.[0-9]+$'
-          tags=$(git ls-remote --tags --refs origin 'refs/tags/v*' | awk '{ sub("^refs/tags/", "", $2); print $2 }' | grep -E "$stable" || true)
-          if grep -qxF "$TAG" <<<"$tags"; then
-            git fetch --quiet --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
-            at=$(git rev-parse "refs/tags/${TAG}^{commit}")
-            if [[ "$at" != "$COMMIT" ]]; then
-              echo "::error::${TAG} already exists at ${at}, not at ${COMMIT}. Cargo.toml's version at ${COMMIT} is already released; land the version roll (or a bump) and a change, then release that."
-              exit 1
-            fi
-            echo "${TAG} already points at ${COMMIT}: resuming that release."
-            echo "resume=true" >> "$GITHUB_OUTPUT"
-          else
-            highest=$(printf '%s\n' "$tags" "$TAG" | grep -E "$stable" | sort -V | tail -n 1)
-            if [[ "$highest" != "$TAG" ]]; then
-              echo "::error::${TAG} would not be the highest release tag (${highest} exists); a release never moves :latest backwards."
-              exit 1
-            fi
-            echo "${TAG} is new and the highest release tag."
-            echo "resume=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Require a non-empty [Unreleased] section
-        run: .github/scripts/changelog-section.sh Unreleased CHANGELOG.md
-
-  verify-smoke:
-    needs: [resolve, check]
-    runs-on: self-hosted
     timeout-minutes: 30
     permissions:
       contents: read
       packages: read
+      statuses: read
+      actions: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.image.outputs.digest }}
     steps:
-      # The smoke test script and the Qdrant pin it reads, as of the released commit.
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.resolve.outputs.commit }}
-          persist-credentials: false
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Smoke test the pinned image
-        run: .github/scripts/smoke-test-image.sh "${{ needs.resolve.outputs.image }}@${{ needs.resolve.outputs.digest }}"
-
-  verify-full:
-    needs: [resolve, check]
-    if: inputs.full_tests
-    permissions:
-      contents: read
-    uses: ./.github/workflows/checks.yml
-    with:
-      ref: ${{ needs.resolve.outputs.commit }}
-      fast: true
-      integration: true
-
-  release:
-    needs: [resolve, check, verify-smoke, verify-full]
-    if: >-
-      !cancelled() && needs.check.result == 'success' && needs.verify-smoke.result == 'success' &&
-      (needs.verify-full.result == 'success' || needs.verify-full.result == 'skipped')
-    runs-on: self-hosted
-    timeout-minutes: 20
-    environment: release
-    # packages: the retag pushes :latest and :<tag> to ghcr. Everything that writes to
-    # the repository (tag, release, assets) uses the App token.
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Generate App token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ vars.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.resolve.outputs.commit }}
-          persist-credentials: false
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Creating the release creates the tag at the commit. On a resumed release the tag
-      # exists; the release itself may not (a run that died in between), so it is created
-      # on the existing tag then. The notes are (re)set either way.
-      - name: Create the tag and the release
+      - name: Require a stable, non-draft release from an allowed sender
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          COMMIT: ${{ needs.resolve.outputs.commit }}
-          TAG: ${{ needs.resolve.outputs.tag }}
+          SENDER: ${{ github.event.sender.login }}
+          DRAFT: ${{ github.event.release.draft }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          notes="${RUNNER_TEMP}/release-notes.md"
-          .github/scripts/changelog-section.sh Unreleased CHANGELOG.md > "$notes"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release ${TAG} exists; updating its notes."
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
-          else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --target "$COMMIT" --title "$TAG" --notes-file "$notes"
+          allowed=false
+          for s in ${RELEASE_SENDERS}; do
+            if [[ -n "$SENDER" && "$SENDER" == "$s" ]]; then allowed=true; fi
+          done
+          if [[ "$allowed" != true ]]; then
+            echo "::error::this release was published by '${SENDER}', not one of: ${RELEASE_SENDERS}."
+            exit 1
           fi
-          # The tag must name the commit whichever path ran (a tag created by someone
-          # else between `check` and here would not).
-          at=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq '.sha')
-          if [[ "$at" != "$COMMIT" ]]; then
-            echo "::error::${TAG} names ${at}, not ${COMMIT}."
+          if [[ "$DRAFT" != false || "$PRERELEASE" != false ]]; then
+            echo "::error::draft/prerelease releases are not shipped (draft=${DRAFT}, prerelease=${PRERELEASE})."
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tag '${TAG}' is not vX.Y.Z."
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/tags/${TAG}" ]]; then
+            echo "::error::GITHUB_REF is ${GITHUB_REF}, expected refs/tags/${TAG}"
             exit 1
           fi
 
-      # Byte-identical to what was tested: copied out of the pinned image, once per
-      # architecture. `docker create` never runs the image, so a non-amd64 copy would need
-      # no emulation on this amd64 host. Each architecture is pulled by its own platform
-      # manifest digest, not the index digest: the classic image store records an index
-      # digest against the first platform pulled and refuses the second ("cannot
-      # overwrite digest").
-      - name: Attach the binaries
+      # Credentials persisted (read-only token): the guards below fetch and `git ls-remote`.
+      - name: Checkout the tagged commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Read the version at the tagged commit
+        id: meta
+        run: |
+          version=$(awk '
+            /^\[/ { in_package = ($0 == "[package]") }
+            in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }
+          ' Cargo.toml)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::could not read a valid [package] version from Cargo.toml (got '${version}')"
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "tag=v${version}"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - name: Require tag == Cargo.toml version
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          IMAGE: ${{ needs.resolve.outputs.image }}
-          DIGEST: ${{ needs.resolve.outputs.digest }}
-          TAG: ${{ needs.resolve.outputs.tag }}
+          TAG: ${{ github.event.release.tag_name }}
+          CARGO_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if [[ "$TAG" != "$CARGO_TAG" ]]; then
+            echo "::error::release tag ${TAG} does not match Cargo.toml's version (${CARGO_TAG}) at ${GITHUB_SHA}."
+            exit 1
+          fi
+          echo "${TAG} == Cargo.toml's version at ${GITHUB_SHA}"
+
+      - name: Require the tag at this run's commit, on master
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git fetch --quiet --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}" "+refs/heads/master:refs/remotes/origin/master"
+          tag_commit=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          if [[ "$tag_commit" != "$GITHUB_SHA" || "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "::error::tag ${TAG} is at ${tag_commit}, the checkout at $(git rev-parse HEAD), the event names ${GITHUB_SHA}."
+            exit 1
+          fi
+          status=0
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/master || status=$?
+          case "$status" in
+            0) echo "${GITHUB_SHA} is on master" ;;
+            1) echo "::error::${GITHUB_SHA} is not on master. Release only a merged commit."; exit 1 ;;
+            *) echo "::error::git merge-base failed (exit ${status})."; exit 1 ;;
+          esac
+
+      - name: Require the highest stable release tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: .github/scripts/require-highest-tag.sh "$TAG"
+
+      # It becomes the notes (an empty body) and the dated section the roll PR adds.
+      - name: Require a non-empty [Unreleased] section
+        run: .github/scripts/changelog-section.sh Unreleased CHANGELOG.md
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Require the tested image (:sha-<commit>)
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          digest=$(.github/scripts/wait-image.sh "$IMAGE" "$GITHUB_SHA")
+          if [[ -z "$digest" ]]; then
+            echo "::error::no ${IMAGE}:sha-${GITHUB_SHA}: nothing tested to promote. A version-only commit (the roll PR, a hand bump) has none; release a commit with a build."
+            exit 1
+          fi
+          # The revision label: the tree hash the image was built from (build-image.yml).
+          # Both platform images of an index carry the same labels; read amd64's.
+          revision=$(docker buildx imagetools inspect "${IMAGE}@${digest}" --format '{{json .Image}}' |
+            jq -r 'if has("linux/amd64") then .["linux/amd64"] else . end
+                   | .config.Labels["org.opencontainers.image.revision"] // empty')
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::${IMAGE}@${digest} has no revision label"; exit 1; }
+          echo "${IMAGE}:sha-${GITHUB_SHA} -> ${digest} (built from tree ${revision})"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Require the verified status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # shellcheck source=/dev/null
+          . .github/scripts/status-lib.sh
+          deadline=$((SECONDS + 1200))
+          while :; do
+            st=$(latest_status "$GITHUB_SHA" verified)
+            if [[ "$st" == success* ]]; then
+              echo "verified: ${st#success }"
+              exit 0
+            fi
+            running=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow master.yml --commit "$GITHUB_SHA" \
+              --json status --jq '[.[] | select(.status != "completed")] | length')
+            if [[ "$running" == 0 || $SECONDS -ge $deadline ]]; then
+              echo "::error::${GITHUB_SHA} has no 'verified' success (${st:-no status}): its tree was never proven tested."
+              exit 1
+            fi
+            sleep 20
+          done
+
+  image:
+    needs: [check]
+    # An amd64 host with Docker where the smoke test can run the image.
+    runs-on: self-hosted
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest_changed: ${{ steps.promote.outputs.digest_changed }}
+    env:
+      IMAGE: ${{ needs.check.outputs.image }}
+      TAG: ${{ needs.check.outputs.tag }}
+      DIGEST: ${{ needs.check.outputs.digest }}
+    steps:
+      # Credentials persisted (read-only token): the highest-tag guard runs `git ls-remote`.
+      # The smoke test script and the Qdrant pin it reads, as of the released commit.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Smoke test the image being promoted
+        run: .github/scripts/smoke-test-image.sh "${IMAGE}@${DIGEST}"
+
+      # Immediately before the retag, so a release published meanwhile is seen. A run this
+      # guard stops stays failed; to ship a fix on top of a newer release, release it as a
+      # new, higher version.
+      - name: Refuse to move :latest backwards
+        run: .github/scripts/require-highest-tag.sh "$TAG"
+
+      # No rebuild, no layer push: the source is the tested image index, copied verbatim,
+      # so the new tags carry the :sha- digest. Verified below rather than trusted.
+      - name: Promote to :vX.Y.Z and :latest
+        id: promote
+        run: |
+          current=$(.github/scripts/image-digest.sh "${IMAGE}:sha-${GITHUB_SHA}")
+          [[ "$current" == "$DIGEST" ]] || { echo "::error::${IMAGE}:sha-${GITHUB_SHA} is '${current}', not ${DIGEST}"; exit 1; }
+          # What :latest names now: a re-run re-applies the digest :latest already carries,
+          # and then Watchtower correctly updates nothing (deploy reads this).
+          prev=$(.github/scripts/image-digest.sh "${IMAGE}:latest")
+          docker buildx imagetools create --tag "${IMAGE}:${TAG}" --tag "${IMAGE}:latest" "${IMAGE}@${DIGEST}"
+          for t in "$TAG" latest "sha-${GITHUB_SHA}"; do
+            got=$(.github/scripts/image-digest.sh "${IMAGE}:${t}")
+            [[ "$got" == "$DIGEST" ]] || { echo "::error::${IMAGE}:${t} is '${got}', expected ${DIGEST}"; exit 1; }
+            echo "${IMAGE}:${t} -> ${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          if [[ "$prev" == "$DIGEST" ]]; then
+            echo "::notice:::latest already named ${DIGEST}; nothing for Watchtower to update."
+            echo "digest_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "digest_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Byte-identical to what was tested: copied out of the promoted image, never rebuilt.
+  binaries:
+    needs: [check]
+    runs-on: self-hosted
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+      packages: read
+    env:
+      IMAGE: ${{ needs.check.outputs.image }}
+      TAG: ${{ needs.check.outputs.tag }}
+      DIGEST: ${{ needs.check.outputs.digest }}
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Once per architecture. `docker create` never runs the image, so a non-amd64 copy
+      # would need no emulation on this amd64 host. Each architecture is pulled by its own
+      # platform manifest digest, not the index digest: the classic image store records an
+      # index digest against the first platform pulled and refuses the second ("cannot
+      # overwrite digest").
+      - name: Copy the binaries out of the tested image
         run: |
           dir="${RUNNER_TEMP}/binaries"
           rm -rf "$dir"
           mkdir -p "$dir"
           index=$(docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}")
-          files=()
           # ELF e_machine (2 bytes at offset 18) of the binary each platform must carry.
-          # The platforms build-image.yml builds.
           declare -A machine=([amd64]=62 [arm64]=183)
+          # The platforms build-image.yml builds.
           for arch in amd64; do
             pdigest=$(jq -r --arg a "$arch" \
               '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest] | if length == 1 then .[0] else empty end' \
@@ -379,93 +321,59 @@ jobs:
               exit 1
             fi
             echo "mcp-md-wiki-linux-${arch}: $(stat -c %s "$out") bytes, from ${pdigest}"
-            files+=("$out")
           done
-          gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          (cd "$dir" && sha256sum mcp-md-wiki-linux-* > SHA256SUMS && cat SHA256SUMS)
 
-      # Immediately before the retag, so a release made meanwhile is seen. A run this
-      # guard stops stays failed; to ship a fix on top of a newer release, release it as a
-      # new, higher version.
-      - name: Refuse to move :latest backwards
+      # Uploads to the existing release; never creates one. --clobber: re-runs are idempotent.
+      - name: Upload to the release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          refs=$(curl -fsSL \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v")
-          highest=$(printf '%s' "${refs}" |
-            jq -r '.[].ref | sub("^refs/tags/"; "") | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' |
-            sort -V | tail -n 1)
-          if [ -z "${highest}" ] || [ "${TAG}" != "${highest}" ]; then
-            echo "::error::${TAG} is not the highest release tag (${highest:-none found}); not moving :latest or any other tag."
-            exit 1
-          fi
-          echo "${TAG} is the highest release tag."
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "${RUNNER_TEMP}"/binaries/* --clobber --repo "$GITHUB_REPOSITORY"
 
-      - name: Tag as latest
-        id: retag
+  notes:
+    needs: [check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fill empty release notes
         env:
-          IMAGE: ${{ needs.resolve.outputs.image }}
-          DIGEST: ${{ needs.resolve.outputs.digest }}
-          COMMIT: ${{ needs.resolve.outputs.commit }}
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          digest_of() {
-            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null |
-              jq -r '.digest // empty' || true
-          }
-          SHA_TAG="sha-${COMMIT}"
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: .github/scripts/release-notes.sh "$TAG"
 
-          # The digest verify-smoke tested must still be what the commit's sha- tag
-          # names.
-          current=$(digest_of "${IMAGE}:${SHA_TAG}")
-          if [ -z "${DIGEST}" ] || [ "${current}" != "${DIGEST}" ]; then
-            echo "::error::${IMAGE}:${SHA_TAG} is '${current}', not the verified ${DIGEST}."
-            exit 1
-          fi
-
-          # What :latest points at now. A re-run of a release that already shipped
-          # re-applies the digest :latest already carries, and then Watchtower correctly
-          # reports updated=0 — which the step below otherwise treats as a failure.
-          PREV_DIGEST=$(digest_of "${IMAGE}:latest")
-
-          # No rebuild, no layer push. The source is the train's image index,
-          # and a single index source with no annotations is copied verbatim, so the new
-          # tags carry the same digest as :sha-<commit> (--prefer-index=false only
-          # matters for a single-manifest source). Verified below rather than trusted.
-          docker buildx imagetools create \
-            --tag "${IMAGE}:latest" \
-            --tag "${IMAGE}:${TAG}" \
-            "${IMAGE}@${DIGEST}"
-
-          for tag in latest "${TAG}" "${SHA_TAG}"; do
-            got=$(digest_of "${IMAGE}:${tag}")
-            if [ "${got}" != "${DIGEST}" ]; then
-              echo "::error::${IMAGE}:${tag} is '${got}' after the retag, expected ${DIGEST}."
-              exit 1
-            fi
-            echo "${IMAGE}:${tag} -> ${DIGEST}"
-          done
-
-          if [ "$PREV_DIGEST" = "$DIGEST" ]; then
-            echo "::notice:::latest already pointed at this manifest (${DIGEST}) — nothing for Watchtower to update."
-            echo "digest_changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "digest_changed=true" >> "$GITHUB_OUTPUT"
-          fi
+  # Self-hosted: the pull below lands the new :latest on the host daemon Watchtower
+  # compares against, rather than racing registry propagation.
+  deploy:
+    needs: [check, image]
+    runs-on: self-hosted
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Trigger Watchtower
         env:
-          IMAGE: ${{ needs.resolve.outputs.image }}
+          IMAGE: ${{ needs.check.outputs.image }}
           WATCHTOWER_URL: ${{ vars.WATCHTOWER_ATLAS_URL }}
           WATCHTOWER_TOKEN: ${{ secrets.WATCHTOWER_ATLAS_TOKEN }}
-          DIGEST_CHANGED: ${{ steps.retag.outputs.digest_changed }}
+          DIGEST_CHANGED: ${{ needs.image.outputs.digest_changed }}
         run: |
-          # Pull the retagged image onto the host daemon first so Watchtower's
-          # local digest comparison sees the new :latest immediately, rather
-          # than racing registry propagation.
           docker pull "${IMAGE}:latest"
           # Do not swallow transport errors — a failed trigger must fail the job.
           response=$(curl -fsSL -X POST \
@@ -477,19 +385,15 @@ jobs:
             echo "Watchtower updated ${updated} container(s)"
             exit 0
           fi
-          # updated=0 is expected and fine when :latest did not actually move —
-          # a re-run of a release that already shipped re-applies the manifest
-          # already deployed. Only treat it as a failure when the digest really
-          # did change.
+          # updated=0 is expected when :latest did not actually move — a re-run of a
+          # release that already shipped re-applies the manifest already deployed.
           if [ "${DIGEST_CHANGED}" = "false" ]; then
             echo "Watchtower reported updated=0, and :latest did not move — already running this image."
             exit 0
           fi
-          # We just retagged :latest to a new digest, so an update is expected.
-          # updated=0 means Watchtower saw the request but changed nothing —
-          # historically because the container lacked the opt-in label while
-          # Watchtower runs with WATCHTOWER_LABEL_ENABLE=true, so the deploy
-          # silently no-opped for weeks. Fail loudly instead.
+          # :latest moved, so an update is expected. updated=0 means Watchtower changed
+          # nothing — historically because the container lacked the opt-in label while
+          # Watchtower runs with WATCHTOWER_LABEL_ENABLE=true. Fail loudly instead.
           echo "::error::Watchtower reported updated=0 after retagging :latest."
           echo "Check that the target container carries the opt-in label:"
           echo "  com.centurylinklabs.watchtower.enable=true"
@@ -500,10 +404,9 @@ jobs:
   # follow every release. A separate run, not a job of this one: the release does not wait
   # for the arm64 build, and an arm64 failure shows as its own red run rather than failing
   # a release whose amd64 image already shipped. Dispatch is the one GITHUB_TOKEN event
-  # that does start a run. Explicit condition for the same reason as `roll`'s.
+  # that does start a run.
   arm64:
-    needs: [resolve, release]
-    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    needs: [check, deploy]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -512,29 +415,29 @@ jobs:
       - name: Dispatch the arm64 build of the released commit
         env:
           GH_TOKEN: ${{ github.token }}
-          COMMIT: ${{ needs.resolve.outputs.commit }}
-        run: gh workflow run arm64-image.yml --ref master -f sha="$COMMIT" --repo "$GITHUB_REPOSITORY"
+        run: gh workflow run arm64-image.yml --ref master -f sha="$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
 
   # Opens the PR that moves master's Cargo.toml to the next patch version, as the App —
-  # so it needs no exception in auto-merge.yml's owner-only gate, and the train sees it
-  # like any other armed PR. Idempotent: an existing roll branch/PR is reused.
-  # Explicit condition: the implicit success() skips a job when anything upstream was
-  # skipped, and verify-full is skipped on every release without full_tests.
+  # so it needs no exception in auto-merge.yml's owner-only gate, and its arming starts
+  # ci-slow like any PR's (a version-only change builds nothing). Idempotent: an existing
+  # roll branch/PR is reused. Only after everything shipped: until then master keeps
+  # X.Y.Z, so a failed release is fixed and re-released under the same version.
   roll:
-    needs: [resolve, release]
-    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    needs: [check, image, binaries, notes, deploy]
+    if: ${{ !cancelled() && needs.check.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      actions: write
+    timeout-minutes: 20
     steps:
+      # The App, never GITHUB_TOKEN: a PR or arming made with GITHUB_TOKEN starts no
+      # workflow, so the roll PR would never get ci-fast or ci-slow.
       - name: Generate App token
         id: app-token
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
 
       # The App token is kept in the checkout's config so the push below is the App's.
       - uses: actions/checkout@v5
@@ -543,13 +446,15 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
       - name: Open and arm the version-roll PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          DISPATCH_TOKEN: ${{ github.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-          COMMIT: ${{ needs.resolve.outputs.commit }}
-          RELEASED: ${{ needs.resolve.outputs.version }}
+          COMMIT: ${{ github.sha }}
+          RELEASED: ${{ needs.check.outputs.version }}
         run: |
           current=$(awk '
             /^\[/ { in_package = ($0 == "[package]") }
@@ -585,7 +490,6 @@ jobs:
               rc=0
               .github/scripts/roll-version.sh "$RELEASED" "$next" "$(date -u +%F)" "$notes" || rc=$?
               if ((rc == 3)); then review=true; elif ((rc != 0)); then exit "$rc"; fi
-              # rust-toolchain.toml makes this install the pinned toolchain if needed.
               got=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mcp-md-wiki") | .version')
               if [[ "$got" != "$next" ]]; then
                 echo "::error::cargo metadata reports ${got} after the roll, expected ${next}."
@@ -594,10 +498,10 @@ jobs:
               # The App's bot identity, so the commit is attributed to it.
               uid=$(gh api "users/${APP_SLUG}%5Bbot%5D" --jq '.id')
               git -c user.name="${APP_SLUG}[bot]" -c user.email="${uid}+${APP_SLUG}[bot]@users.noreply.github.com" \
-                commit --quiet -am "$title"
+                -c commit.gpgsign=false commit --quiet -am "$title"
               git push --quiet origin "HEAD:refs/heads/${branch}"
             fi
-            body="Rolls master to the next patch version after releasing v${RELEASED}: \`Cargo.toml\`/\`Cargo.lock\` ${RELEASED} -> ${next}, and CHANGELOG.md's \`[Unreleased]\` section becomes \`[${RELEASED}]\` under a fresh \`[Unreleased]\`. Opened by release.yml."
+            body="Rolls master to the next patch version after releasing v${RELEASED}: \`Cargo.toml\`/\`Cargo.lock\` ${RELEASED} -> ${next}, and CHANGELOG.md's \`[Unreleased]\` section becomes \`[${RELEASED}]\` under a fresh \`[Unreleased]\`. Version-only, so it builds nothing. Opened by release.yml."
             if [[ "$review" == true ]]; then
               body+=$'\n\n'"**Needs the owner: not armed.** master's \`[Unreleased]\` section changed after the released commit, so it was kept as is and the released section was inserted from the released commit; remove the entries that shipped in v${RELEASED} from \`[Unreleased]\`, then arm auto-merge."
             fi
@@ -610,6 +514,6 @@ jobs:
             echo "::warning::#${pr} left unarmed: CHANGELOG.md needs reconciling by hand (see the PR body)."
             exit 0
           fi
+          # Arming fires slow-trigger.yml (auto_merge_enabled), which starts ci-slow.
           gh pr merge "$pr" --auto --merge --repo "$GITHUB_REPOSITORY"
-          # Arming fires train-trigger.yml too; dispatching here does not depend on it.
-          GH_TOKEN=$DISPATCH_TOKEN gh workflow run train.yml --ref master --repo "$GITHUB_REPOSITORY"
+          echo "#${pr} armed for auto-merge"

@@ -3,10 +3,10 @@
 #
 #   version  <x.y.z>-dev.<n>: x.y.z is Cargo.toml's [package] version at the commit —
 #            which on master is always the NEXT release, since the post-release roll PR
-#            bumps it (release.yml) — and n is the number of commits since the latest
+#            (release.yml's roll) bumps it — and n is the number of commits since the latest
 #            release tag reachable from the commit (every commit, before the first
 #            release). Semver-valid, and it sorts after the release it follows.
-#   sha_tag  sha-<full commit sha>: the tag release.yml resolves to find this build.
+#   sha_tag  sha-<full commit sha>: the tag release.yml promotes.
 #
 # A commit whose Cargo.toml still names an already-released version (one merged after a
 # release but before its roll PR) would get <released>-dev.<n>, which sorts BEFORE that

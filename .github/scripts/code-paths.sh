@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Prints `true` when the change from <from> to <to> touches a code path, `false` when it
-# does not. The ONE definition of "code path": train.yml (whether to run the pipeline),
-# master.yml (whether a merge without a train-built image needs a fallback build) and
-# pr-fast.yml (whether to run contributor checks) all call this, so they cannot disagree.
+# does not. The ONE definition of "code path": ci-fast.yml (whether to run the cargo
+# checks), slow.yml (whether to build and test) and master.yml (whether a merge needs an
+# artifact of its own) all call this, so they cannot disagree.
 #
 # Code paths: anything compiled into, tested against, or building the binary or image —
 #   src/**  assets/**  migrations/**  Cargo.toml  Cargo.lock  rust-toolchain.toml
@@ -13,9 +13,12 @@
 # One exception: a change to Cargo.toml / Cargo.lock that ONLY moves this crate's own
 # `version` (the [package] version and Cargo.lock's own entry, which is what the
 # post-release roll PR and a hand-made minor/major bump do) is not a code change. Such a
-# PR lands through the train with no build, so `:dev` keeps naming the last build — a
-# release of it then resumes or no-ops instead of publishing an untested version — and the
-# next code change builds with the new version compiled in.
+# PR lands with no build and its master commit gets no image, so releasing it fails
+# closed (nothing new to release), and the next code change builds with the new version
+# compiled in.
+#
+# Unlike the template, Markdown is NOT excluded: assets/mcp/*.md are compiled in
+# (include_str!).
 #
 # Usage: code-paths.sh <from> <to>   (any commit-ish; needs both in the local clone)
 set -euo pipefail

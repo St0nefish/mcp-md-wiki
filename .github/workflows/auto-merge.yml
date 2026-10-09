@@ -1,18 +1,30 @@
 name: Auto-merge
 
+# Arms GitHub's auto-merge (merge commit) on the owner's PRs. Arming is what starts
+# `ci-slow` (slow-trigger.yml listens for `auto_merge_enabled`); both required checks
+# green -> GitHub merges. Arming a contributor's PR by hand is the approval to run the
+# slow tier on it.
+#
+# Armed with the GitHub App's token, never GITHUB_TOKEN: GitHub starts no workflow for
+# an event GITHUB_TOKEN causes, so neither slow-trigger.yml (auto_merge_enabled) nor
+# master.yml (the merge's push) would run. GitHub withholds the App secrets from fork
+# PRs, so only same-repo branches can auto-merge.
+#
+# Not a required check, so gating it by author is safe.
+
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    branches: [master]
+    types: [opened, reopened, ready_for_review]
 
 permissions:
   contents: read
 
 jobs:
   auto-merge:
-    # Only the owner's PRs auto-merge. Other contributors' PRs still run CI
-    # and can be merged manually after review, but must never land unattended.
-    if: github.event.pull_request.user.login == 'St0nefish'
+    if: github.event.pull_request.user.login == 'St0nefish' && !github.event.pull_request.draft
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Generate App token
         id: app-token
@@ -20,6 +32,8 @@ jobs:
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Enable auto-merge
         run: gh pr merge "$PR_NUMBER" --auto --merge --repo "$REPO"
