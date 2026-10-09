@@ -63,8 +63,8 @@ FROM alpine:3.21
 # REVISION=...`); default to "unknown" so a plain local `docker build .` with no
 # build args still produces a valid, if uninformative, label instead of an empty
 # one. REVISION (org.opencontainers.image.revision) records the git TREE hash the
-# image was built from, not a commit: the merge train builds the image before the
-# merge commit exists, from a squash with the same tree (.github/workflows/train.yml).
+# image was built from, not a commit: ci-slow builds the image before the merge
+# commit exists, from a local merge with the same tree (.github/workflows/slow.yml).
 # `git log --format='%H %T' master` maps it back to the commit(s) with that tree.
 ARG VERSION=unknown
 ARG REVISION=unknown
