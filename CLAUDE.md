@@ -77,6 +77,18 @@ Check each claim against the code rather than the plan that preceded it. Code co
 
 ## Workflow
 
+**At a glance (`pr-manual-release`; KB `dev/tools/repo-workflow-patterns.md`, detailed
+spec `dev/tools/merge-train-pattern.md`):**
+
+- PR open -> `ci-fast`; armed (auto-merge enabled) -> `ci-slow` after `ci-fast` passes -> merge commit. Never push to `master`; no squash/rebase.
+- A master merge produces `:dev`, `:sha-<commit>`, `:x.y.z-dev.N` and a `verified` status. It ships nothing durable.
+- Release is MANUAL and owner-only: `gh release create vX.Y.Z --target <verified master sha> --title vX.Y.Z --notes ""`.
+- The tag must equal `Cargo.toml`'s version, and `CHANGELOG.md` `[Unreleased]` must be non-empty (it becomes the notes).
+- Only a commit with a `verified` success status can be released.
+- The release workflow never builds: it promotes the tested `:sha-` image (amd64 + arm64) to `:vX.Y.Z` + `:latest`, publishes the binary, deploys via Watchtower to atlas, then opens and arms a roll PR bumping to the next patch.
+- Master's `Cargo.toml` always holds the NEXT version; a minor/major bump is made by hand in the PR that warrants it.
+- `:latest` = last release; `:dev` = every master merge.
+
 **`pr-manual-release`**, per the knowledge base: `dev/tools/repo-workflow-patterns.md`
 (policy) and `dev/tools/merge-train-pattern.md` (mechanics; the copy-from reference is
 `St0nefish/template-pr-manual-release`). `master` takes no direct pushes and is
