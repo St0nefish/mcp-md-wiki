@@ -1,7 +1,7 @@
 # Changelog
 
-Releases are cut by the owner running `.github/workflows/release.yml`, which tags the
-version in `Cargo.toml` and promotes the already-tested image.
+Releases are cut by the owner publishing a GitHub release `v<Cargo.toml version>`;
+`.github/workflows/release.yml` then promotes the already-tested image.
 The container image `ghcr.io/st0nefish/mcp-md-wiki` has three kinds of tag: `:latest`
 is the most recent release, `:vX.Y.Z` pins one release, and `:dev` follows `master`.
 This file tracks notable, operator-relevant changes: unreleased ones under
@@ -13,6 +13,18 @@ included an automated multi-agent documentation and correctness audit that close
 roughly forty issues across security hardening, indexing correctness, and doc drift.
 
 ## [Unreleased]
+
+### Release process
+
+- **Releases are GitHub releases the owner creates; PRs no longer queue.** A release
+  is now `gh release create vX.Y.Z --target <commit>` (the version in `Cargo.toml` at
+  that commit) instead of `gh workflow run release.yml`; the workflow validates it,
+  promotes the commit's tested `:sha-<commit>` image to `:vX.Y.Z` and `:latest`,
+  attaches `mcp-md-wiki-linux-amd64` (now with a `SHA256SUMS` file), deploys, and
+  rolls `master` to the next patch version. PRs are no longer serialized through a
+  merge train: each is tested merged onto `master` as of its test, and a merge whose
+  tree nobody tested is tested again on `master` before it gets an image. Image tags
+  are unchanged.
 
 ## [0.2.0] - 2026-10-07
 
