@@ -77,53 +77,63 @@ Check each claim against the code rather than the plan that preceded it. Code co
 
 ## Workflow
 
-**Merge train (serialized, test-once)**, per the knowledge base:
-`dev/tools/merge-train-pattern.md` (it replaces the PR gate and post-merge
-re-test of Pattern C in `dev/tools/repo-workflow-patterns.md`). `master` takes
-no direct pushes and is protected by a repo **ruleset** (not classic branch
-protection): direct push disabled, status checks required.
+**`pr-manual-release`**, per the knowledge base: `dev/tools/repo-workflow-patterns.md`
+(policy) and `dev/tools/merge-train-pattern.md` (mechanics; the copy-from reference is
+`St0nefish/template-pr-manual-release`). `master` takes no direct pushes and is
+protected by a repo **ruleset** (not classic branch protection). **A merge ships
+nothing durable** (`:dev` and immutable dev tags move); **a release is a manual act by
+the owner**, and no version change ever creates one.
+
+```text
+PR opened ───────────► ci-fast   (ci-fast.yml: actionlint, shellcheck; fmt, clippy, audit,
+                                  cargo test when a code path changed)
+auto-merge armed ────► ci-slow   (slow-trigger.yml -> slow.yml from master: waits for ci-fast,
+                                  merges head onto master, live-Qdrant suite + image
+                                  :tree-<tree>, posts the ci-slow status naming the tree)
+both green ──────────► GitHub merges (merge commit, as the App that armed it)
+push to master ──────► master.yml: tree tested -> :sha-<commit>, :x.y.z-dev.N, :dev, `verified`;
+                                  untested tree -> both tiers + build first (fallback);
+                                  docs-only -> inherits the parent's :sha- and `verified`
+owner: gh release create vX.Y.Z --target <full sha> --title vX.Y.Z --notes ""
+release: published ──► release.yml: check -> :vX.Y.Z + :latest, binary, notes -> Watchtower
+                                  on atlas -> arm64 build + roll PR (next patch), as the App
+```
 
 - Work on a branch and open a PR against `master`. Opening an owner PR arms
-  merge-commit auto-merge (`auto-merge.yml`, as the GitHub App, owner-authored PRs
-  only), and **an armed PR is a queued PR**. Arming fires `train-trigger.yml`
-  (`pull_request_target`, which only runs `gh workflow run train.yml --ref
-  master`), and so does a push to an armed PR. A contributor's PR is never
-  armed automatically: the owner arming it is the approval and the merge
-  trigger in one act.
-- `train.yml` runs one PR at a time (concurrency group `train`, never
-  cancelled, always master's copy of the workflow): it takes the oldest armed
-  PR whose current head has no train status, pins that head and current
-  `master`, squashes the head onto `master` locally
-  (`.github/scripts/train-squash.sh`, fixed identity and dates, so every job
-  rebuilds the identical commit and asserts its tree), and tests exactly that
-  tree. The fast tier (`checks.yml` `lint` + `test`) posts `ci-fast`; then the
-  slow tier runs in parallel (`checks.yml` `qdrant-integration`, and
-  `build-image.yml`, which builds the `linux/amd64` image, smoke-tests it and tags
-  it `:tree-<tree hash>`) and `ci-slow` is posted. GitHub's auto-merge then
-  merges the PR (merge commit), and the train waits for that before dispatching the
-  next run. Every status the train posts carries the run as its target URL and
-  a `train:` description. A conflict with `master`, a failure, a cancellation
-  or a merge that does not happen within 10 minutes turns both statuses
-  `failure` and comments on the PR. A failed head is not retried until it
-  changes: push a fix (the new head re-queues), or re-test the same head after
-  a flaky failure with `gh workflow run train.yml --ref master -f pr=<n>`. A
-  15-minute schedule restarts the queue after a run that died; each run first
-  resets any train `success`/`pending` left on an armed head by such a run.
-- A PR that touches no code path (`.github/scripts/code-paths.sh`, the one
-  list the train, `master.yml` and `pr-fast.yml` share; a change that only
-  moves this crate's own version in `Cargo.toml`/`Cargo.lock` does not count)
-  still queues, so it lands in order, but the train posts both statuses green
-  without running anything.
-- **Required checks.** The ruleset requires exactly `ci-fast` + `ci-slow`,
-  statuses only `train.yml` posts. There is no per-PR gate workflow: a PR is
-  tested once, by the train, on its squash onto `master`. Never list individual
-  job names as required checks.
-- `pr-fast.yml` gives PRs the owner did not open (and that no bot opened) the
-  fast tier on GitHub-hosted runners, as the non-required `pr-fast` check — an
-  unreviewed PR's code never runs on the self-hosted runners, and it cannot
-  start the slow tier.
+  merge-commit auto-merge (`auto-merge.yml`, as the `stonefish-ci` GitHub App,
+  owner-authored PRs only — never `GITHUB_TOKEN`, whose events start no workflow). A
+  contributor's PR is never armed automatically: the owner arming it is the approval
+  to run `ci-slow` on it.
+- **Required checks: exactly `ci-fast` and `ci-slow`**, both pinned to GitHub Actions
+  (integration 15368). `ci-fast` is the fan-in job of `ci-fast.yml` (`pull_request`,
+  the PR's own copy): lint always, the `checks.yml` fast tier when a code path
+  changed — on the self-hosted runners for the owner's same-repo PRs, on
+  GitHub-hosted ones for everyone else's, so an unreviewed PR's code never runs on the
+  self-hosted runners. `ci-slow` is a **commit status** posted only by `slow.yml`,
+  which `slow-trigger.yml` (`pull_request_target`, master's copy) dispatches with
+  `--ref master` when a PR is armed or an armed PR gets a new head: a PR cannot change
+  how it is slow-tested, and a skipped job can never satisfy it. `slow.yml` waits for
+  `ci-fast` on the same head (red `ci-fast` -> `ci-slow` failure, nothing built),
+  merges the head onto current `master` (`.github/scripts/merge-tree.sh`, fixed
+  identity and dates, so every job rebuilds the identical tree and asserts it), runs
+  `checks.yml` `qdrant-integration` and `build-image.yml` (build, smoke test,
+  `:tree-<tree hash>`) on it, and posts `ci-slow` naming the full tree. A conflict or
+  failure posts `failure` and comments on the PR. Re-test a head (a flaky failure, or
+  `ci-fast` re-run green after `ci-slow` failed on it):
+  `gh workflow run slow.yml --ref master -f pr=<n>`. Never list individual job names
+  as required checks.
+- **Not serialized.** PRs land in parallel; `ci-slow` certifies the merge onto
+  `master` *as of the test*. If another PR lands first, the merge commit's tree is one
+  nobody tested and `master.yml` runs both tiers on it before attaching `:sha-` (the
+  fallback). Every `:sha-` image — the only thing a release promotes — was tested on
+  its exact tree; master itself can briefly hold an untested combination.
+- A PR that touches no code path (`.github/scripts/code-paths.sh`, the one list
+  `ci-fast.yml`, `slow.yml` and `master.yml` share; a change that only moves this
+  crate's own version in `Cargo.toml`/`Cargo.lock` does not count; Markdown under
+  `assets/` does, it is compiled in) gets both checks green without a build.
 - Merges are **merge commits only** (`allow_squash_merge: false`,
-  `allow_rebase_merge: false`), titled `Merge pull request #<number> from <branch>`; read history with `git log --first-parent`.
+  `allow_rebase_merge: false`), titled `Merge pull request #<number> from <branch>`;
+  read history with `git log --first-parent`.
 - **Auto-merge is the workflow, not an escalation.** An owner PR landing on
   green CI without a human reading the diff first is the intended, configured
   behavior — CI is the gate. Do not disable auto-merge on a PR, do not open
@@ -134,97 +144,99 @@ protection): direct push disabled, status checks required.
   fix is to say so and not open the PR yet — not to open one and hold it.
 - The ruleset's required-status-checks rule has
   `strict_required_status_checks_policy: false` — PR branches do **not** need
-  to be up to date with `master` before merging, and must not: the train tests
-  the squash onto current `master`, not the head, so the head stays behind
-  `master` by design and the strict flag would block every merge.
-  Serialization comes from the train instead. **Do not routinely rebase a PR
+  to be up to date with `master` before merging, and must not: `ci-slow` tests the
+  merge onto current `master`, not the head. **Do not routinely rebase a PR
   branch just because `master` moved, and do not add a bot that
-  force-pushes/rebases open PRs when `master` advances.** Rebase only to
-  resolve a real conflict (the train reports it on the PR).
-- On every push to `master`, `master.yml` attaches the train's image to the
-  merge commit — no build, no tests: it looks up `:tree-<the commit's tree>`
-  and adds `:sha-<commit>` and `:<x.y.z>-dev.<n>` to that digest, and moves
-  `:dev` if the commit is still master's tip. A code-path merge with no
-  `:tree-` image (one that bypassed the train, or a server-side merge that
-  differs from the train's) gets a warning and the fallback: full `checks.yml`, then
-  `build-image.yml` on the commit. A docs-only or version-roll merge gets no
-  image, and `:dev` stays where it is. **A merge deploys nothing:** it never
-  touches `:latest` or Watchtower.
-- **Watching a PR** covers the train run that tests it (`select` → `fast` →
-  `slow-integration`/`slow-image` → `land` → `finish`), the merge, and
-  `master.yml` on the merge commit, each reported by its own outcome, not just
-  "merged". A green `master.yml` run that tagged an image is the signal the
-  commit is releasable (it has its `:sha-<commit>` image). **Watching a
-  release** is a separate watch: `release.yml`'s `resolve` → `check` →
-  `verify-smoke` (/ `verify-full`) → `release` → `roll` + `arm64`, and it is not
-  done until Watchtower reports `failed: 0`, `:latest` actually moved to the new
-  digest, the roll PR (if any) is armed, and the `arm64-image.yml` run it
-  dispatched has tagged `:latest-arm64`.
+  force-pushes/rebases open PRs when `master` advances.** Merge `master` in only to
+  resolve a real conflict (`ci-slow` reports it on the PR).
+- On every push to `master`, `master.yml` classifies the commit: **tested** (the PR
+  head's `ci-slow` names this commit's tree: `:tree-<tree>` gets `:sha-<commit>` and
+  `:<x.y.z>-dev.<n>`, no build, no tests), **fallback** (a code change whose tree
+  nobody tested: full `checks.yml`, then `build-image.yml`, then the tags), **inherit**
+  (docs-only, version unchanged: the parent's `:sha-` digest), or **none** (version
+  moved without code — the roll PR, a hand bump: nothing). `:dev` moves only if the
+  commit is still master's tip. It posts the `verified` status on every tested tree
+  and closes roll PRs a hand minor/major bump made obsolete. Re-process a commit:
+  `gh workflow run master.yml --ref master -f sha=<commit>`. **A merge deploys
+  nothing:** it never touches `:latest` or Watchtower.
+- **Watching a PR** covers `ci-fast`, the `slow.yml` run that posts `ci-slow`
+  (`prepare` → `integration`/`image` → `report`), the merge, and `master.yml` on the
+  merge commit, each reported by its own outcome, not just "merged". A green
+  `master.yml` run with `:sha-<commit>` and `verified` is the signal the commit is
+  releasable. **Watching a release** is a separate watch: `release.yml`'s `check` →
+  `image`/`binaries`/`notes` → `deploy` → `arm64` + `roll`, and it is not done until
+  Watchtower reports `failed: 0`, `:latest` actually moved to the new digest, the roll
+  PR (if any) has merged, and the `arm64-image.yml` run it dispatched has tagged
+  `:latest-arm64`.
 - `fix #N` in the merge commit auto-closes GitHub issues.
 - Branches auto-delete after merge.
 - Pre-commit hook enforces `cargo fmt` + `cargo clippy` (activate with
   `./scripts/setup-dev.sh` after cloning).
 - **No need to batch PRs to save builds or restarts.** Merging does not
-  deploy, so several small PRs cost only their train runs (queued PRs wait
-  for each other's full pipeline — the accepted cost of testing once); only a
-  release restarts the live service.
+  deploy; only a release restarts the live service.
 
 ### Releasing
 
-`Cargo.toml`'s version on `master` is always the **next** release; the tag is
-derived from it, never typed. A change that warrants a minor or major bump
-raises the version in its own PR before it merges; patch bumps are automatic.
-The release itself is one owner-only step, and nothing else moves `:latest`:
+`Cargo.toml`'s version on `master` is always the **next** release. A change that
+warrants a minor or major bump raises the version in its own PR (`Cargo.toml` +
+`Cargo.lock`); patch bumps are automatic (the roll PR). The release is one owner-only
+step, and nothing else moves `:latest`:
 
 ```bash
-gh workflow run release.yml --ref master                  # release what :dev names
-gh workflow run release.yml --ref master -f sha=<commit>  # or one master commit
-# add -f full_tests=true to re-run the whole checks.yml first
+gh release create vX.Y.Z --target <full master sha> --title vX.Y.Z --notes ""
 ```
 
-`release.yml` (trigger: `workflow_dispatch` only; concurrency `release`, never
-cancelled) never builds; it promotes the train's tested image. `resolve` pins
-the commit and digest (`:dev`'s digest and the newest master commit whose tree
-is that image's `revision` label, or the given `sha` and its `:sha-<commit>`
-digest; `:sha-<commit>` must name the pinned digest either way). `check` fails
-unless the owner started the run (`github.triggering_actor`), the commit is on
-`master`, `v<Cargo.toml version>` is either absent and would be the highest
-stable `v*` tag or already points at this commit (a resumed release), and the
-commit's `CHANGELOG.md` `[Unreleased]` section is non-empty. `verify-smoke`
-smoke-tests the pinned digest (`verify-full` runs `checks.yml` too, with
-`full_tests`). `release` (environment `release`, self-hosted) creates the tag
-and the release at the commit as the GitHub App (the `[Unreleased]` section is
-the notes), uploads `mcp-md-wiki-linux-amd64` copied out of the
-image, re-checks that the tag is the highest stable one, retags the digest
-`:vX.Y.Z` and `:latest` (no rebuild) and triggers Watchtower on atlas. `roll`
-then opens `release: roll version to <next>` as the App (patch bump in
-`Cargo.toml`/`Cargo.lock`; `[Unreleased]` becomes `## [X.Y.Z] - <date>` under
-a fresh `[Unreleased]`, link references updated), arms it, and dispatches the
-train; it skips when `master` already moved past the released version, and
-leaves the PR unarmed for the owner when `master`'s `[Unreleased]` changed
-after the released commit. `arm64` dispatches `arm64-image.yml` for the
-released commit as a separate run (the release does not wait for it, and an
-arm64 failure does not fail the release). No `:sha-<commit>` image means no
-release.
+`X.Y.Z` = `Cargo.toml`'s version at that commit. Target the full sha (not `master`). A
+commit is releasable when it has `:sha-<commit>` and the `verified` status: every code
+merge, and a docs-only commit on top of one (it inherits). A version-only commit (the
+roll PR, a hand bump) is not — there is nothing new to release. `--notes ""` leaves
+the body empty for `CHANGELOG.md`'s `[Unreleased]` section to fill; a body the owner
+writes (or `--generate-notes`) is kept as is.
 
-Recovery: every step is idempotent — a transient failure is
-`gh run rerun <id> --failed`, or dispatch again with the same `sha`. If the
-released commit is genuinely broken, merge the fix and release that.
+`release.yml` (`release: published` only, concurrency `release-<tag>`, never cancelled,
+runs the tagged commit's copy, never builds): `check` fails closed unless the sender is
+in `RELEASE_SENDERS` (`St0nefish`), the release is not a draft/prerelease, the tag is
+`vX.Y.Z` == `Cargo.toml` at the tagged commit == the run's commit, the commit is on
+`master`, the tag is the highest stable `v*` tag, `CHANGELOG.md`'s `[Unreleased]` is
+non-empty, `:sha-<commit>` exists and the commit carries `verified` success. Then:
+`image` (environment `release`, self-hosted) smoke-tests the digest, re-checks the
+highest tag, and retags it `:vX.Y.Z` + `:latest` (no rebuild, read back); `binaries`
+uploads `mcp-md-wiki-linux-amd64` copied out of the image plus `SHA256SUMS`; `notes`
+fills an empty body from `[Unreleased]` (GitHub's generated notes if that were empty);
+`deploy` (self-hosted, `WATCHTOWER_ATLAS_TOKEN`) pulls `:latest` and pokes Watchtower
+on atlas, failing on `updated=0` unless `:latest` did not move; `arm64` dispatches
+`arm64-image.yml` for the released commit as a separate run; `roll` (only when every
+other job succeeded) opens `release: roll version to <next>` as the App (patch bump in
+`Cargo.toml`/`Cargo.lock`; `[Unreleased]` becomes `## [X.Y.Z] - <date>` under a fresh
+`[Unreleased]`, link references updated) and arms it; it lands through both checks
+without a build. `roll` skips when `master` already moved past the released version,
+and leaves the PR unarmed for the owner when `master`'s `[Unreleased]` changed after
+the released commit.
+
+Recovery: every job is idempotent — a transient failure is `gh run rerun <id> --failed`.
+If the released commit is genuinely broken: `gh release delete vX.Y.Z --cleanup-tag`,
+merge the fix (master still holds `X.Y.Z`: `roll` runs only after everything shipped),
+release again.
+
+**Why only the owner can cause a release:** ruleset `release-tags` (`refs/tags/v*`:
+creation, update, deletion, non-fast-forward restricted; bypass: repository admin
+only), environment `release` (deployment policy: `v*` tags only; holds
+`WATCHTOWER_ATLAS_TOKEN`), and `check`'s sender test.
 
 Image tags (`ghcr.io/st0nefish/mcp-md-wiki`, `linux/amd64` only, all one digest
-per tested tree):
+per tested tree). Consumers pick `:dev` (every merge) or `:latest` (releases only):
 
 | Tag | Set by | Meaning |
 |---|---|---|
-| `:tree-<tree hash>` | `train.yml` (`build-image.yml`) | The build of a tested squash, after its smoke test; labels: `revision` = the tree hash, `version` = `Cargo.toml`'s version |
-| `:sha-<full commit sha>` | `master.yml` | Immutable; the merge commit's image; what `release.yml` resolves |
+| `:tree-<tree hash>` | `build-image.yml` (from `slow.yml` or `master.yml`) | The smoke-tested build of a tree; labels: `revision` = the tree hash, `version` = `Cargo.toml`'s version |
+| `:sha-<full commit sha>` | `master.yml` | Immutable; the tested image of that master commit; what `release.yml` promotes |
 | `:<x.y.z>-dev.<n>` | `master.yml` | Immutable; x.y.z = `Cargo.toml`'s version (the next release), n = first-parent commits (one per merged PR) since the latest release tag |
 | `:dev` | `master.yml` | Newest master commit that has an image (only master's tip moves it) |
-| `:latest` | `release.yml` | Most recent release; the only tag Watchtower deploys |
-| `:vX.Y.Z` | `release.yml` | Pins one release |
-| `:sha-<commit>-arm64`, `:vX.Y.Z-arm64`, `:latest-arm64` | `arm64-image.yml` (dispatched by every release, or by hand) | Single-platform `linux/arm64` builds of a master commit (default: the latest release), smoke-tested but not train-tested; never added to the amd64 tags above, so Watchtower never sees them |
+| `:latest` | `release.yml` | The current release; the only tag Watchtower deploys |
+| `:vX.Y.Z` | `release.yml` | Pins one release (same digest as its `:sha-`) |
+| `:sha-<commit>-arm64`, `:vX.Y.Z-arm64`, `:latest-arm64` | `arm64-image.yml` (dispatched by every release, or by hand) | Single-platform `linux/arm64` builds of a master commit (default: the latest release), smoke-tested but not otherwise tested; never added to the amd64 tags above, so Watchtower never sees them |
 
-`:build-<tag>` (staging) and `:buildcache-<arch>` (cargo-chef layer cache) also
+`:build-tree-<tree>` (staging) and `:buildcache-<arch>` (cargo-chef layer cache) also
 exist but are not images to run.
 
 ## Issue tracking
