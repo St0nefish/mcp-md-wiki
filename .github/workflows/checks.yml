@@ -310,13 +310,15 @@ jobs:
           # per runner, so key the name off it, and export it so the `Stop
           # Qdrant` step (a separate step, with its own shell) removes the same
           # container this one created.
-          name="ci-qdrant-${cid}"
+          name="ci-mcp-md-wiki-${GITHUB_JOB}-qdrant-${cid}"
           echo "CI_QDRANT_NAME=${name}" >> "$GITHUB_ENV"
           docker rm -f "$name" 2>/dev/null || true
           # Image stays single-sourced from docker-compose.yml so the pin
           # can't drift from what the deployment runs.
           image=$(docker compose -f docker-compose.yml config --images qdrant)
-          docker run -d --name "$name" --network "container:${cid}" "$image"
+          docker run -d --name "$name" \
+            --label ci.repo=mcp-md-wiki --label "ci.job=${GITHUB_JOB}" --label "ci.run=${GITHUB_RUN_ID}" \
+            --network "container:${cid}" "$image"
 
       - name: Wait for Qdrant to be ready
         run: |
