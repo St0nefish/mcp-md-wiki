@@ -25,6 +25,14 @@ pub trait EmbedStore: Send + Sync {
 
 pub trait QueryEmbedder: Send + Sync {
     async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>>;
+
+    /// Embed document text on the *document* side of an asymmetric model
+    /// (`embedding.document_prefix`), for callers comparing a text against indexed
+    /// chunks like with like (the write path's dedup gate). The default is
+    /// `embed_query`, right for any embedder with no prefixes.
+    async fn embed_document(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        self.embed_query(text).await
+    }
 }
 
 /// Cloning is cheap: `Client<OpenAIConfig>` and `reqwest::Client` both clone an
@@ -39,9 +47,41 @@ pub struct EmbedClient {
     batch_size: usize,
     batch_concurrency: usize,
     api_key: Option<String>,
+    /// `embedding.query_prefix`, prepended to every query embedded via `embed_query`.
+    query_prefix: String,
+    /// `embedding.document_prefix`, prepended to every text embedded as a document
+    /// (`embed_texts`, `QueryEmbedder::embed_document`).
+    document_prefix: String,
+}
+
+/// Prepend an instruction prefix. An empty prefix leaves the text exactly as it was,
+/// so the default configuration sends what it always did.
+fn with_prefix(prefix: &str, text: &str) -> String {
+    if prefix.is_empty() {
+        text.to_string()
+    } else {
+        format!("{prefix}{text}")
+    }
 }
 
 impl EmbedClient {
+    /// The text actually sent to the model for a query.
+    fn query_input(&self, query: &str) -> String {
+        with_prefix(&self.query_prefix, query)
+    }
+
+    /// Split `texts` into request batches, document prefix applied to each text.
+    fn document_batches(&self, texts: &[String]) -> Vec<Vec<String>> {
+        texts
+            .chunks(self.batch_size)
+            .map(|b| {
+                b.iter()
+                    .map(|t| with_prefix(&self.document_prefix, t))
+                    .collect()
+            })
+            .collect()
+    }
+
     pub fn new(config: &ResolvedEmbeddingConfig) -> Self {
         let api_key = config.api_key.as_deref().unwrap_or("not-needed");
         let openai_config = OpenAIConfig::new()
@@ -76,6 +116,8 @@ impl EmbedClient {
             batch_size: config.batch_size,
             batch_concurrency: config.batch_concurrency,
             api_key: config.api_key.clone(),
+            query_prefix: config.query_prefix.clone(),
+            document_prefix: config.document_prefix.clone(),
         }
     }
 
@@ -129,7 +171,7 @@ impl EmbedClient {
     /// `texts` despite batches completing out of order.
     pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let total = texts.len();
-        let batches: Vec<Vec<String>> = texts.chunks(self.batch_size).map(|b| b.to_vec()).collect();
+        let batches = self.document_batches(texts);
 
         let mut done = 0usize;
         let mut last_progress = std::time::Instant::now();
@@ -278,6 +320,16 @@ impl QueryEmbedder for EmbedClient {
     async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>> {
         EmbedClient::embed_query(self, q).await
     }
+
+    async fn embed_document(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        let results = self
+            .embed_batch(&[with_prefix(&self.document_prefix, text)], 0)
+            .await?;
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No embedding returned for document text"))
+    }
 }
 
 impl EmbedClient {
@@ -301,7 +353,7 @@ impl EmbedClient {
         // Goes straight to `embed_batch`, bypassing `embed_texts`' progress reporting:
         // searches run concurrently with indexing and must not be counted as indexing
         // work. See the note on `embed_texts`.
-        let results = self.embed_batch(&[query.to_string()], 0).await?;
+        let results = self.embed_batch(&[self.query_input(query)], 0).await?;
         results
             .into_iter()
             .next()
@@ -495,6 +547,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let client = EmbedClient::new(&config);
         assert_eq!(client.api_key.as_deref(), Some("sk-test-key-123"));
@@ -510,9 +564,58 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let client = EmbedClient::new(&config);
         assert!(client.api_key.is_none());
+    }
+
+    fn prefixed_client(query: &str, document: &str) -> EmbedClient {
+        EmbedClient::new(&crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "m".into(),
+            api_key: None,
+            vector_size: 8,
+            batch_size: 2,
+            request_timeout_secs: 5,
+            batch_concurrency: 1,
+            query_prefix: query.into(),
+            document_prefix: document.into(),
+        })
+    }
+
+    #[test]
+    fn query_prefix_applies_to_queries_only() {
+        let c = prefixed_client("query: ", "passage: ");
+        assert_eq!(c.query_input("how"), "query: how");
+    }
+
+    #[test]
+    fn document_prefix_applies_to_every_batched_text() {
+        let c = prefixed_client("query: ", "passage: ");
+        let texts: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            c.document_batches(&texts),
+            vec![
+                vec!["passage: a".to_string(), "passage: b".to_string()],
+                vec!["passage: c".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_prefixes_are_a_no_op() {
+        let c = prefixed_client("", "");
+        assert_eq!(c.query_input("how"), "how");
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            c.document_batches(&texts),
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string()]
+            ]
+        );
     }
 
     #[test]
@@ -525,6 +628,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let client = EmbedClient::new(&config);
         // The health_check URL should not have a double slash

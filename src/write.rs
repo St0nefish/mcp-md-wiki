@@ -1520,6 +1520,16 @@ async fn validate_document<E: QueryEmbedder, Q: RetrievalStore>(
     Ok(validated)
 }
 
+/// Adapter that routes `embed_query` to the wrapped embedder's `embed_document`,
+/// so the dedup search embeds like with like against the indexed chunks.
+struct DocumentSideEmbedder<'a, E: QueryEmbedder>(&'a E);
+
+impl<E: QueryEmbedder> QueryEmbedder for DocumentSideEmbedder<'_, E> {
+    async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>> {
+        self.0.embed_document(q).await
+    }
+}
+
 /// The create-path dedup gate: refuse when an existing document is a near
 /// duplicate of `validated`. Runs before the lock — it embeds and queries
 /// Qdrant, which can take a while — and only for a create, whose content is fixed.
@@ -1557,8 +1567,11 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
     }
     // Detach the reranker: `dedup_threshold` is a cosine similarity, and a
     // cross-encoder relevance score is not comparable to it.
+    // Embed on the document side: the text is compared against indexed chunks, so it
+    // takes `embedding.document_prefix`, not the query prefix.
+    let document_side = DocumentSideEmbedder(deps.retrieval.embed_client);
     let dedup_deps = RetrievalDeps {
-        embed_client: deps.retrieval.embed_client,
+        embed_client: &document_side,
         qdrant: deps.retrieval.qdrant,
         collection: deps.retrieval.collection,
         data_path: deps.retrieval.data_path,
@@ -5255,6 +5268,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
         (embed, qdrant)
@@ -10653,5 +10668,21 @@ mod tests {
         // as the single-document move's equivalent test above.
         assert!(!tmp.path().join("new-dir-no-repo/a.md").exists());
         assert!(!sub.join("a.md").exists());
+    }
+
+    #[tokio::test]
+    async fn document_side_embedder_routes_query_calls_to_embed_document() {
+        struct Split;
+        impl QueryEmbedder for Split {
+            async fn embed_query(&self, _q: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![1.0])
+            }
+            async fn embed_document(&self, _t: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![2.0])
+            }
+        }
+        let inner = Split;
+        let adapter = DocumentSideEmbedder(&inner);
+        assert_eq!(adapter.embed_query("x").await.unwrap(), vec![2.0]);
     }
 }

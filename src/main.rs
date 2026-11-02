@@ -19,6 +19,7 @@ mod server;
 mod sparse;
 mod state;
 mod status;
+mod sync;
 mod tool_schema;
 mod validate;
 mod web;
@@ -147,6 +148,13 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
+    /// Fetch and fast-forward the existing KB clone from its remote, then index what changed
+    ///
+    /// The same fetch + ff-only merge the push webhook and `POST /admin/sync` run
+    /// (needs `source.git_url`; the token comes from `source.git_token_env`). With no
+    /// worker in this process, the pull is followed by the `index` subcommand's
+    /// incremental reconcile, which picks up exactly the files the pull changed.
+    GitPull,
     /// Validate all markdown files without indexing
     Validate {
         /// Exit non-zero if any file fails validation, regardless of config strict setting
@@ -312,6 +320,30 @@ async fn main() -> anyhow::Result<()> {
                     .context("Failed to create directory for state DB")?;
             }
             ingest::scan_and_index(&cfg, full, status::Trigger::Cli).await?;
+        }
+        Commands::GitPull => {
+            let token = secrets::git_token(&cfg).context("Failed to resolve the git token")?;
+            let pulled = sync::pull_clone(&cfg, token.as_deref()).await?;
+            if pulled.old_head == pulled.new_head {
+                println!("Already up to date at {}", pulled.new_head);
+            } else {
+                println!(
+                    "Updated {} -> {} ({} changed paths)",
+                    pulled.old_head,
+                    pulled.new_head,
+                    pulled.changed.len()
+                );
+            }
+            // No worker here, so index synchronously. The incremental reconcile
+            // stat/hash-compares the corpus against the state DB, which finds exactly
+            // what the pull changed (and anything an earlier failed run missed), so the
+            // diff's path list is not needed.
+            let db_path = cfg.state_db_path();
+            if let Some(parent) = std::path::Path::new(&db_path).parent() {
+                std::fs::create_dir_all(parent)
+                    .context("Failed to create directory for state DB")?;
+            }
+            ingest::scan_and_index(&cfg, false, status::Trigger::Cli).await?;
         }
         Commands::Validate { strict, json } => {
             let data_path = Path::new(cfg.data_path());
