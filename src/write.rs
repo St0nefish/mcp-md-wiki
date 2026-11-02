@@ -717,6 +717,28 @@ pub(crate) fn check_include_pattern_against(
     }
 }
 
+/// The include-only half of [`check_include_pattern_against`], for the side of a
+/// write that only ever LEAVES the index: the source of a move and the target of
+/// a delete. A document sitting in an excluded directory must stay movable out of
+/// it and deletable (#312 refuses writes that would land in excluded paths, not
+/// cleanup of what is already there).
+fn check_include_only<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    rel_path: &str,
+) -> Result<(), WriteError> {
+    let normalized = crate::retrieval::kb_root_relative(rel_path);
+    if deps.retrieval.include_patterns.is_match(normalized) {
+        return Ok(());
+    }
+    Err(WriteError::UnsafePath {
+        msg: format!(
+            "path '{}' does not match any indexable include pattern \
+             (e.g. must be a markdown file under an included path)",
+            rel_path
+        ),
+    })
+}
+
 fn check_include_pattern<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     rel_path: &str,
@@ -2077,7 +2099,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     //    particular before a configured validation.lint_command exec).
     check_not_schema_file(source_rel)?;
     check_not_schema_file(dest_rel)?;
-    check_include_pattern(deps, source_rel)?;
+    check_include_only(deps, source_rel)?;
     check_include_pattern(deps, dest_rel)?;
     safe_write_path(deps, source_rel)?;
     safe_write_path(deps, dest_rel)?;
@@ -3716,7 +3738,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     let mut originals: Vec<(String, String)> = Vec::new();
 
     for (old_rel, new_rel) in &moves {
-        check_include_pattern(deps, old_rel)?;
+        check_include_only(deps, old_rel)?;
         check_include_pattern(deps, new_rel)?;
         let abs_source_doc = safe_write_path(deps, old_rel)?;
         let abs_dest_doc = safe_write_path(deps, new_rel)?;
@@ -4420,7 +4442,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     // Schema-file guard, then include-pattern eligibility guard, then the early
     // path-safety check, ahead of everything else — see `write_document`.
     check_not_schema_file(rel_path)?;
-    check_include_pattern(deps, rel_path)?;
+    check_include_only(deps, rel_path)?;
     safe_write_path(deps, rel_path)?;
 
     // Validate the commit message BEFORE deleting anything: rejecting it after
@@ -6137,8 +6159,13 @@ mod tests {
             )
             .await,
         );
-        // Delete of an excluded path.
-        expect_excluded(delete_document(&harness.deps(), "README.md", None, None).await);
+        // Delete of an excluded path is NOT refused by this gate: cleaning up a
+        // document already sitting in an excluded path must stay possible (it
+        // gets past eligibility and stops at the missing version).
+        assert!(matches!(
+            delete_document(&harness.deps(), "README.md", None, None).await,
+            Err(WriteError::VersionRequired)
+        ));
 
         assert_eq!(head_sha(&work), head_before, "nothing is committed");
         assert!(harness.reindex_queue.snapshot_paths().is_empty());

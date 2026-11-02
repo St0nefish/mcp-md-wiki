@@ -15232,7 +15232,7 @@ mod tests {
         assert!(related_json(&[]).is_none());
         let json = related_json(&[crate::write::RelatedDocument {
             path: "a.md".into(),
-            score: 0.723_456_79,
+            score: 0.723_456_8,
         }])
         .unwrap();
         assert_eq!(json[0]["path"], "a.md");
