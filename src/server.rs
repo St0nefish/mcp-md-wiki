@@ -2917,6 +2917,8 @@ mod tests {
                 batch_size: 32,
                 request_timeout_secs: 60,
                 batch_concurrency: 4,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 // Port 1 refuses immediately rather than hanging the test.
@@ -4250,6 +4252,8 @@ mod tests {
             batch_size: 1,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         });
 
         let state = HealthState {
@@ -5269,6 +5273,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 
@@ -5491,6 +5497,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 

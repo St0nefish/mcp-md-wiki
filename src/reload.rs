@@ -486,6 +486,30 @@ const DIFF_TABLE: &[DiffField] = &[
                    EmbedClient::new).",
         }],
     },
+    DiffField {
+        path: "embedding.query_prefix",
+        get: |c| Some(d(&c.embedding.query_prefix)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "embedding.query_prefix",
+            note: "EmbedClient captures this at construction (embed.rs \
+                   EmbedClient::new). reload_config keeps the running value in the \
+                   live config so it cannot drift from the client until restart.",
+        }],
+    },
+    DiffField {
+        path: "embedding.document_prefix",
+        get: |c| Some(d(&c.embedding.document_prefix)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "embedding.document_prefix",
+            note: "EmbedClient captures this at construction (embed.rs \
+                   EmbedClient::new) and ingest::indexing_fingerprint folds it in, so \
+                   after the restart the next reconcile re-embeds every file. \
+                   reload_config keeps the running value in the live config so the \
+                   fingerprint never gets ahead of the client.",
+        }],
+    },
     // ── validation ───────────────────────────────────────────────────────────
     DiffField {
         path: "validation.enabled",
@@ -1211,9 +1235,15 @@ pub fn reload_config(
     shared: &SharedConfig,
     queue: &crate::reindex::ReindexQueue,
 ) -> anyhow::Result<ReloadReport> {
-    let new = Config::load(path)?;
+    let mut new = Config::load(path)?;
     let old = crate::config::load_shared_config(shared);
     let report = diff(&old, &new);
+    // The embedding prefixes are baked into the startup-built `EmbedClient`, and the
+    // document prefix is part of the indexing fingerprint. Keep the running values in
+    // the live config so a reload cannot stamp files with a prefix the client is not
+    // yet sending; the change is reported `restart_required` and lands on restart.
+    new.embedding.query_prefix = old.embedding.query_prefix.clone();
+    new.embedding.document_prefix = old.embedding.document_prefix.clone();
     crate::config::store_shared_config(shared, new);
     queue.mark_full();
     Ok(report)
@@ -1350,6 +1380,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_embedding_prefix_reload_is_restart_required_and_not_applied_live() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "chunking:\n  max_chunk_size: 1000\n");
+        let running = Config::load(&path).unwrap();
+        assert_eq!(running.embedding.document_prefix, "");
+        let shared = crate::config::shared_config(std::sync::Arc::new(running));
+
+        write_config(
+            tmp.path(),
+            "chunking:\n  max_chunk_size: 1000\nembedding:\n  query_prefix: \"query: \"\n  document_prefix: \"passage: \"\n",
+        );
+        let queue = crate::reindex::ReindexQueue::new();
+        let report = reload_config(&path, &shared, &queue).unwrap();
+        let names: Vec<&str> = report
+            .restart_required
+            .iter()
+            .map(|c| c.setting.as_str())
+            .collect();
+        assert!(names.contains(&"embedding.query_prefix"), "{names:?}");
+        assert!(names.contains(&"embedding.document_prefix"), "{names:?}");
+
+        let live = crate::config::load_shared_config(&shared);
+        assert_eq!(live.embedding.query_prefix, "");
+        assert_eq!(live.embedding.document_prefix, "");
+
+        clear_required_env();
     }
 
     #[test]

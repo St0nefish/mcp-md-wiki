@@ -537,6 +537,8 @@ mod tests {
                 batch_size: 32,
                 request_timeout_secs: 60,
                 batch_concurrency: 4,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 url: "http://localhost:6334".into(),

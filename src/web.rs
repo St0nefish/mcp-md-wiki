@@ -1819,6 +1819,8 @@ mod tests {
                 batch_size: 1,
                 request_timeout_secs: 5,
                 batch_concurrency: 1,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 // Port 1 refuses immediately rather than hanging a test that

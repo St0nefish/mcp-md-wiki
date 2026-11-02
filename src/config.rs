@@ -319,6 +319,17 @@ pub struct EmbeddingConfig {
     /// no env var override.
     #[serde(default = "default_batch_concurrency")]
     pub batch_concurrency: usize,
+    /// Instruction prefix prepended to every search query before it is embedded, for
+    /// asymmetric models (e5: `"query: "`, nomic: `"search_query: "`). Default empty =
+    /// no prefix. Part of the vector contract with `document_prefix`; YAML-only.
+    #[serde(default)]
+    pub query_prefix: String,
+    /// Instruction prefix prepended to every chunk (and dedup-gate document text)
+    /// before it is embedded (e5: `"passage: "`, nomic: `"search_document: "`).
+    /// Default empty. Folded into the per-file indexing fingerprint, so changing it
+    /// re-embeds the corpus on the next reconcile. YAML-only.
+    #[serde(default)]
+    pub document_prefix: String,
 }
 
 impl Default for EmbeddingConfig {
@@ -328,6 +339,8 @@ impl Default for EmbeddingConfig {
             batch_size: default_batch_size(),
             request_timeout_secs: default_request_timeout_secs(),
             batch_concurrency: default_batch_concurrency(),
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         }
     }
 }
@@ -1245,6 +1258,8 @@ pub struct ResolvedEmbeddingConfig {
     pub batch_size: usize,
     pub request_timeout_secs: u64,
     pub batch_concurrency: usize,
+    pub query_prefix: String,
+    pub document_prefix: String,
 }
 
 /// Resolved Qdrant config — `url` is guaranteed present.
@@ -1356,6 +1371,8 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("embedding.batch_size", "embedding"),
     ("embedding.request_timeout_secs", "embedding"),
     ("embedding.batch_concurrency", "embedding"),
+    ("embedding.query_prefix", "embedding"),
+    ("embedding.document_prefix", "embedding"),
     ("validation.enabled", "validation"),
     ("validation.strict", "validation"),
     ("validation.lint_command", "validation"),
@@ -2075,6 +2092,8 @@ impl Config {
                 batch_size: self.embedding.batch_size,
                 request_timeout_secs: self.embedding.request_timeout_secs,
                 batch_concurrency: self.embedding.batch_concurrency,
+                query_prefix: self.embedding.query_prefix.clone(),
+                document_prefix: self.embedding.document_prefix.clone(),
             },
             qdrant: ResolvedQdrantConfig {
                 url: qdrant_url,
@@ -2828,6 +2847,8 @@ mcp:
                 batch_size: 32,
                 request_timeout_secs: 60,
                 batch_concurrency: 4,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
             qdrant: ResolvedQdrantConfig {
                 url: "http://qdrant:6334".into(),
@@ -3434,6 +3455,8 @@ mcp:
                 batch_size: 32,
                 request_timeout_secs: 60,
                 batch_concurrency: 4,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
             qdrant: ResolvedQdrantConfig {
                 url: "http://qdrant:6334".into(),
