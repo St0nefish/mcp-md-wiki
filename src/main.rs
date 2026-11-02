@@ -7,6 +7,7 @@ mod eval;
 mod git;
 mod heading;
 mod ingest;
+mod lint;
 mod mcp;
 mod qdrant;
 mod reindex;
@@ -138,6 +139,13 @@ struct GetArgs {
     end_line: Option<usize>,
 }
 
+/// Checks the `lint` subcommand can run.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LintCheck {
+    /// Broken internal markdown links across the corpus
+    DeadLinks,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Start the server (MCP + webhook endpoints) [default]
@@ -172,6 +180,23 @@ enum Commands {
         /// uses, so the JSON on stdout is always parseable on its own.
         #[arg(long)]
         json: bool,
+    },
+    /// Run corpus-wide lint checks against the last indexed state (#354)
+    ///
+    /// Read-only: reads the state DB, never creates it. Findings are reported, not
+    /// failed on: the exit code is 0 whether or not anything is found, and non-zero
+    /// only when there is no state DB to read (run `index` first). That keeps the
+    /// command safe to run from cron or CI without turning link rot into an outage.
+    Lint {
+        /// Which check to run (more will be added; dead-links is the default)
+        #[arg(long, value_enum, default_value_t = LintCheck::DeadLinks)]
+        check: LintCheck,
+        /// Emit the report as JSON on stdout
+        #[arg(long)]
+        json: bool,
+        /// Maximum broken links to list (the true count is always reported)
+        #[arg(long, default_value_t = lint::DEFAULT_DEAD_LINK_LIMIT)]
+        limit: usize,
     },
     /// Print collection stats and state DB info
     Status {
@@ -447,6 +472,25 @@ async fn main() -> anyhow::Result<()> {
             let strict = cfg.validation.strict || strict;
             if invalid_count > 0 && strict {
                 anyhow::bail!("{} file(s) failed validation in strict mode", invalid_count);
+            }
+        }
+        Commands::Lint { check, json, limit } => {
+            let state_db_path = cfg.state_db_path();
+            if !std::path::Path::new(&state_db_path).exists() {
+                anyhow::bail!("no index at {state_db_path}; run `mcp-md-wiki index` first");
+            }
+            let state = state::StateDb::new(std::path::Path::new(&state_db_path)).await?;
+            match check {
+                LintCheck::DeadLinks => {
+                    let limit = limit.clamp(1, lint::MAX_DEAD_LINK_LIMIT);
+                    let report =
+                        lint::dead_links(&state, Path::new(cfg.data_path()), limit).await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        lint::write_dead_links(&mut std::io::stdout().lock(), &report)?;
+                    }
+                }
             }
         }
         Commands::Status { json, files } => {

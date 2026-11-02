@@ -597,6 +597,17 @@ fn target_is_present(data_path: &Path, canonical_root: Option<&Path>, target: &s
 /// target_path`, which is what lets the grouping loop below key off "did the
 /// source change from the previous pair" instead of a hash map.
 pub fn broken_links_report(pairs: Vec<(String, String)>, data_path: &Path) -> BrokenLinksReport {
+    broken_links_report_limited(pairs, data_path, MAX_BROKEN_LINKS_SHOWN)
+}
+
+/// [`broken_links_report`] with a caller-chosen display cap instead of
+/// [`MAX_BROKEN_LINKS_SHOWN`]; `lint` (dead-links check) and `GET /status/links` share
+/// this so they agree with `validate` on what counts as broken.
+pub fn broken_links_report_limited(
+    pairs: Vec<(String, String)>,
+    data_path: &Path,
+    limit: usize,
+) -> BrokenLinksReport {
     // Canonicalized once, not per-pair: every candidate target below is
     // checked for containment against this. `None` (data_path itself doesn't
     // canonicalize — a misconfigured/missing KB root) means containment can
@@ -610,10 +621,10 @@ pub fn broken_links_report(pairs: Vec<(String, String)>, data_path: &Path) -> Br
         .collect();
 
     let total = live.len();
-    let truncated = total > MAX_BROKEN_LINKS_SHOWN;
+    let truncated = total > limit;
 
     let mut by_source: Vec<BrokenLinksBySource> = Vec::new();
-    for (source, target) in live.into_iter().take(MAX_BROKEN_LINKS_SHOWN) {
+    for (source, target) in live.into_iter().take(limit) {
         match by_source.last_mut() {
             Some(entry) if entry.source_path == source => entry.broken_targets.push(target),
             _ => by_source.push(BrokenLinksBySource {

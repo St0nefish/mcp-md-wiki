@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::response::IntoResponse as _;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
@@ -664,6 +665,50 @@ async fn status_handler(State(state): State<StatusState>) -> Json<StatusHttpResp
         phrase_matching_available: crate::status::INDEX_STATUS.phrase_matching_available(),
         status,
     })
+}
+
+/// Query string for `GET /status/links`.
+#[derive(serde::Deserialize)]
+struct LinksQuery {
+    /// Maximum broken links listed; defaults to `lint::DEFAULT_DEAD_LINK_LIMIT`,
+    /// clamped to `1..=lint::MAX_DEAD_LINK_LIMIT`.
+    limit: Option<usize>,
+}
+
+/// `GET /status/links`: the corpus-wide dead-link report (`lint` check `dead-links`,
+/// #354), read-only, behind the same auth as `/status`. 503 when no index exists yet.
+async fn links_handler(
+    State(state): State<StatusState>,
+    axum::extract::Query(q): axum::extract::Query<LinksQuery>,
+) -> Response {
+    let cfg = config::load_shared_config(&state.config);
+    if !Path::new(&cfg.state_db_path()).exists() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no index yet"})),
+        )
+            .into_response();
+    }
+    let limit = q
+        .limit
+        .unwrap_or(crate::lint::DEFAULT_DEAD_LINK_LIMIT)
+        .clamp(1, crate::lint::MAX_DEAD_LINK_LIMIT);
+    let result = async {
+        let db = state.state_db().await?;
+        crate::lint::dead_links(db, Path::new(cfg.data_path()), limit).await
+    }
+    .await;
+    match result {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => {
+            error!("dead-link report failed: {e:#}");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "dead-link report failed"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn metrics_handler(State(state): State<StatusState>) -> Response {
@@ -1744,6 +1789,7 @@ async fn wait_for_indexing_to_settle(is_indexing: impl Fn() -> bool) {
 // free instead of needing a matching edit of its own.
 const STATUS_PATH: &str = "/status";
 const METRICS_PATH: &str = "/metrics";
+const STATUS_LINKS_PATH: &str = "/status/links";
 const ADMIN_RELOAD_PATH: &str = "/admin/reload";
 const ADMIN_SYNC_PATH: &str = "/admin/sync";
 const MCP_PATH: &str = "/mcp";
@@ -1846,7 +1892,7 @@ fn unauthenticated_mcp_warning(bearer_token_env: &str) -> String {
     format!(
         "SECURITY: bearer token env var '{bearer_token_env}' (or '{bearer_token_env}_FILE') is \
          not set — {MCP_PATH}, \
-         {STATUS_PATH}, {METRICS_PATH}, {ADMIN_RELOAD_PATH} and {ADMIN_SYNC_PATH} are all reachable WITHOUT \
+         {STATUS_PATH}, {STATUS_LINKS_PATH}, {METRICS_PATH}, {ADMIN_RELOAD_PATH} and {ADMIN_SYNC_PATH} are all reachable WITHOUT \
          authentication. {MCP_PATH} will serve full document content to any caller; \
          {STATUS_PATH} and {METRICS_PATH} expose tag vocabularies, area names and document \
          counts; {ADMIN_RELOAD_PATH} lets any caller force a config reload and an \
@@ -1941,6 +1987,7 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
     let status_router = Router::new()
         .route(STATUS_PATH, axum::routing::get(status_handler))
         .route(METRICS_PATH, axum::routing::get(metrics_handler))
+        .route(STATUS_LINKS_PATH, axum::routing::get(links_handler))
         .with_state(deps.status_state)
         .route_layer(middleware::from_fn_with_state(
             deps.auth.clone(),
@@ -4915,6 +4962,7 @@ mod tests {
         for (method, path) in [
             ("GET", STATUS_PATH),
             ("GET", METRICS_PATH),
+            ("GET", STATUS_LINKS_PATH),
             ("POST", ADMIN_RELOAD_PATH),
             ("POST", ADMIN_SYNC_PATH),
             ("POST", MCP_PATH),
@@ -5407,6 +5455,7 @@ mod tests {
         for (method, path) in [
             ("GET", STATUS_PATH),
             ("GET", METRICS_PATH),
+            ("GET", STATUS_LINKS_PATH),
             ("POST", ADMIN_RELOAD_PATH),
             ("POST", ADMIN_SYNC_PATH),
             ("POST", MCP_PATH),
