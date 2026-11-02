@@ -1,8 +1,5 @@
 use std::sync::Arc;
 
-use tokio::process::Command;
-use tokio::time::timeout;
-
 use axum::{
     body::Bytes,
     extract::State,
@@ -12,11 +9,9 @@ use axum::{
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{SharedConfig, WebhookProvider};
-use crate::git::GIT_TIMEOUT;
-use crate::git::{authenticated_url, redact_url};
 #[cfg(test)]
 use crate::reindex;
 
@@ -136,199 +131,21 @@ pub async fn handle_webhook(
     }
 
     // Git fetch + merge if git_url is configured
-    if let Some(ref git_url) = config.source.git_url {
-        let data_path = config.data_path();
-        let branch = &config.source.branch;
-
-        // Build fetch URL with optional token injection
-        let fetch_url = authenticated_url(git_url, state.git_token.as_deref());
-
-        // One acquisition for the whole rev-parse → fetch → merge → rev-parse →
-        // diff sequence. Per-command locking would be worse than useless here: a
-        // write landing between our fetch and our merge changes what the merge
-        // does, and one landing between the merge and the diff makes the computed
-        // range attribute that write's files to this webhook's pull.
-        //
-        // The inline `git fetch`/`git merge` below are covered by this guard being
-        // alive for the rest of the block, not by a signature — they are the only
-        // git invocations outside `git.rs`. Keep it that way.
-        let git_lock = crate::git::lock_git().await;
-
-        // Captured before the fetch so the range diffed below covers exactly what
-        // this webhook's pull brought in — the same before/after pattern
-        // `commit_and_sync` uses around its own fetch + rebase.
-        let old_head = match crate::git::rev_parse_head(&git_lock, data_path).await {
-            Ok(sha) => sha,
-            Err(e) => {
-                error!("Failed to read HEAD before fetch: {:#}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to read local HEAD".to_string(),
-                );
-            }
-        };
-
-        info!(
-            "Running git fetch in {} from {}",
-            data_path,
-            redact_url(&fetch_url)
-        );
-
-        // git fetch --no-tags <url> <branch>
-        let fetch_result = timeout(
-            GIT_TIMEOUT,
-            Command::new("git")
-                .args([
-                    "-c",
-                    &format!("safe.directory={}", data_path),
-                    "fetch",
-                    "--no-tags",
-                    &fetch_url,
-                    branch,
-                ])
-                .current_dir(data_path)
-                .output(),
-        )
-        .await;
-
-        match fetch_result {
-            Err(_elapsed) => {
-                error!("git fetch timed out after {:?}", GIT_TIMEOUT);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Git fetch timed out".to_string(),
-                );
-            }
-            Ok(Err(e)) => {
-                error!("Failed to run git fetch: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to run git".to_string(),
-                );
-            }
-            Ok(Ok(o)) if o.status.success() => {
-                info!("Git fetch succeeded");
-            }
-            Ok(Ok(o)) => {
-                let stderr = redact_url(&String::from_utf8_lossy(&o.stderr));
-                error!("Git fetch failed: {}", stderr);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Git fetch failed".to_string(),
-                );
-            }
-        }
-
-        // git merge --ff-only FETCH_HEAD
-        let merge_result = timeout(
-            GIT_TIMEOUT,
-            Command::new("git")
-                .args([
-                    "-c",
-                    &format!("safe.directory={}", data_path),
-                    "merge",
-                    "--ff-only",
-                    "FETCH_HEAD",
-                ])
-                .current_dir(data_path)
-                .output(),
-        )
-        .await;
-
-        match merge_result {
-            Err(_elapsed) => {
-                error!("git merge timed out after {:?}", GIT_TIMEOUT);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Git merge timed out".to_string(),
-                );
-            }
-            Ok(Err(e)) => {
-                error!("Failed to run git merge: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to run git".to_string(),
-                );
-            }
-            Ok(Ok(o)) if o.status.success() => {
-                info!("Git merge (ff-only) succeeded");
-            }
-            Ok(Ok(o)) => {
-                let stderr = redact_url(&String::from_utf8_lossy(&o.stderr));
-                error!("Git merge failed: {}", stderr);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Git merge failed".to_string(),
-                );
-            }
-        }
-
-        // Diff exactly what this pull changed and mark those paths dirty. The worker
-        // (src/reindex.rs) picks this up and does the actual indexing out of band, so
-        // this handler can return as soon as the local clone is up to date — it no
-        // longer waits for (or even starts) a reindex itself.
-        let new_head = match crate::git::rev_parse_head(&git_lock, data_path).await {
-            Ok(sha) => sha,
-            Err(e) => {
-                error!("Failed to read HEAD after merge: {:#}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to read local HEAD".to_string(),
-                );
-            }
-        };
-
-        let changed = match crate::git::git_diff_name_status(
-            &git_lock, data_path, &old_head, &new_head,
-        )
-        .await
+    if config.source.git_url.is_some() {
+        // The shared fetch + ff-only merge + diff + filter + mark sequence (sync.rs),
+        // also behind `POST /admin/sync` and the `git-pull` subcommand. Only the fixed
+        // `message` reaches the caller; the redacted detail stays in the logs.
+        match crate::sync::pull_and_mark(&config, state.git_token.as_deref(), &state.reindex_queue)
+            .await
         {
-            Ok(paths) => paths,
-            Err(e) => {
-                error!("Failed to diff webhook pull range: {:#}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to diff pulled changes".to_string(),
-                );
-            }
-        };
-
-        // Filter the diffed paths through the same include/exclude/exclude_files
-        // predicate a full reconcile applies (`ingest::discover_files`), so a push
-        // touching a non-indexable path (e.g. the default-excluded `README.md`)
-        // doesn't get marked dirty, indexed, and counted as invalid the way a
-        // reconcile would never do (#278). `ingest::partition_indexable` also
-        // fails open on a glob-build error rather than 500ing an otherwise-
-        // successful pull.
-        //
-        // A changed schema file is never indexable, so the filter drops it;
-        // checked first so the push still rebuilds the shared schema cache (and
-        // re-validates every document it governs) via a full reconcile — or, when
-        // the pushed schema is invalid, gets refused loudly by that rebuild.
-        if state
-            .reindex_queue
-            .mark_schema_changes(&config.indexing, &changed)
-        {
-            info!("Webhook push changed a schema file; queued a full reconcile");
+            Ok(outcome) => info!(
+                provider = ?provider,
+                branch = %config.source.branch,
+                changed = outcome.marked,
+                "Webhook pull applied; marked changed paths dirty"
+            ),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.message.to_string()),
         }
-        let (indexable, filtered_out) =
-            crate::ingest::partition_indexable(&config.indexing, changed);
-
-        if !filtered_out.is_empty() {
-            debug!(
-                filtered = filtered_out.len(),
-                paths = ?filtered_out,
-                "Webhook diff included non-indexable paths; skipping"
-            );
-        }
-
-        info!(
-            provider = ?provider,
-            branch = %branch,
-            changed = indexable.len(),
-            "Webhook pull applied; marking changed paths dirty"
-        );
-        state.reindex_queue.mark_paths(indexable);
     } else {
         // No git_url configured, so there was nothing to fetch and therefore no range
         // to diff. Fall back to a full reconcile so the webhook still causes the

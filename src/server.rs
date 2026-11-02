@@ -1329,6 +1329,60 @@ async fn reload_handler(State(state): State<AdminState>) -> (StatusCode, Json<se
     }
 }
 
+/// `POST /admin/sync` — fetch the configured branch into the existing clone, fast-
+/// forward to it, and mark what changed dirty on the reindex queue, exactly the sequence
+/// a push webhook runs (`sync::pull_and_mark`). For instances with no webhook wired up.
+/// Behind the same auth as `/admin/reload`. No request body. The response names the
+/// before/after HEAD: operator-facing only, never reachable from an MCP tool.
+async fn sync_handler(State(state): State<AdminState>) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::sync::SyncErrorKind;
+
+    let config = crate::config::load_shared_config(&state.shared_config);
+    let token = match crate::secrets::git_token(&config) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("Sync refused: could not resolve the git token: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "error": "Could not resolve the git token",
+                    "detail": e.to_string(),
+                })),
+            );
+        }
+    };
+    match crate::sync::pull_and_mark(&config, token.as_deref(), &state.reindex_queue).await {
+        Ok(o) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "synced",
+                "changed": o.old_head != o.new_head,
+                "old_head": o.old_head,
+                "new_head": o.new_head,
+                "paths_queued": o.marked,
+                "paths_filtered_out": o.filtered_out,
+                "full_reconcile_queued": o.schema_changed,
+            })),
+        ),
+        Err(e) => {
+            warn!("Sync failed: {e}");
+            let status = match e.kind {
+                SyncErrorKind::NoRemote | SyncErrorKind::NotACheckout => StatusCode::BAD_REQUEST,
+                SyncErrorKind::Git => StatusCode::BAD_GATEWAY,
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "error": e.message,
+                    "detail": e.detail,
+                })),
+            )
+        }
+    }
+}
+
 /// Streamable HTTP transport settings for the MCP service.
 ///
 /// Stateless deliberately: every POST is self-contained, so there is no server-side
@@ -1690,6 +1744,7 @@ async fn wait_for_indexing_to_settle(is_indexing: impl Fn() -> bool) {
 const STATUS_PATH: &str = "/status";
 const METRICS_PATH: &str = "/metrics";
 const ADMIN_RELOAD_PATH: &str = "/admin/reload";
+const ADMIN_SYNC_PATH: &str = "/admin/sync";
 const MCP_PATH: &str = "/mcp";
 /// Open by design, unlike the four paths above — see `web.rs`'s module doc for why
 /// `/health` and the UI routes carry no `require_auth` layer.
@@ -1783,11 +1838,12 @@ fn unauthenticated_mcp_warning(bearer_token_env: &str) -> String {
     format!(
         "SECURITY: bearer token env var '{bearer_token_env}' (or '{bearer_token_env}_FILE') is \
          not set — {MCP_PATH}, \
-         {STATUS_PATH}, {METRICS_PATH} and {ADMIN_RELOAD_PATH} are all reachable WITHOUT \
+         {STATUS_PATH}, {METRICS_PATH}, {ADMIN_RELOAD_PATH} and {ADMIN_SYNC_PATH} are all reachable WITHOUT \
          authentication. {MCP_PATH} will serve full document content to any caller; \
          {STATUS_PATH} and {METRICS_PATH} expose tag vocabularies, area names and document \
          counts; {ADMIN_RELOAD_PATH} lets any caller force a config reload and an \
-         unconditional full reindex reconcile. Set the env var or restrict network access. \
+         unconditional full reindex reconcile; {ADMIN_SYNC_PATH} lets any caller trigger \
+         a fetch from the remote. Set the env var or restrict network access. \
          (allow_unauthenticated is enabled in config)"
     )
 }
@@ -1862,6 +1918,7 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
     // check hitting it with the wrong verb.
     let admin_router = Router::new()
         .route(ADMIN_RELOAD_PATH, axum::routing::post(reload_handler))
+        .route(ADMIN_SYNC_PATH, axum::routing::post(sync_handler))
         .with_state(deps.admin_state)
         .route_layer(middleware::from_fn_with_state(
             deps.auth.clone(),
@@ -3380,6 +3437,7 @@ mod tests {
         };
         Router::new()
             .route("/admin/reload", axum::routing::post(reload_handler))
+            .route("/admin/sync", axum::routing::post(sync_handler))
             .with_state(admin_state)
             .route_layer(middleware::from_fn_with_state(auth_state, require_auth))
     }
@@ -3444,6 +3502,122 @@ mod tests {
         );
 
         crate::config::test_support::clear_required_env();
+    }
+
+    #[tokio::test]
+    async fn admin_sync_requires_the_bearer_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = config::shared_config(Arc::new(sync_test_config(tmp.path(), None)));
+        let app = admin_test_app(Some("secret".into()), tmp.path().join("c.yaml"), shared);
+
+        for auth in [None, Some("Bearer wrong-token")] {
+            let mut req = Request::builder().method("POST").uri("/admin/sync");
+            if let Some(a) = auth {
+                req = req.header("authorization", a);
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_sync_without_a_remote_is_a_clear_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = config::shared_config(Arc::new(sync_test_config(tmp.path(), None)));
+        let app = admin_test_app(Some("secret".into()), tmp.path().join("c.yaml"), shared);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/sync")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert!(v["detail"].as_str().unwrap().contains("source.git_url"));
+    }
+
+    fn sync_test_config(data_path: &std::path::Path, git_url: Option<String>) -> ResolvedConfig {
+        let mut c = (*status_config(data_path)).clone();
+        c.source.git_url = git_url;
+        c
+    }
+
+    #[tokio::test]
+    async fn admin_sync_pulls_a_new_commit_and_queues_it() {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "-q", "-b", "master"]);
+        std::fs::write(remote.path().join("a.md"), "# A\n").unwrap();
+        git(remote.path(), &["add", "-A"]);
+        git(remote.path(), &["commit", "-q", "-m", "init"]);
+        let clone = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q"])
+            .arg(remote.path())
+            .arg(clone.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        std::fs::write(remote.path().join("b.md"), "# B\n").unwrap();
+        git(remote.path(), &["add", "-A"]);
+        git(remote.path(), &["commit", "-q", "-m", "more"]);
+
+        let cfg = sync_test_config(
+            clone.path(),
+            Some(remote.path().to_string_lossy().into_owned()),
+        );
+        let queue = Arc::new(crate::reindex::ReindexQueue::new());
+        let auth_state = test_auth_layer(Some("secret".into()), None);
+        let app = Router::new()
+            .route("/admin/sync", axum::routing::post(sync_handler))
+            .with_state(AdminState {
+                shared_config: config::shared_config(Arc::new(cfg)),
+                config_path: Arc::new(clone.path().join("c.yaml")),
+                reindex_queue: Arc::clone(&queue),
+            })
+            .route_layer(middleware::from_fn_with_state(auth_state, require_auth));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/sync")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "synced");
+        assert_eq!(v["changed"], true);
+        assert_eq!(v["paths_queued"], 1);
+        assert_eq!(
+            queue.snapshot_paths(),
+            std::collections::HashSet::from([std::path::PathBuf::from("b.md")])
+        );
     }
 
     // See the comment on the sibling auth test above for why the guard must stay
@@ -4648,7 +4822,13 @@ mod tests {
     #[test]
     fn unauthenticated_warning_names_every_protected_path() {
         let msg = unauthenticated_mcp_warning("MCP_BEARER_TOKEN");
-        for path in [MCP_PATH, STATUS_PATH, METRICS_PATH, ADMIN_RELOAD_PATH] {
+        for path in [
+            MCP_PATH,
+            STATUS_PATH,
+            METRICS_PATH,
+            ADMIN_RELOAD_PATH,
+            ADMIN_SYNC_PATH,
+        ] {
             assert!(
                 msg.contains(path),
                 "warning must name {path} as unauthenticated-reachable: {msg}"
@@ -4679,6 +4859,7 @@ mod tests {
             ("GET", STATUS_PATH),
             ("GET", METRICS_PATH),
             ("POST", ADMIN_RELOAD_PATH),
+            ("POST", ADMIN_SYNC_PATH),
             ("POST", MCP_PATH),
         ] {
             let req = Request::builder()
@@ -5170,6 +5351,7 @@ mod tests {
             ("GET", STATUS_PATH),
             ("GET", METRICS_PATH),
             ("POST", ADMIN_RELOAD_PATH),
+            ("POST", ADMIN_SYNC_PATH),
             ("POST", MCP_PATH),
         ] {
             let req = Request::builder()
