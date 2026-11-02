@@ -2432,7 +2432,25 @@ fn create_edit_success_to_result(
         fields.insert("from".to_string(), serde_json::json!(rel_path));
     }
     insert_paths(&mut fields, "rewritten_paths", &success.rewritten_paths);
+    if let Some(related) = related_json(&success.related) {
+        fields.insert("related".to_string(), related);
+    }
     CallToolResult::structured(serde_json::Value::Object(fields))
+}
+
+/// The `related` array of a create result (#356): `[{path, score}]` nearest first,
+/// scores rounded like every other score; `None` when there are none, so the key
+/// is omitted.
+pub(crate) fn related_json(related: &[crate::write::RelatedDocument]) -> Option<serde_json::Value> {
+    if related.is_empty() {
+        return None;
+    }
+    Some(serde_json::Value::Array(
+        related
+            .iter()
+            .map(|r| serde_json::json!({"path": r.path, "score": round_score(f64::from(r.score))}))
+            .collect(),
+    ))
 }
 
 /// The scope directory ([`crate::schema::scope_label`]) of a KB-relative schema file
@@ -4225,6 +4243,16 @@ impl KbSearchServer {
                 .map_or(serde_json::json!(threshold), |v| serde_json::json!(v));
             dedup.insert("threshold".into(), shown);
         }
+        if let Some(limit) = schema.related_limit {
+            dedup.insert("related_limit".into(), serde_json::json!(limit));
+        }
+        if let Some(score) = schema.related_min_score {
+            let shown = score
+                .to_string()
+                .parse::<f64>()
+                .map_or(serde_json::json!(score), |v| serde_json::json!(v));
+            dedup.insert("related_min_score".into(), shown);
+        }
         if !dedup.is_empty() {
             structured["dedup"] = serde_json::Value::Object(dedup);
         }
@@ -4732,6 +4760,8 @@ impl KbSearchServer {
             prepend_description: config.chunking.prepend_description,
             dedup_enabled: config.write.dedup_enabled,
             dedup_threshold: config.write.dedup_threshold,
+            related_limit: config.write.related_limit,
+            related_min_score: config.write.related_min_score,
             git_url: config.source.git_url.as_deref(),
             branch: &config.source.branch,
             token,
@@ -4938,7 +4968,12 @@ impl KbSearchServer {
         // runs here as well, ahead of the `exists()` pre-check below, so a path
         // that both exists and fails it gets the include-pattern message rather
         // than a misleading "already exists".
-        crate::write::check_include_pattern_against(&self.include_patterns, raw).map_err(|e| {
+        crate::write::check_include_pattern_against(
+            &self.include_patterns,
+            &self.config().indexing,
+            raw,
+        )
+        .map_err(|e| {
             create_edit_error_to_mcp_error(e, raw, true, &self.canonical_data_path, None)
         })?;
 
@@ -5164,9 +5199,11 @@ impl KbSearchServer {
                         ));
                         continue;
                     };
-                    if let Err(e) =
-                        write::check_include_pattern_against(&self.include_patterns, &raw)
-                    {
+                    if let Err(e) = write::check_include_pattern_against(
+                        &self.include_patterns,
+                        &self.config().indexing,
+                        &raw,
+                    ) {
                         parse_errors.push(format!(
                             "documents: '{raw}': {}",
                             batch_write_document_error_text(&e)
@@ -12998,6 +13035,8 @@ mod tests {
             write: crate::config::WriteConfig {
                 dedup_enabled: false,
                 dedup_threshold: 0.85,
+                related_min_score: 0.5,
+                related_limit: 5,
                 commit_author_name: "mcp-md-wiki".to_string(),
                 commit_author_email: "mcp-md-wiki@localhost".to_string(),
             },
@@ -15079,6 +15118,46 @@ mod tests {
             "{}",
             credential.message
         );
+    }
+
+    #[test]
+    fn related_json_rounds_scores_and_is_omitted_when_empty() {
+        assert!(related_json(&[]).is_none());
+        let json = related_json(&[crate::write::RelatedDocument {
+            path: "a.md".into(),
+            score: 0.723_456_79,
+        }])
+        .unwrap();
+        assert_eq!(json[0]["path"], "a.md");
+        assert_eq!(json[0]["score"].as_f64(), Some(0.7235));
+    }
+
+    #[test]
+    fn create_result_carries_related_only_when_present() {
+        let mk = |related| WriteSuccess {
+            outcome: crate::write::WriteOutcome::Synced,
+            sha: "abc".into(),
+            rebased_paths: Vec::new(),
+            diff: String::new(),
+            rewritten_paths: Vec::new(),
+            referencing_paths: Vec::new(),
+            merged: false,
+            version: Some("v".into()),
+            related,
+        };
+        let with = create_edit_success_to_result(
+            mk(vec![crate::write::RelatedDocument {
+                path: "x.md".into(),
+                score: 0.6,
+            }]),
+            "new.md",
+            true,
+            None,
+        );
+        let structured = with.structured_content.unwrap();
+        assert_eq!(structured["related"][0]["path"], "x.md");
+        let without = create_edit_success_to_result(mk(Vec::new()), "new.md", true, None);
+        assert!(without.structured_content.unwrap().get("related").is_none());
     }
 
     #[test]

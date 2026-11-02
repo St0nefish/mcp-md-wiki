@@ -617,6 +617,18 @@ write:
   # shorter or more domain-specific documents.
   dedup_threshold: 0.80
 
+  # Creating a document also returns up to `related_limit` existing documents
+  # (`related` in the result: path and score, nearest first) that score at least
+  # `related_min_score` against it, so the writer can link to them and check them
+  # for conflicts. They come from the same dense query as the duplicate check (no
+  # extra embedding call), never include the written path, and are omitted when
+  # dedup is disabled or bypassed (`force_new`) for that path. `related_limit: 0`
+  # turns the listing off; maximum 20. `related_min_score` range: 0.0–1.0.
+  # A .schema.yaml `dedup:` block can override either per subtree
+  # (`related_limit`, `related_min_score`).
+  related_min_score: 0.50
+  related_limit: 5
+
   # Git author identity used for commits made by the write tools (write_document,
   # delete_document). Setting these to a bot identity makes tool-authored commits
   # easy to distinguish from your own hand-made commits in `git log`.

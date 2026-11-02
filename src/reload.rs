@@ -935,6 +935,28 @@ const DIFF_TABLE: &[DiffField] = &[
         }],
     },
     DiffField {
+        path: "write.related_min_score",
+        get: |c| Some(d(&c.write.related_min_score)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.related_min_score",
+            note: "read fresh from the live config on every document create (write.rs \
+                   effective_related); the global fallback where no schema file `dedup:` \
+                   block overrides it (#356).",
+        }],
+    },
+    DiffField {
+        path: "write.related_limit",
+        get: |c| Some(d(&c.write.related_limit)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.related_limit",
+            note: "read fresh from the live config on every document create (write.rs \
+                   effective_related); the global fallback where no schema file `dedup:` \
+                   block overrides it (#356).",
+        }],
+    },
+    DiffField {
         path: "write.commit_author_name",
         get: |c| Some(d(&c.write.commit_author_name)),
         consumers: &[ConsumerEntry {

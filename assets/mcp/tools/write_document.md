@@ -8,3 +8,6 @@ subtree); `documents` writes several as one change.
 Frontmatter is validated against the destination directory's rules. If the
 result says `merged_with_other_changes`, a concurrent edit was merged in:
 re-read with `get_document` before editing further.
+
+A create may return `related`: existing pages close to the new one. Link the
+new page to those that apply and read them for conflicts.

@@ -115,6 +115,30 @@ pub(crate) fn effective_dedup<E: QueryEmbedder, Q: RetrievalStore>(
     )
 }
 
+/// Upper bound on `write.related_limit` / `dedup.related_limit`.
+pub const MAX_RELATED_LIMIT: usize = 20;
+
+/// An existing document close to a newly created one, reported by the create-path
+/// dedup query so the writer can link to it and check it for conflicts (#356).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RelatedDocument {
+    pub path: String,
+    pub score: f32,
+}
+
+/// The create-path neighbour listing's effective `(limit, min_score)` for a
+/// document governed by `schema`: the schema file `dedup:` cascade where it sets a
+/// key, else the global `write.*` value (#356). A limit of `0` lists none.
+pub(crate) fn effective_related<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    schema: &schema::ResolvedSchema,
+) -> (usize, f32) {
+    (
+        schema.related_limit.unwrap_or(deps.related_limit),
+        schema.related_min_score.unwrap_or(deps.related_min_score),
+    )
+}
+
 /// Search options for the dedup gate.
 ///
 /// Deliberately pinned to dense-only rather than inheriting `search.hybrid`, so
@@ -124,8 +148,15 @@ pub(crate) fn effective_dedup<E: QueryEmbedder, Q: RetrievalStore>(
 /// cross-encoder relevance score is not a similarity at all, so reranking is
 /// also kept out of this path (see the `reranker: None` at the call site).
 pub(crate) fn dedup_search_opts() -> crate::retrieval::SearchOptions {
+    dedup_search_opts_with_limit(1)
+}
+
+/// [`dedup_search_opts`] asking for the `limit` nearest chunks, one per document
+/// when more than one is wanted, so the extras are distinct neighbours (#356).
+/// The top hit is the same chunk `dedup_search_opts` returns.
+pub(crate) fn dedup_search_opts_with_limit(limit: usize) -> crate::retrieval::SearchOptions {
     crate::retrieval::SearchOptions {
-        limit: 1,
+        limit: limit.max(1) as u64,
         min_score: None,
         hybrid: false,
         // Unused in the dense-only path, which performs no RRF fusion.
@@ -141,7 +172,7 @@ pub(crate) fn dedup_search_opts() -> crate::retrieval::SearchOptions {
         // The dedup gate wants the single closest existing chunk, full stop — not
         // a diversified page of results (limit: 1 above makes a per-document cap
         // moot anyway, but this keeps intent explicit rather than accidental).
-        diversity_max_per_document: None,
+        diversity_max_per_document: (limit > 1).then_some(1),
     }
 }
 
@@ -232,17 +263,20 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     /// any rewritten referencing documents, and `commit_outcome.rebased_paths`
     /// (paths pulled in from OTHER commits during this write's own git
     /// fetch/rebase/push) — before they reach `queue.mark_paths` (#278).
-    /// `check_include_pattern` only checks `indexing.include`, never
-    /// `exclude`/`exclude_files`, so a write's own target can match `include`
-    /// (e.g. the default-excluded `README.md` against the default `**/*.md`)
-    /// and still not be reconcile-indexable; this filter is what keeps that
-    /// path out of the reindex queue the same way a reconcile would.
+    /// `check_include_pattern` applies the same predicate upfront and refuses a
+    /// write to an excluded target (#312); this filter still guards the paths
+    /// that gate never sees (rewritten referencing documents, rebase-pulled-in
+    /// paths).
     pub indexing: &'a crate::config::IndexingConfig,
     /// Mirrors `chunking.prepend_description` — the dedup query must be built on
     /// the same textual basis the indexer embeds.
     pub prepend_description: bool,
     pub dedup_enabled: bool,
     pub dedup_threshold: f32,
+    /// Global fallback for the create-path neighbour listing (#356); see
+    /// [`effective_related`].
+    pub related_limit: usize,
+    pub related_min_score: f32,
     pub git_url: Option<&'a str>,
     pub branch: &'a str,
     pub token: Option<&'a str>,
@@ -384,6 +418,12 @@ pub struct WriteSuccess {
     /// and when a merge during sync means the on-disk bytes are not known here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Existing documents close to a just-CREATED one, nearest first, from the
+    /// dedup query the create already ran (#356). Empty for every other change,
+    /// when dedup is off or bypassed for the path, or when nothing scores at least
+    /// the floor. Never contains the written path.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RelatedDocument>,
 }
 
 /// Every structured failure mode of the write pipeline. Callers map these onto
@@ -632,6 +672,9 @@ fn safe_write_path<E: QueryEmbedder, Q: RetrievalStore>(
 /// existing caller's (necessarily exhaustive) match over `WriteError` keeps
 /// compiling unchanged — see `mcp.rs`'s and `web.rs`'s error-mapping functions.
 ///
+/// Also applies `indexing.exclude`/`exclude_files` (#312), so the gate answers
+/// "could this path ever be indexed" the same way a reconcile does.
+///
 /// `pub(crate)` (rather than folded entirely into `check_include_pattern`
 /// below) so `mcp.rs`'s `create_document` adapter can run this exact check —
 /// same message text — ahead of its own `exists()` pre-check, restoring the
@@ -639,26 +682,45 @@ fn safe_write_path<E: QueryEmbedder, Q: RetrievalStore>(
 /// check. See that call site's comment.
 pub(crate) fn check_include_pattern_against(
     include_patterns: &globset::GlobSet,
+    indexing: &crate::config::IndexingConfig,
     rel_path: &str,
 ) -> Result<(), WriteError> {
     let normalized = crate::retrieval::kb_root_relative(rel_path);
-    if include_patterns.is_match(normalized) {
-        return Ok(());
+    if !include_patterns.is_match(normalized) {
+        return Err(WriteError::UnsafePath {
+            msg: format!(
+                "path '{}' does not match any indexable include pattern \
+                 (e.g. must be a markdown file under an included path)",
+                rel_path
+            ),
+        });
     }
-    Err(WriteError::UnsafePath {
-        msg: format!(
-            "path '{}' does not match any indexable include pattern \
-             (e.g. must be a markdown file under an included path)",
-            rel_path
-        ),
-    })
+    // Matching `include` is not enough: a reconcile also applies `exclude` and
+    // `exclude_files`, so a path they rule out would be committed and then never
+    // indexed (#312). Fails open on a glob-build error, like `partition_indexable`.
+    match crate::ingest::PathFilter::from_config(indexing) {
+        Ok(filter) if !filter.is_indexable(normalized) => Err(WriteError::UnsafePath {
+            msg: format!(
+                "path '{}' is excluded from indexing (it matches an exclusion rule), \
+                 so a document written there would never be searchable",
+                rel_path
+            ),
+        }),
+        Ok(_) => Ok(()),
+        Err(e) => {
+            error!(
+                "Failed to build indexing path filter, skipping the exclusion check for '{rel_path}': {e:#}"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn check_include_pattern<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     rel_path: &str,
 ) -> Result<(), WriteError> {
-    check_include_pattern_against(deps.retrieval.include_patterns, rel_path)
+    check_include_pattern_against(deps.retrieval.include_patterns, deps.indexing, rel_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,17 +1522,22 @@ async fn validate_document<E: QueryEmbedder, Q: RetrievalStore>(
 /// The create-path dedup gate: refuse when an existing document is a near
 /// duplicate of `validated`. Runs before the lock — it embeds and queries
 /// Qdrant, which can take a while — and only for a create, whose content is fixed.
+///
+/// Returns the nearest other documents scoring at least the effective
+/// `related_min_score`, nearest first, taken from the same query (#356). Empty
+/// when dedup is off or bypassed, the limit is `0`, or the search fails.
 async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     rel_path: &str,
     validated: Option<&validate::ValidatedFile>,
     force_new: Option<bool>,
-) -> Result<(), WriteError> {
+) -> Result<Vec<RelatedDocument>, WriteError> {
     let schemas = crate::schema::load_shared(deps.schema_cache);
     let schema = schemas.resolve_for(Path::new(rel_path));
     let (dedup_enabled, dedup_threshold) = effective_dedup(deps, schema);
+    let (related_limit, related_min_score) = effective_related(deps, schema);
     if !dedup_enabled || matches!(force_new, Some(true)) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // The body already parsed during validation keeps the dedup query on exactly
     // the frontmatter-stripped basis the indexer embeds.
@@ -1485,7 +1552,7 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
             "Dedup gate skipped for '{}': no body text to compare",
             rel_path
         );
-        return Ok(());
+        return Ok(Vec::new());
     }
     // Detach the reranker: `dedup_threshold` is a cosine similarity, and a
     // cross-encoder relevance score is not comparable to it.
@@ -1501,20 +1568,24 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
         &dedup_deps,
         &query_text,
         &SearchFilters::default(),
-        &dedup_search_opts(),
+        &dedup_search_opts_with_limit(related_limit),
     )
     .await
     {
         Ok(results) => {
-            let top = results.into_iter().next().map(|r| {
-                let path = r
-                    .payload
-                    .get("file_path")
-                    .and_then(|v| v.as_str())
-                    .map(|p| crate::retrieval::relative_to_data(p, deps.canonical_data_path))
-                    .unwrap_or_default();
-                (path, r.score)
-            });
+            let hits: Vec<(String, f32)> = results
+                .into_iter()
+                .map(|r| {
+                    let path = r
+                        .payload
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .map(|p| crate::retrieval::relative_to_data(p, deps.canonical_data_path))
+                        .unwrap_or_default();
+                    (path, r.score)
+                })
+                .collect();
+            let top = hits.first().cloned();
             if let Some((path, score)) = top.as_ref() {
                 tracing::debug!(
                     "Dedup gate for '{}': nearest '{}' at dense cosine {:.4} (threshold {:.2})",
@@ -1531,6 +1602,12 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
                     threshold: dedup_threshold,
                 });
             }
+            return Ok(related_from_hits(
+                hits,
+                rel_path,
+                related_min_score,
+                related_limit,
+            ));
         }
         Err(e) => {
             warn!(
@@ -1539,7 +1616,35 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
             );
         }
     }
-    Ok(())
+    Ok(Vec::new())
+}
+
+/// The neighbours worth reporting from the dedup query's hits (path, dense cosine):
+/// scoring at least `min_score`, never `own_path`, each document once, nearest
+/// first, at most `limit` (#356).
+fn related_from_hits(
+    mut hits: Vec<(String, f32)>,
+    own_path: &str,
+    min_score: f32,
+    limit: usize,
+) -> Vec<RelatedDocument> {
+    let own = crate::retrieval::kb_root_relative(own_path);
+    hits.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut out: Vec<RelatedDocument> = Vec::new();
+    for (path, score) in hits {
+        if out.len() >= limit {
+            break;
+        }
+        if path.is_empty()
+            || score < min_score
+            || crate::retrieval::kb_root_relative(&path) == own
+            || out.iter().any(|r| r.path == path)
+        {
+            continue;
+        }
+        out.push(RelatedDocument { path, score });
+    }
+    out
 }
 
 /// Read a document, `None` when it does not exist.
@@ -1672,9 +1777,10 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     //    the lock: the gate's embedding call and Qdrant query are the one slow step
     //    deliberately kept outside it. Every other change is validated under the
     //    lock, against the content it actually computes there.
+    let mut related: Vec<RelatedDocument> = Vec::new();
     if let DocChange::Create(content) = change {
         let validated = validate_document(deps, rel_path, content).await?;
-        dedup_gate(deps, rel_path, validated.as_ref(), force_new).await?;
+        related = dedup_gate(deps, rel_path, validated.as_ref(), force_new).await?;
     }
 
     // 2. Validate the commit message BEFORE touching the filesystem.
@@ -1755,6 +1861,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
             // says what the caller asked for, so report it as it stands.
             if applied.content == current {
                 return Ok(WriteSuccess {
+                    related: related.clone(),
                     outcome: WriteOutcome::Synced,
                     sha: head.unwrap_or_default(),
                     rebased_paths: Vec::new(),
@@ -1851,6 +1958,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                 );
                 mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
                 return Ok(WriteSuccess {
+                    related: related.clone(),
                     outcome: WriteOutcome::CommittedPendingSync,
                     sha,
                     rebased_paths: Vec::new(),
@@ -1896,6 +2004,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
             Some(document_version(applied.content.as_bytes()))
         };
         return Ok(WriteSuccess {
+            related: related.clone(),
             outcome: WriteOutcome::Synced,
             sha: commit_outcome.sha,
             diff: render_unified_diff(&old_content, &applied.content, rel_path),
@@ -2271,6 +2380,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                         .collect(),
                 );
                 return Ok(WriteSuccess {
+                    related: Vec::new(),
                     outcome: WriteOutcome::CommittedPendingSync,
                     sha,
                     rebased_paths: Vec::new(),
@@ -2312,6 +2422,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
         let rebase_merged = rebase_touched(&commit_outcome.rebased_paths, &commit_paths);
         let dest_merged = rebase_touched(&commit_outcome.rebased_paths, &[dest_rel]);
         return Ok(WriteSuccess {
+            related: Vec::new(),
             outcome: WriteOutcome::Synced,
             sha: commit_outcome.sha,
             diff: render_unified_diff(&current, &content_to_write, dest_rel),
@@ -4424,6 +4535,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
                 );
                 mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
                 return Ok(WriteSuccess {
+                    related: Vec::new(),
                     outcome: WriteOutcome::CommittedPendingSync,
                     sha,
                     rebased_paths: Vec::new(),
@@ -4458,6 +4570,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
         );
 
         return Ok(WriteSuccess {
+            related: Vec::new(),
             outcome: WriteOutcome::Synced,
             sha: commit_outcome.sha,
             diff: render_unified_diff(&old_content, "", rel_path),
@@ -5244,6 +5357,8 @@ mod tests {
                 prepend_description: self.config.chunking.prepend_description,
                 dedup_enabled: self.config.write.dedup_enabled,
                 dedup_threshold: self.config.write.dedup_threshold,
+                related_limit: self.config.write.related_limit,
+                related_min_score: self.config.write.related_min_score,
                 git_url: self.config.source.git_url.as_deref(),
                 branch: &self.config.source.branch,
                 token: self.token.as_deref(),
@@ -5303,6 +5418,74 @@ mod tests {
             expected_version: Some(leak(document_version(old_content.as_bytes()))),
             dest_path: Some(dest_rel),
         }
+    }
+
+    #[test]
+    fn related_from_hits_applies_floor_limit_order_and_excludes_self() {
+        let hits = vec![
+            ("a.md".to_string(), 0.60),
+            ("docs/new.md".to_string(), 0.79),
+            ("b.md".to_string(), 0.75),
+            ("a.md".to_string(), 0.55),
+            ("c.md".to_string(), 0.40),
+            ("d.md".to_string(), 0.50),
+        ];
+        let got = related_from_hits(hits.clone(), "docs/new.md", 0.5, 5);
+        let paths: Vec<&str> = got.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["b.md", "a.md", "d.md"],
+            "ordered, floor applied, self gone"
+        );
+        assert_eq!(
+            got[1].score, 0.60,
+            "a document appears once, at its best score"
+        );
+
+        let capped = related_from_hits(hits.clone(), "docs/new.md", 0.5, 2);
+        assert_eq!(capped.len(), 2);
+        assert!(related_from_hits(hits.clone(), "docs/new.md", 0.5, 0).is_empty());
+        assert!(related_from_hits(hits, "docs/new.md", 0.9, 5).is_empty());
+        assert!(related_from_hits(Vec::new(), "x.md", 0.0, 5).is_empty());
+    }
+
+    #[test]
+    fn dedup_search_opts_with_limit_spreads_over_documents_only_when_listing() {
+        let one = dedup_search_opts_with_limit(1);
+        assert_eq!((one.limit, one.diversity_max_per_document), (1, None));
+        let zero = dedup_search_opts_with_limit(0);
+        assert_eq!(
+            zero.limit, 1,
+            "the gate itself always needs the nearest hit"
+        );
+        let many = dedup_search_opts_with_limit(5);
+        assert_eq!((many.limit, many.diversity_max_per_document), (5, Some(1)));
+        assert!(!many.hybrid, "still dense-only");
+    }
+
+    #[test]
+    fn effective_related_prefers_schema_override_per_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = (*crate::mcp::make_test_resolved_config(tmp.path())).clone();
+        config.write.related_limit = 5;
+        config.write.related_min_score = 0.5;
+        let harness = Harness::new(&tmp, Arc::new(config));
+        let deps = harness.deps();
+
+        assert_eq!(
+            effective_related(&deps, &schema::ResolvedSchema::default()),
+            (5, 0.5)
+        );
+        let tuned = schema::ResolvedSchema {
+            related_limit: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(effective_related(&deps, &tuned), (0, 0.5));
+        let floor = schema::ResolvedSchema {
+            related_min_score: Some(0.7),
+            ..Default::default()
+        };
+        assert_eq!(effective_related(&deps, &floor), (5, 0.7));
     }
 
     /// A schema `dedup:` key overrides the global `write.*` value per key; an unset
@@ -5901,32 +6084,63 @@ mod tests {
         );
     }
 
-    /// #278 (own-target gap): a write's OWN target path — not just
-    /// `commit_outcome.rebased_paths` — must also be filtered through
-    /// `indexing.include`/`exclude`/`exclude_files` before it reaches
-    /// `queue.mark_paths`. `check_include_pattern` only checks `include`, so a
-    /// path that matches the default `**/*.md` include glob but is ALSO in the
-    /// default `exclude_files` (here, `README.md`) still passes eligibility
-    /// and commits successfully — but a full reconcile would never index it,
-    /// so it must never be marked dirty either.
+    /// #312: a path that matches `include` but also `exclude_files` (the default
+    /// `README.md`) is refused upfront for edit, create, move and delete, with
+    /// nothing committed and nothing marked dirty.
     #[tokio::test]
-    async fn write_document_does_not_mark_its_own_excluded_target_path_dirty() {
+    async fn write_document_refuses_a_path_the_indexing_config_excludes() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let head_before = head_sha(&work);
+        let harness = git_backed_harness(&work);
+
+        let expect_excluded = |r: Result<WriteSuccess, WriteError>| match r {
+            Err(WriteError::UnsafePath { msg }) => {
+                assert!(msg.contains("excluded from indexing"), "got: {msg}")
+            }
+            other => panic!("expected UnsafePath, got {other:?}"),
+        };
+
+        // Edit of the seeded README.md.
+        expect_excluded(
+            write_document(
+                &harness.deps(),
+                make_req("README.md", "# Test repo\n\nUpdated.\n", false),
+            )
+            .await,
+        );
+        // Create at another excluded filename.
+        expect_excluded(
+            write_document(&harness.deps(), make_req("docs/README.md", "# Hi\n", true)).await,
+        );
+        // Move to an excluded destination.
+        expect_excluded(
+            write_document(
+                &harness.deps(),
+                make_move_req("docs/a.md", "docs/README.md", "# A\n", "# A\n"),
+            )
+            .await,
+        );
+        // Delete of an excluded path.
+        expect_excluded(delete_document(&harness.deps(), "README.md", None, None).await);
+
+        assert_eq!(head_sha(&work), head_before, "nothing is committed");
+        assert!(harness.reindex_queue.snapshot_paths().is_empty());
+    }
+
+    /// An ordinary document is unaffected by the exclusion gate (#312).
+    #[tokio::test]
+    async fn write_document_still_accepts_a_normal_indexable_path() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         let harness = git_backed_harness(&work);
-
-        // `create_bare_repo` already seeds a `README.md` at the repo root, so
-        // this is an edit, not a create.
-        let req = make_req("README.md", "# Test repo\n\nUpdated.\n", false);
-        let success = write_document(&harness.deps(), req).await.unwrap();
+        let success = write_document(
+            &harness.deps(),
+            make_req("docs/new.md", "# New\n\nBody.\n", true),
+        )
+        .await
+        .unwrap();
         assert_eq!(success.outcome, WriteOutcome::Synced);
-
-        let pending = harness.reindex_queue.snapshot_paths();
-        assert!(
-            pending.is_empty(),
-            "README.md is in the default exclude_files list and must not be marked \
-             dirty, even though it is its own write's target: {pending:?}"
-        );
     }
 
     #[tokio::test]
