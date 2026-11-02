@@ -1150,6 +1150,17 @@ const DIFF_TABLE: &[DiffField] = &[
                    Run `mcp-md-wiki index --full` for a consistent corpus.",
         }],
     },
+    DiffField {
+        path: "ui.api_auth",
+        get: |c| Some(d(&c.ui.api_auth)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "ui.api_auth",
+            note: "whether the /api/* routes sit behind the bearer-auth layer is decided \
+                   once when the router is assembled (server.rs assemble_router); the \
+                   layer is never rebuilt.",
+        }],
+    },
 ];
 
 /// Compare every YAML-reloadable setting between `old` and `new`, recording each one

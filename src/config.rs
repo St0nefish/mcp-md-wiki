@@ -1198,6 +1198,12 @@ fn default_section_max_bytes() -> usize {
 pub struct UiConfig {
     #[serde(default)]
     pub semantic_edges: SemanticEdgesConfig,
+    /// Put the same bearer-auth layer that guards `/mcp` in front of every `/api/*`
+    /// route (#297). Off by default: the web UI is normally reached through an
+    /// SSO proxy and its routes are open. The static UI shell and assets stay open
+    /// either way. Read once at startup, so changing it needs a restart.
+    #[serde(default)]
+    pub api_auth: bool,
 }
 
 /// Precomputed semantic (kNN) graph edges shown alongside markdown-link edges
@@ -1414,6 +1420,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("ui.semantic_edges.enabled", "ui"),
     ("ui.semantic_edges.k", "ui"),
     ("ui.semantic_edges.min_score", "ui"),
+    ("ui.api_auth", "ui"),
 ];
 
 /// Recursively flattens a `serde_yaml_ng::Value` tree into dot-joined leaf paths,
