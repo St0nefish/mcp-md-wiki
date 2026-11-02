@@ -905,6 +905,18 @@ pub struct WriteConfig {
     /// `reranking.enabled`, whose relevance scores are not similarities.
     #[serde(default = "default_dedup_threshold")]
     pub dedup_threshold: f32,
+    /// Cosine floor for the `related` neighbours a document create returns from the
+    /// dedup query (#356): existing documents scoring at least this (but below
+    /// `dedup_threshold`, else the create is refused) are listed so the writer can
+    /// link to them and check them for conflicts. A schema file's `dedup:` block
+    /// overrides it per subtree.
+    #[serde(default = "default_related_min_score")]
+    pub related_min_score: f32,
+    /// Most `related` neighbours a create returns; `0` returns none. Overridable by
+    /// a schema file's `dedup:` block. Reuses the dedup query, so costs no extra
+    /// embedding call; dedup disabled for a path means no neighbours for it.
+    #[serde(default = "default_related_limit")]
+    pub related_limit: usize,
     /// Git author name used for commits made by the write tools.
     /// Distinguishes tool-authored commits from hand-made commits.
     #[serde(default = "default_commit_author_name")]
@@ -923,6 +935,14 @@ fn default_dedup_threshold() -> f32 {
     0.80
 }
 
+fn default_related_min_score() -> f32 {
+    0.50
+}
+
+fn default_related_limit() -> usize {
+    5
+}
+
 fn default_commit_author_name() -> String {
     "mcp-md-wiki".to_string()
 }
@@ -936,6 +956,8 @@ impl Default for WriteConfig {
         Self {
             dedup_enabled: default_dedup_enabled(),
             dedup_threshold: default_dedup_threshold(),
+            related_min_score: default_related_min_score(),
+            related_limit: default_related_limit(),
             commit_author_name: default_commit_author_name(),
             commit_author_email: default_commit_author_email(),
         }
@@ -1402,6 +1424,8 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("rate_limit.client_ip_source", "rate_limit"),
     ("write.dedup_enabled", "write"),
     ("write.dedup_threshold", "write"),
+    ("write.related_min_score", "write"),
+    ("write.related_limit", "write"),
     ("write.commit_author_name", "write"),
     ("write.commit_author_email", "write"),
     ("search.hybrid", "search"),
@@ -1892,6 +1916,15 @@ impl Config {
         }
         if !(0.0..=1.0).contains(&self.write.dedup_threshold) {
             anyhow::bail!("write.dedup_threshold must be between 0.0 and 1.0");
+        }
+        if !(0.0..=1.0).contains(&self.write.related_min_score) {
+            anyhow::bail!("write.related_min_score must be between 0.0 and 1.0");
+        }
+        if self.write.related_limit > crate::write::MAX_RELATED_LIMIT {
+            anyhow::bail!(
+                "write.related_limit must be at most {}",
+                crate::write::MAX_RELATED_LIMIT
+            );
         }
         if self.search.rrf_candidates == 0 {
             anyhow::bail!("search.rrf_candidates must be >= 1");
@@ -2546,6 +2579,27 @@ mcp:
         assert!(err.contains("RERANKING_BASE_URL"), "{err}");
         assert!(err.contains("RERANKING_MODEL"), "{err}");
 
+        clear_required_env();
+    }
+
+    #[test]
+    fn write_related_keys_default_and_are_range_checked() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert_eq!(cfg.write.related_limit, 5);
+        assert_eq!(cfg.write.related_min_score, 0.5);
+
+        for (line, msg) in [
+            ("related_min_score: 1.5", "write.related_min_score"),
+            ("related_limit: 21", "write.related_limit"),
+        ] {
+            let yaml = format!("{MINIMAL_CONFIG}\nwrite:\n  {line}\n");
+            let err = Config::from_str(&yaml).unwrap_err();
+            assert!(err.to_string().contains(msg), "got: {err}");
+        }
+        let yaml = format!("{MINIMAL_CONFIG}\nwrite:\n  related_limit: 0\n");
+        Config::from_str(&yaml).expect("0 turns the listing off");
         clear_required_env();
     }
 

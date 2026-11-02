@@ -226,6 +226,8 @@ impl UiState {
             prepend_description: config.chunking.prepend_description,
             dedup_enabled: config.write.dedup_enabled,
             dedup_threshold: config.write.dedup_threshold,
+            related_limit: config.write.related_limit,
+            related_min_score: config.write.related_min_score,
             git_url: config.source.git_url.as_deref(),
             branch: &config.source.branch,
             token: token.as_deref(),
@@ -1350,19 +1352,20 @@ fn write_success_response(success: WriteSuccess) -> Response {
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "outcome": outcome,
-            "sha": success.sha,
-            "rebased_paths": rebased_paths,
-            "rewritten_paths": success.rewritten_paths,
-            "referencing_paths": success.referencing_paths,
-            "version": success.version,
-            "merged_with_other_changes": success.merged,
-        })),
-    )
-        .into_response()
+    let mut body = serde_json::json!({
+        "outcome": outcome,
+        "sha": success.sha,
+        "rebased_paths": rebased_paths,
+        "rewritten_paths": success.rewritten_paths,
+        "referencing_paths": success.referencing_paths,
+        "version": success.version,
+        "merged_with_other_changes": success.merged,
+    });
+    // Create-only, omitted when empty (#356).
+    if let Some(related) = crate::mcp::related_json(&success.related) {
+        body["related"] = related;
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Map a `write::write_document`/`write::delete_document` failure onto the fixed
@@ -3735,6 +3738,37 @@ mod tests {
         assert_eq!(json["outcome"], "failed_no_change");
     }
 
+    #[tokio::test]
+    async fn write_success_response_includes_related_only_when_present() {
+        let mk = |related| WriteSuccess {
+            outcome: WriteOutcome::Synced,
+            sha: "deadbeef".into(),
+            rebased_paths: Vec::new(),
+            diff: String::new(),
+            rewritten_paths: Vec::new(),
+            referencing_paths: Vec::new(),
+            merged: false,
+            version: None,
+            related,
+        };
+        let body = |resp: Response| async move {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let with = body(write_success_response(mk(vec![
+            crate::write::RelatedDocument {
+                path: "x.md".into(),
+                score: 0.6,
+            },
+        ])))
+        .await;
+        assert_eq!(with["related"][0]["path"], "x.md");
+        let without = body(write_success_response(mk(Vec::new()))).await;
+        assert!(without.get("related").is_none());
+    }
+
     #[test]
     fn write_success_response_reports_outcome_sha_and_rebased_paths() {
         let success = WriteSuccess {
@@ -3746,6 +3780,7 @@ mod tests {
             referencing_paths: vec!["referencer.md".to_string()],
             merged: false,
             version: None,
+            related: Vec::new(),
         };
         let resp = write_success_response(success);
         assert_eq!(resp.status(), StatusCode::OK);
