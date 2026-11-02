@@ -27,8 +27,12 @@ use axum::{
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use oauth_resource_server::axum::{AuthLayer, require_auth};
+use rmcp::ErrorData as McpError;
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
+
+use crate::config::Granularity;
+use crate::mcp::{SearchFiltersInput, SearchParams};
 
 use crate::config::{ResolvedConfig, SharedConfig};
 use crate::embed::{EmbedClient, QueryEmbedder};
@@ -196,6 +200,22 @@ impl UiState {
                 .rerank_client
                 .as_ref()
                 .map(|c| c.as_ref() as &(dyn crate::rerank::Reranker + Send + Sync)),
+        }
+    }
+
+    /// The `search` pipeline's view of this state, shared with the MCP tool
+    /// (`mcp::SearchCtx`). `extra_conditions` are ANDed onto query-mode
+    /// filters.
+    fn search_ctx(
+        &self,
+        extra_conditions: Vec<qdrant_client::qdrant::Condition>,
+    ) -> crate::mcp::SearchCtx<'_> {
+        crate::mcp::SearchCtx {
+            deps: self.deps(),
+            config: &self.config,
+            schema_cache: &self.schema_cache,
+            state_db: &self.state_db,
+            extra_conditions,
         }
     }
 
@@ -643,6 +663,18 @@ struct SearchQueryParams {
     r#type: Option<String>,
     #[serde(default)]
     tags: Option<String>,
+    /// `chunk` (default), `section` or `document`, checked against the
+    /// deployment's enabled set exactly as the MCP tool does.
+    #[serde(default)]
+    granularity: Option<String>,
+    /// URL-encoded JSON object, the MCP `search` tool's `filters` shape.
+    /// ANDed with `domain`/`type`/`tags`.
+    #[serde(default)]
+    filters: Option<String>,
+    #[serde(default)]
+    path_prefix: Option<String>,
+    // `heading_prefix` is repeatable, so it is collected from a second,
+    // raw-pairs extraction in `search_handler` (see `DocQueryParams`).
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -651,6 +683,10 @@ struct ApiSearchResult {
     file_path: String,
     title: String,
     text: String,
+    /// True when `text` was cut short. This endpoint returns each chunk's
+    /// whole body, so it is always false today; the key is present so a
+    /// client can depend on it.
+    text_truncated: bool,
     line_start: Option<i64>,
     line_end: Option<i64>,
     /// Always present in the payload (see `ingest::upsert_pending`); optional
@@ -683,6 +719,7 @@ fn to_api_result(r: &SearchResult, data_path: &Path) -> ApiSearchResult {
             .unwrap_or("(untitled)")
             .to_string(),
         text: crate::qdrant::chunk_body_text(&r.payload).to_string(),
+        text_truncated: false,
         line_start: r.payload.get("line_start").and_then(|v| v.as_i64()),
         line_end: r.payload.get("line_end").and_then(|v| v.as_i64()),
         chunk_index: r.payload.get("chunk_index").and_then(|v| v.as_i64()),
@@ -748,6 +785,7 @@ fn search_error_response(err: &retrieval::SearchError) -> (StatusCode, serde_jso
 async fn search_handler(
     State(state): State<UiState>,
     Query(params): Query<SearchQueryParams>,
+    Query(raw_pairs): Query<Vec<(String, String)>>,
 ) -> Response {
     let q = params.q.as_deref().map(str::trim).unwrap_or("");
     if q.is_empty() {
@@ -799,20 +837,95 @@ async fn search_handler(
     });
 
     let config = state.config();
-    let limit = params
-        .limit
-        .unwrap_or(config.search.default_limit)
-        .min(config.search.max_limit)
-        .max(1);
+    let granularity = match params.granularity.as_deref() {
+        // The default stays `chunk` whatever `search.granularities` enables, as
+        // before this parameter existed.
+        None => Granularity::Chunk,
+        Some(raw) => match crate::mcp::resolve_search_granularity(
+            true,
+            Some(raw),
+            &config.effective_granularities(),
+            config.section_gated_off(),
+        ) {
+            Ok(g) => g,
+            Err(e) => return mcp_error_response(e),
+        },
+    };
+    let filters_input = match parse_filters_param(params.filters.as_deref()) {
+        Ok(f) => f,
+        Err(msg) => return bad_request(msg),
+    };
+    let heading_prefix: Vec<String> = raw_pairs
+        .into_iter()
+        .filter(|(k, _)| k == "heading_prefix")
+        .map(|(_, v)| v)
+        .collect();
+    let search_params = SearchParams {
+        query: Some(q.to_string()),
+        filters: filters_input,
+        path_prefix: params.path_prefix.clone(),
+        heading_prefix: (!heading_prefix.is_empty()).then_some(heading_prefix),
+        limit: params.limit,
+        ..Default::default()
+    };
+    if let Err(e) = crate::mcp::validate_search_params(&search_params) {
+        return mcp_error_response(e);
+    }
 
-    let filters = retrieval::plain_search_filters(
+    let sugar = retrieval::plain_search_filters(
         params.domain.as_deref(),
         params.r#type.as_deref(),
         tags.as_deref(),
     );
-    // Same defaults `KbSearchServer::search` resolves from config — explain, the
-    // mtime range filters, and path_prefix are not exposed by this endpoint's query
-    // params.
+    let ctx = state.search_ctx(sugar.conditions);
+    if let Err(e) = ctx.check_filter_vocabulary(&search_params).await {
+        return mcp_error_response(e);
+    }
+
+    match granularity {
+        Granularity::Chunk => {
+            chunk_search(&state, &ctx, &search_params, q, &config, params.limit).await
+        }
+        Granularity::Section => structured_response(ctx.search_sections(&search_params).await),
+        Granularity::Document => structured_response(ctx.search_grouped(&search_params).await),
+    }
+}
+
+/// The `chunk` branch of `/api/search`: the original behavior, plus the MCP
+/// tool's `filters`, `path_prefix` and `heading_prefix` lowered through the
+/// same functions it uses.
+async fn chunk_search(
+    state: &UiState,
+    ctx: &crate::mcp::SearchCtx<'_>,
+    search_params: &SearchParams,
+    q: &str,
+    config: &ResolvedConfig,
+    requested_limit: Option<u64>,
+) -> Response {
+    if let Err(e) = crate::mcp::validate_path_prefix(&search_params.path_prefix) {
+        return mcp_error_response(e);
+    }
+    let schemas = schema::load_shared(&state.schema_cache);
+    // Also ANDs in the `domain`/`type`/`tags` sugar (the context's
+    // `extra_conditions`).
+    let conditions = match ctx.query_conditions(search_params, config, &schemas) {
+        Ok(c) => c,
+        Err(e) => return mcp_error_response(e),
+    };
+    let filters = SearchFilters { conditions };
+    let path_filter = match ctx
+        .resolve_path_filter(search_params.path_prefix.as_deref())
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return mcp_error_response(e),
+    };
+    let limit = requested_limit
+        .unwrap_or(config.search.default_limit)
+        .min(config.search.max_limit)
+        .max(1);
+    // Same defaults `KbSearchServer::search` resolves from config — explain and
+    // the mtime range filters are not exposed by this endpoint's query params.
     let opts = SearchOptions {
         limit,
         min_score: config.search.min_score,
@@ -822,7 +935,7 @@ async fn search_handler(
         explain: false,
         modified_after: None,
         modified_before: None,
-        path_filter: None,
+        path_filter,
         rerank_candidate_limit: config.reranking.as_ref().map(|r| r.candidate_limit as u64),
         diversity_max_per_document: config.search.diversity_max_per_document,
     };
@@ -838,6 +951,119 @@ async fn search_handler(
             (status, Json(body)).into_response()
         }
     }
+}
+
+/// Map the MCP search path's error onto a status: `invalid_params` (a bad
+/// filter, a refused vocabulary, a disabled granularity, ...) is a 400 whose
+/// body carries the same message and structured `data` the MCP tool gives;
+/// anything else is a 500.
+fn mcp_error_response(err: McpError) -> Response {
+    let status = if err.code == rmcp::model::ErrorCode::INVALID_PARAMS {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let mut body = match err.data {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    body.insert("error".into(), serde_json::json!(err.message));
+    (status, Json(serde_json::Value::Object(body))).into_response()
+}
+
+/// A successful MCP search result as the HTTP body (its `structured_content`,
+/// the same object the tool returns), or the mapped error.
+fn structured_response(result: Result<rmcp::model::CallToolResult, McpError>) -> Response {
+    match result {
+        Ok(r) => match r.structured_content {
+            Some(v) => (StatusCode::OK, Json(v)).into_response(),
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "search returned no result"})),
+            )
+                .into_response(),
+        },
+        Err(e) => mcp_error_response(e),
+    }
+}
+
+/// Upper bound on the raw `filters` query value, before it is parsed.
+const MAX_FILTERS_PARAM_LEN: usize = 64 * 1024;
+
+/// Parse a `filters` query value (a JSON object, in the MCP tool's shape).
+fn parse_filters_param(raw: Option<&str>) -> Result<Option<SearchFiltersInput>, String> {
+    let Some(raw) = raw.filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if raw.len() > MAX_FILTERS_PARAM_LEN {
+        return Err(format!(
+            "filters exceeds maximum length of {MAX_FILTERS_PARAM_LEN} characters"
+        ));
+    }
+    serde_json::from_str::<SearchFiltersInput>(raw)
+        .map(Some)
+        .map_err(|e| format!("invalid filters: {e}"))
+}
+// ---------------------------------------------------------------------------
+// GET /api/enumerate
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct EnumerateQueryParams {
+    #[serde(default)]
+    filters: Option<String>,
+    #[serde(default)]
+    path_prefix: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+    #[serde(default)]
+    offset: Option<u64>,
+}
+
+/// Exact frontmatter listing — the MCP `search` tool with no `query`, served
+/// from the metadata index. Shares that path's filter parsing, vocabulary
+/// refusals, `path_prefix` matching and paging, so the two cannot disagree.
+async fn enumerate_handler(
+    State(state): State<UiState>,
+    Query(params): Query<EnumerateQueryParams>,
+) -> Response {
+    let filters = match parse_filters_param(params.filters.as_deref()) {
+        Ok(f) => f,
+        Err(msg) => return bad_request(msg),
+    };
+    let search_params = SearchParams {
+        filters,
+        path_prefix: params.path_prefix,
+        limit: params.limit,
+        offset: params.offset,
+        ..Default::default()
+    };
+    let ctx = state.search_ctx(Vec::new());
+    if let Err(e) = ctx.check_filter_vocabulary(&search_params).await {
+        return mcp_error_response(e);
+    }
+    let result = match ctx.search_enumerate(&search_params).await {
+        Ok(r) => r,
+        Err(e) => return mcp_error_response(e),
+    };
+    let Some(mut body) = result.structured_content else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "enumeration returned no result"})),
+        )
+            .into_response();
+    };
+    // The tool omits `has_more` unless true and adds a `returned` count; this
+    // route always states `has_more` and leaves `returned` to the array.
+    let has_more = body
+        .get("has_more")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("returned");
+        obj.insert("has_more".into(), serde_json::json!(has_more));
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1788,6 +2014,7 @@ pub fn ui_router_with_api_auth(state: UiState, api_auth: Option<AuthLayer>) -> R
     let mut api_router = Router::new()
         .route("/api/graph", get(graph_handler))
         .route("/api/search", get(search_handler))
+        .route("/api/enumerate", get(enumerate_handler))
         .route("/api/schema/{*path}", get(get_schema_handler))
         .route("/api/history", get(history_handler))
         .merge(doc_router)
@@ -2622,6 +2849,132 @@ mod tests {
         assert_eq!(json["palette"], serde_json::json!({}));
         assert_eq!(json["total_nodes"], serde_json::json!(0));
         assert_eq!(json["nodes_truncated"], serde_json::json!(false));
+    }
+
+    /// `GET <uri>` against a router over `canonical`, returning status + JSON.
+    async fn get_json(canonical: &Path, uri: &str) -> (StatusCode, serde_json::Value) {
+        let app = ui_router(test_state(canonical));
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        (status, body_json(resp).await)
+    }
+
+    async fn seed_typed_docs(canonical: &Path) {
+        let db = StateDb::new(&canonical.join("state.db")).await.unwrap();
+        for (path, title, ty) in [
+            ("notes/a.md", "Doc A", "guide"),
+            ("notes/b.md", "Doc B", "guide"),
+            ("other/c.md", "Doc C", "reference"),
+        ] {
+            let fm: HashMap<String, serde_json::Value> = [
+                ("title".to_string(), serde_json::json!(title)),
+                ("type".to_string(), serde_json::json!(ty)),
+            ]
+            .into_iter()
+            .collect();
+            db.upsert_document_metadata(path, &fm, 100, path, 1)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn enumerate_lists_exact_matches_with_paging() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        seed_typed_docs(&canonical).await;
+
+        let (status, json) = get_json(
+            &canonical,
+            "/api/enumerate?filters=%7B%22type%22%3A%22guide%22%7D",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["has_more"], false);
+        assert!(json.get("returned").is_none());
+        let docs = json["documents"].as_array().unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0]["file_path"], "notes/a.md");
+        assert_eq!(docs[0]["title"], "Doc A");
+        assert_eq!(docs[0]["frontmatter"]["type"], "guide");
+
+        let (_, page) = get_json(&canonical, "/api/enumerate?limit=1&offset=0").await;
+        assert_eq!(page["total"], 3);
+        assert_eq!(page["has_more"], true);
+        assert_eq!(page["documents"].as_array().unwrap().len(), 1);
+
+        let (_, scoped) = get_json(&canonical, "/api/enumerate?path_prefix=other/").await;
+        assert_eq!(scoped["total"], 1);
+        assert_eq!(scoped["documents"][0]["file_path"], "other/c.md");
+    }
+
+    #[tokio::test]
+    async fn enumerate_refuses_bad_filters_with_a_4xx() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        seed_typed_docs(&canonical).await;
+
+        for uri in [
+            "/api/enumerate?filters=not-json",
+            "/api/enumerate?filters=%5B1%5D",
+            "/api/enumerate?filters=%7B%22type%22%3A%7B%22bogus%22%3A1%7D%7D",
+        ] {
+            let (status, json) = get_json(&canonical, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+            assert!(json["error"].is_string(), "{uri}: {json}");
+        }
+
+        // The MCP tool's vocabulary refusal, with its structured data.
+        let (status, json) = get_json(
+            &canonical,
+            "/api/enumerate?filters=%7B%22nonesuch%22%3A%22x%22%7D",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown filter field")
+        );
+        assert!(json["filterable_fields"].is_array());
+    }
+
+    #[tokio::test]
+    async fn search_rejects_what_the_mcp_tool_rejects_before_any_retrieval() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        seed_typed_docs(&canonical).await;
+
+        for uri in [
+            "/api/search?q=x&granularity=bogus",
+            // `chunking.heading_metadata` is off in the test config.
+            "/api/search?q=x&granularity=section",
+            "/api/search?q=x&heading_prefix=Intro",
+            "/api/search?q=x&filters=nope",
+            "/api/search?q=x&granularity=document&filters=%7B%22nonesuch%22%3A%22x%22%7D",
+            "/api/search?q=x&filters=%7B%22nonesuch%22%3A%22x%22%7D",
+        ] {
+            let (status, json) = get_json(&canonical, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+            assert!(json["error"].is_string(), "{uri}: {json}");
+        }
+    }
+
+    #[test]
+    fn api_search_result_always_states_text_truncated() {
+        let result = SearchResult {
+            score: 0.5,
+            payload: HashMap::new(),
+            dense_score: None,
+            sparse_score: None,
+            phrase_score: None,
+            pre_rerank_score: None,
+        };
+        let row = serde_json::to_value(to_api_result(&result, Path::new("/data"))).unwrap();
+        assert_eq!(row["text_truncated"], false);
     }
 
     #[tokio::test]

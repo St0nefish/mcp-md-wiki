@@ -147,6 +147,7 @@ pub(crate) fn effective_related<E: QueryEmbedder, Q: RetrievalStore>(
 /// cosine threshold like the 0.80 default the gate could never fire — and a
 /// cross-encoder relevance score is not a similarity at all, so reranking is
 /// also kept out of this path (see the `reranker: None` at the call site).
+#[cfg(test)]
 pub(crate) fn dedup_search_opts() -> crate::retrieval::SearchOptions {
     dedup_search_opts_with_limit(1)
 }
