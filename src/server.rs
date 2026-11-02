@@ -32,6 +32,7 @@ use crate::rerank::RerankClient;
 use crate::schema::{self, SchemaCache};
 use crate::webhook::{self, WebhookState};
 use oauth_resource_server::axum::{AuthLayer, metadata_router, require_auth};
+use oauth_resource_server::mcp::McpToolScopes;
 use oauth_resource_server::{
     OAuthValidator, PROTECTED_RESOURCE_METADATA_PREFIX, StaticTokenDecision, static_token_policy,
 };
@@ -1173,11 +1174,11 @@ pub fn render_prometheus(
 /// challenge as a bad one; the difference lives in the log level only.
 ///
 /// On an OAuth success the middleware inserts the `oauth_resource_server::
-/// AuthorizedToken` (and a `Credential`) into request extensions. NOTHING READS IT
-/// YET: write-scope enforcement (`mcp:write` for write_document / delete_document /
-/// update_schema) is not implemented, because the middleware cannot see which MCP
-/// tool a request invokes — that is in the JSON-RPC body, which only rmcp parses.
-/// Any valid token therefore grants full access today, writes included.
+/// AuthorizedToken` (and a `Credential`) into request extensions. The layer itself
+/// cannot see which MCP tool a request invokes (that is in the JSON-RPC body), so
+/// `/mcp` additionally carries the crate's `McpToolScopes` ([`mcp_tool_scopes`],
+/// #360), which requires `mcp:write` for write_document / delete_document /
+/// update_schema and lets a static token through unchecked.
 ///
 /// The layer is built from [`static_bearer_token`]'s decision, never from a raw
 /// token, so the crate's `AuthLayerBuilder::build_with_decision` owns the mapping:
@@ -1691,6 +1692,13 @@ const STATUS_PATH: &str = "/status";
 const METRICS_PATH: &str = "/metrics";
 const ADMIN_RELOAD_PATH: &str = "/admin/reload";
 const MCP_PATH: &str = "/mcp";
+/// The scope an OAuth token needs, on top of the layer's required scope(s), to call
+/// a write tool (#360). Fixed rather than configurable: the defaults this server
+/// advertises (`mcp.oauth.scopes_supported`) are `mcp:read` and `mcp:write`.
+const MCP_WRITE_SCOPE: &str = "mcp:write";
+/// The tools that change the knowledge base or its schema; `descriptions::TOOL_NAMES`
+/// holds the full set.
+const MCP_WRITE_TOOLS: [&str; 3] = ["write_document", "delete_document", "update_schema"];
 /// Open by design, unlike the four paths above — see `web.rs`'s module doc for why
 /// `/health` and the UI routes carry no `require_auth` layer.
 const HEALTH_PATH: &str = "/health";
@@ -1809,7 +1817,31 @@ struct RouterAssemblyDeps {
     /// the `if let Some(secret) = webhook_secret` this replaces: `/hooks/reindex` only
     /// exists at all when a secret is configured.
     webhook_state: Option<WebhookState>,
+    /// `ui.api_auth`: put `auth` in front of the `/api/*` routes too (#297).
+    api_auth: bool,
 }
+
+/// Per-tool scope enforcement for `/mcp` (#360): a write tool needs
+/// [`MCP_WRITE_SCOPE`] on top of whatever the auth layer already requires of every
+/// request. `None` when OAuth is off — the layer would otherwise answer 401 to the
+/// unauthenticated pass-through (no credential at all) — and a static-token-only
+/// deployment has no scopes to enforce. A static token keeps full access when OAuth
+/// is on as well (`static_token_bypasses_scopes`).
+fn mcp_tool_scopes(auth: &AuthLayer) -> Option<McpToolScopes> {
+    auth.oauth()?;
+    let mut scopes = McpToolScopes::new()
+        // `RequestBodyLimitLayer` below caps the body at 10 MB; the scope layer reads
+        // the body first, so it needs the same ceiling rather than its 1 MiB default.
+        .body_limit(MCP_BODY_LIMIT)
+        .static_token_bypasses_scopes();
+    for tool in MCP_WRITE_TOOLS {
+        scopes = scopes.tool(tool, [MCP_WRITE_SCOPE]);
+    }
+    Some(scopes)
+}
+
+/// Request body ceiling for `/mcp` (10 MB).
+const MCP_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Assembles the full router `run_server` serves: `/health`, the bearer-protected
 /// `/mcp` + `/status`/`/metrics` + `/admin/reload` group, the open web UI, and the
@@ -1825,7 +1857,7 @@ struct RouterAssemblyDeps {
 /// outside the `require_auth` layer, no matter how many assertions it makes about
 /// routes it already knows the names of.
 fn assemble_router(deps: RouterAssemblyDeps) -> Router {
-    let mcp_router = Router::new()
+    let mut mcp_router = Router::new()
         .nest_service(MCP_PATH, deps.mcp_service)
         // NOT `DefaultBodyLimit`: that works only by inserting a marker into request
         // extensions for axum's `Bytes`/`String`/`Json` extractors to consult, and
@@ -1835,11 +1867,16 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
         // 11.5 MB body reached `/mcp` and returned 200 OK). `RequestBodyLimitLayer`
         // instead wraps the body type itself, so the cap applies no matter how the
         // inner service reads it.
-        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)) // 10 MB
-        .route_layer(middleware::from_fn_with_state(
-            deps.auth.clone(),
-            require_auth,
-        ));
+        .layer(RequestBodyLimitLayer::new(MCP_BODY_LIMIT));
+    // Added before (so inside) `require_auth`: it reads the credential `require_auth`
+    // leaves in the request extensions.
+    if let Some(tool_scopes) = mcp_tool_scopes(&deps.auth) {
+        mcp_router = mcp_router.route_layer(tool_scopes);
+    }
+    let mcp_router = mcp_router.route_layer(middleware::from_fn_with_state(
+        deps.auth.clone(),
+        require_auth,
+    ));
 
     // `/status` and `/metrics` sit behind the same bearer token as `/mcp`, not open like
     // `/health`. `/health` answers "is it up" and reveals nothing; these enumerate tag
@@ -1888,9 +1925,12 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
         .merge(mcp_router)
         // Merged BEFORE the `GovernorLayer` wrap (applied by `run_server`, outside
         // this function), same as every other route, so rate limiting applies to
-        // the UI/API routes too. No bearer-auth layer — see `web.rs`'s module doc
-        // for why these routes are deliberately open.
-        .merge(crate::web::ui_router(deps.ui_state));
+        // the UI/API routes too. No bearer-auth layer unless `ui.api_auth` is on, and
+        // then only on `/api/*` — see `web.rs`'s module doc for why the rest stays open.
+        .merge(crate::web::ui_router_with_api_auth(
+            deps.ui_state,
+            deps.api_auth.then(|| deps.auth.clone()),
+        ));
 
     if let Some(webhook_state) = deps.webhook_state {
         let webhook_router = Router::new()
@@ -2303,6 +2343,21 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         config.mcp.oauth.as_ref(),
         config.mcp.allow_unauthenticated,
     )?;
+    if let Some(oauth_config) = config.mcp.oauth.as_ref()
+        && !oauth_config
+            .scopes_supported
+            .iter()
+            .any(|s| s == MCP_WRITE_SCOPE)
+    {
+        // Enforced regardless: an authorization server that is never told about the
+        // scope will issue read-only tokens, so the write tools stay unreachable by
+        // OAuth (a static token still works).
+        warn!(
+            "mcp.oauth.scopes_supported does not list '{MCP_WRITE_SCOPE}' — the write \
+             tools (write_document, delete_document, update_schema) require it and \
+             clients will not be told to request it"
+        );
+    }
     let auth = auth_layer(decision, oauth)?;
 
     // Rate limiting, per client address as chosen by `rate_limit.client_ip_source`
@@ -2358,6 +2413,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
             reindex_queue: Arc::clone(&reindex_queue),
         },
         ui_state,
+        api_auth: config.ui.api_auth,
         webhook_state: webhook_secret.map(|secret| WebhookState {
             config: Arc::clone(&shared_config),
             secret,
@@ -4624,6 +4680,7 @@ mod tests {
                 reindex_queue: Arc::clone(&reindex_queue),
             },
             ui_state,
+            api_auth: false,
             webhook_state: Some(WebhookState {
                 config: Arc::clone(&shared_config),
                 secret: "webhook-secret".into(),
@@ -5685,5 +5742,238 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // --- #360 per-tool write scope; #297 gated /api/* ---
+
+    fn scoped_token(scope: &str) -> String {
+        oauth_testing::mint(
+            oauth_testing::KEY_A_PEM,
+            oauth_testing::KID_A,
+            &serde_json::json!({
+                "iss": oauth_testing::ISSUER, "aud": oauth_testing::AUDIENCE, "sub": "user-1",
+                "exp": oauth_testing::now() + 3600, "scope": scope,
+            }),
+        )
+    }
+
+    fn tool_call_body(tool: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": tool, "arguments": {}}
+        })
+        .to_string()
+    }
+
+    async fn mcp_post(app: &Router, authorization: Option<&str>, body: String) -> Response {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(MCP_PATH)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(h) = authorization {
+            req = req.header("authorization", h);
+        }
+        app.clone()
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// The assembled router with OAuth (and optionally a static token) on.
+    async fn oauth_assembled(
+        dir: &std::path::Path,
+        static_token: Option<&str>,
+        api_auth: bool,
+    ) -> (oauth_testing::FakeJwksServer, Router) {
+        let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
+        let mut deps = test_router_assembly_deps_with_oauth(
+            dir,
+            static_token.map(str::to_string),
+            Some(test_oauth_validator(&jwks.url)),
+        );
+        deps.api_auth = api_auth;
+        (jwks, assemble_router(deps))
+    }
+
+    #[tokio::test]
+    async fn read_only_token_is_refused_on_every_write_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), Some("secret"), false).await;
+        let header = format!("Bearer {}", scoped_token("mcp:read"));
+        for tool in MCP_WRITE_TOOLS {
+            let resp = mcp_post(&app, Some(&header), tool_call_body(tool)).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{tool}");
+            let challenge = www_authenticate(&resp);
+            assert!(
+                challenge.contains("error=\"insufficient_scope\""),
+                "{tool}: {challenge}"
+            );
+            assert!(challenge.contains("mcp:write"), "{tool}: {challenge}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_token_still_reaches_the_read_tools_and_the_other_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), None, false).await;
+        let header = format!("Bearer {}", scoped_token("mcp:read"));
+        for tool in ["search", "get_document", "get_schema"] {
+            let resp = mcp_post(&app, Some(&header), tool_call_body(tool)).await;
+            assert!(
+                resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+                "{tool}: {}",
+                resp.status()
+            );
+        }
+        // The GET event stream and DELETE carry no body: they need only the default.
+        for method in ["GET", "DELETE"] {
+            let req = Request::builder()
+                .method(method)
+                .uri(MCP_PATH)
+                .header("authorization", &header)
+                .header("accept", "text/event-stream")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert!(
+                resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+                "{method}: {}",
+                resp.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_and_write_token_passes_the_write_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), None, false).await;
+        let header = format!("Bearer {}", scoped_token("mcp:read mcp:write"));
+        for tool in MCP_WRITE_TOOLS {
+            let resp = mcp_post(&app, Some(&header), tool_call_body(tool)).await;
+            assert!(
+                resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+                "{tool}: {}",
+                resp.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn static_token_keeps_full_access_with_oauth_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), Some("secret"), false).await;
+        for tool in MCP_WRITE_TOOLS {
+            let resp = mcp_post(&app, Some("Bearer secret"), tool_call_body(tool)).await;
+            assert!(
+                resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+                "{tool}: {}",
+                resp.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn static_only_and_unauthenticated_deployments_get_no_scope_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        // Static-only: no OAuth, so no scope layer; the token reaches write tools.
+        let app = assemble_router(test_router_assembly_deps(dir.path(), Some("secret".into())));
+        let resp = mcp_post(
+            &app,
+            Some("Bearer secret"),
+            tool_call_body("write_document"),
+        )
+        .await;
+        assert!(
+            resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+            "{}",
+            resp.status()
+        );
+        // allow_unauthenticated: no credential at all must still reach the tools.
+        let app = assemble_router(test_router_assembly_deps(dir.path(), None));
+        let resp = mcp_post(&app, None, tool_call_body("write_document")).await;
+        assert!(
+            resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+            "{}",
+            resp.status()
+        );
+        assert!(mcp_tool_scopes(&test_auth_layer(Some("s".into()), None)).is_none());
+        assert!(mcp_tool_scopes(&test_auth_layer(None, None)).is_none());
+    }
+
+    async fn api_get(app: &Router, path: &str, authorization: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().uri(path);
+        if let Some(h) = authorization {
+            req = req.header("authorization", h);
+        }
+        app.clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn api_routes_are_open_when_api_auth_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), Some("secret"), false).await;
+        assert_eq!(api_get(&app, "/api/history", None).await, StatusCode::OK);
+        assert_eq!(api_get(&app, "/", None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_routes_require_a_credential_when_api_auth_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), Some("secret"), true).await;
+        let jwt = format!("Bearer {}", scoped_token("mcp:read"));
+        for path in [
+            "/api/graph",
+            "/api/search?q=x",
+            "/api/schema/x",
+            "/api/history",
+            "/api/doc/x.md",
+        ] {
+            assert_eq!(
+                api_get(&app, path, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+            for h in ["Bearer secret", jwt.as_str()] {
+                let status = api_get(&app, path, Some(h)).await;
+                assert!(
+                    status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                    "{path}: {status}"
+                );
+            }
+        }
+        // Writes and deletes are gated too.
+        for method in ["POST", "DELETE"] {
+            let req = Request::builder()
+                .method(method)
+                .uri("/api/doc/x.md")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method}");
+        }
+        // The shell and assets stay open.
+        assert_eq!(api_get(&app, "/", None).await, StatusCode::OK);
+        assert_eq!(api_get(&app, "/assets/viz.js", None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_routes_with_api_auth_on_and_static_token_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deps = test_router_assembly_deps(dir.path(), Some("secret".into()));
+        deps.api_auth = true;
+        let app = assemble_router(deps);
+        assert_eq!(
+            api_get(&app, "/api/history", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            api_get(&app, "/api/history", Some("Bearer secret")).await,
+            StatusCode::OK
+        );
     }
 }

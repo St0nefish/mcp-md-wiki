@@ -2,10 +2,12 @@
 //! binary (`assets/ui/`, embedded via `include_str!` — no filesystem reads at
 //! request time, no external network fetches, no new server dependency).
 //!
-//! Deliberately unauthenticated (see the feature plan): every route in
-//! [`ui_router`] is mounted with no bearer-auth layer, the same posture `/health`
-//! already has. The deployment sits behind Authentik via Traefik; this binary does
-//! not gate these routes itself.
+//! Unauthenticated by default (see the feature plan): every route in
+//! [`ui_router_with_api_auth`] is mounted with no bearer-auth layer, the same posture
+//! `/health` already has. The deployment sits behind Authentik via Traefik; this
+//! binary does not gate these routes itself. `ui.api_auth: true` (#297) opts the
+//! `/api/*` routes — never the static shell or assets — into the same bearer-auth
+//! layer as `/mcp`, for deployments whose API consumer is a backend service.
 //!
 //! [`UiState`] mirrors `server::StatusState` and `mcp::KbSearchServer`'s own
 //! fields/`deps()` helper — same retrieval plumbing (`retrieval::search`,
@@ -24,6 +26,7 @@ use axum::{
     routing::get,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use oauth_resource_server::axum::{AuthLayer, require_auth};
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
@@ -1749,10 +1752,22 @@ async fn delete_doc_handler(
 // Router
 // ---------------------------------------------------------------------------
 
+/// Assemble every UI route with no auth layer (the browser-only posture the module
+/// doc describes). Production goes through [`ui_router_with_api_auth`].
+#[cfg(test)]
+pub fn ui_router(state: UiState) -> Router {
+    ui_router_with_api_auth(state, None)
+}
+
 /// Assemble every UI route. Merged into the main app in `server::run_server`
 /// BEFORE the `GovernorLayer` wrap, so rate limiting applies to it like every
 /// other route — see that function's comments at the merge site.
-pub fn ui_router(state: UiState) -> Router {
+///
+/// `api_auth` is `Some` only when `ui.api_auth` is on (#297): the same `AuthLayer`
+/// that guards `/mcp` is then put in front of every `/api/*` route, so it accepts
+/// exactly what `/mcp` accepts. The static shell and `/assets/*` never get it — a
+/// browser has to be able to load the page before it can present a credential.
+pub fn ui_router_with_api_auth(state: UiState, api_auth: Option<AuthLayer>) -> Router {
     // `/api/doc/{*path}` carries all three methods (read, write, delete) on one
     // route so a single `DefaultBodyLimit` layer — matching `mcp_router`'s 10 MB
     // limit in `server.rs` — governs the two methods that accept a body, without
@@ -1767,6 +1782,18 @@ pub fn ui_router(state: UiState) -> Router {
         )
         .layer(DefaultBodyLimit::max(MAX_WRITE_BODY_BYTES));
 
+    let mut api_router = Router::new()
+        .route("/api/graph", get(graph_handler))
+        .route("/api/search", get(search_handler))
+        .route("/api/schema/{*path}", get(get_schema_handler))
+        .route("/api/history", get(history_handler))
+        .merge(doc_router)
+        .with_state(state.clone());
+    if let Some(auth) = api_auth {
+        api_router =
+            api_router.route_layer(axum::middleware::from_fn_with_state(auth, require_auth));
+    }
+
     Router::new()
         .route("/", get(index_handler))
         .route("/assets/viz.css", get(viz_css_handler))
@@ -1778,12 +1805,8 @@ pub fn ui_router(state: UiState) -> Router {
         .route("/assets/marked.min.js", get(marked_handler))
         .route("/assets/dompurify.min.js", get(dompurify_handler))
         .route("/assets/edit.js", get(edit_js_handler))
-        .route("/api/graph", get(graph_handler))
-        .route("/api/search", get(search_handler))
-        .route("/api/schema/{*path}", get(get_schema_handler))
-        .route("/api/history", get(history_handler))
-        .merge(doc_router)
         .with_state(state)
+        .merge(api_router)
 }
 
 #[cfg(test)]

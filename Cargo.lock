@@ -1818,7 +1818,9 @@ checksum = "34c1b460bd0156759e95f4122f031b54f09724a488678ee7abafc21dcaa19302"
 dependencies = [
  "axum 0.8.8",
  "base64 0.23.1",
+ "bytes",
  "http",
+ "http-body",
  "jsonwebtoken",
  "reqwest",
  "serde",
