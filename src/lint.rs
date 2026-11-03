@@ -1,4 +1,4 @@
-//! Corpus-wide lint checks (#354). Milestone 1 is one check: the dead-link report.
+//! Corpus-wide lint checks (#354). One check today: the dead-link report.
 //!
 //! A dead link here is exactly what `get_document`'s per-document `broken_links`
 //! lists — an author-written (`kind = 'markdown'`) edge whose target has no

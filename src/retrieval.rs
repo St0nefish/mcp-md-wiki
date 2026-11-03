@@ -2226,6 +2226,10 @@ fn visible_change(
     }
 }
 
+/// Longest `since`, `cursor` or `path_prefix` `changes_since_json` accepts; the
+/// same ceiling the MCP tools put on a document path.
+pub const MAX_CHANGES_PARAM_LEN: usize = 4096;
+
 /// `changes_since` (#358): the documents that changed between `since` and the
 /// current head, net of every commit in between, with each one's latest commit.
 ///
@@ -2238,7 +2242,13 @@ fn visible_change(
 /// `limit` (clamped to `1..=MAX_CHANGES_LIMIT`) per page. `{"available": false}`
 /// when the data directory is not a git working copy. Read-only: no `GitLock`
 /// (see `git.rs`'s corpus-wide net changes section).
+///
+/// `since`, `cursor` and `path_prefix` over [`MAX_CHANGES_PARAM_LEN`] bytes are
+/// refused before any git call. `include_commit` adds each entry's `commit` (the
+/// revision id): the REST route sets it, the MCP tool does not, since git is an
+/// internal detail to a tool caller.
 pub async fn changes_since_json(
+    include_commit: bool,
     data_path: &str,
     indexing: &crate::config::IndexingConfig,
     since: Option<&str>,
@@ -2247,6 +2257,17 @@ pub async fn changes_since_json(
     cursor: Option<&str>,
 ) -> Result<serde_json::Value, ChangesSinceError> {
     use crate::git::{self, CommitDiffError, NetChangeKind as K};
+    for (name, value) in [
+        ("since", since),
+        ("cursor", cursor),
+        ("path_prefix", path_prefix),
+    ] {
+        if value.is_some_and(|v| v.len() > MAX_CHANGES_PARAM_LEN) {
+            return Err(ChangesSinceError::Invalid(format!(
+                "{name} exceeds maximum length of {MAX_CHANGES_PARAM_LEN} characters"
+            )));
+        }
+    }
     let git_err = ChangesSinceError::Git;
     let unknown = |e: CommitDiffError, what: &str| match e {
         CommitDiffError::UnknownRevision(r) => {
@@ -2367,7 +2388,9 @@ pub async fn changes_since_json(
             entry["old_path"] = serde_json::json!(old);
         }
         if let Some(info) = commit.map_err(ChangesSinceError::Git)? {
-            entry["commit"] = serde_json::json!(info.sha);
+            if include_commit {
+                entry["commit"] = serde_json::json!(info.sha);
+            }
             entry["date"] = serde_json::json!(
                 chrono::DateTime::from_timestamp(info.timestamp, 0)
                     .map_or_else(String::new, |d| d.format("%Y-%m-%dT%H:%MZ").to_string())

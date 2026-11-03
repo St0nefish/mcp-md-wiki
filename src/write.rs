@@ -726,9 +726,10 @@ pub(crate) fn check_include_pattern_against(
     }
 }
 
-/// The include-only half of [`check_include_pattern_against`], for the side of a
-/// write that only ever LEAVES the index: the source of a move and the target of
-/// a delete. A document sitting in an excluded directory must stay movable out of
+/// The include-only half of [`check_include_pattern_against`], for a side of a
+/// write that is not held to the exclusion rules: the source of a move, the
+/// target of a delete, and the destination of a document that was already
+/// excluded from indexing at its source. A document sitting in an excluded directory must stay movable out of
 /// it and deletable (#312 refuses writes that would land in excluded paths, not
 /// cleanup of what is already there).
 fn check_include_only<E: QueryEmbedder, Q: RetrievalStore>(
@@ -3971,9 +3972,31 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // (old_rel, content as read) — the snapshot the under-lock check compares.
     let mut originals: Vec<(String, String)> = Vec::new();
 
+    // A document already excluded from indexing at its source (a `README.md`
+    // under the default `exclude_files`) only has to land inside `include`:
+    // holding it to `exclude` at the destination would refuse any directory
+    // that carries one. An indexable document keeps the full check, so a move
+    // cannot push it into a path a reconcile would never index. Fails open on a
+    // glob-build error, like `partition_indexable`.
+    let path_filter = match crate::ingest::PathFilter::from_config(deps.indexing) {
+        Ok(filter) => Some(filter),
+        Err(e) => {
+            error!(
+                "Failed to build indexing path filter, skipping the exclusion check for the directory move '{source_dir}' -> '{dest_dir}': {e:#}"
+            );
+            None
+        }
+    };
     for (old_rel, new_rel) in &moves {
         check_include_only(deps, old_rel)?;
-        check_include_pattern(deps, new_rel)?;
+        let excluded_at_source = path_filter
+            .as_ref()
+            .is_some_and(|f| !f.is_indexable(crate::retrieval::kb_root_relative(old_rel)));
+        if excluded_at_source {
+            check_include_only(deps, new_rel)?;
+        } else {
+            check_include_pattern(deps, new_rel)?;
+        }
         let abs_source_doc = safe_write_path(deps, old_rel)?;
         let abs_dest_doc = safe_write_path(deps, new_rel)?;
 
@@ -9974,6 +9997,57 @@ mod tests {
         // Every document plus both prefixes' worth of filesystem changes landed
         // in the single commit — nothing left staged or dangling.
         assert_eq!(git_status(&work), "");
+    }
+
+    #[tokio::test]
+    async fn move_directory_carries_a_readme_excluded_from_indexing() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("readme-src")).unwrap();
+        let doc = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# A\n";
+        let readme = "---\ntitle: R\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# R\n";
+        std::fs::write(work.path().join("readme-src/a.md"), doc).unwrap();
+        std::fs::write(work.path().join("readme-src/README.md"), readme).unwrap();
+        git_commit_paths(
+            &work,
+            &["readme-src/a.md", "readme-src/README.md"],
+            "add readme-src",
+        );
+
+        let harness = git_backed_harness(&work);
+        let success = move_directory(&harness.deps(), "readme-src", "readme-dst", None)
+            .await
+            .unwrap();
+
+        assert_eq!(success.moved.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("readme-dst/README.md")).unwrap(),
+            readme
+        );
+        assert!(!work.path().join("readme-src").exists());
+    }
+
+    #[tokio::test]
+    async fn move_directory_refuses_an_indexable_document_landing_in_an_excluded_path() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("excl-src")).unwrap();
+        let doc = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# A\n";
+        std::fs::write(work.path().join("excl-src/a.md"), doc).unwrap();
+        git_commit_paths(&work, &["excl-src/a.md"], "add excl-src");
+
+        let harness = git_backed_harness(&work);
+        let err = move_directory(&harness.deps(), "excl-src", "node_modules/x", None)
+            .await
+            .unwrap_err();
+
+        match err {
+            DirectoryMoveError::UnsafePath { msg } => {
+                assert!(msg.contains("excluded from indexing"), "got: {msg}")
+            }
+            other => panic!("expected UnsafePath, got {other:?}"),
+        }
+        assert!(work.path().join("excl-src/a.md").exists());
     }
 
     #[tokio::test]

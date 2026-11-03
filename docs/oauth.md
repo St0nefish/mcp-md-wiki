@@ -207,7 +207,7 @@ What's specific to this server:
   http --client-id <id> --callback-port <port> <name> <url>`. The redirect URI must
   be registered exactly.
 - **`ui.api_auth`** (default `false`, restart required) puts this same authentication
-  in front of the web UI's `/api/*` routes (mcp-md-wiki#297); `/` and `/assets/*` stay open.
+  in front of the web UI's `/api/*` routes (mcp-md-wiki#297); `/` and `/assets/*` stay open. With OAuth on, `POST` and `DELETE /api/doc/{*path}` also require `mcp:write`, like the write tools on `/mcp` (a static token keeps full access).
 - **Hosted clients** (claude.ai, Claude Desktop, the mobile apps) can only connect
   to a remote MCP server through the OAuth authorization-code flow — the static
   bearer token does not work for them. See [README.md](../README.md#authentication-oauth-recommended).

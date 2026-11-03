@@ -70,6 +70,7 @@ async fn run(
     cursor: Option<&str>,
 ) -> Result<serde_json::Value, ChangesSinceError> {
     changes_since_json(
+        true,
         repo.path(),
         &IndexingConfig::default(),
         since,
@@ -291,6 +292,7 @@ async fn path_prefix_scopes_and_moves_across_the_boundary_read_as_add_or_delete(
 async fn non_git_directory_is_unavailable_and_an_empty_repo_has_no_changes() {
     let dir = tempfile::TempDir::new().unwrap();
     let v = changes_since_json(
+        true,
         dir.path().to_str().unwrap(),
         &IndexingConfig::default(),
         Some("2026-01-01"),
@@ -324,5 +326,42 @@ fn since_timestamps_parse_in_the_documented_forms() {
     }
     for s in ["", "abc1234", "20260301", "main"] {
         assert!(parse_since_timestamp(s).is_none(), "{s}");
+    }
+}
+
+#[tokio::test]
+async fn commit_ids_appear_only_when_asked_for() {
+    let r = Repo::new();
+    r.write("a.md", "# A\n");
+    r.commit("add a");
+    let with = run(&r, Some("2000-01-01"), None, None, None).await.unwrap();
+    assert!(with["changes"][0]["commit"].as_str().is_some(), "{with}");
+    let without = changes_since_json(
+        false,
+        r.path(),
+        &IndexingConfig::default(),
+        Some("2000-01-01"),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(without["changes"][0].get("commit").is_none(), "{without}");
+    assert!(without["changes"][0]["subject"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn over_long_parameters_are_invalid() {
+    let r = Repo::new();
+    r.write("a.md", "# A\n");
+    r.commit("add a");
+    let long = "a".repeat(MAX_CHANGES_PARAM_LEN + 1);
+    for res in [
+        run(&r, Some(&long), None, None, None).await,
+        run(&r, None, None, None, Some(&long)).await,
+        run(&r, Some("2000-01-01"), Some(&long), None, None).await,
+    ] {
+        assert!(matches!(res, Err(ChangesSinceError::Invalid(_))), "{res:?}");
     }
 }

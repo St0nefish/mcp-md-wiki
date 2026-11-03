@@ -3088,9 +3088,8 @@ impl<'a> SearchCtx<'a> {
         // from the Qdrant chunk payload and never joins that index, so `fields`
         // has nothing to draw from here. `search_grouped`/`build_document_query`
         // (document granularity, query or enumeration) are its only real
-        // consumers; reject explicitly here rather than silently drop it the way
-        // it used to (this was the SAME silent-no-op bug `explain` at document
-        // granularity is, just for the mirror-image parameter/granularity pair).
+        // consumers; reject explicitly here rather than silently drop it (the
+        // mirror image of `explain` at document granularity).
         if params.fields.is_some() {
             return Err(fields_rejection(
                 Granularity::Chunk,
@@ -3223,7 +3222,7 @@ impl<'a> SearchCtx<'a> {
         // flag through `RetrievalStore::search_grouped` and adding a
         // client-side-fused, per-arm-scored grouped-query path in `qdrant.rs`
         // mirroring `hybrid_search_explain` — real work, out of scope for this
-        // fix. Reject explicitly instead of the silent no-op this used to be:
+        // fix. Reject explicitly rather than ignore the flag silently:
         // a caller that turned `explain` on to diagnose a confusing document
         // ranking deserves an error telling them so, not a response that quietly
         // drops the one thing they asked for.
@@ -3267,7 +3266,7 @@ impl<'a> SearchCtx<'a> {
         let opts = SearchOptions {
             limit,
             min_score: params.min_score.or(config.search.min_score),
-            // Grouped queries now share `search_chunks`'s dense/sparse/phrase arms
+            // Grouped queries share `search_chunks`'s dense/sparse/phrase arms
             // (see `retrieval::search_grouped`'s doc comment) — a query only the
             // sparse or phrase arm can find must be just as retrievable at
             // document granularity as at chunk granularity. Reranking and
@@ -3585,7 +3584,7 @@ fn build_include_globset(patterns: &[String]) -> GlobSet {
     })
 }
 
-#[tool_router]
+#[tool_router(vis = "pub(crate)")]
 impl KbSearchServer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -4233,6 +4232,7 @@ impl KbSearchServer {
         let data_path = self.canonical_data_path.to_string_lossy().into_owned();
         let indexing = self.config().indexing.clone();
         match retrieval::changes_since_json(
+            false,
             &data_path,
             &indexing,
             params.since.as_deref(),
@@ -11214,6 +11214,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changes_since_entries_carry_no_revision_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+        run_git(tmp.path(), &["init", "-q"]);
+        run_git(tmp.path(), &["add", "range_doc.md"]);
+        run_git(
+            tmp.path(),
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "docs: add range_doc.md\n\nTool: mcp-md-wiki\nOperation: write_document",
+            ],
+        );
+
+        let result = server
+            .changes_since(Parameters(ChangesSinceParams {
+                since: Some("2000-01-01".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let structured = single_representation(&result);
+
+        let changes = structured["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1, "{structured}");
+        let mut keys: Vec<&str> = changes[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["author", "date", "operation", "path", "status", "subject"]
+        );
+        assert!(structured["head"].as_str().is_some(), "{structured}");
+    }
+
+    #[tokio::test]
+    async fn changes_since_rejects_over_long_parameters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+        let long = "a".repeat(MAX_PATH_LEN + 1);
+        for params in [
+            ChangesSinceParams {
+                since: Some(long.clone()),
+                ..Default::default()
+            },
+            ChangesSinceParams {
+                cursor: Some(long.clone()),
+                ..Default::default()
+            },
+            ChangesSinceParams {
+                since: Some("2000-01-01".into()),
+                path_prefix: Some(long.clone()),
+                ..Default::default()
+            },
+        ] {
+            let err = server.changes_since(Parameters(params)).await.unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(err.message.contains("maximum length"), "{}", err.message);
+        }
+    }
+
+    #[tokio::test]
     async fn get_document_history_is_clamped_and_reports_truncation() {
         let tmp = tempfile::tempdir().unwrap();
         let server = range_test_server(&tmp);
@@ -15417,7 +15484,7 @@ mod tests {
             assert_eq!(a.destructive_hint, Some(true), "{name}");
             assert_eq!(a.idempotent_hint, Some(false), "{name}");
         }
-        for name in ["search", "get_document", "get_schema"] {
+        for name in ["search", "get_document", "get_schema", "changes_since"] {
             assert_eq!(annotations(name).read_only_hint, Some(true), "{name}");
         }
     }

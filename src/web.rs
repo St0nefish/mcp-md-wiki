@@ -838,8 +838,7 @@ async fn search_handler(
 
     let config = state.config();
     let granularity = match params.granularity.as_deref() {
-        // The default stays `chunk` whatever `search.granularities` enables, as
-        // before this parameter existed.
+        // The default is `chunk` whatever `search.granularities` enables.
         None => Granularity::Chunk,
         Some(raw) => match crate::mcp::resolve_search_granularity(
             true,
@@ -891,7 +890,7 @@ async fn search_handler(
     }
 }
 
-/// The `chunk` branch of `/api/search`: the original behavior, plus the MCP
+/// The `chunk` branch of `/api/search`: ranked chunk retrieval, with the MCP
 /// tool's `filters`, `path_prefix` and `heading_prefix` lowered through the
 /// same functions it uses.
 async fn chunk_search(
@@ -1507,6 +1506,7 @@ async fn changes_handler(
     let data_path = state.canonical_data_path.to_string_lossy().into_owned();
     let indexing = state.config().indexing.clone();
     match retrieval::changes_since_json(
+        true,
         &data_path,
         &indexing,
         params.since.as_deref(),
@@ -2041,7 +2041,7 @@ async fn delete_doc_handler(
 /// doc describes). Production goes through [`ui_router_with_api_auth`].
 #[cfg(test)]
 pub fn ui_router(state: UiState) -> Router {
-    ui_router_with_api_auth(state, None)
+    ui_router_with_api_auth(state, None, None)
 }
 
 /// Assemble every UI route. Merged into the main app in `server::run_server`
@@ -2052,19 +2052,33 @@ pub fn ui_router(state: UiState) -> Router {
 /// that guards `/mcp` is then put in front of every `/api/*` route, so it accepts
 /// exactly what `/mcp` accepts. The static shell and `/assets/*` never get it — a
 /// browser has to be able to load the page before it can present a credential.
-pub fn ui_router_with_api_auth(state: UiState, api_auth: Option<AuthLayer>) -> Router {
+///
+/// `api_write_auth` is the same layer built to also require the MCP write scope
+/// (`server::api_write_auth_layer`), `Some` only with OAuth on: it wraps `POST` and
+/// `DELETE /api/doc/{*path}`, so a read-only token reads but cannot write. A static
+/// token passes it.
+pub fn ui_router_with_api_auth(
+    state: UiState,
+    api_auth: Option<AuthLayer>,
+    api_write_auth: Option<AuthLayer>,
+) -> Router {
     // `/api/doc/{*path}` carries all three methods (read, write, delete) on one
     // route so a single `DefaultBodyLimit` layer — matching `mcp_router`'s 10 MB
     // limit in `server.rs` — governs the two methods that accept a body, without
     // widening the limit for every other route in this router (which keeps
     // axum's un-overridden default for everything else).
+    //
+    // `route_layer` wraps only the methods registered before it, so the write
+    // scope is layered onto `post`/`delete` and `get` is added after it.
+    let mut doc_methods = axum::routing::post(post_doc_handler).delete(delete_doc_handler);
+    if let Some(write_auth) = api_write_auth {
+        doc_methods = doc_methods.route_layer(axum::middleware::from_fn_with_state(
+            write_auth,
+            require_auth,
+        ));
+    }
     let doc_router = Router::new()
-        .route(
-            "/api/doc/{*path}",
-            get(get_doc_handler)
-                .post(post_doc_handler)
-                .delete(delete_doc_handler),
-        )
+        .route("/api/doc/{*path}", doc_methods.get(get_doc_handler))
         .layer(DefaultBodyLimit::max(MAX_WRITE_BODY_BYTES));
 
     let mut api_router = Router::new()
@@ -2856,6 +2870,21 @@ mod tests {
         assert_eq!(body["changes"][0]["path"], "docs/a.md");
         assert_eq!(body["changes"][0]["status"], "added");
         assert!(body["head"].as_str().is_some());
+        assert!(
+            body["changes"][0]["commit"].as_str().is_some(),
+            "the REST route keeps each change's commit: {body}"
+        );
+
+        let long = "a".repeat(retrieval::MAX_CHANGES_PARAM_LEN + 1);
+        for uri in [
+            format!("/api/changes?since={long}"),
+            format!("/api/changes?cursor={long}"),
+            format!("/api/changes?since=2000-01-01&path_prefix={long}"),
+        ] {
+            let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{}", &uri[..40]);
+        }
 
         for uri in [
             "/api/changes?since=0123456789abcdef0123456789abcdef01234567",

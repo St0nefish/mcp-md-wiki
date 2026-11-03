@@ -1244,6 +1244,30 @@ fn auth_layer(
         .context("Failed to build the bearer-auth layer")
 }
 
+/// The layer that puts [`MCP_WRITE_SCOPE`] in front of the web UI's write routes
+/// (`POST`/`DELETE /api/doc/{*path}`) when `ui.api_auth` is on, so a read-only
+/// OAuth token cannot write over REST what it cannot write over `/mcp`. Built from
+/// the same decision and validator as [`auth_layer`] (one key cache); a static token
+/// bypasses the scope like it does on `/mcp`. `None` when OAuth is off: there are
+/// no scopes to enforce, and the scoped layer would refuse the unauthenticated
+/// pass-through.
+fn api_write_auth_layer(
+    decision: StaticTokenDecision,
+    oauth: Option<Arc<OAuthValidator>>,
+) -> Result<Option<AuthLayer>> {
+    if oauth.is_none() {
+        return Ok(None);
+    }
+    AuthLayer::builder()
+        .optional_oauth(oauth)
+        .static_challenge(None)
+        .require_scopes([MCP_WRITE_SCOPE])
+        .static_token_bypasses_scopes()
+        .build_with_decision(decision)
+        .map(Some)
+        .context("Failed to build the write-scoped bearer-auth layer for the web API")
+}
+
 /// Decide the static bearer token the auth layer holds — as the crate's
 /// `StaticTokenDecision`, which [`auth_layer`] builds the layer from — from the
 /// env var's value (`env_value`, read by the caller so this stays a pure,
@@ -1921,6 +1945,9 @@ struct RouterAssemblyDeps {
     webhook_state: Option<WebhookState>,
     /// `ui.api_auth`: put `auth` in front of the `/api/*` routes too (#297).
     api_auth: bool,
+    /// [`api_write_auth_layer`]'s layer, applied to the web write routes only when
+    /// `api_auth` is on.
+    api_write_auth: Option<AuthLayer>,
 }
 
 /// Per-tool scope enforcement for `/mcp` (#360): a write tool needs
@@ -2034,6 +2061,7 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
         .merge(crate::web::ui_router_with_api_auth(
             deps.ui_state,
             deps.api_auth.then(|| deps.auth.clone()),
+            deps.api_auth.then_some(deps.api_write_auth).flatten(),
         ));
 
     if let Some(webhook_state) = deps.webhook_state {
@@ -2462,6 +2490,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
              clients will not be told to request it"
         );
     }
+    let api_write_auth = api_write_auth_layer(decision.clone(), oauth.clone())?;
     let auth = auth_layer(decision, oauth)?;
 
     // Rate limiting, per client address as chosen by `rate_limit.client_ip_source`
@@ -2518,6 +2547,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         },
         ui_state,
         api_auth: config.ui.api_auth,
+        api_write_auth,
         webhook_state: webhook_secret.map(|secret| WebhookState {
             config: Arc::clone(&shared_config),
             secret,
@@ -2645,6 +2675,20 @@ mod tests {
         )
         .unwrap();
         auth_layer(decision, oauth).unwrap()
+    }
+
+    fn test_api_write_auth(
+        bearer_token: Option<String>,
+        oauth: Option<Arc<OAuthValidator>>,
+    ) -> Option<AuthLayer> {
+        let decision = static_bearer_token(
+            "T",
+            bearer_token,
+            oauth.as_deref().map(|v| v.config()),
+            true,
+        )
+        .unwrap();
+        api_write_auth_layer(decision, oauth).unwrap()
     }
 
     #[test]
@@ -4887,7 +4931,7 @@ mod tests {
 
         RouterAssemblyDeps {
             mcp_service,
-            auth: test_auth_layer(bearer_token, oauth),
+            auth: test_auth_layer(bearer_token.clone(), oauth.clone()),
             health_state: HealthState {
                 qdrant: Arc::clone(&qdrant),
                 embed: Arc::clone(&embed),
@@ -4906,6 +4950,7 @@ mod tests {
             },
             ui_state,
             api_auth: false,
+            api_write_auth: test_api_write_auth(bearer_token.clone(), oauth.clone()),
             webhook_state: Some(WebhookState {
                 config: Arc::clone(&shared_config),
                 secret: "webhook-secret".into(),
@@ -6059,7 +6104,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_jwks, app) = oauth_assembled(dir.path(), None, false).await;
         let header = format!("Bearer {}", scoped_token("mcp:read"));
-        for tool in ["search", "get_document", "get_schema"] {
+        for tool in ["search", "get_document", "get_schema", "changes_since"] {
             let resp = mcp_post(&app, Some(&header), tool_call_body(tool)).await;
             assert!(
                 resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
@@ -6140,6 +6185,73 @@ mod tests {
         );
         assert!(mcp_tool_scopes(&test_auth_layer(Some("s".into()), None)).is_none());
         assert!(mcp_tool_scopes(&test_auth_layer(None, None)).is_none());
+    }
+
+    #[test]
+    fn mcp_write_tools_are_exactly_the_tools_without_the_read_only_hint() {
+        let mut not_read_only: Vec<String> = KbSearchServer::tool_router()
+            .list_all()
+            .into_iter()
+            .filter(|t| {
+                t.annotations
+                    .as_ref()
+                    .and_then(|a| a.read_only_hint)
+                    .is_none_or(|ro| !ro)
+            })
+            .map(|t| t.name.to_string())
+            .collect();
+        not_read_only.sort();
+        let mut write_tools: Vec<String> = MCP_WRITE_TOOLS.iter().map(|t| t.to_string()).collect();
+        write_tools.sort();
+        assert_eq!(
+            not_read_only, write_tools,
+            "MCP_WRITE_TOOLS must list every tool that is not read_only_hint = true, and no other"
+        );
+    }
+
+    async fn api_write(app: &Router, method: &str, authorization: &str) -> StatusCode {
+        // An empty JSON body is refused by the handler before any git or network
+        // work, so a request that gets past auth returns fast.
+        let req = Request::builder()
+            .method(method)
+            .uri("/api/doc/x.md")
+            .header("authorization", authorization)
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn api_writes_need_the_write_scope_when_api_auth_and_oauth_are_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), Some("secret"), true).await;
+        let read_only = format!("Bearer {}", scoped_token("mcp:read"));
+        let read_write = format!("Bearer {}", scoped_token("mcp:read mcp:write"));
+
+        for method in ["POST", "DELETE"] {
+            assert_eq!(
+                api_write(&app, method, &read_only).await,
+                StatusCode::FORBIDDEN,
+                "{method} with a read-only token"
+            );
+            for (who, h) in [
+                ("read+write", &read_write),
+                ("static", &"Bearer secret".to_string()),
+            ] {
+                let status = api_write(&app, method, h).await;
+                assert!(
+                    status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                    "{method} with a {who} token: {status}"
+                );
+            }
+        }
+        // Reads stay read-scoped.
+        let status = api_get(&app, "/api/doc/x.md", Some(&read_only)).await;
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+            "GET with a read-only token: {status}"
+        );
     }
 
     async fn api_get(app: &Router, path: &str, authorization: Option<&str>) -> StatusCode {

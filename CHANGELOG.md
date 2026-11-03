@@ -19,8 +19,9 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 - **`changes_since` MCP tool (the seventh) and `GET /api/changes`** (#358). Read-only,
   corpus-wide listing of the documents that changed since a commit id (the `head` a
   previous call returned) or a timestamp: `path`, net `status` (`added`, `modified`,
-  `deleted`, `renamed`, with `old_path`), the last change's `commit`, `date`, `author`,
-  `subject` and `operation`. Parameters `since`, `path_prefix`, `limit` (default 50,
+  `deleted`, `renamed`, with `old_path`), the last change's `date`, `author`,
+  `subject` and `operation` (the REST route also carries its `commit`; the MCP result
+  has no revision id beyond the opaque `head`). Parameters `since`, `path_prefix`, `limit` (default 50,
   max 200) and `cursor`. Like `get_document`'s `history` (#257), a deliberate exception
   to "nothing git-related reaches a tool caller". `mcp.disabled_tools` /
   `mcp.enabled_tools` accept the new name.
@@ -81,6 +82,19 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   (equal to the chunking fingerprint while it is empty, so existing indexes do not
   re-embed on upgrade). Changing only `query_prefix` needs no reindex. Match the
   prefixes to the model's conventions.
+
+### Fixed
+
+- **`move_directory` carries documents excluded from indexing.** A directory holding a
+  `README.md` or `CLAUDE.md` (default `indexing.exclude_files`) is no longer refused
+  whole: a document already excluded at its source only has to land inside
+  `indexing.include`; an indexable document is still refused a destination the
+  exclusion rules rule out.
+- **`ui.api_auth` with OAuth: a read-only token cannot write over REST.** `POST` and
+  `DELETE /api/doc/{*path}` now require `mcp:write`, like the write tools on `/mcp`;
+  `GET` stays read-scoped and a static token keeps full access.
+- **`changes_since` / `GET /api/changes` cap `since`, `cursor` and `path_prefix` at
+  4096 characters** (invalid params / HTTP 400 above it).
 
 ## [0.2.1] - 2026-10-09
 
