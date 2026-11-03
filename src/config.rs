@@ -930,6 +930,18 @@ pub struct WriteConfig {
     /// embedding call; dedup disabled for a path means no neighbours for it.
     #[serde(default = "default_related_limit")]
     pub related_limit: usize,
+    /// Directory an archived document moves under: `write_document` with
+    /// `archive: true` relocates `<path>` to `<archive_prefix>/<path>`. A normal,
+    /// indexed path (archived documents stay searchable and filterable by
+    /// `status`); it must not be excluded by `indexing.exclude`, or the archive
+    /// write is refused like any write to an excluded path.
+    #[serde(default = "default_archive_prefix")]
+    pub archive_prefix: String,
+    /// What archiving does to links that point at the archived document:
+    /// `repoint` rewrites them to the archived location, `unlink` replaces each
+    /// with its plain label. A call can override it with `archive_links`.
+    #[serde(default)]
+    pub archive_links: ArchiveLinkPolicy,
     /// Git author name used for commits made by the write tools.
     /// Distinguishes tool-authored commits from hand-made commits.
     #[serde(default = "default_commit_author_name")]
@@ -956,6 +968,41 @@ fn default_related_limit() -> usize {
     5
 }
 
+fn default_archive_prefix() -> String {
+    "_archive".to_string()
+}
+
+/// How archiving treats inbound links to the archived document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveLinkPolicy {
+    /// Point each link at the document's archived location.
+    #[default]
+    Repoint,
+    /// Replace each link with plain text (the label stays, the link goes).
+    Unlink,
+}
+
+/// `prefix` as a clean `a/b` directory path: surrounding slashes dropped, and
+/// every segment required to be a plain name (no empty, `.` or `..` segment,
+/// no backslash).
+pub fn normalize_archive_prefix(prefix: &str) -> Result<String, String> {
+    let trimmed = prefix.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return Err("must name a directory".to_string());
+    }
+    if trimmed.contains('\\') {
+        return Err("must use `/` separators".to_string());
+    }
+    if trimmed
+        .split('/')
+        .any(|s| s.is_empty() || s == "." || s == "..")
+    {
+        return Err("must not contain empty, `.` or `..` segments".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
 fn default_commit_author_name() -> String {
     "mcp-md-wiki".to_string()
 }
@@ -971,6 +1018,8 @@ impl Default for WriteConfig {
             dedup_threshold: default_dedup_threshold(),
             related_min_score: default_related_min_score(),
             related_limit: default_related_limit(),
+            archive_prefix: default_archive_prefix(),
+            archive_links: ArchiveLinkPolicy::default(),
             commit_author_name: default_commit_author_name(),
             commit_author_email: default_commit_author_email(),
         }
@@ -1443,6 +1492,8 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("write.dedup_threshold", "write"),
     ("write.related_min_score", "write"),
     ("write.related_limit", "write"),
+    ("write.archive_prefix", "write"),
+    ("write.archive_links", "write"),
     ("write.commit_author_name", "write"),
     ("write.commit_author_email", "write"),
     ("search.hybrid", "search"),
@@ -1942,6 +1993,9 @@ impl Config {
                 "write.related_limit must be at most {}",
                 crate::write::MAX_RELATED_LIMIT
             );
+        }
+        if let Err(e) = normalize_archive_prefix(&self.write.archive_prefix) {
+            anyhow::bail!("write.archive_prefix {e}");
         }
         if self.search.rrf_candidates == 0 {
             anyhow::bail!("search.rrf_candidates must be >= 1");

@@ -629,6 +629,18 @@ write:
   related_min_score: 0.50
   related_limit: 5
 
+  # `write_document` with `archive: true` moves a document to
+  # `<archive_prefix>/<its path>` in one commit, sets `status: archived` when the
+  # governing schema declares a `status` field that allows that value, and
+  # handles links that point at it per `archive_links`: `repoint` rewrites them
+  # to the archived location, `unlink` replaces each with its plain label. A call
+  # can override the policy with its own `archive_links`. The prefix is an
+  # ordinary indexed path (archived documents stay searchable; filter on
+  # `status`); do not exclude it in `indexing.exclude`, which would make the
+  # archive write refuse. Reloadable without a restart.
+  archive_prefix: "_archive"
+  archive_links: repoint
+
   # Git author identity used for commits made by the write tools (write_document,
   # delete_document). Setting these to a bot identity makes tool-authored commits
   # easy to distinguish from your own hand-made commits in `git log`.

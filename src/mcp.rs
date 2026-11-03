@@ -1635,6 +1635,18 @@ pub struct WriteDocumentParams {
     /// Skip the near-duplicate check when creating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_new: Option<bool>,
+    /// Retire `path` instead of editing it: as one change, move it under the
+    /// server's archive directory, set `status: archived` when the governing
+    /// schema allows that (the result says whether it did), and handle links
+    /// pointing at it as `archive_links` says. Needs `expected_version`; takes
+    /// no edit mode, `new_path` or `documents`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<bool>,
+    /// With `archive`: `repoint` rewrites links to the archived location,
+    /// `unlink` replaces each with its plain text. Default: the server's setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["repoint", "unlink"]))]
+    pub archive_links: Option<String>,
     // The cap below is `write::MAX_BATCH_DOCUMENTS`; doc comments cannot
     // interpolate it, so `batch_documents_description_states_the_real_cap`
     // pins the number. Moves are excluded per `write::BatchWriteRequest`.
@@ -1701,6 +1713,11 @@ pub struct DeleteDocumentParams {
     /// The `version` from your last `get_document` read; required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
+    /// Also replace links to this document, in the documents that carry them,
+    /// with their plain text, in the same change. Default false: links are left
+    /// as they are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlink_inbound: Option<bool>,
 }
 
 /// Validated edit mode, produced by `parse_edit_mode`.
@@ -2015,6 +2032,8 @@ fn batch_input_as_write_params(input: &BatchDocumentInput) -> WriteDocumentParam
         message: None,
         expected_version: input.expected_version.clone(),
         force_new: input.force_new,
+        archive: None,
+        archive_links: None,
         documents: None,
     }
 }
@@ -2415,12 +2434,14 @@ fn create_edit_success_to_result(
     rel_path: &str,
     is_create: bool,
     dest_path: Option<&str>,
+    archive: bool,
 ) -> CallToolResult {
     let (path, action) = match dest_path {
         Some(dest) => (dest, "moved"),
         None if is_create => (rel_path, "created"),
         None => (rel_path, "updated"),
     };
+    let action = if archive { "archived" } else { action };
     let mut fields = write_response(
         path,
         action,
@@ -2430,6 +2451,19 @@ fn create_edit_success_to_result(
     );
     if dest_path.is_some() {
         fields.insert("from".to_string(), serde_json::json!(rel_path));
+    }
+    if archive {
+        if success.status_set {
+            fields.insert("status".to_string(), serde_json::json!("archived"));
+        } else {
+            fields.insert(
+                "status_note".to_string(),
+                serde_json::json!(
+                    "the governing schema declares no status field that allows 'archived'; \
+                     frontmatter left unchanged"
+                ),
+            );
+        }
     }
     insert_paths(&mut fields, "rewritten_paths", &success.rewritten_paths);
     if let Some(related) = related_json(&success.related) {
@@ -2624,6 +2658,7 @@ fn create_edit_error_to_mcp_error(
 /// counterpart of the reverse-link check #181 logs server-side.
 fn delete_success_to_result(success: WriteSuccess, rel_path: &str) -> CallToolResult {
     let mut fields = write_response(rel_path, "deleted", "", None, success.merged);
+    insert_paths(&mut fields, "rewritten_paths", &success.rewritten_paths);
     insert_paths(&mut fields, "referencing_paths", &success.referencing_paths);
     CallToolResult::structured(serde_json::Value::Object(fields))
 }
@@ -4882,6 +4917,7 @@ impl KbSearchServer {
         operation: &str,
         dest_path: Option<&str>,
         expected_version: Option<&str>,
+        archive: Option<crate::config::ArchiveLinkPolicy>,
     ) -> Result<CallToolResult, McpError> {
         // One snapshot for the whole call, so a concurrent `POST /admin/reload`
         // cannot mix old and new values across this method's several config reads.
@@ -4925,11 +4961,16 @@ impl KbSearchServer {
             operation,
             expected_version,
             dest_path,
+            archive,
         };
 
         match crate::write::write_document(&deps, req).await {
             Ok(success) => Ok(create_edit_success_to_result(
-                success, rel_path, is_create, dest_path,
+                success,
+                rel_path,
+                is_create,
+                dest_path,
+                archive.is_some(),
             )),
             Err(err) => Err(create_edit_error_to_mcp_error(
                 err,
@@ -4974,6 +5015,8 @@ impl KbSearchServer {
             ("append", params.append.is_some()),
             ("expected_version", params.expected_version.is_some()),
             ("force_new", params.force_new.is_some()),
+            ("archive", params.archive.is_some()),
+            ("archive_links", params.archive_links.is_some()),
         ] {
             if is_set {
                 return Err(McpError::invalid_params(
@@ -5033,6 +5076,14 @@ impl KbSearchServer {
                 None,
             ));
         }
+        if params.archive.is_some() || params.archive_links.is_some() {
+            return Err(McpError::invalid_params(
+                "archive is not valid when creating a new document — there is nothing at path \
+                 to archive"
+                    .to_string(),
+                None,
+            ));
+        }
         if params.new_path.is_some() {
             return Err(McpError::invalid_params(
                 "new_path is not valid when creating a new document — there is \
@@ -5087,6 +5138,7 @@ impl KbSearchServer {
             "write_document",
             None, // a create never moves a document
             params.expected_version.as_deref(),
+            None,
         )
         .await
     }
@@ -5100,6 +5152,15 @@ impl KbSearchServer {
         params: WriteDocumentParams,
         canonical: PathBuf,
     ) -> Result<CallToolResult, McpError> {
+        if params.archive == Some(true) {
+            return self.write_document_archive(&params, canonical).await;
+        }
+        if params.archive_links.is_some() {
+            return Err(McpError::invalid_params(
+                "archive_links needs archive: true".to_string(),
+                None,
+            ));
+        }
         // Parse and validate the content-edit mode (surgical vs full-replace vs
         // neither). `new_path` is an orthogonal axis handled below, independent of
         // this — see `parse_edit_mode`'s doc comment.
@@ -5127,6 +5188,79 @@ impl KbSearchServer {
             operation,
             dest_path,
             params.expected_version.as_deref(),
+            None,
+        )
+        .await
+    }
+
+    /// `write_document`'s archive path (#357): `path` resolved to an existing
+    /// document, `archive: true`. A pure move to `<write.archive_prefix>/<path>`
+    /// with `status: archived` and inbound-link handling, all in the pipeline's
+    /// one commit (`write::WriteRequest::archive`).
+    async fn write_document_archive(
+        &self,
+        params: &WriteDocumentParams,
+        canonical: PathBuf,
+    ) -> Result<CallToolResult, McpError> {
+        for (field, is_set) in [
+            ("content", params.content.is_some()),
+            ("old_string", params.old_string.is_some()),
+            ("new_string", params.new_string.is_some()),
+            ("frontmatter_patch", params.frontmatter_patch.is_some()),
+            ("append", params.append.is_some()),
+            ("new_path", params.new_path.is_some()),
+            ("force_new", params.force_new.is_some()),
+        ] {
+            if is_set {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "{field} is not valid with archive: an archive only takes path, \
+                         expected_version, archive_links and message"
+                    ),
+                    None,
+                ));
+            }
+        }
+        let config = self.config();
+        let policy = match params.archive_links.as_deref().map(str::trim) {
+            None => config.write.archive_links,
+            Some(p) if p.eq_ignore_ascii_case("repoint") => {
+                crate::config::ArchiveLinkPolicy::Repoint
+            }
+            Some(p) if p.eq_ignore_ascii_case("unlink") => crate::config::ArchiveLinkPolicy::Unlink,
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!("archive_links must be 'repoint' or 'unlink', not '{other}'"),
+                    None,
+                ));
+            }
+        };
+        let rel_path = canonical
+            .strip_prefix(&self.canonical_data_path)
+            .unwrap_or(&canonical)
+            .to_string_lossy()
+            .into_owned();
+        let dest = write::archive_destination(&config.write.archive_prefix, &rel_path)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        if self.canonical_data_path.join(&dest).exists() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Cannot archive '{rel_path}': '{dest}' already exists. Move or delete the \
+                     document already there first."
+                ),
+                None,
+            ));
+        }
+        self.run_document_write(
+            write::DocChange::Keep,
+            &rel_path,
+            params.message.as_deref(),
+            "update",
+            None,
+            "write_document (archive)",
+            Some(&dest),
+            params.expected_version.as_deref(),
+            Some(policy),
         )
         .await
     }
@@ -5160,6 +5294,8 @@ impl KbSearchServer {
             ("new_path", params.new_path.is_some()),
             ("expected_version", params.expected_version.is_some()),
             ("force_new", params.force_new.is_some()),
+            ("archive", params.archive.is_some()),
+            ("archive_links", params.archive_links.is_some()),
         ] {
             if is_set {
                 return Err(McpError::invalid_params(
@@ -5508,11 +5644,12 @@ impl KbSearchServer {
         let state_db = self.state_db().await.ok();
         let deps = self.write_deps(&config, token.as_deref(), state_db);
 
-        match crate::write::delete_document(
+        match crate::write::delete_document_with(
             &deps,
             &rel_path,
             params.message.as_deref(),
             params.expected_version.as_deref(),
+            params.unlink_inbound.unwrap_or(false),
         )
         .await
         {
@@ -12295,6 +12432,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12335,6 +12474,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12382,6 +12523,8 @@ mod tests {
             }]),
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
         let result = result.expect("frontmatter_patch must succeed against an existing document");
@@ -12428,6 +12571,8 @@ mod tests {
             frontmatter_patch: None,
             append: Some("- entry two".to_string()),
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
         result.expect("append must succeed against an existing document");
@@ -12468,6 +12613,8 @@ mod tests {
             }]),
             append: Some("- entry two".to_string()),
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
         result.expect("frontmatter_patch + append must succeed together");
@@ -12515,6 +12662,8 @@ mod tests {
             }]),
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
         let err = result.expect_err("a schema-violating patch must fail validation");
@@ -12549,6 +12698,8 @@ mod tests {
             }]),
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let err = server
             .write_document(Parameters(params))
@@ -12579,6 +12730,8 @@ mod tests {
             frontmatter_patch: None,
             append: Some("text".to_string()),
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let err = server
             .write_document(Parameters(params))
@@ -12620,6 +12773,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12722,6 +12877,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12756,6 +12913,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12811,6 +12970,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12907,6 +13068,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -13144,6 +13307,8 @@ mod tests {
                 dedup_threshold: 0.85,
                 related_min_score: 0.5,
                 related_limit: 5,
+                archive_prefix: "_archive".to_string(),
+                archive_links: crate::config::ArchiveLinkPolicy::Repoint,
                 commit_author_name: "mcp-md-wiki".to_string(),
                 commit_author_email: "mcp-md-wiki@localhost".to_string(),
             },
@@ -13169,6 +13334,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -13209,6 +13376,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -13250,6 +13419,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -13276,6 +13447,7 @@ mod tests {
             path: "docs/nonexistent.md".to_string(),
             message: None,
             expected_version: None,
+            unlink_inbound: None,
         };
         let result = server.delete_document(Parameters(params)).await;
 
@@ -13369,6 +13541,7 @@ mod tests {
             path: "   ".to_string(), // whitespace-only
             message: None,
             expected_version: None,
+            unlink_inbound: None,
         };
         let result = server.delete_document(Parameters(params)).await;
 
@@ -13395,6 +13568,7 @@ mod tests {
             path: "a".repeat(MAX_PATH_LEN + 1),
             message: None,
             expected_version: None,
+            unlink_inbound: None,
         };
         let err = server
             .delete_document(Parameters(params))
@@ -13423,6 +13597,7 @@ mod tests {
                 path: "guide.md".to_string(),
                 message: None,
                 expected_version: None,
+                unlink_inbound: None,
             }))
             .await
             .expect_err("a bare basename is not a path relative to the KB root");
@@ -13482,6 +13657,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         }
     }
 
@@ -14090,6 +14267,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -14146,6 +14325,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
         assert!(
@@ -14183,6 +14364,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
         assert!(
@@ -14228,6 +14411,7 @@ mod tests {
                 path: "doomed-queued-cleanup-test.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "doomed-queued-cleanup-test.md"),
+                unlink_inbound: None,
             }))
             .await;
 
@@ -14276,6 +14460,7 @@ mod tests {
                 path: "linked.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "linked.md"),
+                unlink_inbound: None,
             }))
             .await
             .expect("an inbound link must not block the delete");
@@ -14304,6 +14489,7 @@ mod tests {
                 path: "unlinked.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "unlinked.md"),
+                unlink_inbound: None,
             }))
             .await
             .unwrap();
@@ -14477,6 +14663,7 @@ mod tests {
                 path: "gone.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "gone.md"),
+                unlink_inbound: None,
             }))
             .await
             .unwrap();
@@ -14510,6 +14697,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await
             .unwrap();
@@ -14592,6 +14781,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         }
     }
 
@@ -14947,6 +15138,7 @@ mod tests {
                 path: "docs/target.md".to_string(),
                 message: None,
                 expected_version: None,
+                unlink_inbound: None,
             }))
             .await
             .expect_err("a delete needs expected_version");
@@ -14975,6 +15167,7 @@ mod tests {
                 path: "docs/target.md".to_string(),
                 message: None,
                 expected_version: Some(base.clone()),
+                unlink_inbound: None,
             }))
             .await
             .expect_err("a stale delete is refused");
@@ -15248,6 +15441,7 @@ mod tests {
             diff: String::new(),
             rewritten_paths: Vec::new(),
             referencing_paths: Vec::new(),
+            status_set: false,
             merged: false,
             version: Some("v".into()),
             related,
@@ -15260,10 +15454,11 @@ mod tests {
             "new.md",
             true,
             None,
+            false,
         );
         let structured = with.structured_content.unwrap();
         assert_eq!(structured["related"][0]["path"], "x.md");
-        let without = create_edit_success_to_result(mk(Vec::new()), "new.md", true, None);
+        let without = create_edit_success_to_result(mk(Vec::new()), "new.md", true, None, false);
         assert!(without.structured_content.unwrap().get("related").is_none());
     }
 
@@ -15468,6 +15663,7 @@ mod tests {
                 path: "doomed.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "doomed.md"),
+                unlink_inbound: None,
             }))
             .await;
 
@@ -15527,6 +15723,7 @@ mod tests {
                 path: "doomed.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "doomed.md"),
+                unlink_inbound: None,
             }))
             .await;
 
@@ -15575,6 +15772,7 @@ mod tests {
             path: "docs/delete-me.md".to_string(),
             message: None,
             expected_version: version_at(&tmp, "docs/delete-me.md"),
+            unlink_inbound: None,
         };
         let result = server.delete_document(Parameters(params)).await;
 
@@ -15611,6 +15809,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15664,6 +15864,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15719,6 +15921,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15813,6 +16017,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15863,6 +16069,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15902,6 +16110,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15945,6 +16155,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15990,6 +16202,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -16053,6 +16267,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -16093,6 +16309,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -16125,6 +16343,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
 
         let cases: Vec<(&str, WriteDocumentParams)> = vec![
@@ -16231,6 +16451,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: one_doc(),
+            archive: None,
+            archive_links: None,
         };
 
         let cases: Vec<(&str, WriteDocumentParams)> = vec![
@@ -16301,6 +16523,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: Some(documents),
+                archive: None,
+                archive_links: None,
             }))
             .await;
         let err = result.expect_err("a batch over the size cap must be rejected");
@@ -16360,6 +16584,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: Some(documents),
+                archive: None,
+                archive_links: None,
             }))
             .await
             .expect("batch write should succeed");
@@ -16430,6 +16656,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: Some(documents),
+                archive: None,
+                archive_links: None,
             }))
             .await;
         let err = result.expect_err("a batch entry with no edit mode must be rejected");
@@ -16469,6 +16697,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -16503,6 +16733,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await
             .expect_err("overlong path should return Err");
@@ -16539,6 +16771,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await
             .expect_err("overlong new_path should return Err");
@@ -16568,6 +16802,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -16604,6 +16840,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -17125,6 +17363,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
         assert!(

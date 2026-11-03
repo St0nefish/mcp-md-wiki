@@ -981,6 +981,26 @@ const DIFF_TABLE: &[DiffField] = &[
         }],
     },
     DiffField {
+        path: "write.archive_prefix",
+        get: |c| Some(d(&c.write.archive_prefix)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.archive_prefix",
+            note: "read fresh from the live config on every archive write_document call \
+                   (mcp.rs write_deps, write.rs archive_destination, #357).",
+        }],
+    },
+    DiffField {
+        path: "write.archive_links",
+        get: |c| Some(d(&c.write.archive_links)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.archive_links",
+            note: "read fresh from the live config on every archive write_document call; a \
+                   call's own archive_links overrides it (#357).",
+        }],
+    },
+    DiffField {
         path: "write.commit_author_name",
         get: |c| Some(d(&c.write.commit_author_name)),
         consumers: &[ConsumerEntry {
