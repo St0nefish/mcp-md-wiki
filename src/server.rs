@@ -6169,7 +6169,10 @@ mod tests {
         let jwt = format!("Bearer {}", scoped_token("mcp:read"));
         for path in [
             "/api/graph",
-            "/api/search?q=x",
+            // A bad `granularity` is refused (400) before any embedding call, so a
+            // credentialed request gets past auth without waiting on a network
+            // embedder this test does not have.
+            "/api/search?q=x&granularity=bogus",
             "/api/schema/x",
             "/api/history",
             "/api/doc/x.md",
