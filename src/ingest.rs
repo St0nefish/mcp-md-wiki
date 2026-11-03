@@ -417,6 +417,22 @@ pub fn compute_hash_from_bytes(content: &[u8]) -> String {
 /// written before fingerprints existed carry `''`, which never matches.
 pub(crate) const CHUNKER_VERSION: u32 = 2;
 
+/// [`chunking_fingerprint`] extended with `embedding.document_prefix`: the prefix is part
+/// of the text that gets embedded, so a change must make every file dirty. This is the
+/// fingerprint stored in `indexed_files` and compared by the reconcile scan. With an
+/// empty prefix (the default) it equals [`chunking_fingerprint`] exactly, so an upgrade
+/// that sets no prefix re-embeds nothing.
+pub(crate) fn indexing_fingerprint(
+    chunking: &crate::config::ChunkingConfig,
+    document_prefix: &str,
+) -> String {
+    let base = chunking_fingerprint(chunking);
+    if document_prefix.is_empty() {
+        return base;
+    }
+    compute_hash_from_bytes(format!("{base};document_prefix={document_prefix:?}").as_bytes())
+}
+
 /// Stable fingerprint of everything that determines a file's chunks and their payload,
 /// apart from the file's own bytes and its schema (tracked separately as
 /// `schema_hash`): [`CHUNKER_VERSION`] plus every `chunking.*` setting.
@@ -2877,7 +2893,7 @@ pub async fn scan_for_dirty(
 
     let schemas = build_run_schemas(&data_path, config)?;
     // Once per scan, not per row — see `chunking_fingerprint`'s doc comment.
-    let chunking_fp = chunking_fingerprint(&config.chunking);
+    let chunking_fp = indexing_fingerprint(&config.chunking, &config.embedding.document_prefix);
 
     // Every path currently on disk. Needed twice: to tell an orphan (row, no file)
     // from a live one while paging `indexed_files`, and — via `visited`, below — to
@@ -3389,7 +3405,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     let git_mtimes = build_git_mtimes(config, &rel_keys).await;
 
     // Once per run, not per file — compared against each row in `process_file`.
-    let chunking_fp = chunking_fingerprint(&config.chunking);
+    let chunking_fp = indexing_fingerprint(&config.chunking, &config.embedding.document_prefix);
 
     // #266: once per run. `None` (fail closed — see `for_exclusion_purge`) means only
     // files missing on disk are purged. A `force` run is fed `discover_files`'s
@@ -3921,6 +3937,8 @@ mod tests {
                 batch_size: 32,
                 request_timeout_secs: 60,
                 batch_concurrency: 4,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 url: "http://test:6334".into(),
@@ -5568,6 +5586,20 @@ mod tests {
             assert_ne!(fp, base_fp, "changing {field} must change the fingerprint");
             assert!(seen.insert(fp), "{field} collided with another variant");
         }
+    }
+
+    #[test]
+    fn indexing_fingerprint_changes_with_the_document_prefix_only_when_set() {
+        let c = crate::config::ChunkingConfig::default();
+        assert_eq!(
+            indexing_fingerprint(&c, ""),
+            chunking_fingerprint(&c),
+            "an empty prefix must not move any stored fingerprint"
+        );
+        let a = indexing_fingerprint(&c, "passage: ");
+        assert_ne!(a, chunking_fingerprint(&c));
+        assert_ne!(a, indexing_fingerprint(&c, "search_document: "));
+        assert_eq!(a, indexing_fingerprint(&c, "passage: "));
     }
 
     #[test]

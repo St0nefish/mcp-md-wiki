@@ -400,6 +400,12 @@ pub struct RawDedup {
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f32>,
+    /// Overrides `write.related_min_score` (#356).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_min_score: Option<f32>,
+    /// Overrides `write.related_limit` (#356).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_limit: Option<usize>,
 }
 
 impl SchemaFile {
@@ -410,6 +416,21 @@ impl SchemaFile {
         {
             return Err(format!(
                 "dedup.threshold must be between 0.0 and 1.0, got {threshold}"
+            ));
+        }
+        if let Some(score) = self.dedup.as_ref().and_then(|d| d.related_min_score)
+            && !(0.0..=1.0).contains(&score)
+        {
+            return Err(format!(
+                "dedup.related_min_score must be between 0.0 and 1.0, got {score}"
+            ));
+        }
+        if let Some(limit) = self.dedup.as_ref().and_then(|d| d.related_limit)
+            && limit > crate::write::MAX_RELATED_LIMIT
+        {
+            return Err(format!(
+                "dedup.related_limit must be at most {}, got {limit}",
+                crate::write::MAX_RELATED_LIMIT
             ));
         }
         for (name, raw) in &self.fields {
@@ -874,6 +895,10 @@ pub struct ResolvedSchema {
     pub dedup_enabled: Option<bool>,
     /// As `dedup_enabled`, for `write.dedup_threshold`.
     pub dedup_threshold: Option<f32>,
+    /// As `dedup_enabled`, for `write.related_min_score` (#356).
+    pub related_min_score: Option<f32>,
+    /// As `dedup_enabled`, for `write.related_limit` (#356).
+    pub related_limit: Option<usize>,
 }
 
 impl ResolvedSchema {
@@ -974,6 +999,10 @@ impl ResolvedSchema {
             origin: origins,
             dedup_enabled: dedup.and_then(|d| d.enabled).or(self.dedup_enabled),
             dedup_threshold: dedup.and_then(|d| d.threshold).or(self.dedup_threshold),
+            related_min_score: dedup
+                .and_then(|d| d.related_min_score)
+                .or(self.related_min_score),
+            related_limit: dedup.and_then(|d| d.related_limit).or(self.related_limit),
         }
     }
 
@@ -3703,6 +3732,36 @@ mod tests {
         }
         let ok: SchemaFile = serde_yaml_ng::from_str("dedup:\n  threshold: 1.0\n").unwrap();
         ok.validate_self().unwrap();
+    }
+
+    #[test]
+    fn related_keys_cascade_per_key_and_are_range_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        write_schema(
+            dir.path(),
+            "food",
+            "dedup:\n  related_limit: 3\n  related_min_score: 0.6\n",
+        );
+        write_schema(dir.path(), "food/recipes", "dedup:\n  related_limit: 0\n");
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+        let food = cache.resolve_for(Path::new("food/x.md"));
+        assert_eq!(food.related_limit, Some(3));
+        assert_eq!(food.related_min_score, Some(0.6));
+        let recipes = cache.resolve_for(Path::new("food/recipes/x.md"));
+        assert_eq!(recipes.related_limit, Some(0));
+        assert_eq!(recipes.related_min_score, Some(0.6), "inherited");
+        let dev = cache.resolve_for(Path::new("dev/x.md"));
+        assert_eq!(dev.related_limit, None);
+
+        for (yaml, key) in [
+            ("dedup:\n  related_min_score: 1.5\n", "related_min_score"),
+            ("dedup:\n  related_limit: 21\n", "related_limit"),
+        ] {
+            let file: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+            let err = file.validate_self().unwrap_err();
+            assert!(err.contains(key), "got: {err}");
+        }
+        assert!(serde_yaml_ng::from_str::<SchemaFile>("dedup:\n  related_limit: -1\n").is_err());
     }
 
     #[test]

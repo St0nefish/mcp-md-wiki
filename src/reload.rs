@@ -486,6 +486,30 @@ const DIFF_TABLE: &[DiffField] = &[
                    EmbedClient::new).",
         }],
     },
+    DiffField {
+        path: "embedding.query_prefix",
+        get: |c| Some(d(&c.embedding.query_prefix)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "embedding.query_prefix",
+            note: "EmbedClient captures this at construction (embed.rs \
+                   EmbedClient::new). reload_config keeps the running value in the \
+                   live config so it cannot drift from the client until restart.",
+        }],
+    },
+    DiffField {
+        path: "embedding.document_prefix",
+        get: |c| Some(d(&c.embedding.document_prefix)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "embedding.document_prefix",
+            note: "EmbedClient captures this at construction (embed.rs \
+                   EmbedClient::new) and ingest::indexing_fingerprint folds it in, so \
+                   after the restart the next reconcile re-embeds every file. \
+                   reload_config keeps the running value in the live config so the \
+                   fingerprint never gets ahead of the client.",
+        }],
+    },
     // ── validation ───────────────────────────────────────────────────────────
     DiffField {
         path: "validation.enabled",
@@ -935,6 +959,48 @@ const DIFF_TABLE: &[DiffField] = &[
         }],
     },
     DiffField {
+        path: "write.related_min_score",
+        get: |c| Some(d(&c.write.related_min_score)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.related_min_score",
+            note: "read fresh from the live config on every document create (write.rs \
+                   effective_related); the global fallback where no schema file `dedup:` \
+                   block overrides it (#356).",
+        }],
+    },
+    DiffField {
+        path: "write.related_limit",
+        get: |c| Some(d(&c.write.related_limit)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.related_limit",
+            note: "read fresh from the live config on every document create (write.rs \
+                   effective_related); the global fallback where no schema file `dedup:` \
+                   block overrides it (#356).",
+        }],
+    },
+    DiffField {
+        path: "write.archive_prefix",
+        get: |c| Some(d(&c.write.archive_prefix)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.archive_prefix",
+            note: "read fresh from the live config on every archive write_document call \
+                   (mcp.rs write_deps, write.rs archive_destination, #357).",
+        }],
+    },
+    DiffField {
+        path: "write.archive_links",
+        get: |c| Some(d(&c.write.archive_links)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.archive_links",
+            note: "read fresh from the live config on every archive write_document call; a \
+                   call's own archive_links overrides it (#357).",
+        }],
+    },
+    DiffField {
         path: "write.commit_author_name",
         get: |c| Some(d(&c.write.commit_author_name)),
         consumers: &[ConsumerEntry {
@@ -1150,6 +1216,17 @@ const DIFF_TABLE: &[DiffField] = &[
                    Run `mcp-md-wiki index --full` for a consistent corpus.",
         }],
     },
+    DiffField {
+        path: "ui.api_auth",
+        get: |c| Some(d(&c.ui.api_auth)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "ui.api_auth",
+            note: "whether the /api/* routes sit behind the bearer-auth layer is decided \
+                   once when the router is assembled (server.rs assemble_router); the \
+                   layer is never rebuilt.",
+        }],
+    },
 ];
 
 /// Compare every YAML-reloadable setting between `old` and `new`, recording each one
@@ -1211,9 +1288,15 @@ pub fn reload_config(
     shared: &SharedConfig,
     queue: &crate::reindex::ReindexQueue,
 ) -> anyhow::Result<ReloadReport> {
-    let new = Config::load(path)?;
+    let mut new = Config::load(path)?;
     let old = crate::config::load_shared_config(shared);
     let report = diff(&old, &new);
+    // The embedding prefixes are baked into the startup-built `EmbedClient`, and the
+    // document prefix is part of the indexing fingerprint. Keep the running values in
+    // the live config so a reload cannot stamp files with a prefix the client is not
+    // yet sending; the change is reported `restart_required` and lands on restart.
+    new.embedding.query_prefix = old.embedding.query_prefix.clone();
+    new.embedding.document_prefix = old.embedding.document_prefix.clone();
     crate::config::store_shared_config(shared, new);
     queue.mark_full();
     Ok(report)
@@ -1350,6 +1433,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_embedding_prefix_reload_is_restart_required_and_not_applied_live() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "chunking:\n  max_chunk_size: 1000\n");
+        let running = Config::load(&path).unwrap();
+        assert_eq!(running.embedding.document_prefix, "");
+        let shared = crate::config::shared_config(std::sync::Arc::new(running));
+
+        write_config(
+            tmp.path(),
+            "chunking:\n  max_chunk_size: 1000\nembedding:\n  query_prefix: \"query: \"\n  document_prefix: \"passage: \"\n",
+        );
+        let queue = crate::reindex::ReindexQueue::new();
+        let report = reload_config(&path, &shared, &queue).unwrap();
+        let names: Vec<&str> = report
+            .restart_required
+            .iter()
+            .map(|c| c.setting.as_str())
+            .collect();
+        assert!(names.contains(&"embedding.query_prefix"), "{names:?}");
+        assert!(names.contains(&"embedding.document_prefix"), "{names:?}");
+
+        let live = crate::config::load_shared_config(&shared);
+        assert_eq!(live.embedding.query_prefix, "");
+        assert_eq!(live.embedding.document_prefix, "");
+
+        clear_required_env();
     }
 
     #[test]
@@ -1622,6 +1737,7 @@ mod tests {
         // `descriptions::TOOL_NAMES`.
         new.mcp.disabled_tools = vec![
             "get_document".to_string(),
+            "changes_since".to_string(),
             "write_document".to_string(),
             "delete_document".to_string(),
             "get_schema".to_string(),

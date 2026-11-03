@@ -7,6 +7,7 @@ mod eval;
 mod git;
 mod heading;
 mod ingest;
+mod lint;
 mod mcp;
 mod qdrant;
 mod reindex;
@@ -19,6 +20,7 @@ mod server;
 mod sparse;
 mod state;
 mod status;
+mod sync;
 mod tool_schema;
 mod validate;
 mod web;
@@ -137,6 +139,13 @@ struct GetArgs {
     end_line: Option<usize>,
 }
 
+/// Checks the `lint` subcommand can run.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LintCheck {
+    /// Broken internal markdown links across the corpus
+    DeadLinks,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Start the server (MCP + webhook endpoints) [default]
@@ -147,6 +156,13 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
+    /// Fetch and fast-forward the existing KB clone from its remote, then index what changed
+    ///
+    /// The same fetch + ff-only merge the push webhook and `POST /admin/sync` run
+    /// (needs `source.git_url`; the token comes from `source.git_token_env`). With no
+    /// worker in this process, the pull is followed by the `index` subcommand's
+    /// incremental reconcile, which picks up exactly the files the pull changed.
+    GitPull,
     /// Validate all markdown files without indexing
     Validate {
         /// Exit non-zero if any file fails validation, regardless of config strict setting
@@ -164,6 +180,23 @@ enum Commands {
         /// uses, so the JSON on stdout is always parseable on its own.
         #[arg(long)]
         json: bool,
+    },
+    /// Run corpus-wide lint checks against the last indexed state (#354)
+    ///
+    /// Read-only: reads the state DB, never creates it. Findings are reported, not
+    /// failed on: the exit code is 0 whether or not anything is found, and non-zero
+    /// only when there is no state DB to read (run `index` first). That keeps the
+    /// command safe to run from cron or CI without turning link rot into an outage.
+    Lint {
+        /// Which check to run (more will be added; dead-links is the default)
+        #[arg(long, value_enum, default_value_t = LintCheck::DeadLinks)]
+        check: LintCheck,
+        /// Emit the report as JSON on stdout
+        #[arg(long)]
+        json: bool,
+        /// Maximum broken links to list (the true count is always reported)
+        #[arg(long, default_value_t = lint::DEFAULT_DEAD_LINK_LIMIT)]
+        limit: usize,
     },
     /// Print collection stats and state DB info
     Status {
@@ -313,6 +346,30 @@ async fn main() -> anyhow::Result<()> {
             }
             ingest::scan_and_index(&cfg, full, status::Trigger::Cli).await?;
         }
+        Commands::GitPull => {
+            let token = secrets::git_token(&cfg).context("Failed to resolve the git token")?;
+            let pulled = sync::pull_clone(&cfg, token.as_deref()).await?;
+            if pulled.old_head == pulled.new_head {
+                println!("Already up to date at {}", pulled.new_head);
+            } else {
+                println!(
+                    "Updated {} -> {} ({} changed paths)",
+                    pulled.old_head,
+                    pulled.new_head,
+                    pulled.changed.len()
+                );
+            }
+            // No worker here, so index synchronously. The incremental reconcile
+            // stat/hash-compares the corpus against the state DB, which finds exactly
+            // what the pull changed (and anything an earlier failed run missed), so the
+            // diff's path list is not needed.
+            let db_path = cfg.state_db_path();
+            if let Some(parent) = std::path::Path::new(&db_path).parent() {
+                std::fs::create_dir_all(parent)
+                    .context("Failed to create directory for state DB")?;
+            }
+            ingest::scan_and_index(&cfg, false, status::Trigger::Cli).await?;
+        }
         Commands::Validate { strict, json } => {
             let data_path = Path::new(cfg.data_path());
             let files = ingest::discover_files(data_path, &cfg.indexing)?;
@@ -415,6 +472,25 @@ async fn main() -> anyhow::Result<()> {
             let strict = cfg.validation.strict || strict;
             if invalid_count > 0 && strict {
                 anyhow::bail!("{} file(s) failed validation in strict mode", invalid_count);
+            }
+        }
+        Commands::Lint { check, json, limit } => {
+            let state_db_path = cfg.state_db_path();
+            if !std::path::Path::new(&state_db_path).exists() {
+                anyhow::bail!("no index at {state_db_path}; run `mcp-md-wiki index` first");
+            }
+            let state = state::StateDb::new(std::path::Path::new(&state_db_path)).await?;
+            match check {
+                LintCheck::DeadLinks => {
+                    let limit = limit.clamp(1, lint::MAX_DEAD_LINK_LIMIT);
+                    let report =
+                        lint::dead_links(&state, Path::new(cfg.data_path()), limit).await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        lint::write_dead_links(&mut std::io::stdout().lock(), &report)?;
+                    }
+                }
             }
         }
         Commands::Status { json, files } => {

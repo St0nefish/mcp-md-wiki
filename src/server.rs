@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::response::IntoResponse as _;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
@@ -32,6 +33,7 @@ use crate::rerank::RerankClient;
 use crate::schema::{self, SchemaCache};
 use crate::webhook::{self, WebhookState};
 use oauth_resource_server::axum::{AuthLayer, metadata_router, require_auth};
+use oauth_resource_server::mcp::McpToolScopes;
 use oauth_resource_server::{
     OAuthValidator, PROTECTED_RESOURCE_METADATA_PREFIX, StaticTokenDecision, static_token_policy,
 };
@@ -665,6 +667,50 @@ async fn status_handler(State(state): State<StatusState>) -> Json<StatusHttpResp
     })
 }
 
+/// Query string for `GET /status/links`.
+#[derive(serde::Deserialize)]
+struct LinksQuery {
+    /// Maximum broken links listed; defaults to `lint::DEFAULT_DEAD_LINK_LIMIT`,
+    /// clamped to `1..=lint::MAX_DEAD_LINK_LIMIT`.
+    limit: Option<usize>,
+}
+
+/// `GET /status/links`: the corpus-wide dead-link report (`lint` check `dead-links`,
+/// #354), read-only, behind the same auth as `/status`. 503 when no index exists yet.
+async fn links_handler(
+    State(state): State<StatusState>,
+    axum::extract::Query(q): axum::extract::Query<LinksQuery>,
+) -> Response {
+    let cfg = config::load_shared_config(&state.config);
+    if !Path::new(&cfg.state_db_path()).exists() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no index yet"})),
+        )
+            .into_response();
+    }
+    let limit = q
+        .limit
+        .unwrap_or(crate::lint::DEFAULT_DEAD_LINK_LIMIT)
+        .clamp(1, crate::lint::MAX_DEAD_LINK_LIMIT);
+    let result = async {
+        let db = state.state_db().await?;
+        crate::lint::dead_links(db, Path::new(cfg.data_path()), limit).await
+    }
+    .await;
+    match result {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => {
+            error!("dead-link report failed: {e:#}");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "dead-link report failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn metrics_handler(State(state): State<StatusState>) -> Response {
     let status = cached_status(&state).await;
     let retrieval = crate::status::QUERY_METRICS.snapshot();
@@ -1173,11 +1219,11 @@ pub fn render_prometheus(
 /// challenge as a bad one; the difference lives in the log level only.
 ///
 /// On an OAuth success the middleware inserts the `oauth_resource_server::
-/// AuthorizedToken` (and a `Credential`) into request extensions. NOTHING READS IT
-/// YET: write-scope enforcement (`mcp:write` for write_document / delete_document /
-/// update_schema) is not implemented, because the middleware cannot see which MCP
-/// tool a request invokes — that is in the JSON-RPC body, which only rmcp parses.
-/// Any valid token therefore grants full access today, writes included.
+/// AuthorizedToken` (and a `Credential`) into request extensions. The layer itself
+/// cannot see which MCP tool a request invokes (that is in the JSON-RPC body), so
+/// `/mcp` additionally carries the crate's `McpToolScopes` ([`mcp_tool_scopes`],
+/// #360), which requires `mcp:write` for write_document / delete_document /
+/// update_schema and lets a static token through unchecked.
 ///
 /// The layer is built from [`static_bearer_token`]'s decision, never from a raw
 /// token, so the crate's `AuthLayerBuilder::build_with_decision` owns the mapping:
@@ -1196,6 +1242,30 @@ fn auth_layer(
         .static_challenge(None)
         .build_with_decision(decision)
         .context("Failed to build the bearer-auth layer")
+}
+
+/// The layer that puts [`MCP_WRITE_SCOPE`] in front of the web UI's write routes
+/// (`POST`/`DELETE /api/doc/{*path}`) when `ui.api_auth` is on, so a read-only
+/// OAuth token cannot write over REST what it cannot write over `/mcp`. Built from
+/// the same decision and validator as [`auth_layer`] (one key cache); a static token
+/// bypasses the scope like it does on `/mcp`. `None` when OAuth is off: there are
+/// no scopes to enforce, and the scoped layer would refuse the unauthenticated
+/// pass-through.
+fn api_write_auth_layer(
+    decision: StaticTokenDecision,
+    oauth: Option<Arc<OAuthValidator>>,
+) -> Result<Option<AuthLayer>> {
+    if oauth.is_none() {
+        return Ok(None);
+    }
+    AuthLayer::builder()
+        .optional_oauth(oauth)
+        .static_challenge(None)
+        .require_scopes([MCP_WRITE_SCOPE])
+        .static_token_bypasses_scopes()
+        .build_with_decision(decision)
+        .map(Some)
+        .context("Failed to build the write-scoped bearer-auth layer for the web API")
 }
 
 /// Decide the static bearer token the auth layer holds — as the crate's
@@ -1323,6 +1393,60 @@ async fn reload_handler(State(state): State<AdminState>) -> (StatusCode, Json<se
                 Json(serde_json::json!({
                     "status": "rejected",
                     "error": format!("{e:#}"),
+                })),
+            )
+        }
+    }
+}
+
+/// `POST /admin/sync` — fetch the configured branch into the existing clone, fast-
+/// forward to it, and mark what changed dirty on the reindex queue, exactly the sequence
+/// a push webhook runs (`sync::pull_and_mark`). For instances with no webhook wired up.
+/// Behind the same auth as `/admin/reload`. No request body. The response names the
+/// before/after HEAD: operator-facing only, never reachable from an MCP tool.
+async fn sync_handler(State(state): State<AdminState>) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::sync::SyncErrorKind;
+
+    let config = crate::config::load_shared_config(&state.shared_config);
+    let token = match crate::secrets::git_token(&config) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("Sync refused: could not resolve the git token: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "error": "Could not resolve the git token",
+                    "detail": e.to_string(),
+                })),
+            );
+        }
+    };
+    match crate::sync::pull_and_mark(&config, token.as_deref(), &state.reindex_queue).await {
+        Ok(o) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "synced",
+                "changed": o.old_head != o.new_head,
+                "old_head": o.old_head,
+                "new_head": o.new_head,
+                "paths_queued": o.marked,
+                "paths_filtered_out": o.filtered_out,
+                "full_reconcile_queued": o.schema_changed,
+            })),
+        ),
+        Err(e) => {
+            warn!("Sync failed: {e}");
+            let status = match e.kind {
+                SyncErrorKind::NoRemote | SyncErrorKind::NotACheckout => StatusCode::BAD_REQUEST,
+                SyncErrorKind::Git => StatusCode::BAD_GATEWAY,
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "error": e.message,
+                    "detail": e.detail,
                 })),
             )
         }
@@ -1689,8 +1813,17 @@ async fn wait_for_indexing_to_settle(is_indexing: impl Fn() -> bool) {
 // free instead of needing a matching edit of its own.
 const STATUS_PATH: &str = "/status";
 const METRICS_PATH: &str = "/metrics";
+const STATUS_LINKS_PATH: &str = "/status/links";
 const ADMIN_RELOAD_PATH: &str = "/admin/reload";
+const ADMIN_SYNC_PATH: &str = "/admin/sync";
 const MCP_PATH: &str = "/mcp";
+/// The scope an OAuth token needs, on top of the layer's required scope(s), to call
+/// a write tool (#360). Fixed rather than configurable: the defaults this server
+/// advertises (`mcp.oauth.scopes_supported`) are `mcp:read` and `mcp:write`.
+const MCP_WRITE_SCOPE: &str = "mcp:write";
+/// The tools that change the knowledge base or its schema; `descriptions::TOOL_NAMES`
+/// holds the full set.
+const MCP_WRITE_TOOLS: [&str; 3] = ["write_document", "delete_document", "update_schema"];
 /// Open by design, unlike the four paths above — see `web.rs`'s module doc for why
 /// `/health` and the UI routes carry no `require_auth` layer.
 const HEALTH_PATH: &str = "/health";
@@ -1783,11 +1916,12 @@ fn unauthenticated_mcp_warning(bearer_token_env: &str) -> String {
     format!(
         "SECURITY: bearer token env var '{bearer_token_env}' (or '{bearer_token_env}_FILE') is \
          not set — {MCP_PATH}, \
-         {STATUS_PATH}, {METRICS_PATH} and {ADMIN_RELOAD_PATH} are all reachable WITHOUT \
+         {STATUS_PATH}, {STATUS_LINKS_PATH}, {METRICS_PATH}, {ADMIN_RELOAD_PATH} and {ADMIN_SYNC_PATH} are all reachable WITHOUT \
          authentication. {MCP_PATH} will serve full document content to any caller; \
          {STATUS_PATH} and {METRICS_PATH} expose tag vocabularies, area names and document \
          counts; {ADMIN_RELOAD_PATH} lets any caller force a config reload and an \
-         unconditional full reindex reconcile. Set the env var or restrict network access. \
+         unconditional full reindex reconcile; {ADMIN_SYNC_PATH} lets any caller trigger \
+         a fetch from the remote. Set the env var or restrict network access. \
          (allow_unauthenticated is enabled in config)"
     )
 }
@@ -1809,7 +1943,34 @@ struct RouterAssemblyDeps {
     /// the `if let Some(secret) = webhook_secret` this replaces: `/hooks/reindex` only
     /// exists at all when a secret is configured.
     webhook_state: Option<WebhookState>,
+    /// `ui.api_auth`: put `auth` in front of the `/api/*` routes too (#297).
+    api_auth: bool,
+    /// [`api_write_auth_layer`]'s layer, applied to the web write routes only when
+    /// `api_auth` is on.
+    api_write_auth: Option<AuthLayer>,
 }
+
+/// Per-tool scope enforcement for `/mcp` (#360): a write tool needs
+/// [`MCP_WRITE_SCOPE`] on top of whatever the auth layer already requires of every
+/// request. `None` when OAuth is off — the layer would otherwise answer 401 to the
+/// unauthenticated pass-through (no credential at all) — and a static-token-only
+/// deployment has no scopes to enforce. A static token keeps full access when OAuth
+/// is on as well (`static_token_bypasses_scopes`).
+fn mcp_tool_scopes(auth: &AuthLayer) -> Option<McpToolScopes> {
+    auth.oauth()?;
+    let mut scopes = McpToolScopes::new()
+        // `RequestBodyLimitLayer` below caps the body at 10 MB; the scope layer reads
+        // the body first, so it needs the same ceiling rather than its 1 MiB default.
+        .body_limit(MCP_BODY_LIMIT)
+        .static_token_bypasses_scopes();
+    for tool in MCP_WRITE_TOOLS {
+        scopes = scopes.tool(tool, [MCP_WRITE_SCOPE]);
+    }
+    Some(scopes)
+}
+
+/// Request body ceiling for `/mcp` (10 MB).
+const MCP_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Assembles the full router `run_server` serves: `/health`, the bearer-protected
 /// `/mcp` + `/status`/`/metrics` + `/admin/reload` group, the open web UI, and the
@@ -1825,7 +1986,7 @@ struct RouterAssemblyDeps {
 /// outside the `require_auth` layer, no matter how many assertions it makes about
 /// routes it already knows the names of.
 fn assemble_router(deps: RouterAssemblyDeps) -> Router {
-    let mcp_router = Router::new()
+    let mut mcp_router = Router::new()
         .nest_service(MCP_PATH, deps.mcp_service)
         // NOT `DefaultBodyLimit`: that works only by inserting a marker into request
         // extensions for axum's `Bytes`/`String`/`Json` extractors to consult, and
@@ -1835,11 +1996,16 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
         // 11.5 MB body reached `/mcp` and returned 200 OK). `RequestBodyLimitLayer`
         // instead wraps the body type itself, so the cap applies no matter how the
         // inner service reads it.
-        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)) // 10 MB
-        .route_layer(middleware::from_fn_with_state(
-            deps.auth.clone(),
-            require_auth,
-        ));
+        .layer(RequestBodyLimitLayer::new(MCP_BODY_LIMIT));
+    // Added before (so inside) `require_auth`: it reads the credential `require_auth`
+    // leaves in the request extensions.
+    if let Some(tool_scopes) = mcp_tool_scopes(&deps.auth) {
+        mcp_router = mcp_router.route_layer(tool_scopes);
+    }
+    let mcp_router = mcp_router.route_layer(middleware::from_fn_with_state(
+        deps.auth.clone(),
+        require_auth,
+    ));
 
     // `/status` and `/metrics` sit behind the same bearer token as `/mcp`, not open like
     // `/health`. `/health` answers "is it up" and reveals nothing; these enumerate tag
@@ -1848,6 +2014,7 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
     let status_router = Router::new()
         .route(STATUS_PATH, axum::routing::get(status_handler))
         .route(METRICS_PATH, axum::routing::get(metrics_handler))
+        .route(STATUS_LINKS_PATH, axum::routing::get(links_handler))
         .with_state(deps.status_state)
         .route_layer(middleware::from_fn_with_state(
             deps.auth.clone(),
@@ -1862,6 +2029,7 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
     // check hitting it with the wrong verb.
     let admin_router = Router::new()
         .route(ADMIN_RELOAD_PATH, axum::routing::post(reload_handler))
+        .route(ADMIN_SYNC_PATH, axum::routing::post(sync_handler))
         .with_state(deps.admin_state)
         .route_layer(middleware::from_fn_with_state(
             deps.auth.clone(),
@@ -1888,9 +2056,13 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
         .merge(mcp_router)
         // Merged BEFORE the `GovernorLayer` wrap (applied by `run_server`, outside
         // this function), same as every other route, so rate limiting applies to
-        // the UI/API routes too. No bearer-auth layer — see `web.rs`'s module doc
-        // for why these routes are deliberately open.
-        .merge(crate::web::ui_router(deps.ui_state));
+        // the UI/API routes too. No bearer-auth layer unless `ui.api_auth` is on, and
+        // then only on `/api/*` — see `web.rs`'s module doc for why the rest stays open.
+        .merge(crate::web::ui_router_with_api_auth(
+            deps.ui_state,
+            deps.api_auth.then(|| deps.auth.clone()),
+            deps.api_auth.then_some(deps.api_write_auth).flatten(),
+        ));
 
     if let Some(webhook_state) = deps.webhook_state {
         let webhook_router = Router::new()
@@ -2303,6 +2475,22 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         config.mcp.oauth.as_ref(),
         config.mcp.allow_unauthenticated,
     )?;
+    if let Some(oauth_config) = config.mcp.oauth.as_ref()
+        && !oauth_config
+            .scopes_supported
+            .iter()
+            .any(|s| s == MCP_WRITE_SCOPE)
+    {
+        // Enforced regardless: an authorization server that is never told about the
+        // scope will issue read-only tokens, so the write tools stay unreachable by
+        // OAuth (a static token still works).
+        warn!(
+            "mcp.oauth.scopes_supported does not list '{MCP_WRITE_SCOPE}' — the write \
+             tools (write_document, delete_document, update_schema) require it and \
+             clients will not be told to request it"
+        );
+    }
+    let api_write_auth = api_write_auth_layer(decision.clone(), oauth.clone())?;
     let auth = auth_layer(decision, oauth)?;
 
     // Rate limiting, per client address as chosen by `rate_limit.client_ip_source`
@@ -2358,6 +2546,8 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
             reindex_queue: Arc::clone(&reindex_queue),
         },
         ui_state,
+        api_auth: config.ui.api_auth,
+        api_write_auth,
         webhook_state: webhook_secret.map(|secret| WebhookState {
             config: Arc::clone(&shared_config),
             secret,
@@ -2485,6 +2675,20 @@ mod tests {
         )
         .unwrap();
         auth_layer(decision, oauth).unwrap()
+    }
+
+    fn test_api_write_auth(
+        bearer_token: Option<String>,
+        oauth: Option<Arc<OAuthValidator>>,
+    ) -> Option<AuthLayer> {
+        let decision = static_bearer_token(
+            "T",
+            bearer_token,
+            oauth.as_deref().map(|v| v.config()),
+            true,
+        )
+        .unwrap();
+        api_write_auth_layer(decision, oauth).unwrap()
     }
 
     #[test]
@@ -2917,6 +3121,8 @@ mod tests {
                 batch_size: 32,
                 request_timeout_secs: 60,
                 batch_concurrency: 4,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 // Port 1 refuses immediately rather than hanging the test.
@@ -3378,6 +3584,7 @@ mod tests {
         };
         Router::new()
             .route("/admin/reload", axum::routing::post(reload_handler))
+            .route("/admin/sync", axum::routing::post(sync_handler))
             .with_state(admin_state)
             .route_layer(middleware::from_fn_with_state(auth_state, require_auth))
     }
@@ -3442,6 +3649,122 @@ mod tests {
         );
 
         crate::config::test_support::clear_required_env();
+    }
+
+    #[tokio::test]
+    async fn admin_sync_requires_the_bearer_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = config::shared_config(Arc::new(sync_test_config(tmp.path(), None)));
+        let app = admin_test_app(Some("secret".into()), tmp.path().join("c.yaml"), shared);
+
+        for auth in [None, Some("Bearer wrong-token")] {
+            let mut req = Request::builder().method("POST").uri("/admin/sync");
+            if let Some(a) = auth {
+                req = req.header("authorization", a);
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_sync_without_a_remote_is_a_clear_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = config::shared_config(Arc::new(sync_test_config(tmp.path(), None)));
+        let app = admin_test_app(Some("secret".into()), tmp.path().join("c.yaml"), shared);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/sync")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert!(v["detail"].as_str().unwrap().contains("source.git_url"));
+    }
+
+    fn sync_test_config(data_path: &std::path::Path, git_url: Option<String>) -> ResolvedConfig {
+        let mut c = (*status_config(data_path)).clone();
+        c.source.git_url = git_url;
+        c
+    }
+
+    #[tokio::test]
+    async fn admin_sync_pulls_a_new_commit_and_queues_it() {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "-q", "-b", "master"]);
+        std::fs::write(remote.path().join("a.md"), "# A\n").unwrap();
+        git(remote.path(), &["add", "-A"]);
+        git(remote.path(), &["commit", "-q", "-m", "init"]);
+        let clone = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q"])
+            .arg(remote.path())
+            .arg(clone.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        std::fs::write(remote.path().join("b.md"), "# B\n").unwrap();
+        git(remote.path(), &["add", "-A"]);
+        git(remote.path(), &["commit", "-q", "-m", "more"]);
+
+        let cfg = sync_test_config(
+            clone.path(),
+            Some(remote.path().to_string_lossy().into_owned()),
+        );
+        let queue = Arc::new(crate::reindex::ReindexQueue::new());
+        let auth_state = test_auth_layer(Some("secret".into()), None);
+        let app = Router::new()
+            .route("/admin/sync", axum::routing::post(sync_handler))
+            .with_state(AdminState {
+                shared_config: config::shared_config(Arc::new(cfg)),
+                config_path: Arc::new(clone.path().join("c.yaml")),
+                reindex_queue: Arc::clone(&queue),
+            })
+            .route_layer(middleware::from_fn_with_state(auth_state, require_auth));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/sync")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "synced");
+        assert_eq!(v["changed"], true);
+        assert_eq!(v["paths_queued"], 1);
+        assert_eq!(
+            queue.snapshot_paths(),
+            std::collections::HashSet::from([std::path::PathBuf::from("b.md")])
+        );
     }
 
     // See the comment on the sibling auth test above for why the guard must stay
@@ -4250,6 +4573,8 @@ mod tests {
             batch_size: 1,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         });
 
         let state = HealthState {
@@ -4606,7 +4931,7 @@ mod tests {
 
         RouterAssemblyDeps {
             mcp_service,
-            auth: test_auth_layer(bearer_token, oauth),
+            auth: test_auth_layer(bearer_token.clone(), oauth.clone()),
             health_state: HealthState {
                 qdrant: Arc::clone(&qdrant),
                 embed: Arc::clone(&embed),
@@ -4624,6 +4949,8 @@ mod tests {
                 reindex_queue: Arc::clone(&reindex_queue),
             },
             ui_state,
+            api_auth: false,
+            api_write_auth: test_api_write_auth(bearer_token.clone(), oauth.clone()),
             webhook_state: Some(WebhookState {
                 config: Arc::clone(&shared_config),
                 secret: "webhook-secret".into(),
@@ -4644,7 +4971,13 @@ mod tests {
     #[test]
     fn unauthenticated_warning_names_every_protected_path() {
         let msg = unauthenticated_mcp_warning("MCP_BEARER_TOKEN");
-        for path in [MCP_PATH, STATUS_PATH, METRICS_PATH, ADMIN_RELOAD_PATH] {
+        for path in [
+            MCP_PATH,
+            STATUS_PATH,
+            METRICS_PATH,
+            ADMIN_RELOAD_PATH,
+            ADMIN_SYNC_PATH,
+        ] {
             assert!(
                 msg.contains(path),
                 "warning must name {path} as unauthenticated-reachable: {msg}"
@@ -4674,7 +5007,9 @@ mod tests {
         for (method, path) in [
             ("GET", STATUS_PATH),
             ("GET", METRICS_PATH),
+            ("GET", STATUS_LINKS_PATH),
             ("POST", ADMIN_RELOAD_PATH),
+            ("POST", ADMIN_SYNC_PATH),
             ("POST", MCP_PATH),
         ] {
             let req = Request::builder()
@@ -5165,7 +5500,9 @@ mod tests {
         for (method, path) in [
             ("GET", STATUS_PATH),
             ("GET", METRICS_PATH),
+            ("GET", STATUS_LINKS_PATH),
             ("POST", ADMIN_RELOAD_PATH),
+            ("POST", ADMIN_SYNC_PATH),
             ("POST", MCP_PATH),
         ] {
             let req = Request::builder()
@@ -5269,6 +5606,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 
@@ -5402,8 +5741,10 @@ mod tests {
         // Pins the exact registered set: `list_documents` merged into `search` (one
         // tool covers both semantic retrieval and exhaustive enumeration now), and
         // `create_document`/`edit_document`/`move_directory` merged into
-        // `write_document` earlier — so this must be exactly six, not "at least".
+        // `write_document` earlier, and `changes_since` (#358) added as a separate
+        // read — so this must be exactly seven, not "at least".
         let mut expected = vec![
+            "changes_since",
             "delete_document",
             "get_document",
             "get_schema",
@@ -5414,7 +5755,7 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(
             names, expected,
-            "registered tool set must be exactly these six"
+            "registered tool set must be exactly these seven"
         );
 
         // Every tool's description reaches the real `tools/list` response
@@ -5491,6 +5832,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 
@@ -5685,5 +6028,308 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // --- #360 per-tool write scope; #297 gated /api/* ---
+
+    fn scoped_token(scope: &str) -> String {
+        oauth_testing::mint(
+            oauth_testing::KEY_A_PEM,
+            oauth_testing::KID_A,
+            &serde_json::json!({
+                "iss": oauth_testing::ISSUER, "aud": oauth_testing::AUDIENCE, "sub": "user-1",
+                "exp": oauth_testing::now() + 3600, "scope": scope,
+            }),
+        )
+    }
+
+    fn tool_call_body(tool: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": tool, "arguments": {}}
+        })
+        .to_string()
+    }
+
+    async fn mcp_post(app: &Router, authorization: Option<&str>, body: String) -> Response {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(MCP_PATH)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(h) = authorization {
+            req = req.header("authorization", h);
+        }
+        app.clone()
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// The assembled router with OAuth (and optionally a static token) on.
+    async fn oauth_assembled(
+        dir: &std::path::Path,
+        static_token: Option<&str>,
+        api_auth: bool,
+    ) -> (oauth_testing::FakeJwksServer, Router) {
+        let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
+        let mut deps = test_router_assembly_deps_with_oauth(
+            dir,
+            static_token.map(str::to_string),
+            Some(test_oauth_validator(&jwks.url)),
+        );
+        deps.api_auth = api_auth;
+        (jwks, assemble_router(deps))
+    }
+
+    #[tokio::test]
+    async fn read_only_token_is_refused_on_every_write_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), Some("secret"), false).await;
+        let header = format!("Bearer {}", scoped_token("mcp:read"));
+        for tool in MCP_WRITE_TOOLS {
+            let resp = mcp_post(&app, Some(&header), tool_call_body(tool)).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{tool}");
+            let challenge = www_authenticate(&resp);
+            assert!(
+                challenge.contains("error=\"insufficient_scope\""),
+                "{tool}: {challenge}"
+            );
+            assert!(challenge.contains("mcp:write"), "{tool}: {challenge}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_token_still_reaches_the_read_tools_and_the_other_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), None, false).await;
+        let header = format!("Bearer {}", scoped_token("mcp:read"));
+        for tool in ["search", "get_document", "get_schema", "changes_since"] {
+            let resp = mcp_post(&app, Some(&header), tool_call_body(tool)).await;
+            assert!(
+                resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+                "{tool}: {}",
+                resp.status()
+            );
+        }
+        // The GET event stream and DELETE carry no body: they need only the default.
+        for method in ["GET", "DELETE"] {
+            let req = Request::builder()
+                .method(method)
+                .uri(MCP_PATH)
+                .header("authorization", &header)
+                .header("accept", "text/event-stream")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert!(
+                resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+                "{method}: {}",
+                resp.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_and_write_token_passes_the_write_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), None, false).await;
+        let header = format!("Bearer {}", scoped_token("mcp:read mcp:write"));
+        for tool in MCP_WRITE_TOOLS {
+            let resp = mcp_post(&app, Some(&header), tool_call_body(tool)).await;
+            assert!(
+                resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+                "{tool}: {}",
+                resp.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn static_token_keeps_full_access_with_oauth_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), Some("secret"), false).await;
+        for tool in MCP_WRITE_TOOLS {
+            let resp = mcp_post(&app, Some("Bearer secret"), tool_call_body(tool)).await;
+            assert!(
+                resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+                "{tool}: {}",
+                resp.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn static_only_and_unauthenticated_deployments_get_no_scope_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        // Static-only: no OAuth, so no scope layer; the token reaches write tools.
+        let app = assemble_router(test_router_assembly_deps(dir.path(), Some("secret".into())));
+        let resp = mcp_post(
+            &app,
+            Some("Bearer secret"),
+            tool_call_body("write_document"),
+        )
+        .await;
+        assert!(
+            resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+            "{}",
+            resp.status()
+        );
+        // allow_unauthenticated: no credential at all must still reach the tools.
+        let app = assemble_router(test_router_assembly_deps(dir.path(), None));
+        let resp = mcp_post(&app, None, tool_call_body("write_document")).await;
+        assert!(
+            resp.status() != StatusCode::FORBIDDEN && resp.status() != StatusCode::UNAUTHORIZED,
+            "{}",
+            resp.status()
+        );
+        assert!(mcp_tool_scopes(&test_auth_layer(Some("s".into()), None)).is_none());
+        assert!(mcp_tool_scopes(&test_auth_layer(None, None)).is_none());
+    }
+
+    #[test]
+    fn mcp_write_tools_are_exactly_the_tools_without_the_read_only_hint() {
+        let mut not_read_only: Vec<String> = KbSearchServer::tool_router()
+            .list_all()
+            .into_iter()
+            .filter(|t| {
+                t.annotations
+                    .as_ref()
+                    .and_then(|a| a.read_only_hint)
+                    .is_none_or(|ro| !ro)
+            })
+            .map(|t| t.name.to_string())
+            .collect();
+        not_read_only.sort();
+        let mut write_tools: Vec<String> = MCP_WRITE_TOOLS.iter().map(|t| t.to_string()).collect();
+        write_tools.sort();
+        assert_eq!(
+            not_read_only, write_tools,
+            "MCP_WRITE_TOOLS must list every tool that is not read_only_hint = true, and no other"
+        );
+    }
+
+    async fn api_write(app: &Router, method: &str, authorization: &str) -> StatusCode {
+        // An empty JSON body is refused by the handler before any git or network
+        // work, so a request that gets past auth returns fast.
+        let req = Request::builder()
+            .method(method)
+            .uri("/api/doc/x.md")
+            .header("authorization", authorization)
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn api_writes_need_the_write_scope_when_api_auth_and_oauth_are_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), Some("secret"), true).await;
+        let read_only = format!("Bearer {}", scoped_token("mcp:read"));
+        let read_write = format!("Bearer {}", scoped_token("mcp:read mcp:write"));
+
+        for method in ["POST", "DELETE"] {
+            assert_eq!(
+                api_write(&app, method, &read_only).await,
+                StatusCode::FORBIDDEN,
+                "{method} with a read-only token"
+            );
+            for (who, h) in [
+                ("read+write", &read_write),
+                ("static", &"Bearer secret".to_string()),
+            ] {
+                let status = api_write(&app, method, h).await;
+                assert!(
+                    status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                    "{method} with a {who} token: {status}"
+                );
+            }
+        }
+        // Reads stay read-scoped.
+        let status = api_get(&app, "/api/doc/x.md", Some(&read_only)).await;
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+            "GET with a read-only token: {status}"
+        );
+    }
+
+    async fn api_get(app: &Router, path: &str, authorization: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().uri(path);
+        if let Some(h) = authorization {
+            req = req.header("authorization", h);
+        }
+        app.clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn api_routes_are_open_when_api_auth_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), Some("secret"), false).await;
+        assert_eq!(api_get(&app, "/api/history", None).await, StatusCode::OK);
+        assert_eq!(api_get(&app, "/", None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_routes_require_a_credential_when_api_auth_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, app) = oauth_assembled(dir.path(), Some("secret"), true).await;
+        let jwt = format!("Bearer {}", scoped_token("mcp:read"));
+        for path in [
+            "/api/graph",
+            // A bad `granularity` is refused (400) before any embedding call, so a
+            // credentialed request gets past auth without waiting on a network
+            // embedder this test does not have.
+            "/api/search?q=x&granularity=bogus",
+            "/api/schema/x",
+            "/api/history",
+            "/api/doc/x.md",
+        ] {
+            assert_eq!(
+                api_get(&app, path, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+            for h in ["Bearer secret", jwt.as_str()] {
+                let status = api_get(&app, path, Some(h)).await;
+                assert!(
+                    status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                    "{path}: {status}"
+                );
+            }
+        }
+        // Writes and deletes are gated too.
+        for method in ["POST", "DELETE"] {
+            let req = Request::builder()
+                .method(method)
+                .uri("/api/doc/x.md")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method}");
+        }
+        // The shell and assets stay open.
+        assert_eq!(api_get(&app, "/", None).await, StatusCode::OK);
+        assert_eq!(api_get(&app, "/assets/viz.js", None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_routes_with_api_auth_on_and_static_token_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deps = test_router_assembly_deps(dir.path(), Some("secret".into()));
+        deps.api_auth = true;
+        let app = assemble_router(deps);
+        assert_eq!(
+            api_get(&app, "/api/history", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            api_get(&app, "/api/history", Some("Bearer secret")).await,
+            StatusCode::OK
+        );
     }
 }

@@ -319,6 +319,17 @@ pub struct EmbeddingConfig {
     /// no env var override.
     #[serde(default = "default_batch_concurrency")]
     pub batch_concurrency: usize,
+    /// Instruction prefix prepended to every search query before it is embedded, for
+    /// asymmetric models (e5: `"query: "`, nomic: `"search_query: "`). Default empty =
+    /// no prefix. Part of the vector contract with `document_prefix`; YAML-only.
+    #[serde(default)]
+    pub query_prefix: String,
+    /// Instruction prefix prepended to every chunk (and dedup-gate document text)
+    /// before it is embedded (e5: `"passage: "`, nomic: `"search_document: "`).
+    /// Default empty. Folded into the per-file indexing fingerprint, so changing it
+    /// re-embeds the corpus on the next reconcile. YAML-only.
+    #[serde(default)]
+    pub document_prefix: String,
 }
 
 impl Default for EmbeddingConfig {
@@ -328,6 +339,8 @@ impl Default for EmbeddingConfig {
             batch_size: default_batch_size(),
             request_timeout_secs: default_request_timeout_secs(),
             batch_concurrency: default_batch_concurrency(),
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         }
     }
 }
@@ -905,6 +918,30 @@ pub struct WriteConfig {
     /// `reranking.enabled`, whose relevance scores are not similarities.
     #[serde(default = "default_dedup_threshold")]
     pub dedup_threshold: f32,
+    /// Cosine floor for the `related` neighbours a document create returns from the
+    /// dedup query (#356): existing documents scoring at least this (but below
+    /// `dedup_threshold`, else the create is refused) are listed so the writer can
+    /// link to them and check them for conflicts. A schema file's `dedup:` block
+    /// overrides it per subtree.
+    #[serde(default = "default_related_min_score")]
+    pub related_min_score: f32,
+    /// Most `related` neighbours a create returns; `0` returns none. Overridable by
+    /// a schema file's `dedup:` block. Reuses the dedup query, so costs no extra
+    /// embedding call; dedup disabled for a path means no neighbours for it.
+    #[serde(default = "default_related_limit")]
+    pub related_limit: usize,
+    /// Directory an archived document moves under: `write_document` with
+    /// `archive: true` relocates `<path>` to `<archive_prefix>/<path>`. A normal,
+    /// indexed path (archived documents stay searchable and filterable by
+    /// `status`); it must not be excluded by `indexing.exclude`, or the archive
+    /// write is refused like any write to an excluded path.
+    #[serde(default = "default_archive_prefix")]
+    pub archive_prefix: String,
+    /// What archiving does to links that point at the archived document:
+    /// `repoint` rewrites them to the archived location, `unlink` replaces each
+    /// with its plain label. A call can override it with `archive_links`.
+    #[serde(default)]
+    pub archive_links: ArchiveLinkPolicy,
     /// Git author name used for commits made by the write tools.
     /// Distinguishes tool-authored commits from hand-made commits.
     #[serde(default = "default_commit_author_name")]
@@ -923,6 +960,49 @@ fn default_dedup_threshold() -> f32 {
     0.80
 }
 
+fn default_related_min_score() -> f32 {
+    0.50
+}
+
+fn default_related_limit() -> usize {
+    5
+}
+
+fn default_archive_prefix() -> String {
+    "_archive".to_string()
+}
+
+/// How archiving treats inbound links to the archived document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveLinkPolicy {
+    /// Point each link at the document's archived location.
+    #[default]
+    Repoint,
+    /// Replace each link with plain text (the label stays, the link goes).
+    Unlink,
+}
+
+/// `prefix` as a clean `a/b` directory path: surrounding slashes dropped, and
+/// every segment required to be a plain name (no empty, `.` or `..` segment,
+/// no backslash).
+pub fn normalize_archive_prefix(prefix: &str) -> Result<String, String> {
+    let trimmed = prefix.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return Err("must name a directory".to_string());
+    }
+    if trimmed.contains('\\') {
+        return Err("must use `/` separators".to_string());
+    }
+    if trimmed
+        .split('/')
+        .any(|s| s.is_empty() || s == "." || s == "..")
+    {
+        return Err("must not contain empty, `.` or `..` segments".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
 fn default_commit_author_name() -> String {
     "mcp-md-wiki".to_string()
 }
@@ -936,6 +1016,10 @@ impl Default for WriteConfig {
         Self {
             dedup_enabled: default_dedup_enabled(),
             dedup_threshold: default_dedup_threshold(),
+            related_min_score: default_related_min_score(),
+            related_limit: default_related_limit(),
+            archive_prefix: default_archive_prefix(),
+            archive_links: ArchiveLinkPolicy::default(),
             commit_author_name: default_commit_author_name(),
             commit_author_email: default_commit_author_email(),
         }
@@ -1198,6 +1282,12 @@ fn default_section_max_bytes() -> usize {
 pub struct UiConfig {
     #[serde(default)]
     pub semantic_edges: SemanticEdgesConfig,
+    /// Put the same bearer-auth layer that guards `/mcp` in front of every `/api/*`
+    /// route (#297). Off by default: the web UI is normally reached through an
+    /// SSO proxy and its routes are open. The static UI shell and assets stay open
+    /// either way. Read once at startup, so changing it needs a restart.
+    #[serde(default)]
+    pub api_auth: bool,
 }
 
 /// Precomputed semantic (kNN) graph edges shown alongside markdown-link edges
@@ -1245,6 +1335,8 @@ pub struct ResolvedEmbeddingConfig {
     pub batch_size: usize,
     pub request_timeout_secs: u64,
     pub batch_concurrency: usize,
+    pub query_prefix: String,
+    pub document_prefix: String,
 }
 
 /// Resolved Qdrant config — `url` is guaranteed present.
@@ -1356,6 +1448,8 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("embedding.batch_size", "embedding"),
     ("embedding.request_timeout_secs", "embedding"),
     ("embedding.batch_concurrency", "embedding"),
+    ("embedding.query_prefix", "embedding"),
+    ("embedding.document_prefix", "embedding"),
     ("validation.enabled", "validation"),
     ("validation.strict", "validation"),
     ("validation.lint_command", "validation"),
@@ -1396,6 +1490,10 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("rate_limit.client_ip_source", "rate_limit"),
     ("write.dedup_enabled", "write"),
     ("write.dedup_threshold", "write"),
+    ("write.related_min_score", "write"),
+    ("write.related_limit", "write"),
+    ("write.archive_prefix", "write"),
+    ("write.archive_links", "write"),
     ("write.commit_author_name", "write"),
     ("write.commit_author_email", "write"),
     ("search.hybrid", "search"),
@@ -1414,6 +1512,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("ui.semantic_edges.enabled", "ui"),
     ("ui.semantic_edges.k", "ui"),
     ("ui.semantic_edges.min_score", "ui"),
+    ("ui.api_auth", "ui"),
 ];
 
 /// Recursively flattens a `serde_yaml_ng::Value` tree into dot-joined leaf paths,
@@ -1886,6 +1985,18 @@ impl Config {
         if !(0.0..=1.0).contains(&self.write.dedup_threshold) {
             anyhow::bail!("write.dedup_threshold must be between 0.0 and 1.0");
         }
+        if !(0.0..=1.0).contains(&self.write.related_min_score) {
+            anyhow::bail!("write.related_min_score must be between 0.0 and 1.0");
+        }
+        if self.write.related_limit > crate::write::MAX_RELATED_LIMIT {
+            anyhow::bail!(
+                "write.related_limit must be at most {}",
+                crate::write::MAX_RELATED_LIMIT
+            );
+        }
+        if let Err(e) = normalize_archive_prefix(&self.write.archive_prefix) {
+            anyhow::bail!("write.archive_prefix {e}");
+        }
         if self.search.rrf_candidates == 0 {
             anyhow::bail!("search.rrf_candidates must be >= 1");
         }
@@ -2075,6 +2186,8 @@ impl Config {
                 batch_size: self.embedding.batch_size,
                 request_timeout_secs: self.embedding.request_timeout_secs,
                 batch_concurrency: self.embedding.batch_concurrency,
+                query_prefix: self.embedding.query_prefix.clone(),
+                document_prefix: self.embedding.document_prefix.clone(),
             },
             qdrant: ResolvedQdrantConfig {
                 url: qdrant_url,
@@ -2543,6 +2656,27 @@ mcp:
     }
 
     #[test]
+    fn write_related_keys_default_and_are_range_checked() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert_eq!(cfg.write.related_limit, 5);
+        assert_eq!(cfg.write.related_min_score, 0.5);
+
+        for (line, msg) in [
+            ("related_min_score: 1.5", "write.related_min_score"),
+            ("related_limit: 21", "write.related_limit"),
+        ] {
+            let yaml = format!("{MINIMAL_CONFIG}\nwrite:\n  {line}\n");
+            let err = Config::from_str(&yaml).unwrap_err();
+            assert!(err.to_string().contains(msg), "got: {err}");
+        }
+        let yaml = format!("{MINIMAL_CONFIG}\nwrite:\n  related_limit: 0\n");
+        Config::from_str(&yaml).expect("0 turns the listing off");
+        clear_required_env();
+    }
+
+    #[test]
     fn reranking_zero_candidate_limit_is_rejected_when_enabled() {
         let _lock = ENV_MUTEX.lock().unwrap();
         set_required_env();
@@ -2828,6 +2962,8 @@ mcp:
                 batch_size: 32,
                 request_timeout_secs: 60,
                 batch_concurrency: 4,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
             qdrant: ResolvedQdrantConfig {
                 url: "http://qdrant:6334".into(),
@@ -3334,6 +3470,7 @@ mcp:
         assert_eq!(
             cfg.mcp.disabled_tools,
             vec![
+                "changes_since".to_string(),
                 "write_document".to_string(),
                 "delete_document".to_string(),
                 "get_schema".to_string(),
@@ -3434,6 +3571,8 @@ mcp:
                 batch_size: 32,
                 request_timeout_secs: 60,
                 batch_concurrency: 4,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
             qdrant: ResolvedQdrantConfig {
                 url: "http://qdrant:6334".into(),

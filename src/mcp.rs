@@ -898,7 +898,7 @@ fn parse_filters(
 
 /// Shared length check for `path_prefix`, used by both enumeration mode
 /// ([`build_document_query`]) and query mode ([`KbSearchServer::search`]).
-fn validate_path_prefix(path_prefix: &Option<String>) -> Result<(), McpError> {
+pub(crate) fn validate_path_prefix(path_prefix: &Option<String>) -> Result<(), McpError> {
     if let Some(prefix) = path_prefix
         && prefix.len() > MAX_FILTER_STR_LEN
     {
@@ -1255,7 +1255,7 @@ fn granularity_disabled_error(
 /// `descriptions::granularity_description` states these defaults in prose;
 /// `granularity_description_matches_resolution_for_every_effective_set`
 /// keeps the two in step.
-fn resolve_search_granularity(
+pub(crate) fn resolve_search_granularity(
     query_present: bool,
     requested: Option<&str>,
     effective: &[Granularity],
@@ -1302,7 +1302,7 @@ fn query_is_present(query: &Option<String>) -> bool {
     query.as_deref().is_some_and(|q| !q.trim().is_empty())
 }
 
-fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
+pub(crate) fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
     if let Some(query) = &params.query
         && query.len() > MAX_QUERY_LEN
     {
@@ -1471,6 +1471,27 @@ pub struct GetSchemaParams {
     pub values_in_use: Option<bool>,
 }
 
+/// Parameters for `changes_since`.
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct ChangesSinceParams {
+    /// A timestamp (RFC 3339, `2026-03-01`, or `2026-03-01T12:30Z`; UTC) or the
+    /// `head` an earlier call returned. Required unless `cursor` is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+
+    /// Only documents under this folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+
+    /// Changes per page (default 50, max 200), ordered by path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+
+    /// The `next_cursor` of a truncated page; continues that same range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
 /// Parameters for `update_schema`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UpdateSchemaParams {
@@ -1635,6 +1656,18 @@ pub struct WriteDocumentParams {
     /// Skip the near-duplicate check when creating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_new: Option<bool>,
+    /// Retire `path` instead of editing it: as one change, move it under the
+    /// server's archive directory, set `status: archived` when the governing
+    /// schema allows that (the result says whether it did), and handle links
+    /// pointing at it as `archive_links` says. Needs `expected_version`; takes
+    /// no edit mode, `new_path` or `documents`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<bool>,
+    /// With `archive`: `repoint` rewrites links to the archived location,
+    /// `unlink` replaces each with its plain text. Default: the server's setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["repoint", "unlink"]))]
+    pub archive_links: Option<String>,
     // The cap below is `write::MAX_BATCH_DOCUMENTS`; doc comments cannot
     // interpolate it, so `batch_documents_description_states_the_real_cap`
     // pins the number. Moves are excluded per `write::BatchWriteRequest`.
@@ -1701,6 +1734,11 @@ pub struct DeleteDocumentParams {
     /// The `version` from your last `get_document` read; required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
+    /// Also replace links to this document, in the documents that carry them,
+    /// with their plain text, in the same change. Default false: links are left
+    /// as they are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlink_inbound: Option<bool>,
 }
 
 /// Validated edit mode, produced by `parse_edit_mode`.
@@ -2015,6 +2053,8 @@ fn batch_input_as_write_params(input: &BatchDocumentInput) -> WriteDocumentParam
         message: None,
         expected_version: input.expected_version.clone(),
         force_new: input.force_new,
+        archive: None,
+        archive_links: None,
         documents: None,
     }
 }
@@ -2415,12 +2455,14 @@ fn create_edit_success_to_result(
     rel_path: &str,
     is_create: bool,
     dest_path: Option<&str>,
+    archive: bool,
 ) -> CallToolResult {
     let (path, action) = match dest_path {
         Some(dest) => (dest, "moved"),
         None if is_create => (rel_path, "created"),
         None => (rel_path, "updated"),
     };
+    let action = if archive { "archived" } else { action };
     let mut fields = write_response(
         path,
         action,
@@ -2431,8 +2473,39 @@ fn create_edit_success_to_result(
     if dest_path.is_some() {
         fields.insert("from".to_string(), serde_json::json!(rel_path));
     }
+    if archive {
+        if success.status_set {
+            fields.insert("status".to_string(), serde_json::json!("archived"));
+        } else {
+            fields.insert(
+                "status_note".to_string(),
+                serde_json::json!(
+                    "the governing schema declares no status field that allows 'archived'; \
+                     frontmatter left unchanged"
+                ),
+            );
+        }
+    }
     insert_paths(&mut fields, "rewritten_paths", &success.rewritten_paths);
+    if let Some(related) = related_json(&success.related) {
+        fields.insert("related".to_string(), related);
+    }
     CallToolResult::structured(serde_json::Value::Object(fields))
+}
+
+/// The `related` array of a create result (#356): `[{path, score}]` nearest first,
+/// scores rounded like every other score; `None` when there are none, so the key
+/// is omitted.
+pub(crate) fn related_json(related: &[crate::write::RelatedDocument]) -> Option<serde_json::Value> {
+    if related.is_empty() {
+        return None;
+    }
+    Some(serde_json::Value::Array(
+        related
+            .iter()
+            .map(|r| serde_json::json!({"path": r.path, "score": round_score(f64::from(r.score))}))
+            .collect(),
+    ))
 }
 
 /// The scope directory ([`crate::schema::scope_label`]) of a KB-relative schema file
@@ -2606,6 +2679,7 @@ fn create_edit_error_to_mcp_error(
 /// counterpart of the reverse-link check #181 logs server-side.
 fn delete_success_to_result(success: WriteSuccess, rel_path: &str) -> CallToolResult {
     let mut fields = write_response(rel_path, "deleted", "", None, success.merged);
+    insert_paths(&mut fields, "rewritten_paths", &success.rewritten_paths);
     insert_paths(&mut fields, "referencing_paths", &success.referencing_paths);
     CallToolResult::structured(serde_json::Value::Object(fields))
 }
@@ -2796,6 +2870,643 @@ fn move_directory_error_to_mcp_error(
     }
 }
 
+/// The pieces of server state a `search` call reads, borrowed for one call.
+///
+/// `KbSearchServer` (the MCP tool) and `web.rs`'s `UiState` (the REST routes)
+/// each build one, so both transports run the same validation, filter
+/// lowering, vocabulary check and retrieval calls rather than two copies of
+/// them. The methods return `McpError` because that is the shape the MCP tool
+/// emits; the web adapter maps `invalid_params` to a 4xx and everything else
+/// to a 500.
+pub(crate) struct SearchCtx<'a> {
+    pub(crate) deps: RetrievalDeps<'a, EmbedClient, QdrantStore>,
+    pub(crate) config: &'a crate::config::SharedConfig,
+    pub(crate) schema_cache: &'a crate::schema::SharedSchemaCache,
+    pub(crate) state_db: &'a tokio::sync::OnceCell<StateDb>,
+    /// Qdrant conditions ANDed onto the lowered `filters` in query mode. The
+    /// MCP tool passes none; the REST `domain`/`type`/`tags` sugar lands here.
+    pub(crate) extra_conditions: Vec<qdrant_client::qdrant::Condition>,
+}
+
+impl<'a> SearchCtx<'a> {
+    fn config(&self) -> Arc<ResolvedConfig> {
+        crate::config::load_shared_config(self.config)
+    }
+
+    fn deps(&self) -> &RetrievalDeps<'a, EmbedClient, QdrantStore> {
+        &self.deps
+    }
+
+    /// The document metadata index, opened on first use.
+    pub(crate) async fn state_db(&self) -> anyhow::Result<&StateDb> {
+        self.state_db
+            .get_or_try_init(|| async {
+                let path = self.config().state_db_path();
+                StateDb::new(std::path::Path::new(&path))
+                    .await
+                    .with_context(|| format!("Failed to open state DB at {}", path))
+            })
+            .await
+    }
+
+    /// Query-mode Qdrant conditions: the lowered `filters` and `heading_prefix`
+    /// ([`build_query_conditions`]) plus [`Self::extra_conditions`].
+    pub(crate) fn query_conditions(
+        &self,
+        params: &SearchParams,
+        config: &ResolvedConfig,
+        schemas: &SchemaCache,
+    ) -> Result<Vec<qdrant_client::qdrant::Condition>, McpError> {
+        let mut conditions = build_query_conditions(params, config, schemas)?;
+        conditions.extend(self.extra_conditions.iter().cloned());
+        Ok(conditions)
+    }
+
+    /// Refuse a `search` filter that can only ever match nothing, listing what
+    /// would match instead — the teach-on-error replacement for enumerating
+    /// every vocabulary in the server instructions. Applies to every
+    /// granularity, so the metadata-index (no query) and Qdrant (query)
+    /// backends share it.
+    ///
+    /// - A field is unknown when no schema scope declares it
+    ///   (`SchemaCache::declared_field_paths`), it is not a built-in filter key
+    ///   ([`builtin_filter_field`]), and no document carries it.
+    /// - A value is refused when the field has a closed value set across the
+    ///   governing scopes (`SchemaCache::filter_closed_values`, narrowed by
+    ///   `path_prefix` as [`retrieval::normalize_path_needle`] reads it, the
+    ///   needle `search` itself matches on), the value is outside it, and no
+    ///   document uses it either — so a refusal never hides a match, whichever
+    ///   scope the matching document sits in.
+    /// - A filter is refused only when no document could match it: an `all_of`
+    ///   as soon as one of its values is refused (no document can carry it),
+    ///   but a scalar or array filter is an any-of and still matches through
+    ///   its other values, so it is refused only when every value is.
+    ///
+    /// Fails open: when the metadata index cannot be opened or queried, the
+    /// filter runs as given.
+    pub(crate) async fn check_filter_vocabulary(
+        &self,
+        params: &SearchParams,
+    ) -> Result<(), McpError> {
+        if params.filters.as_ref().is_none_or(|f| f.0.is_empty()) {
+            return Ok(());
+        }
+        let filters = parse_filters(&params.filters)?;
+        let Ok(index) = self.state_db().await else {
+            return Ok(());
+        };
+        let schemas = crate::schema::load_shared(self.schema_cache);
+        let config = self.config();
+        let declared = schemas.declared_field_paths();
+        let path_needle = retrieval::normalize_path_needle(params.path_prefix.as_deref());
+
+        for (field, filter) in &filters {
+            let known = declared.contains(field)
+                || builtin_filter_field(field, &config)
+                || index.field_in_use(field).await.unwrap_or(true);
+            if !known {
+                let mut names: std::collections::BTreeSet<String> = declared.clone();
+                names.extend(
+                    config
+                        .effective_indexed_fields()
+                        .into_iter()
+                        .chain(crate::ingest::DERIVED_FIELDS.iter().map(|f| f.to_string())),
+                );
+                if let Ok(in_use) = index.fields_in_use(None, 500).await {
+                    names.extend(in_use.into_iter().map(|(name, _)| name));
+                }
+                names.remove("file_path");
+                let names: Vec<String> = names
+                    .iter()
+                    .map(|n| crate::server::sanitize_facet_value(n))
+                    .collect();
+                return Err(McpError::invalid_params(
+                    format!(
+                        "unknown filter field '{}'; filterable fields: {}",
+                        crate::server::sanitize_facet_value(field),
+                        capped_list(&names)
+                    ),
+                    Some(serde_json::json!({ "filterable_fields": capped_vec(&names) })),
+                ));
+            }
+
+            let (values, needs_every_value) = match filter {
+                FieldFilter::AnyOf(values) => (values, false),
+                FieldFilter::AllOf(values) => (values, true),
+                FieldFilter::Range { .. } => continue,
+            };
+            let Some(allowed) = schemas.filter_closed_values(field, path_needle) else {
+                continue;
+            };
+            let outside: Vec<String> = values
+                .iter()
+                .filter(|v| !allowed.contains(*v))
+                .cloned()
+                .collect();
+            if outside.is_empty() {
+                continue;
+            }
+            let Ok(present) = index.values_present(field, &outside).await else {
+                continue;
+            };
+            let refused: Vec<&String> = outside.iter().filter(|v| !present.contains(*v)).collect();
+            // `all_of` needs a document to carry every value, so one that nothing can
+            // match sinks the filter; an any-of still matches through the rest of its
+            // values and is empty only when none of them could match.
+            let matches_nothing = if needs_every_value {
+                !refused.is_empty()
+            } else {
+                !refused.is_empty() && refused.len() == values.len()
+            };
+            if matches_nothing {
+                let mut seen = std::collections::HashSet::new();
+                let refused: Vec<String> = refused
+                    .iter()
+                    .map(|v| format!("'{}'", crate::server::sanitize_facet_value(v)))
+                    .filter(|v| seen.insert(v.clone()))
+                    .collect();
+                let allowed: Vec<String> = allowed
+                    .iter()
+                    .map(|v| crate::server::sanitize_facet_value(v))
+                    .collect();
+                let verb = if refused.len() == 1 {
+                    "is not an allowed value"
+                } else {
+                    "are not allowed values"
+                };
+                return Err(McpError::invalid_params(
+                    format!(
+                        "filter '{}': {} {verb}; allowed: {}",
+                        crate::server::sanitize_facet_value(field),
+                        capped_list(&refused),
+                        capped_list(&allowed)
+                    ),
+                    Some(serde_json::json!({ "field": field, "allowed": capped_vec(&allowed) })),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a `path_prefix` needle to the documents it actually matches (#182).
+    ///
+    /// The metadata index is the single authority for that question, so both query
+    /// modes route through here and enumeration applies the identical `LIKE` inline
+    /// (`state::StateDb::push_where`) — one needle can only ever mean one thing.
+    /// `None` in gives `None` out: no filter, matching everything.
+    pub(crate) async fn resolve_path_filter(
+        &self,
+        path_prefix: Option<&str>,
+    ) -> Result<Option<retrieval::PathFilter>, McpError> {
+        let Some(needle) = retrieval::normalize_path_needle(path_prefix) else {
+            return Ok(None);
+        };
+        let index = self.state_db().await.map_err(|e| {
+            error!("search could not open the metadata index: {:#}", e);
+            McpError::internal_error(format!("Document index unavailable: {}", e), None)
+        })?;
+        let matches = index
+            .paths_matching(needle, retrieval::PATH_FILTER_MAX_PATHS)
+            .await
+            .map_err(|e| {
+                error!("search could not resolve path_prefix '{}': {:#}", needle, e);
+                McpError::internal_error(format!("path_prefix lookup failed: {}", e), None)
+            })?;
+        Ok(Some(matches.into()))
+    }
+
+    /// query+chunk: the original `search` tool's behavior, unchanged output shape.
+    pub(crate) async fn search_chunks(
+        &self,
+        params: &SearchParams,
+    ) -> Result<CallToolResult, McpError> {
+        let query = params.query.as_deref().unwrap_or_default();
+
+        validate_path_prefix(&params.path_prefix)?;
+        // #132 (audit follow-up): `fields` selects per-result frontmatter fields
+        // from the document metadata index — a chunk result is hydrated straight
+        // from the Qdrant chunk payload and never joins that index, so `fields`
+        // has nothing to draw from here. `search_grouped`/`build_document_query`
+        // (document granularity, query or enumeration) are its only real
+        // consumers; reject explicitly here rather than silently drop it (the
+        // mirror image of `explain` at document granularity).
+        if params.fields.is_some() {
+            return Err(fields_rejection(
+                Granularity::Chunk,
+                &self.config().effective_granularities(),
+            ));
+        }
+        let schemas = crate::schema::load_shared(self.schema_cache);
+        // Fetched once per call so every field below — including
+        // reranking.candidate_limit — reflects the same live snapshot, rather than
+        // racing a concurrent `POST /admin/reload` mid-request.
+        let config = self.config();
+        let conditions = self.query_conditions(params, &config, &schemas)?;
+
+        let limit = resolve_limit(
+            params.limit,
+            config.search.default_limit,
+            config.search.max_limit,
+        );
+
+        let filters = SearchFilters { conditions };
+
+        let modified_after = params
+            .modified_after
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let modified_before = params
+            .modified_before
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let explain = params.explain.unwrap_or(false);
+        let path_filter = self
+            .resolve_path_filter(params.path_prefix.as_deref())
+            .await?;
+        let opts = SearchOptions {
+            limit,
+            min_score: params.min_score.or(config.search.min_score),
+            hybrid: config.search.hybrid,
+            rrf_candidates: config.search.rrf_candidates as u64,
+            // Config-enabled AND confirmed available on this server right now —
+            // see `status::IndexStatus::phrase_matching_available`'s doc comment
+            // for why an unconfirmed index must not attempt a phrase arm.
+            phrase: config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available(),
+            explain,
+            modified_after,
+            modified_before,
+            path_filter,
+            rerank_candidate_limit: config.reranking.as_ref().map(|r| r.candidate_limit as u64),
+            diversity_max_per_document: config.search.diversity_max_per_document,
+        };
+
+        // The `explain` mode label must describe the query that actually ran, not
+        // the config that permitted it. An enabled phrase arm only fires when the
+        // query carries a quoted span, and with `hybrid` off a phrase query is
+        // still a two-arm RRF fusion — reporting that as "dense cosine" would be a
+        // lie in exactly the situation someone turned `explain` on to diagnose.
+        let phrase_arm_ran = opts.phrase && !retrieval::extract_phrases(query).1.is_empty();
+
+        // #224: `offset` pages over the already fused/reranked/diversity-capped
+        // ranking — see `retrieval::search_paged`'s doc comment for the funnel
+        // placement and the depth bound `offset_truncated` reports against.
+        let offset = params.offset.unwrap_or(0);
+        let outcome = retrieval::search_paged(self.deps(), query, &filters, &opts, offset)
+            .await
+            .map_err(|e| match e {
+                retrieval::SearchError::Embed(err) => {
+                    error!("Embedding query failed: {:#}", err);
+                    McpError::internal_error("Failed to generate query embedding".to_string(), None)
+                }
+                retrieval::SearchError::Search(err) => {
+                    error!("Qdrant search failed: {:#}", err);
+                    McpError::internal_error("Search query failed".to_string(), None)
+                }
+                retrieval::SearchError::Document(err) => {
+                    error!("Document metadata lookup failed: {:#}", err);
+                    McpError::internal_error("Document metadata lookup failed".to_string(), None)
+                }
+            })?;
+        let path_prefix_truncated = outcome.path_prefix_truncated;
+        let offset_truncated = outcome.offset_truncated;
+        let results = outcome.results;
+
+        debug!(
+            result_count = results.len(),
+            path_prefix_truncated, offset_truncated, "search returned results"
+        );
+
+        let mode = match (config.search.hybrid, phrase_arm_ran) {
+            (true, true) => "hybrid RRF + phrase",
+            (true, false) => "hybrid RRF",
+            (false, true) => "dense + phrase RRF",
+            (false, false) => "dense cosine",
+        };
+
+        let mut response = build_chunk_search_payload(
+            &results,
+            self.deps.data_path,
+            explain,
+            mode,
+            path_prefix_truncated,
+            offset_truncated,
+        );
+        if params.heading_prefix.is_some() {
+            annotate_heading_results(&mut response, heading_results_indexing_note());
+        }
+        Ok(CallToolResult::structured(response))
+    }
+
+    /// query+document: Qdrant grouped by `file_path`, collapsed to each document's
+    /// best-scoring chunk, hydrated with document-level metadata from `StateDb`. New
+    /// combination — there is no output shape to preserve, only the two the design
+    /// specifies: the document shape `search_enumerate` returns, plus a per-document
+    /// `score`, and no `total`/`has_more` (grouped vector search cannot back either).
+    pub(crate) async fn search_grouped(
+        &self,
+        params: &SearchParams,
+    ) -> Result<CallToolResult, McpError> {
+        let query = params.query.as_deref().unwrap_or_default();
+
+        // #132: `explain` produces a per-result score breakdown (dense/sparse/
+        // phrase/pre-rerank) from the per-arm scores `search_chunks` collects on
+        // each chunk `SearchResult`. This path collapses every document to its
+        // best-scoring chunk via Qdrant's server-side grouping (see this
+        // function's doc comment) with no explain-mode fusion query behind it —
+        // there is no per-arm breakdown to attach, so `GroupedDocument` carries
+        // none. Implementing the real thing would mean threading an `explain`
+        // flag through `RetrievalStore::search_grouped` and adding a
+        // client-side-fused, per-arm-scored grouped-query path in `qdrant.rs`
+        // mirroring `hybrid_search_explain` — real work, out of scope for this
+        // fix. Reject explicitly rather than ignore the flag silently:
+        // a caller that turned `explain` on to diagnose a confusing document
+        // ranking deserves an error telling them so, not a response that quietly
+        // drops the one thing they asked for.
+        if params.explain == Some(true) {
+            return Err(explain_rejection(
+                Granularity::Document,
+                &self.config().effective_granularities(),
+            ));
+        }
+
+        validate_path_prefix(&params.path_prefix)?;
+        validate_fields_count(&params.fields)?;
+        let schemas = crate::schema::load_shared(self.schema_cache);
+        let config = self.config();
+        let conditions = self.query_conditions(params, &config, &schemas)?;
+
+        let limit = resolve_limit(
+            params.limit,
+            config.search.default_limit,
+            config.search.max_limit,
+        );
+
+        let filters = SearchFilters { conditions };
+
+        let modified_after = params
+            .modified_after
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let modified_before = params
+            .modified_before
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        let path_filter = self
+            .resolve_path_filter(params.path_prefix.as_deref())
+            .await?;
+        let opts = SearchOptions {
+            limit,
+            min_score: params.min_score.or(config.search.min_score),
+            // Grouped queries share `search_chunks`'s dense/sparse/phrase arms
+            // (see `retrieval::search_grouped`'s doc comment) — a query only the
+            // sparse or phrase arm can find must be just as retrievable at
+            // document granularity as at chunk granularity. Reranking and
+            // diversity still don't apply here: there is one row per document
+            // already, so per-document diversity is a no-op and there is no
+            // per-chunk candidate pool for a cross-encoder to rerank.
+            hybrid: config.search.hybrid,
+            rrf_candidates: config.search.rrf_candidates as u64,
+            phrase: config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available(),
+            // Always false: `explain: true` is rejected above (#132) before this
+            // point is reached, and `retrieval::search_grouped` never reads this
+            // field regardless — grouped results carry no per-arm score to
+            // explain in the first place. `false` here (rather than
+            // `params.explain.unwrap_or(false)`) says so plainly instead of
+            // leaving a dead-looking reference to a value that can only be
+            // `None`/`Some(false)` by now.
+            explain: false,
+            modified_after,
+            modified_before,
+            path_filter,
+            rerank_candidate_limit: None,
+            diversity_max_per_document: None,
+        };
+
+        let index = self.state_db().await.map_err(|e| {
+            error!(
+                "search (query+document) could not open the metadata index: {:#}",
+                e
+            );
+            McpError::internal_error(format!("Document index unavailable: {}", e), None)
+        })?;
+
+        // #224: same paging entry point and depth-bound reasoning as
+        // `search_chunks` — see `retrieval::search_grouped`'s doc comment.
+        let offset = params.offset.unwrap_or(0);
+        let outcome = retrieval::search_grouped(
+            self.deps(),
+            index,
+            query,
+            &filters,
+            &opts,
+            params.fields.as_deref(),
+            offset,
+        )
+        .await
+        .map_err(|e| match e {
+            retrieval::SearchError::Embed(err) => {
+                error!("Embedding query failed: {:#}", err);
+                McpError::internal_error("Failed to generate query embedding".to_string(), None)
+            }
+            retrieval::SearchError::Search(err) => {
+                error!("Qdrant grouped search failed: {:#}", err);
+                McpError::internal_error("Search query failed".to_string(), None)
+            }
+            retrieval::SearchError::Document(err) => {
+                error!("Document metadata lookup failed: {:#}", err);
+                McpError::internal_error("Document metadata lookup failed".to_string(), None)
+            }
+        })?;
+        let path_prefix_truncated = outcome.path_prefix_truncated;
+        let offset_truncated = outcome.offset_truncated;
+        let documents = outcome.documents;
+
+        let mut response = build_grouped_search_payload(
+            &documents,
+            params.fields.as_deref(),
+            path_prefix_truncated,
+            offset_truncated,
+        );
+        if params.heading_prefix.is_some() {
+            annotate_heading_results(&mut response, heading_results_indexing_note());
+        }
+        Ok(CallToolResult::structured(response))
+    }
+
+    /// query+section: Qdrant grouped by `section_key` (#286), collapsed to
+    /// each section's best-scoring chunk, returned as a path with no text — the
+    /// `search` tool's `section` granularity. Requires
+    /// `chunking.heading_metadata` (the flag that gates writing `section_key` at
+    /// all — see `ingest.rs`) and, like `search_grouped`, rejects `explain`
+    /// (no per-arm breakdown to report) and `fields` (no document-metadata join,
+    /// same reasoning `search_chunks` gives for the identical rejection).
+    pub(crate) async fn search_sections(
+        &self,
+        params: &SearchParams,
+    ) -> Result<CallToolResult, McpError> {
+        let query = params.query.as_deref().unwrap_or_default();
+        let config = self.config();
+
+        if !config.chunking.heading_metadata {
+            return Err(McpError::invalid_params(
+                HEADING_METADATA_OFF_SECTION.to_string(),
+                None,
+            ));
+        }
+        if params.explain == Some(true) {
+            return Err(explain_rejection(
+                Granularity::Section,
+                &config.effective_granularities(),
+            ));
+        }
+        if params.fields.is_some() {
+            return Err(fields_rejection(
+                Granularity::Section,
+                &config.effective_granularities(),
+            ));
+        }
+
+        validate_path_prefix(&params.path_prefix)?;
+        let schemas = crate::schema::load_shared(self.schema_cache);
+        let conditions = self.query_conditions(params, &config, &schemas)?;
+
+        let limit = resolve_limit(
+            params.limit,
+            config.search.default_limit,
+            config.search.max_limit,
+        );
+
+        let filters = SearchFilters { conditions };
+
+        let modified_after = params
+            .modified_after
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let modified_before = params
+            .modified_before
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        let path_filter = self
+            .resolve_path_filter(params.path_prefix.as_deref())
+            .await?;
+        let opts = SearchOptions {
+            limit,
+            min_score: params.min_score.or(config.search.min_score),
+            hybrid: config.search.hybrid,
+            rrf_candidates: config.search.rrf_candidates as u64,
+            phrase: config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available(),
+            explain: false,
+            modified_after,
+            modified_before,
+            path_filter,
+            rerank_candidate_limit: None,
+            diversity_max_per_document: None,
+        };
+
+        let offset = params.offset.unwrap_or(0);
+        let outcome = retrieval::search_sections(self.deps(), query, &filters, &opts, offset)
+            .await
+            .map_err(|e| match e {
+                retrieval::SearchError::Embed(err) => {
+                    error!("Embedding query failed: {:#}", err);
+                    McpError::internal_error("Failed to generate query embedding".to_string(), None)
+                }
+                retrieval::SearchError::Search(err) => {
+                    error!("Qdrant grouped search failed: {:#}", err);
+                    McpError::internal_error("Search query failed".to_string(), None)
+                }
+                retrieval::SearchError::Document(err) => {
+                    error!("Document metadata lookup failed: {:#}", err);
+                    McpError::internal_error("Document metadata lookup failed".to_string(), None)
+                }
+            })?;
+        let path_prefix_truncated = outcome.path_prefix_truncated;
+        let offset_truncated = outcome.offset_truncated;
+        let sections = outcome.sections;
+
+        let mut response =
+            build_section_search_payload(&sections, path_prefix_truncated, offset_truncated);
+        annotate_heading_results(&mut response, heading_results_indexing_note());
+        Ok(CallToolResult::structured(response))
+    }
+
+    /// document, no query: the former `list_documents` tool's behavior, unchanged
+    /// output shape (`{total, returned, offset, has_more, documents}`).
+    pub(crate) async fn search_enumerate(
+        &self,
+        params: &SearchParams,
+    ) -> Result<CallToolResult, McpError> {
+        // Enumeration reads the state DB, which holds no heading data, so
+        // `heading_prefix` cannot be honored here. Validate it the same way
+        // query mode does first (so an empty list / the flag being off get
+        // their own message), then reject rather than silently ignore it —
+        // ignoring it would return every document as if the filter matched.
+        if params.heading_prefix.is_some() {
+            heading_prefix_condition(&params.heading_prefix, &self.config())?;
+            return Err(McpError::invalid_params(
+                "heading_prefix requires a query — a search without one lists whole \
+                 documents, which cannot be filtered by heading"
+                    .to_string(),
+                None,
+            ));
+        }
+        let query = build_document_query(params)?;
+
+        let index = self.state_db().await.map_err(|e| {
+            error!(
+                "search (enumerate) could not open the metadata index: {:#}",
+                e
+            );
+            McpError::internal_error(format!("Document index unavailable: {}", e), None)
+        })?;
+
+        let result = retrieval::list_documents(&DocumentIndexDeps { index }, &query)
+            .await
+            .map_err(|e| {
+                error!("search (enumerate) failed: {:#}", e);
+                McpError::internal_error(format!("Failed to list documents: {}", e), None)
+            })?;
+
+        // `total` always; `has_more` only when another page exists. A row
+        // carries `mtime` only when the listing is ordered by it.
+        let fields = params.fields.as_deref();
+        let with_mtime = query.order_by == crate::state::OrderBy::Mtime;
+        let mut response = serde_json::json!({
+            "total": result.total,
+            "returned": result.documents.len(),
+            "documents": result
+                .documents
+                .iter()
+                .map(|d| {
+                    let mut row = document_row(d, fields);
+                    if with_mtime {
+                        row.insert("mtime".into(), serde_json::json!(d.mtime));
+                    }
+                    serde_json::Value::Object(row)
+                })
+                .collect::<Vec<_>>(),
+        });
+        if result.has_more(query.offset) {
+            response["has_more"] = serde_json::json!(true);
+        }
+        Ok(CallToolResult::structured(response))
+    }
+}
+
 #[derive(Clone)]
 pub struct KbSearchServer {
     embed_client: Arc<EmbedClient>,
@@ -2873,7 +3584,7 @@ fn build_include_globset(patterns: &[String]) -> GlobSet {
     })
 }
 
-#[tool_router]
+#[tool_router(vis = "pub(crate)")]
 impl KbSearchServer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -3420,156 +4131,6 @@ impl KbSearchServer {
             .await
     }
 
-    /// Refuse a `search` filter that can only ever match nothing, listing what
-    /// would match instead — the teach-on-error replacement for enumerating
-    /// every vocabulary in the server instructions. Applies to every
-    /// granularity, so the metadata-index (no query) and Qdrant (query)
-    /// backends share it.
-    ///
-    /// - A field is unknown when no schema scope declares it
-    ///   (`SchemaCache::declared_field_paths`), it is not a built-in filter key
-    ///   ([`builtin_filter_field`]), and no document carries it.
-    /// - A value is refused when the field has a closed value set across the
-    ///   governing scopes (`SchemaCache::filter_closed_values`, narrowed by
-    ///   `path_prefix` as [`retrieval::normalize_path_needle`] reads it, the
-    ///   needle `search` itself matches on), the value is outside it, and no
-    ///   document uses it either — so a refusal never hides a match, whichever
-    ///   scope the matching document sits in.
-    /// - A filter is refused only when no document could match it: an `all_of`
-    ///   as soon as one of its values is refused (no document can carry it),
-    ///   but a scalar or array filter is an any-of and still matches through
-    ///   its other values, so it is refused only when every value is.
-    ///
-    /// Fails open: when the metadata index cannot be opened or queried, the
-    /// filter runs as given.
-    async fn check_filter_vocabulary(&self, params: &SearchParams) -> Result<(), McpError> {
-        if params.filters.as_ref().is_none_or(|f| f.0.is_empty()) {
-            return Ok(());
-        }
-        let filters = parse_filters(&params.filters)?;
-        let Ok(index) = self.state_db().await else {
-            return Ok(());
-        };
-        let schemas = crate::schema::load_shared(&self.schema_cache);
-        let config = self.config();
-        let declared = schemas.declared_field_paths();
-        let path_needle = retrieval::normalize_path_needle(params.path_prefix.as_deref());
-
-        for (field, filter) in &filters {
-            let known = declared.contains(field)
-                || builtin_filter_field(field, &config)
-                || index.field_in_use(field).await.unwrap_or(true);
-            if !known {
-                let mut names: std::collections::BTreeSet<String> = declared.clone();
-                names.extend(
-                    config
-                        .effective_indexed_fields()
-                        .into_iter()
-                        .chain(crate::ingest::DERIVED_FIELDS.iter().map(|f| f.to_string())),
-                );
-                if let Ok(in_use) = index.fields_in_use(None, 500).await {
-                    names.extend(in_use.into_iter().map(|(name, _)| name));
-                }
-                names.remove("file_path");
-                let names: Vec<String> = names
-                    .iter()
-                    .map(|n| crate::server::sanitize_facet_value(n))
-                    .collect();
-                return Err(McpError::invalid_params(
-                    format!(
-                        "unknown filter field '{}'; filterable fields: {}",
-                        crate::server::sanitize_facet_value(field),
-                        capped_list(&names)
-                    ),
-                    Some(serde_json::json!({ "filterable_fields": capped_vec(&names) })),
-                ));
-            }
-
-            let (values, needs_every_value) = match filter {
-                FieldFilter::AnyOf(values) => (values, false),
-                FieldFilter::AllOf(values) => (values, true),
-                FieldFilter::Range { .. } => continue,
-            };
-            let Some(allowed) = schemas.filter_closed_values(field, path_needle) else {
-                continue;
-            };
-            let outside: Vec<String> = values
-                .iter()
-                .filter(|v| !allowed.contains(*v))
-                .cloned()
-                .collect();
-            if outside.is_empty() {
-                continue;
-            }
-            let Ok(present) = index.values_present(field, &outside).await else {
-                continue;
-            };
-            let refused: Vec<&String> = outside.iter().filter(|v| !present.contains(*v)).collect();
-            // `all_of` needs a document to carry every value, so one that nothing can
-            // match sinks the filter; an any-of still matches through the rest of its
-            // values and is empty only when none of them could match.
-            let matches_nothing = if needs_every_value {
-                !refused.is_empty()
-            } else {
-                !refused.is_empty() && refused.len() == values.len()
-            };
-            if matches_nothing {
-                let mut seen = std::collections::HashSet::new();
-                let refused: Vec<String> = refused
-                    .iter()
-                    .map(|v| format!("'{}'", crate::server::sanitize_facet_value(v)))
-                    .filter(|v| seen.insert(v.clone()))
-                    .collect();
-                let allowed: Vec<String> = allowed
-                    .iter()
-                    .map(|v| crate::server::sanitize_facet_value(v))
-                    .collect();
-                let verb = if refused.len() == 1 {
-                    "is not an allowed value"
-                } else {
-                    "are not allowed values"
-                };
-                return Err(McpError::invalid_params(
-                    format!(
-                        "filter '{}': {} {verb}; allowed: {}",
-                        crate::server::sanitize_facet_value(field),
-                        capped_list(&refused),
-                        capped_list(&allowed)
-                    ),
-                    Some(serde_json::json!({ "field": field, "allowed": capped_vec(&allowed) })),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolve a `path_prefix` needle to the documents it actually matches (#182).
-    ///
-    /// The metadata index is the single authority for that question, so both query
-    /// modes route through here and enumeration applies the identical `LIKE` inline
-    /// (`state::StateDb::push_where`) — one needle can only ever mean one thing.
-    /// `None` in gives `None` out: no filter, matching everything.
-    async fn resolve_path_filter(
-        &self,
-        path_prefix: Option<&str>,
-    ) -> Result<Option<retrieval::PathFilter>, McpError> {
-        let Some(needle) = retrieval::normalize_path_needle(path_prefix) else {
-            return Ok(None);
-        };
-        let index = self.state_db().await.map_err(|e| {
-            error!("search could not open the metadata index: {:#}", e);
-            McpError::internal_error(format!("Document index unavailable: {}", e), None)
-        })?;
-        let matches = index
-            .paths_matching(needle, retrieval::PATH_FILTER_MAX_PATHS)
-            .await
-            .map_err(|e| {
-                error!("search could not resolve path_prefix '{}': {:#}", needle, e);
-                McpError::internal_error(format!("path_prefix lookup failed: {}", e), None)
-            })?;
-        Ok(Some(matches.into()))
-    }
-
     /// Build a `RetrievalDeps` bundle from this server's fields.
     fn deps(&self) -> RetrievalDeps<'_, EmbedClient, QdrantStore> {
         RetrievalDeps {
@@ -3585,13 +4146,34 @@ impl KbSearchServer {
         }
     }
 
+    /// The `search` call's view of this server's state.
+    fn search_ctx(&self) -> SearchCtx<'_> {
+        SearchCtx {
+            deps: self.deps(),
+            config: &self.config,
+            schema_cache: &self.schema_cache,
+            state_db: &self.state_db,
+            extra_conditions: Vec::new(),
+        }
+    }
+
+    /// See [`SearchCtx::resolve_path_filter`].
+    #[cfg(test)]
+    async fn resolve_path_filter(
+        &self,
+        path_prefix: Option<&str>,
+    ) -> Result<Option<retrieval::PathFilter>, McpError> {
+        self.search_ctx().resolve_path_filter(path_prefix).await
+    }
+
     #[tool(annotations(read_only_hint = true))]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        let ctx = self.search_ctx();
         validate_search_params(&params)?;
-        self.check_filter_vocabulary(&params).await?;
+        ctx.check_filter_vocabulary(&params).await?;
 
         let query_present = query_is_present(&params.query);
         // This gate reads its own config snapshot; each downstream handler
@@ -3635,431 +4217,43 @@ impl KbSearchServer {
                     .to_string(),
                 None,
             )),
-            (false, Granularity::Document) => self.search_enumerate(&params).await,
-            (true, Granularity::Chunk) => self.search_chunks(&params).await,
-            (true, Granularity::Document) => self.search_grouped(&params).await,
-            (true, Granularity::Section) => self.search_sections(&params).await,
+            (false, Granularity::Document) => ctx.search_enumerate(&params).await,
+            (true, Granularity::Chunk) => ctx.search_chunks(&params).await,
+            (true, Granularity::Document) => ctx.search_grouped(&params).await,
+            (true, Granularity::Section) => ctx.search_sections(&params).await,
         }
     }
 
-    /// query+chunk: the original `search` tool's behavior, unchanged output shape.
-    async fn search_chunks(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
-        let query = params.query.as_deref().unwrap_or_default();
-
-        validate_path_prefix(&params.path_prefix)?;
-        // #132 (audit follow-up): `fields` selects per-result frontmatter fields
-        // from the document metadata index — a chunk result is hydrated straight
-        // from the Qdrant chunk payload and never joins that index, so `fields`
-        // has nothing to draw from here. `search_grouped`/`build_document_query`
-        // (document granularity, query or enumeration) are its only real
-        // consumers; reject explicitly here rather than silently drop it the way
-        // it used to (this was the SAME silent-no-op bug `explain` at document
-        // granularity is, just for the mirror-image parameter/granularity pair).
-        if params.fields.is_some() {
-            return Err(fields_rejection(
-                Granularity::Chunk,
-                &self.config().effective_granularities(),
-            ));
-        }
-        let schemas = crate::schema::load_shared(&self.schema_cache);
-        // Fetched once per call so every field below — including
-        // reranking.candidate_limit — reflects the same live snapshot, rather than
-        // racing a concurrent `POST /admin/reload` mid-request.
-        let config = self.config();
-        let conditions = build_query_conditions(params, &config, &schemas)?;
-
-        let limit = resolve_limit(
+    #[tool(annotations(read_only_hint = true))]
+    async fn changes_since(
+        &self,
+        Parameters(params): Parameters<ChangesSinceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let data_path = self.canonical_data_path.to_string_lossy().into_owned();
+        let indexing = self.config().indexing.clone();
+        match retrieval::changes_since_json(
+            false,
+            &data_path,
+            &indexing,
+            params.since.as_deref(),
+            params.path_prefix.as_deref(),
             params.limit,
-            config.search.default_limit,
-            config.search.max_limit,
-        );
-
-        let filters = SearchFilters { conditions };
-
-        let modified_after = params
-            .modified_after
-            .as_deref()
-            .map(parse_date_to_timestamp)
-            .transpose()
-            .map_err(|e| McpError::invalid_params(e, None))?;
-        let modified_before = params
-            .modified_before
-            .as_deref()
-            .map(parse_date_to_timestamp)
-            .transpose()
-            .map_err(|e| McpError::invalid_params(e, None))?;
-        let explain = params.explain.unwrap_or(false);
-        let path_filter = self
-            .resolve_path_filter(params.path_prefix.as_deref())
-            .await?;
-        let opts = SearchOptions {
-            limit,
-            min_score: params.min_score.or(config.search.min_score),
-            hybrid: config.search.hybrid,
-            rrf_candidates: config.search.rrf_candidates as u64,
-            // Config-enabled AND confirmed available on this server right now —
-            // see `status::IndexStatus::phrase_matching_available`'s doc comment
-            // for why an unconfirmed index must not attempt a phrase arm.
-            phrase: config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available(),
-            explain,
-            modified_after,
-            modified_before,
-            path_filter,
-            rerank_candidate_limit: config.reranking.as_ref().map(|r| r.candidate_limit as u64),
-            diversity_max_per_document: config.search.diversity_max_per_document,
-        };
-
-        // The `explain` mode label must describe the query that actually ran, not
-        // the config that permitted it. An enabled phrase arm only fires when the
-        // query carries a quoted span, and with `hybrid` off a phrase query is
-        // still a two-arm RRF fusion — reporting that as "dense cosine" would be a
-        // lie in exactly the situation someone turned `explain` on to diagnose.
-        let phrase_arm_ran = opts.phrase && !retrieval::extract_phrases(query).1.is_empty();
-
-        // #224: `offset` pages over the already fused/reranked/diversity-capped
-        // ranking — see `retrieval::search_paged`'s doc comment for the funnel
-        // placement and the depth bound `offset_truncated` reports against.
-        let offset = params.offset.unwrap_or(0);
-        let outcome = retrieval::search_paged(&self.deps(), query, &filters, &opts, offset)
-            .await
-            .map_err(|e| match e {
-                retrieval::SearchError::Embed(err) => {
-                    error!("Embedding query failed: {:#}", err);
-                    McpError::internal_error("Failed to generate query embedding".to_string(), None)
-                }
-                retrieval::SearchError::Search(err) => {
-                    error!("Qdrant search failed: {:#}", err);
-                    McpError::internal_error("Search query failed".to_string(), None)
-                }
-                retrieval::SearchError::Document(err) => {
-                    error!("Document metadata lookup failed: {:#}", err);
-                    McpError::internal_error("Document metadata lookup failed".to_string(), None)
-                }
-            })?;
-        let path_prefix_truncated = outcome.path_prefix_truncated;
-        let offset_truncated = outcome.offset_truncated;
-        let results = outcome.results;
-
-        debug!(
-            result_count = results.len(),
-            path_prefix_truncated, offset_truncated, "search returned results"
-        );
-
-        let mode = match (config.search.hybrid, phrase_arm_ran) {
-            (true, true) => "hybrid RRF + phrase",
-            (true, false) => "hybrid RRF",
-            (false, true) => "dense + phrase RRF",
-            (false, false) => "dense cosine",
-        };
-
-        let mut response = build_chunk_search_payload(
-            &results,
-            &self.canonical_data_path,
-            explain,
-            mode,
-            path_prefix_truncated,
-            offset_truncated,
-        );
-        if params.heading_prefix.is_some() {
-            annotate_heading_results(&mut response, heading_results_indexing_note());
-        }
-        Ok(CallToolResult::structured(response))
-    }
-
-    /// query+document: Qdrant grouped by `file_path`, collapsed to each document's
-    /// best-scoring chunk, hydrated with document-level metadata from `StateDb`. New
-    /// combination — there is no output shape to preserve, only the two the design
-    /// specifies: the document shape `search_enumerate` returns, plus a per-document
-    /// `score`, and no `total`/`has_more` (grouped vector search cannot back either).
-    async fn search_grouped(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
-        let query = params.query.as_deref().unwrap_or_default();
-
-        // #132: `explain` produces a per-result score breakdown (dense/sparse/
-        // phrase/pre-rerank) from the per-arm scores `search_chunks` collects on
-        // each chunk `SearchResult`. This path collapses every document to its
-        // best-scoring chunk via Qdrant's server-side grouping (see this
-        // function's doc comment) with no explain-mode fusion query behind it —
-        // there is no per-arm breakdown to attach, so `GroupedDocument` carries
-        // none. Implementing the real thing would mean threading an `explain`
-        // flag through `RetrievalStore::search_grouped` and adding a
-        // client-side-fused, per-arm-scored grouped-query path in `qdrant.rs`
-        // mirroring `hybrid_search_explain` — real work, out of scope for this
-        // fix. Reject explicitly instead of the silent no-op this used to be:
-        // a caller that turned `explain` on to diagnose a confusing document
-        // ranking deserves an error telling them so, not a response that quietly
-        // drops the one thing they asked for.
-        if params.explain == Some(true) {
-            return Err(explain_rejection(
-                Granularity::Document,
-                &self.config().effective_granularities(),
-            ));
-        }
-
-        validate_path_prefix(&params.path_prefix)?;
-        validate_fields_count(&params.fields)?;
-        let schemas = crate::schema::load_shared(&self.schema_cache);
-        let config = self.config();
-        let conditions = build_query_conditions(params, &config, &schemas)?;
-
-        let limit = resolve_limit(
-            params.limit,
-            config.search.default_limit,
-            config.search.max_limit,
-        );
-
-        let filters = SearchFilters { conditions };
-
-        let modified_after = params
-            .modified_after
-            .as_deref()
-            .map(parse_date_to_timestamp)
-            .transpose()
-            .map_err(|e| McpError::invalid_params(e, None))?;
-        let modified_before = params
-            .modified_before
-            .as_deref()
-            .map(parse_date_to_timestamp)
-            .transpose()
-            .map_err(|e| McpError::invalid_params(e, None))?;
-
-        let path_filter = self
-            .resolve_path_filter(params.path_prefix.as_deref())
-            .await?;
-        let opts = SearchOptions {
-            limit,
-            min_score: params.min_score.or(config.search.min_score),
-            // Grouped queries now share `search_chunks`'s dense/sparse/phrase arms
-            // (see `retrieval::search_grouped`'s doc comment) — a query only the
-            // sparse or phrase arm can find must be just as retrievable at
-            // document granularity as at chunk granularity. Reranking and
-            // diversity still don't apply here: there is one row per document
-            // already, so per-document diversity is a no-op and there is no
-            // per-chunk candidate pool for a cross-encoder to rerank.
-            hybrid: config.search.hybrid,
-            rrf_candidates: config.search.rrf_candidates as u64,
-            phrase: config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available(),
-            // Always false: `explain: true` is rejected above (#132) before this
-            // point is reached, and `retrieval::search_grouped` never reads this
-            // field regardless — grouped results carry no per-arm score to
-            // explain in the first place. `false` here (rather than
-            // `params.explain.unwrap_or(false)`) says so plainly instead of
-            // leaving a dead-looking reference to a value that can only be
-            // `None`/`Some(false)` by now.
-            explain: false,
-            modified_after,
-            modified_before,
-            path_filter,
-            rerank_candidate_limit: None,
-            diversity_max_per_document: None,
-        };
-
-        let index = self.state_db().await.map_err(|e| {
-            error!(
-                "search (query+document) could not open the metadata index: {:#}",
-                e
-            );
-            McpError::internal_error(format!("Document index unavailable: {}", e), None)
-        })?;
-
-        // #224: same paging entry point and depth-bound reasoning as
-        // `search_chunks` — see `retrieval::search_grouped`'s doc comment.
-        let offset = params.offset.unwrap_or(0);
-        let outcome = retrieval::search_grouped(
-            &self.deps(),
-            index,
-            query,
-            &filters,
-            &opts,
-            params.fields.as_deref(),
-            offset,
+            params.cursor.as_deref(),
         )
         .await
-        .map_err(|e| match e {
-            retrieval::SearchError::Embed(err) => {
-                error!("Embedding query failed: {:#}", err);
-                McpError::internal_error("Failed to generate query embedding".to_string(), None)
+        {
+            Ok(body) => Ok(CallToolResult::structured(body)),
+            Err(retrieval::ChangesSinceError::Invalid(msg)) => {
+                Err(McpError::invalid_params(msg, None))
             }
-            retrieval::SearchError::Search(err) => {
-                error!("Qdrant grouped search failed: {:#}", err);
-                McpError::internal_error("Search query failed".to_string(), None)
+            Err(retrieval::ChangesSinceError::Git(e)) => {
+                error!("changes_since failed: {e:#}");
+                Err(McpError::internal_error(
+                    "the change listing is unavailable".to_string(),
+                    None,
+                ))
             }
-            retrieval::SearchError::Document(err) => {
-                error!("Document metadata lookup failed: {:#}", err);
-                McpError::internal_error("Document metadata lookup failed".to_string(), None)
-            }
-        })?;
-        let path_prefix_truncated = outcome.path_prefix_truncated;
-        let offset_truncated = outcome.offset_truncated;
-        let documents = outcome.documents;
-
-        let mut response = build_grouped_search_payload(
-            &documents,
-            params.fields.as_deref(),
-            path_prefix_truncated,
-            offset_truncated,
-        );
-        if params.heading_prefix.is_some() {
-            annotate_heading_results(&mut response, heading_results_indexing_note());
         }
-        Ok(CallToolResult::structured(response))
-    }
-
-    /// query+section: Qdrant grouped by `section_key` (#286), collapsed to
-    /// each section's best-scoring chunk, returned as a path with no text — the
-    /// `search` tool's `section` granularity. Requires
-    /// `chunking.heading_metadata` (the flag that gates writing `section_key` at
-    /// all — see `ingest.rs`) and, like `search_grouped`, rejects `explain`
-    /// (no per-arm breakdown to report) and `fields` (no document-metadata join,
-    /// same reasoning `search_chunks` gives for the identical rejection).
-    async fn search_sections(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
-        let query = params.query.as_deref().unwrap_or_default();
-        let config = self.config();
-
-        if !config.chunking.heading_metadata {
-            return Err(McpError::invalid_params(
-                HEADING_METADATA_OFF_SECTION.to_string(),
-                None,
-            ));
-        }
-        if params.explain == Some(true) {
-            return Err(explain_rejection(
-                Granularity::Section,
-                &config.effective_granularities(),
-            ));
-        }
-        if params.fields.is_some() {
-            return Err(fields_rejection(
-                Granularity::Section,
-                &config.effective_granularities(),
-            ));
-        }
-
-        validate_path_prefix(&params.path_prefix)?;
-        let schemas = crate::schema::load_shared(&self.schema_cache);
-        let conditions = build_query_conditions(params, &config, &schemas)?;
-
-        let limit = resolve_limit(
-            params.limit,
-            config.search.default_limit,
-            config.search.max_limit,
-        );
-
-        let filters = SearchFilters { conditions };
-
-        let modified_after = params
-            .modified_after
-            .as_deref()
-            .map(parse_date_to_timestamp)
-            .transpose()
-            .map_err(|e| McpError::invalid_params(e, None))?;
-        let modified_before = params
-            .modified_before
-            .as_deref()
-            .map(parse_date_to_timestamp)
-            .transpose()
-            .map_err(|e| McpError::invalid_params(e, None))?;
-
-        let path_filter = self
-            .resolve_path_filter(params.path_prefix.as_deref())
-            .await?;
-        let opts = SearchOptions {
-            limit,
-            min_score: params.min_score.or(config.search.min_score),
-            hybrid: config.search.hybrid,
-            rrf_candidates: config.search.rrf_candidates as u64,
-            phrase: config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available(),
-            explain: false,
-            modified_after,
-            modified_before,
-            path_filter,
-            rerank_candidate_limit: None,
-            diversity_max_per_document: None,
-        };
-
-        let offset = params.offset.unwrap_or(0);
-        let outcome = retrieval::search_sections(&self.deps(), query, &filters, &opts, offset)
-            .await
-            .map_err(|e| match e {
-                retrieval::SearchError::Embed(err) => {
-                    error!("Embedding query failed: {:#}", err);
-                    McpError::internal_error("Failed to generate query embedding".to_string(), None)
-                }
-                retrieval::SearchError::Search(err) => {
-                    error!("Qdrant grouped search failed: {:#}", err);
-                    McpError::internal_error("Search query failed".to_string(), None)
-                }
-                retrieval::SearchError::Document(err) => {
-                    error!("Document metadata lookup failed: {:#}", err);
-                    McpError::internal_error("Document metadata lookup failed".to_string(), None)
-                }
-            })?;
-        let path_prefix_truncated = outcome.path_prefix_truncated;
-        let offset_truncated = outcome.offset_truncated;
-        let sections = outcome.sections;
-
-        let mut response =
-            build_section_search_payload(&sections, path_prefix_truncated, offset_truncated);
-        annotate_heading_results(&mut response, heading_results_indexing_note());
-        Ok(CallToolResult::structured(response))
-    }
-
-    /// document, no query: the former `list_documents` tool's behavior, unchanged
-    /// output shape (`{total, returned, offset, has_more, documents}`).
-    async fn search_enumerate(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
-        // Enumeration reads the state DB, which holds no heading data, so
-        // `heading_prefix` cannot be honored here. Validate it the same way
-        // query mode does first (so an empty list / the flag being off get
-        // their own message), then reject rather than silently ignore it —
-        // ignoring it would return every document as if the filter matched.
-        if params.heading_prefix.is_some() {
-            heading_prefix_condition(&params.heading_prefix, &self.config())?;
-            return Err(McpError::invalid_params(
-                "heading_prefix requires a query — a search without one lists whole \
-                 documents, which cannot be filtered by heading"
-                    .to_string(),
-                None,
-            ));
-        }
-        let query = build_document_query(params)?;
-
-        let index = self.state_db().await.map_err(|e| {
-            error!(
-                "search (enumerate) could not open the metadata index: {:#}",
-                e
-            );
-            McpError::internal_error(format!("Document index unavailable: {}", e), None)
-        })?;
-
-        let result = retrieval::list_documents(&DocumentIndexDeps { index }, &query)
-            .await
-            .map_err(|e| {
-                error!("search (enumerate) failed: {:#}", e);
-                McpError::internal_error(format!("Failed to list documents: {}", e), None)
-            })?;
-
-        // `total` always; `has_more` only when another page exists. A row
-        // carries `mtime` only when the listing is ordered by it.
-        let fields = params.fields.as_deref();
-        let with_mtime = query.order_by == crate::state::OrderBy::Mtime;
-        let mut response = serde_json::json!({
-            "total": result.total,
-            "returned": result.documents.len(),
-            "documents": result
-                .documents
-                .iter()
-                .map(|d| {
-                    let mut row = document_row(d, fields);
-                    if with_mtime {
-                        row.insert("mtime".into(), serde_json::json!(d.mtime));
-                    }
-                    serde_json::Value::Object(row)
-                })
-                .collect::<Vec<_>>(),
-        });
-        if result.has_more(query.offset) {
-            response["has_more"] = serde_json::json!(true);
-        }
-        Ok(CallToolResult::structured(response))
     }
 
     #[tool(annotations(read_only_hint = true))]
@@ -4224,6 +4418,16 @@ impl KbSearchServer {
                 .parse::<f64>()
                 .map_or(serde_json::json!(threshold), |v| serde_json::json!(v));
             dedup.insert("threshold".into(), shown);
+        }
+        if let Some(limit) = schema.related_limit {
+            dedup.insert("related_limit".into(), serde_json::json!(limit));
+        }
+        if let Some(score) = schema.related_min_score {
+            let shown = score
+                .to_string()
+                .parse::<f64>()
+                .map_or(serde_json::json!(score), |v| serde_json::json!(v));
+            dedup.insert("related_min_score".into(), shown);
         }
         if !dedup.is_empty() {
             structured["dedup"] = serde_json::Value::Object(dedup);
@@ -4732,6 +4936,8 @@ impl KbSearchServer {
             prepend_description: config.chunking.prepend_description,
             dedup_enabled: config.write.dedup_enabled,
             dedup_threshold: config.write.dedup_threshold,
+            related_limit: config.write.related_limit,
+            related_min_score: config.write.related_min_score,
             git_url: config.source.git_url.as_deref(),
             branch: &config.source.branch,
             token,
@@ -4763,6 +4969,7 @@ impl KbSearchServer {
         operation: &str,
         dest_path: Option<&str>,
         expected_version: Option<&str>,
+        archive: Option<crate::config::ArchiveLinkPolicy>,
     ) -> Result<CallToolResult, McpError> {
         // One snapshot for the whole call, so a concurrent `POST /admin/reload`
         // cannot mix old and new values across this method's several config reads.
@@ -4806,11 +5013,16 @@ impl KbSearchServer {
             operation,
             expected_version,
             dest_path,
+            archive,
         };
 
         match crate::write::write_document(&deps, req).await {
             Ok(success) => Ok(create_edit_success_to_result(
-                success, rel_path, is_create, dest_path,
+                success,
+                rel_path,
+                is_create,
+                dest_path,
+                archive.is_some(),
             )),
             Err(err) => Err(create_edit_error_to_mcp_error(
                 err,
@@ -4855,6 +5067,8 @@ impl KbSearchServer {
             ("append", params.append.is_some()),
             ("expected_version", params.expected_version.is_some()),
             ("force_new", params.force_new.is_some()),
+            ("archive", params.archive.is_some()),
+            ("archive_links", params.archive_links.is_some()),
         ] {
             if is_set {
                 return Err(McpError::invalid_params(
@@ -4914,6 +5128,14 @@ impl KbSearchServer {
                 None,
             ));
         }
+        if params.archive.is_some() || params.archive_links.is_some() {
+            return Err(McpError::invalid_params(
+                "archive is not valid when creating a new document — there is nothing at path \
+                 to archive"
+                    .to_string(),
+                None,
+            ));
+        }
         if params.new_path.is_some() {
             return Err(McpError::invalid_params(
                 "new_path is not valid when creating a new document — there is \
@@ -4938,7 +5160,12 @@ impl KbSearchServer {
         // runs here as well, ahead of the `exists()` pre-check below, so a path
         // that both exists and fails it gets the include-pattern message rather
         // than a misleading "already exists".
-        crate::write::check_include_pattern_against(&self.include_patterns, raw).map_err(|e| {
+        crate::write::check_include_pattern_against(
+            &self.include_patterns,
+            &self.config().indexing,
+            raw,
+        )
+        .map_err(|e| {
             create_edit_error_to_mcp_error(e, raw, true, &self.canonical_data_path, None)
         })?;
 
@@ -4963,6 +5190,7 @@ impl KbSearchServer {
             "write_document",
             None, // a create never moves a document
             params.expected_version.as_deref(),
+            None,
         )
         .await
     }
@@ -4976,6 +5204,15 @@ impl KbSearchServer {
         params: WriteDocumentParams,
         canonical: PathBuf,
     ) -> Result<CallToolResult, McpError> {
+        if params.archive == Some(true) {
+            return self.write_document_archive(&params, canonical).await;
+        }
+        if params.archive_links.is_some() {
+            return Err(McpError::invalid_params(
+                "archive_links needs archive: true".to_string(),
+                None,
+            ));
+        }
         // Parse and validate the content-edit mode (surgical vs full-replace vs
         // neither). `new_path` is an orthogonal axis handled below, independent of
         // this — see `parse_edit_mode`'s doc comment.
@@ -5003,6 +5240,79 @@ impl KbSearchServer {
             operation,
             dest_path,
             params.expected_version.as_deref(),
+            None,
+        )
+        .await
+    }
+
+    /// `write_document`'s archive path (#357): `path` resolved to an existing
+    /// document, `archive: true`. A pure move to `<write.archive_prefix>/<path>`
+    /// with `status: archived` and inbound-link handling, all in the pipeline's
+    /// one commit (`write::WriteRequest::archive`).
+    async fn write_document_archive(
+        &self,
+        params: &WriteDocumentParams,
+        canonical: PathBuf,
+    ) -> Result<CallToolResult, McpError> {
+        for (field, is_set) in [
+            ("content", params.content.is_some()),
+            ("old_string", params.old_string.is_some()),
+            ("new_string", params.new_string.is_some()),
+            ("frontmatter_patch", params.frontmatter_patch.is_some()),
+            ("append", params.append.is_some()),
+            ("new_path", params.new_path.is_some()),
+            ("force_new", params.force_new.is_some()),
+        ] {
+            if is_set {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "{field} is not valid with archive: an archive only takes path, \
+                         expected_version, archive_links and message"
+                    ),
+                    None,
+                ));
+            }
+        }
+        let config = self.config();
+        let policy = match params.archive_links.as_deref().map(str::trim) {
+            None => config.write.archive_links,
+            Some(p) if p.eq_ignore_ascii_case("repoint") => {
+                crate::config::ArchiveLinkPolicy::Repoint
+            }
+            Some(p) if p.eq_ignore_ascii_case("unlink") => crate::config::ArchiveLinkPolicy::Unlink,
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!("archive_links must be 'repoint' or 'unlink', not '{other}'"),
+                    None,
+                ));
+            }
+        };
+        let rel_path = canonical
+            .strip_prefix(&self.canonical_data_path)
+            .unwrap_or(&canonical)
+            .to_string_lossy()
+            .into_owned();
+        let dest = write::archive_destination(&config.write.archive_prefix, &rel_path)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        if self.canonical_data_path.join(&dest).exists() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Cannot archive '{rel_path}': '{dest}' already exists. Move or delete the \
+                     document already there first."
+                ),
+                None,
+            ));
+        }
+        self.run_document_write(
+            write::DocChange::Keep,
+            &rel_path,
+            params.message.as_deref(),
+            "update",
+            None,
+            "write_document (archive)",
+            Some(&dest),
+            params.expected_version.as_deref(),
+            Some(policy),
         )
         .await
     }
@@ -5036,6 +5346,8 @@ impl KbSearchServer {
             ("new_path", params.new_path.is_some()),
             ("expected_version", params.expected_version.is_some()),
             ("force_new", params.force_new.is_some()),
+            ("archive", params.archive.is_some()),
+            ("archive_links", params.archive_links.is_some()),
         ] {
             if is_set {
                 return Err(McpError::invalid_params(
@@ -5164,9 +5476,11 @@ impl KbSearchServer {
                         ));
                         continue;
                     };
-                    if let Err(e) =
-                        write::check_include_pattern_against(&self.include_patterns, &raw)
-                    {
+                    if let Err(e) = write::check_include_pattern_against(
+                        &self.include_patterns,
+                        &self.config().indexing,
+                        &raw,
+                    ) {
                         parse_errors.push(format!(
                             "documents: '{raw}': {}",
                             batch_write_document_error_text(&e)
@@ -5382,11 +5696,12 @@ impl KbSearchServer {
         let state_db = self.state_db().await.ok();
         let deps = self.write_deps(&config, token.as_deref(), state_db);
 
-        match crate::write::delete_document(
+        match crate::write::delete_document_with(
             &deps,
             &rel_path,
             params.message.as_deref(),
             params.expected_version.as_deref(),
+            params.unlink_inbound.unwrap_or(false),
         )
         .await
         {
@@ -5729,6 +6044,8 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         },
         qdrant: crate::config::ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
@@ -9660,6 +9977,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 
@@ -9705,6 +10024,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 
@@ -9748,6 +10069,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 
@@ -9884,6 +10207,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
         // `KbSearchServer::new` canonicalizes `tmp`'s path during construction
@@ -10726,6 +11051,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
         let server = KbSearchServer::new(
@@ -10884,6 +11211,73 @@ mod tests {
         assert!(history.get("available").is_none(), "{history}");
         assert!(!text.contains("t@localhost"), "{text}");
         assert_git_free("get_document history", &text);
+    }
+
+    #[tokio::test]
+    async fn changes_since_entries_carry_no_revision_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+        run_git(tmp.path(), &["init", "-q"]);
+        run_git(tmp.path(), &["add", "range_doc.md"]);
+        run_git(
+            tmp.path(),
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "docs: add range_doc.md\n\nTool: mcp-md-wiki\nOperation: write_document",
+            ],
+        );
+
+        let result = server
+            .changes_since(Parameters(ChangesSinceParams {
+                since: Some("2000-01-01".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let structured = single_representation(&result);
+
+        let changes = structured["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1, "{structured}");
+        let mut keys: Vec<&str> = changes[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["author", "date", "operation", "path", "status", "subject"]
+        );
+        assert!(structured["head"].as_str().is_some(), "{structured}");
+    }
+
+    #[tokio::test]
+    async fn changes_since_rejects_over_long_parameters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+        let long = "a".repeat(MAX_PATH_LEN + 1);
+        for params in [
+            ChangesSinceParams {
+                since: Some(long.clone()),
+                ..Default::default()
+            },
+            ChangesSinceParams {
+                cursor: Some(long.clone()),
+                ..Default::default()
+            },
+            ChangesSinceParams {
+                since: Some("2000-01-01".into()),
+                path_prefix: Some(long.clone()),
+                ..Default::default()
+            },
+        ] {
+            let err = server.changes_since(Parameters(params)).await.unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(err.message.contains("maximum length"), "{}", err.message);
+        }
     }
 
     #[tokio::test]
@@ -12108,6 +12502,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
         let instructions = Arc::new(RwLock::new(String::new()));
@@ -12155,6 +12551,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12195,6 +12593,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12242,6 +12642,8 @@ mod tests {
             }]),
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
         let result = result.expect("frontmatter_patch must succeed against an existing document");
@@ -12288,6 +12690,8 @@ mod tests {
             frontmatter_patch: None,
             append: Some("- entry two".to_string()),
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
         result.expect("append must succeed against an existing document");
@@ -12328,6 +12732,8 @@ mod tests {
             }]),
             append: Some("- entry two".to_string()),
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
         result.expect("frontmatter_patch + append must succeed together");
@@ -12375,6 +12781,8 @@ mod tests {
             }]),
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
         let err = result.expect_err("a schema-violating patch must fail validation");
@@ -12409,6 +12817,8 @@ mod tests {
             }]),
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let err = server
             .write_document(Parameters(params))
@@ -12439,6 +12849,8 @@ mod tests {
             frontmatter_patch: None,
             append: Some("text".to_string()),
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let err = server
             .write_document(Parameters(params))
@@ -12480,6 +12892,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12582,6 +12996,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12616,6 +13032,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12671,6 +13089,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12729,6 +13149,8 @@ mod tests {
                 batch_size: 32,
                 request_timeout_secs: 60,
                 batch_concurrency: 4,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 url: "http://localhost:6334".into(),
@@ -12765,6 +13187,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -12986,6 +13410,8 @@ mod tests {
                 batch_size: 32,
                 request_timeout_secs: 60,
                 batch_concurrency: 4,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 url: "http://localhost:6334".into(),
@@ -12998,6 +13424,10 @@ mod tests {
             write: crate::config::WriteConfig {
                 dedup_enabled: false,
                 dedup_threshold: 0.85,
+                related_min_score: 0.5,
+                related_limit: 5,
+                archive_prefix: "_archive".to_string(),
+                archive_links: crate::config::ArchiveLinkPolicy::Repoint,
                 commit_author_name: "mcp-md-wiki".to_string(),
                 commit_author_email: "mcp-md-wiki@localhost".to_string(),
             },
@@ -13023,6 +13453,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -13063,6 +13495,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -13104,6 +13538,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -13130,6 +13566,7 @@ mod tests {
             path: "docs/nonexistent.md".to_string(),
             message: None,
             expected_version: None,
+            unlink_inbound: None,
         };
         let result = server.delete_document(Parameters(params)).await;
 
@@ -13223,6 +13660,7 @@ mod tests {
             path: "   ".to_string(), // whitespace-only
             message: None,
             expected_version: None,
+            unlink_inbound: None,
         };
         let result = server.delete_document(Parameters(params)).await;
 
@@ -13249,6 +13687,7 @@ mod tests {
             path: "a".repeat(MAX_PATH_LEN + 1),
             message: None,
             expected_version: None,
+            unlink_inbound: None,
         };
         let err = server
             .delete_document(Parameters(params))
@@ -13277,6 +13716,7 @@ mod tests {
                 path: "guide.md".to_string(),
                 message: None,
                 expected_version: None,
+                unlink_inbound: None,
             }))
             .await
             .expect_err("a bare basename is not a path relative to the KB root");
@@ -13336,6 +13776,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         }
     }
 
@@ -13944,6 +14386,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -14000,6 +14444,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
         assert!(
@@ -14037,6 +14483,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
         assert!(
@@ -14082,6 +14530,7 @@ mod tests {
                 path: "doomed-queued-cleanup-test.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "doomed-queued-cleanup-test.md"),
+                unlink_inbound: None,
             }))
             .await;
 
@@ -14130,6 +14579,7 @@ mod tests {
                 path: "linked.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "linked.md"),
+                unlink_inbound: None,
             }))
             .await
             .expect("an inbound link must not block the delete");
@@ -14158,6 +14608,7 @@ mod tests {
                 path: "unlinked.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "unlinked.md"),
+                unlink_inbound: None,
             }))
             .await
             .unwrap();
@@ -14331,6 +14782,7 @@ mod tests {
                 path: "gone.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "gone.md"),
+                unlink_inbound: None,
             }))
             .await
             .unwrap();
@@ -14364,6 +14816,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await
             .unwrap();
@@ -14446,6 +14900,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         }
     }
 
@@ -14801,6 +15257,7 @@ mod tests {
                 path: "docs/target.md".to_string(),
                 message: None,
                 expected_version: None,
+                unlink_inbound: None,
             }))
             .await
             .expect_err("a delete needs expected_version");
@@ -14829,6 +15286,7 @@ mod tests {
                 path: "docs/target.md".to_string(),
                 message: None,
                 expected_version: Some(base.clone()),
+                unlink_inbound: None,
             }))
             .await
             .expect_err("a stale delete is refused");
@@ -15026,7 +15484,7 @@ mod tests {
             assert_eq!(a.destructive_hint, Some(true), "{name}");
             assert_eq!(a.idempotent_hint, Some(false), "{name}");
         }
-        for name in ["search", "get_document", "get_schema"] {
+        for name in ["search", "get_document", "get_schema", "changes_since"] {
             assert_eq!(annotations(name).read_only_hint, Some(true), "{name}");
         }
     }
@@ -15079,6 +15537,48 @@ mod tests {
             "{}",
             credential.message
         );
+    }
+
+    #[test]
+    fn related_json_rounds_scores_and_is_omitted_when_empty() {
+        assert!(related_json(&[]).is_none());
+        let json = related_json(&[crate::write::RelatedDocument {
+            path: "a.md".into(),
+            score: 0.723_456_8,
+        }])
+        .unwrap();
+        assert_eq!(json[0]["path"], "a.md");
+        assert_eq!(json[0]["score"].as_f64(), Some(0.7235));
+    }
+
+    #[test]
+    fn create_result_carries_related_only_when_present() {
+        let mk = |related| WriteSuccess {
+            outcome: crate::write::WriteOutcome::Synced,
+            sha: "abc".into(),
+            rebased_paths: Vec::new(),
+            diff: String::new(),
+            rewritten_paths: Vec::new(),
+            referencing_paths: Vec::new(),
+            status_set: false,
+            merged: false,
+            version: Some("v".into()),
+            related,
+        };
+        let with = create_edit_success_to_result(
+            mk(vec![crate::write::RelatedDocument {
+                path: "x.md".into(),
+                score: 0.6,
+            }]),
+            "new.md",
+            true,
+            None,
+            false,
+        );
+        let structured = with.structured_content.unwrap();
+        assert_eq!(structured["related"][0]["path"], "x.md");
+        let without = create_edit_success_to_result(mk(Vec::new()), "new.md", true, None, false);
+        assert!(without.structured_content.unwrap().get("related").is_none());
     }
 
     #[test]
@@ -15282,6 +15782,7 @@ mod tests {
                 path: "doomed.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "doomed.md"),
+                unlink_inbound: None,
             }))
             .await;
 
@@ -15341,6 +15842,7 @@ mod tests {
                 path: "doomed.md".to_string(),
                 message: None,
                 expected_version: version_at(&work, "doomed.md"),
+                unlink_inbound: None,
             }))
             .await;
 
@@ -15389,6 +15891,7 @@ mod tests {
             path: "docs/delete-me.md".to_string(),
             message: None,
             expected_version: version_at(&tmp, "docs/delete-me.md"),
+            unlink_inbound: None,
         };
         let result = server.delete_document(Parameters(params)).await;
 
@@ -15425,6 +15928,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15478,6 +15983,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15533,6 +16040,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15627,6 +16136,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15677,6 +16188,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15716,6 +16229,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15759,6 +16274,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15804,6 +16321,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15867,6 +16386,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15907,6 +16428,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -15939,6 +16462,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: None,
+            archive: None,
+            archive_links: None,
         };
 
         let cases: Vec<(&str, WriteDocumentParams)> = vec![
@@ -16045,6 +16570,8 @@ mod tests {
             frontmatter_patch: None,
             append: None,
             documents: one_doc(),
+            archive: None,
+            archive_links: None,
         };
 
         let cases: Vec<(&str, WriteDocumentParams)> = vec![
@@ -16115,6 +16642,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: Some(documents),
+                archive: None,
+                archive_links: None,
             }))
             .await;
         let err = result.expect_err("a batch over the size cap must be rejected");
@@ -16174,6 +16703,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: Some(documents),
+                archive: None,
+                archive_links: None,
             }))
             .await
             .expect("batch write should succeed");
@@ -16244,6 +16775,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: Some(documents),
+                archive: None,
+                archive_links: None,
             }))
             .await;
         let err = result.expect_err("a batch entry with no edit mode must be rejected");
@@ -16283,6 +16816,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -16317,6 +16852,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await
             .expect_err("overlong path should return Err");
@@ -16353,6 +16890,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await
             .expect_err("overlong new_path should return Err");
@@ -16382,6 +16921,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -16418,6 +16959,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
 
@@ -16939,6 +17482,8 @@ mod tests {
                 frontmatter_patch: None,
                 append: None,
                 documents: None,
+                archive: None,
+                archive_links: None,
             }))
             .await;
         assert!(
