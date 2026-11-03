@@ -1,4 +1,4 @@
-Create, edit, and/or move a document. The change is saved on return and becomes
+Create, edit, move or archive a document. The change is saved on return and becomes
 searchable shortly after.
 
 Edit with `content` (whole file), `old_string`/`new_string`,

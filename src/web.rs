@@ -1926,6 +1926,7 @@ async fn post_doc_handler(
             },
             expected_version: body.expected_version.as_deref(),
             dest_path: dest_rel.as_deref(),
+            archive: None,
         };
 
         match write::write_document(&deps, req).await {
@@ -4189,6 +4190,7 @@ mod tests {
             diff: String::new(),
             rewritten_paths: Vec::new(),
             referencing_paths: Vec::new(),
+            status_set: false,
             merged: false,
             version: None,
             related,
@@ -4220,6 +4222,7 @@ mod tests {
             diff: "+line".into(),
             rewritten_paths: Vec::new(),
             referencing_paths: vec!["referencer.md".to_string()],
+            status_set: false,
             merged: false,
             version: None,
             related: Vec::new(),

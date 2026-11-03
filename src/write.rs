@@ -363,6 +363,11 @@ pub struct WriteRequest<'a> {
     /// DESTINATION's schema; the create-only dedup gate never runs. `change` must
     /// not be a create (reported as `WriteError::Internal`).
     pub dest_path: Option<&'a str>,
+    /// `Some` turns the move into an ARCHIVE (#357): `dest_path` is the archived
+    /// location (see [`archive_destination`]), the document gets `status: archived`
+    /// when its governing schema allows that, and the links pointing at it are
+    /// handled per this policy, all in the one move commit. Requires `dest_path`.
+    pub archive: Option<crate::config::ArchiveLinkPolicy>,
 }
 
 /// The two outcomes a write can land on. Both are the tool's happy path from a
@@ -408,6 +413,10 @@ pub struct WriteSuccess {
     /// caller with no access to server logs (the `warn!` #181 added) can still
     /// learn what it warned about and decide whether follow-up work is needed.
     pub referencing_paths: Vec<String>,
+    /// An archive write set `status: archived` on the moved document. `false` for
+    /// every other change, and for an archive whose governing schema declares no
+    /// `status` field allowing that value (the frontmatter is then left alone).
+    pub status_set: bool,
     /// The written document had other concurrent changes that were merged with
     /// this one (a three-way merge of a stale full replace, a relative edit
     /// applied over changes made since its `expected_version`, or a clean rebase
@@ -1778,6 +1787,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
         operation,
         expected_version,
         dest_path: _,
+        archive: _,
     } = req;
     let is_create = change.is_create();
 
@@ -1904,6 +1914,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                     diff: String::new(),
                     rewritten_paths: Vec::new(),
                     referencing_paths: Vec::new(),
+                    status_set: false,
                     merged: applied.merged,
                     version: Some(document_version(current.as_bytes())),
                 });
@@ -2001,6 +2012,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                     diff: render_unified_diff(&old_content, &applied.content, rel_path),
                     rewritten_paths: Vec::new(),
                     referencing_paths: Vec::new(),
+                    status_set: false,
                     merged: applied.merged,
                     version: Some(document_version(applied.content.as_bytes())),
                 });
@@ -2047,6 +2059,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
             rebased_paths: commit_outcome.rebased_paths,
             rewritten_paths: Vec::new(),
             referencing_paths: Vec::new(),
+            status_set: false,
             merged: applied.merged || rebase_merged,
             version,
         });
@@ -2083,6 +2096,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
         operation,
         expected_version,
         dest_path,
+        archive,
     } = req;
     let dest_rel = dest_path.expect("write_document_move called with req.dest_path == None");
 
@@ -2110,6 +2124,16 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     };
 
     validate_commit_message(message)?;
+
+    // An archive promises its inbound links are handled; without the reverse-link
+    // index it could not keep that promise, so it refuses instead of moving alone.
+    if archive.is_some() && deps.state.is_none() {
+        return Err(WriteError::Internal {
+            msg: "archiving needs the document index to find links to the document, and it is \
+                  unavailable right now"
+                .to_string(),
+        });
+    }
 
     let (git_lock, mut head) = lock_and_sync(deps).await;
     let data_path_str = data_path_of(deps);
@@ -2144,10 +2168,28 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
         //    moved document was authored against its OLD directory; each is
         //    re-relativized from `dest_rel` to its own target, a self-reference
         //    mapping to `dest_rel`.
-        let content_to_write =
+        let mut content_to_write =
             rewrite_outbound_links(&applied.content, source_rel, dest_rel, |resolved| {
                 (resolved == source_rel).then(|| dest_rel.to_string())
             });
+
+        // 6.5. An archive marks the document `status: archived` where the
+        //      DESTINATION's schema declares a `status` field that allows it;
+        //      otherwise the frontmatter is left exactly as it is.
+        let mut status_set = false;
+        if archive.is_some() && archive_status_allowed(deps, dest_rel) {
+            let set_status = [FrontmatterEdit::SetField {
+                field: "status".to_string(),
+                value: serde_json::json!(ARCHIVED_STATUS),
+            }];
+            match apply_frontmatter_patch(&content_to_write, &set_status) {
+                Ok(patched) => {
+                    content_to_write = patched;
+                    status_set = true;
+                }
+                Err(e) => warn!("Archiving '{}': leaving status alone: {}", source_rel, e),
+            }
+        }
 
         // 7. Validation against the DESTINATION's schema, not the source's.
         validate_document(deps, dest_rel, &content_to_write).await?;
@@ -2220,101 +2262,63 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
         //    query, skips it; the links self-heal on each document's next reindex.
         let mut rewritten_paths: Vec<String> = Vec::new();
         if let Some(state) = deps.state {
-            match state.links_targeting(source_rel, "markdown").await {
-                Ok(referencing_paths) => {
-                    for ref_path in referencing_paths {
-                        // A self-reference was handled in `content_to_write`.
-                        if ref_path == source_rel {
-                            continue;
-                        }
-                        let abs_ref = match safe_write_path(deps, &ref_path) {
-                            Ok(p) => p,
-                            Err(_) => {
-                                warn!(
-                                    "Skipping link rewrite in '{}' while moving '{}' -> '{}': \
-                                     the path no longer resolves safely (stale document_links \
-                                     row?)",
-                                    ref_path, source_rel, dest_rel
-                                );
-                                continue;
-                            }
-                        };
-                        let body = match tokio::fs::read_to_string(&abs_ref).await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!(
-                                    "Skipping link rewrite in '{}' while moving '{}' -> '{}': \
-                                     failed to read it, likely a stale document_links row: {}",
-                                    ref_path, source_rel, dest_rel, e
-                                );
-                                continue;
-                            }
-                        };
-                        let occurrences: Vec<_> =
-                            crate::ingest::find_markdown_link_occurrences(&body, &ref_path)
-                                .into_iter()
-                                .filter(|o| o.resolved.as_str() == source_rel)
-                                .collect();
-                        if occurrences.is_empty() {
-                            continue;
-                        }
-                        let replacement = crate::ingest::relativize_md_path(&ref_path, dest_rel);
-                        let new_body = apply_link_replacements(&body, &occurrences, &replacement);
-                        if let Err(e) = tokio::fs::write(&abs_ref, new_body.as_bytes()).await {
-                            error!(
-                                "Failed to rewrite links into '{}' while moving '{}' -> '{}': \
-                                 {}. Undoing every filesystem change made for this move so far.",
-                                ref_path, source_rel, dest_rel, e
-                            );
-                            // Nothing has touched git yet: restore the tracked paths
-                            // from HEAD and delete the untracked destination.
-                            for done in &rewritten_paths {
-                                if let Err(e) =
-                                    git::restore_from_head(&git_lock, data_path_str, done).await
-                                {
-                                    error!(
-                                        "Rollback: failed to restore rewritten referencing \
-                                         document '{}': {:#}. This needs operator attention.",
-                                        done, e
-                                    );
-                                }
-                            }
-                            if let Err(e) =
-                                git::restore_from_head(&git_lock, data_path_str, source_rel).await
-                            {
-                                error!(
-                                    "Rollback: failed to restore source '{}': {:#}. This needs \
-                                     operator attention.",
-                                    source_rel, e
-                                );
-                            }
-                            if let Err(e) = tokio::fs::remove_file(&abs_dest).await {
-                                error!(
-                                    "Rollback: failed to remove destination '{}': {}. This \
-                                     needs operator attention.",
-                                    dest_rel, e
-                                );
-                            }
-                            return Err(WriteError::Io {
-                                msg: format!("Failed to rewrite links in '{}': {}", ref_path, e),
-                            });
-                        }
-                        rewritten_paths.push(ref_path);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Skipping incoming-link rewrite while moving '{}' -> '{}': the \
-                         reverse-link query failed: {:#}",
-                        source_rel, dest_rel, e
+            let action = match archive {
+                Some(crate::config::ArchiveLinkPolicy::Unlink) => InboundAction::Unlink,
+                _ => InboundAction::Repoint(dest_rel),
+            };
+            match rewrite_inbound_links(deps, state, source_rel, action, archive.is_some()).await {
+                Ok(paths) => rewritten_paths = paths,
+                Err(failure) => {
+                    error!(
+                        "Failed to rewrite links into '{}' while moving '{}' -> '{}': {}. \
+                         Undoing every filesystem change made for this move so far.",
+                        failure.path, source_rel, dest_rel, failure.msg
                     );
+                    // Nothing has touched git yet: restore the tracked paths
+                    // from HEAD and delete the untracked destination.
+                    for done in &failure.written {
+                        if let Err(e) = git::restore_from_head(&git_lock, data_path_str, done).await
+                        {
+                            error!(
+                                "Rollback: failed to restore rewritten referencing \
+                                 document '{}': {:#}. This needs operator attention.",
+                                done, e
+                            );
+                        }
+                    }
+                    if let Err(e) =
+                        git::restore_from_head(&git_lock, data_path_str, source_rel).await
+                    {
+                        error!(
+                            "Rollback: failed to restore source '{}': {:#}. This needs \
+                             operator attention.",
+                            source_rel, e
+                        );
+                    }
+                    if let Err(e) = tokio::fs::remove_file(&abs_dest).await {
+                        error!(
+                            "Rollback: failed to remove destination '{}': {}. This \
+                             needs operator attention.",
+                            dest_rel, e
+                        );
+                    }
+                    return Err(WriteError::Io {
+                        msg: format!(
+                            "Failed to rewrite links in '{}': {}",
+                            failure.path, failure.msg
+                        ),
+                    });
                 }
             }
         }
 
         let commit_message = build_commit_message(
             message,
-            &format!("docs: move {} to {}", source_rel, dest_rel),
+            &if archive.is_some() {
+                format!("docs: archive {} to {}", source_rel, dest_rel)
+            } else {
+                format!("docs: move {} to {}", source_rel, dest_rel)
+            },
             operation,
         );
 
@@ -2423,6 +2427,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                     diff: render_unified_diff(&current, &content_to_write, dest_rel),
                     rewritten_paths,
                     referencing_paths: Vec::new(),
+                    status_set,
                     merged: applied.merged,
                     version: Some(document_version(content_to_write.as_bytes())),
                 });
@@ -2465,12 +2470,241 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
             rebased_paths: commit_outcome.rebased_paths,
             rewritten_paths,
             referencing_paths: Vec::new(),
+            status_set,
             merged: applied.merged || rebase_merged,
             version: (!dest_merged).then(|| document_version(content_to_write.as_bytes())),
         });
     }
 
     Err(WriteError::EditedElsewhere)
+}
+
+// ---------------------------------------------------------------------------
+// Archive flow and inbound-link handling (#357)
+// ---------------------------------------------------------------------------
+
+/// The `status` value an archive sets.
+const ARCHIVED_STATUS: &str = "archived";
+
+/// Where an archive of `rel_path` lands: `<prefix>/<rel_path>`. `prefix` is
+/// `write.archive_prefix` (validated at config load; re-checked here). Refuses a
+/// document already under the prefix, so archiving twice cannot nest
+/// `_archive/_archive/...`.
+pub fn archive_destination(prefix: &str, rel_path: &str) -> Result<String, String> {
+    let prefix = crate::config::normalize_archive_prefix(prefix)
+        .map_err(|e| format!("write.archive_prefix {e}"))?;
+    let rel = rel_path.trim_start_matches('/');
+    if rel == prefix || rel.starts_with(&format!("{prefix}/")) {
+        return Err(format!(
+            "'{rel_path}' is already in the archive ('{prefix}/')"
+        ));
+    }
+    Ok(format!("{prefix}/{rel}"))
+}
+
+/// Whether the schema governing `dest_rel` declares a `status` field that can hold
+/// `archived`: a text or enum field, open or listing that value. A document under
+/// a schema without one keeps its frontmatter as it is.
+fn archive_status_allowed<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    dest_rel: &str,
+) -> bool {
+    let schemas = crate::schema::load_shared(deps.schema_cache);
+    let Some(def) = schemas
+        .resolve_for(Path::new(dest_rel))
+        .fields
+        .get("status")
+    else {
+        return false;
+    };
+    matches!(
+        def.ty,
+        None | Some(crate::schema::FieldType::Enum | crate::schema::FieldType::Text)
+    ) && def
+        .values
+        .as_ref()
+        .is_none_or(|v| v.iter().any(|x| x == ARCHIVED_STATUS))
+}
+
+/// What to do with a link that points at a document being moved or removed.
+#[derive(Clone, Copy)]
+enum InboundAction<'a> {
+    /// Point it at this (KB-relative) new location.
+    Repoint(&'a str),
+    /// Replace the whole link with its plain label.
+    Unlink,
+}
+
+/// A failed inbound rewrite: which document, why, and which documents had already
+/// been rewritten on disk (and so need restoring from HEAD).
+struct InboundFailure {
+    path: String,
+    msg: String,
+    written: Vec<String>,
+}
+
+/// Rewrite every other document that links to `source_rel`, in place on disk (the
+/// caller commits them together with its own change and rolls them back on
+/// failure). Each document is read now, under the caller's lock, so a concurrent
+/// change to it is carried along rather than overwritten. Returns the rewritten
+/// paths.
+///
+/// A failed reverse-link query is logged and skipped (the links then heal on each
+/// document's next reindex) unless `strict`, which an archive or an unlinking
+/// delete sets because it promises the links are handled.
+async fn rewrite_inbound_links<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    state: &StateDb,
+    source_rel: &str,
+    action: InboundAction<'_>,
+    strict: bool,
+) -> Result<Vec<String>, InboundFailure> {
+    let referencing_paths = match state.links_targeting(source_rel, "markdown").await {
+        Ok(paths) => paths,
+        Err(e) if strict => {
+            return Err(InboundFailure {
+                path: source_rel.to_string(),
+                msg: format!("the reverse-link query failed: {e:#}"),
+                written: Vec::new(),
+            });
+        }
+        Err(e) => {
+            warn!(
+                "Skipping incoming-link rewrite for '{}': the reverse-link query failed: {:#}",
+                source_rel, e
+            );
+            return Ok(Vec::new());
+        }
+    };
+    let mut written: Vec<String> = Vec::new();
+    for ref_path in referencing_paths {
+        // A self-reference is the moved document's own content, handled by its caller.
+        if ref_path == source_rel {
+            continue;
+        }
+        let abs_ref = match safe_write_path(deps, &ref_path) {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(
+                    "Skipping link rewrite in '{}' for '{}': the path no longer resolves \
+                     safely (stale document_links row?)",
+                    ref_path, source_rel
+                );
+                continue;
+            }
+        };
+        let body = match tokio::fs::read_to_string(&abs_ref).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    "Skipping link rewrite in '{}' for '{}': failed to read it, likely a \
+                     stale document_links row: {}",
+                    ref_path, source_rel, e
+                );
+                continue;
+            }
+        };
+        let occurrences: Vec<_> = crate::ingest::find_markdown_link_occurrences(&body, &ref_path)
+            .into_iter()
+            .filter(|o| o.resolved.as_str() == source_rel)
+            .collect();
+        if occurrences.is_empty() {
+            continue;
+        }
+        let new_body = match action {
+            InboundAction::Repoint(dest_rel) => {
+                let replacement = crate::ingest::relativize_md_path(&ref_path, dest_rel);
+                apply_link_replacements(&body, &occurrences, &replacement)
+            }
+            InboundAction::Unlink => unlink_occurrences(&body, &occurrences),
+        };
+        if new_body == body {
+            continue;
+        }
+        if let Err(e) = tokio::fs::write(&abs_ref, new_body.as_bytes()).await {
+            written.push(ref_path.clone());
+            return Err(InboundFailure {
+                path: ref_path,
+                msg: e.to_string(),
+                written,
+            });
+        }
+        written.push(ref_path);
+    }
+    Ok(written)
+}
+
+/// Replace each of `occurrences` (found in `body`) with its plain label: an inline
+/// `[label](target)` becomes `label`, a wiki `[[target]]` becomes `target` and
+/// `[[target|alias]]` becomes `alias`, an autolink `<target>` becomes `target`, and
+/// a reference definition line is dropped. Back-to-front, like every span rewrite.
+/// A reference-style link's use sites (`[text][ref]`) are left as written: only the
+/// definition holds the target.
+fn unlink_occurrences(body: &str, occurrences: &[crate::ingest::LinkOccurrence]) -> String {
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = occurrences
+        .iter()
+        .filter_map(|o| unlink_edit(body, o))
+        .collect();
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    let mut out = body.to_string();
+    for (range, text) in edits {
+        out.replace_range(range, &text);
+    }
+    out
+}
+
+/// The byte range one link construct occupies in `body`, and the plain text that
+/// replaces it, derived from the surroundings of the occurrence's target span.
+/// `None` for a construct this does not recognise (it is left alone).
+fn unlink_edit(
+    body: &str,
+    o: &crate::ingest::LinkOccurrence,
+) -> Option<(std::ops::Range<usize>, String)> {
+    let (start, end) = (o.span.start, o.span.end);
+    let before = &body[..start];
+    let after = &body[end..];
+    let line_end = after.find('\n').unwrap_or(after.len());
+
+    // Wiki `[[target]]` / `[[target|alias]]`.
+    if before.ends_with("[[") {
+        let close = after[..line_end].find("]]")?;
+        let alias = after[..close].strip_prefix('|').map(str::trim);
+        let text = match alias {
+            Some(a) if !a.is_empty() => a,
+            _ => o.raw.trim(),
+        };
+        return Some((start - 2..end + close + 2, text.to_string()));
+    }
+    // Autolink `<target>` (not the angle form of an inline target).
+    if before.ends_with('<') && !before.ends_with("(<") && after.starts_with('>') {
+        return Some((start - 1..end + 1, o.raw.trim().to_string()));
+    }
+    // Inline `[label](target "title")`.
+    if before.ends_with('(') && before[..before.len() - 1].ends_with(']') {
+        let label_close = before.len() - 2;
+        let line_start = before[..label_close].rfind('\n').map_or(0, |i| i + 1);
+        let open = line_start + before[line_start..label_close].rfind('[')?;
+        let paren = after[..line_end].find(')')?;
+        let label = before[open + 1..label_close].trim();
+        let text = if label.is_empty() {
+            o.raw.trim()
+        } else {
+            label
+        };
+        return Some((open..end + paren + 1, text.to_string()));
+    }
+    // Reference definition `[ref]: target` — a whole line.
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let prefix = before[line_start..].trim();
+    if prefix.starts_with('[') && prefix.ends_with("]:") {
+        let stop = if line_end < after.len() {
+            end + line_end + 1
+        } else {
+            end + line_end
+        };
+        return Some((line_start..stop, String::new()));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -4439,6 +4673,30 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     message: Option<&str>,
     expected_version: Option<&str>,
 ) -> Result<WriteSuccess, WriteError> {
+    delete_document_with(deps, rel_path, message, expected_version, false).await
+}
+
+/// [`delete_document`], optionally with `unlink_inbound` (#357): every other
+/// document that links to `rel_path` has the link replaced with its plain label
+/// in the SAME commit (listed in `WriteSuccess::rewritten_paths`), so the delete
+/// leaves no dangling link. Those documents are read under the lock after the
+/// sync, so a concurrent change to one is carried along; if the remote moves
+/// under the commit the whole attempt is redone. Refused when the document index
+/// is unavailable, since the links could not be found.
+pub async fn delete_document_with<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    rel_path: &str,
+    message: Option<&str>,
+    expected_version: Option<&str>,
+    unlink_inbound: bool,
+) -> Result<WriteSuccess, WriteError> {
+    if unlink_inbound && deps.state.is_none() {
+        return Err(WriteError::Internal {
+            msg: "unlink_inbound needs the document index to find links to the document, and \
+                  it is unavailable right now"
+                .to_string(),
+        });
+    }
     // Schema-file guard, then include-pattern eligibility guard, then the early
     // path-safety check, ahead of everything else — see `write_document`.
     check_not_schema_file(rel_path)?;
@@ -4464,7 +4722,9 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     // the referencing document's own next reindex, same as any stale
     // `document_links` row. A read of the index, so it runs before the lock.
     let mut referencing_paths: Vec<String> = Vec::new();
-    if let Some(state) = deps.state {
+    // With `unlink_inbound` the links are rewritten below, so there is nothing to
+    // warn about.
+    if let Some(state) = deps.state.filter(|_| !unlink_inbound) {
         match state.links_targeting(rel_path, "markdown").await {
             Ok(inbound) if !inbound.is_empty() => {
                 warn!(
@@ -4514,6 +4774,38 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
             }
         })?;
 
+        // Unlink every document that linked to this one, in the same commit.
+        let mut rewritten_paths: Vec<String> = Vec::new();
+        if unlink_inbound && let Some(state) = deps.state {
+            match rewrite_inbound_links(deps, state, rel_path, InboundAction::Unlink, true).await {
+                Ok(paths) => rewritten_paths = paths,
+                Err(failure) => {
+                    error!(
+                        "Failed to unlink '{}' in '{}' while deleting it: {}. Restoring.",
+                        rel_path, failure.path, failure.msg
+                    );
+                    for done in failure.written.iter().map(String::as_str).chain([rel_path]) {
+                        if let Err(e) = git::restore_from_head(&git_lock, data_path_str, done).await
+                        {
+                            error!(
+                                "Rollback: failed to restore '{}': {:#}. This needs operator \
+                                 attention.",
+                                done, e
+                            );
+                        }
+                    }
+                    return Err(WriteError::Io {
+                        msg: format!(
+                            "Failed to rewrite links in '{}': {}",
+                            failure.path, failure.msg
+                        ),
+                    });
+                }
+            }
+        }
+        let mut commit_paths: Vec<&str> = vec![rel_path];
+        commit_paths.extend(rewritten_paths.iter().map(String::as_str));
+
         // `PreCommit`: HEAD never recorded the deletion — restore the file from
         // HEAD so the caller sees "nothing changed". `PostCommit`: the deletion is
         // a real local commit; leave it and report the sync as pending.
@@ -4526,7 +4818,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
             deps.branch,
             data_path_str,
             deps.token,
-            &[rel_path],
+            &commit_paths,
             &commit_message,
             deps.commit_author_name,
             deps.commit_author_email,
@@ -4540,6 +4832,15 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
                     "commit_and_sync pre-commit failure deleting '{}', restoring from HEAD: {:#}",
                     rel_path, source
                 );
+                for path in &rewritten_paths {
+                    if let Err(e) = git::restore_from_head(&git_lock, data_path_str, path).await {
+                        error!(
+                            "Rollback: failed to restore unlinked document '{}': {:#}. This \
+                             needs operator attention.",
+                            path, e
+                        );
+                    }
+                }
                 return match git::restore_from_head(&git_lock, data_path_str, rel_path).await {
                     Ok(()) => Err(WriteError::PreCommitFailed {
                         rolled_back: true,
@@ -4569,15 +4870,22 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
                      {} stands uncorrected: {:#}",
                     rel_path, sha, source
                 );
-                mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
+                mark_dirty(
+                    deps.queue,
+                    deps.indexing,
+                    std::iter::once(PathBuf::from(rel_path))
+                        .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .collect(),
+                );
                 return Ok(WriteSuccess {
                     related: Vec::new(),
                     outcome: WriteOutcome::CommittedPendingSync,
                     sha,
                     rebased_paths: Vec::new(),
                     diff: render_unified_diff(&old_content, "", rel_path),
-                    rewritten_paths: Vec::new(),
+                    rewritten_paths,
                     referencing_paths,
+                    status_set: false,
                     merged: false,
                     version: None,
                 });
@@ -4601,19 +4909,24 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
             deps.queue,
             deps.indexing,
             std::iter::once(PathBuf::from(rel_path))
+                .chain(rewritten_paths.iter().map(PathBuf::from))
                 .chain(commit_outcome.rebased_paths.iter().cloned())
                 .collect(),
         );
 
+        // The deleted document is gone, so a rebase merge only matters for the
+        // documents this call unlinked.
+        let rebase_merged = rebase_touched(&commit_outcome.rebased_paths, &commit_paths[1..]);
         return Ok(WriteSuccess {
             related: Vec::new(),
             outcome: WriteOutcome::Synced,
             sha: commit_outcome.sha,
             diff: render_unified_diff(&old_content, "", rel_path),
             rebased_paths: commit_outcome.rebased_paths,
-            rewritten_paths: Vec::new(),
+            rewritten_paths,
             referencing_paths,
-            merged: false,
+            status_set: false,
+            merged: rebase_merged,
             version: None,
         });
     }
@@ -5435,6 +5748,7 @@ mod tests {
             operation: "test",
             expected_version: None,
             dest_path: None,
+            archive: None,
         }
     }
 
@@ -5455,6 +5769,7 @@ mod tests {
             operation: "test",
             expected_version: Some(leak(document_version(old_content.as_bytes()))),
             dest_path: Some(dest_rel),
+            archive: None,
         }
     }
 
@@ -10695,6 +11010,343 @@ mod tests {
         // as the single-document move's equivalent test above.
         assert!(!tmp.path().join("new-dir-no-repo/a.md").exists());
         assert!(!sub.join("a.md").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Archive flow and unlinking inbound links (#357)
+    // -----------------------------------------------------------------------
+
+    const ARCHIVE_SOURCE: &str = "---\ntitle: Old Page\ndescription: d\ntype: guide\ntags: [t]\nstatus: active\n---\n\n# Body\n";
+    const ARCHIVE_REFERENCER: &str = "---\ntitle: Referencer\ndescription: d\ntype: guide\n\
+         tags: [t]\n---\n\nSee [the page](old/loc.md \"T\"), [[old/loc.md|Alias]] and \
+         [[old/loc.md]] or <old/loc.md>.\n";
+
+    fn archive_req<'a>(
+        source_rel: &'a str,
+        dest_rel: &'a str,
+        version_of: &str,
+        policy: crate::config::ArchiveLinkPolicy,
+    ) -> WriteRequest<'a> {
+        WriteRequest {
+            rel_path: source_rel,
+            change: DocChange::Keep,
+            message: None,
+            default_verb: "update",
+            force_new: None,
+            operation: "test (archive)",
+            expected_version: Some(leak(document_version(version_of.as_bytes()))),
+            dest_path: Some(dest_rel),
+            archive: Some(policy),
+        }
+    }
+
+    /// A work tree holding the archive source and one referencing document,
+    /// optionally under a root schema declaring `status`, with the reverse-link
+    /// index seeded; returns the harness and the HEAD before any write.
+    async fn archive_fixture(work: &tempfile::TempDir, status_schema: bool) -> (Harness, String) {
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        std::fs::write(work.path().join("old/loc.md"), ARCHIVE_SOURCE).unwrap();
+        git_commit_all(work, "old/loc.md", "add old/loc.md");
+        std::fs::write(work.path().join("referencing.md"), ARCHIVE_REFERENCER).unwrap();
+        git_commit_all(work, "referencing.md", "add referencing.md");
+        if status_schema {
+            std::fs::write(
+                work.path().join(crate::schema::SCHEMA_FILE_NAME),
+                "fields:\n  status:\n    type: enum\n    values: [active, archived]\n",
+            )
+            .unwrap();
+            git_commit_all(work, crate::schema::SCHEMA_FILE_NAME, "add schema");
+        }
+        let head_before = head_sha(work);
+        let harness = git_backed_harness_with_state_db(work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing.md",
+                "markdown",
+                &[("old/loc.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+        (harness, head_before)
+    }
+
+    fn commit_count_since(work: &tempfile::TempDir, base: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-list", "--count", &format!("{base}..HEAD")])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn archive_repoint_moves_sets_status_and_rewrites_links_in_one_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, head_before) = archive_fixture(&work, true).await;
+
+        let dest = archive_destination("_archive", "old/loc.md").unwrap();
+        assert_eq!(dest, "_archive/old/loc.md");
+        let req = archive_req(
+            "old/loc.md",
+            &dest,
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(success.status_set);
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+        assert!(!work.path().join("old/loc.md").exists());
+        let archived = std::fs::read_to_string(work.path().join(&dest)).unwrap();
+        assert!(archived.contains("status: archived"), "{archived}");
+        assert!(!archived.contains("status: active"), "{archived}");
+        assert!(archived.ends_with("# Body\n"));
+        assert_eq!(success.version, Some(document_version(archived.as_bytes())));
+
+        let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert!(
+            referencing.contains("[the page](_archive/old/loc.md)"),
+            "{referencing}"
+        );
+        assert!(
+            referencing.contains("[[_archive/old/loc.md|Alias]]"),
+            "{referencing}"
+        );
+        assert!(
+            referencing.contains("[[_archive/old/loc.md]]"),
+            "{referencing}"
+        );
+        assert!(
+            referencing.contains("<_archive/old/loc.md>"),
+            "{referencing}"
+        );
+        assert!(!referencing.contains("(old/loc.md"));
+
+        // The move, the status change and the rewritten links: one commit.
+        assert_eq!(commit_count_since(&work, &head_before), "1");
+        let show = std::process::Command::new("git")
+            .args(["show", "--name-only", "--format=%s", "HEAD"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        let show = String::from_utf8_lossy(&show.stdout);
+        assert!(show.contains("docs: archive old/loc.md to _archive/old/loc.md"));
+        assert!(show.contains("old/loc.md"));
+        assert!(show.contains("_archive/old/loc.md"));
+        assert!(show.contains("referencing.md"));
+        crate::reindex::test_support::assert_marked_dirty(
+            &harness.reindex_queue,
+            &["old/loc.md", "_archive/old/loc.md", "referencing.md"],
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_unlink_replaces_links_with_plain_text_in_one_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, head_before) = archive_fixture(&work, true).await;
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Unlink,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert!(success.status_set);
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+        let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert!(
+            referencing.ends_with("\nSee the page, Alias and old/loc.md or old/loc.md.\n"),
+            "{referencing}"
+        );
+        assert!(!referencing.contains("]("));
+        assert!(!referencing.contains("[["));
+        assert_eq!(commit_count_since(&work, &head_before), "1");
+    }
+
+    #[tokio::test]
+    async fn archive_leaves_frontmatter_alone_when_the_schema_has_no_status_field() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, _) = archive_fixture(&work, false).await;
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert!(!success.status_set);
+        let archived = std::fs::read_to_string(work.path().join("_archive/old/loc.md")).unwrap();
+        assert_eq!(archived, ARCHIVE_SOURCE);
+    }
+
+    #[tokio::test]
+    async fn archive_with_a_stale_or_missing_expected_version_is_refused() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, head_before) = archive_fixture(&work, true).await;
+
+        let stale = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            "some older content\n",
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let err = write_document(&harness.deps(), stale).await.unwrap_err();
+        assert!(matches!(err, WriteError::EditedElsewhere), "{err:?}");
+
+        let mut missing = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        missing.expected_version = None;
+        let err = write_document(&harness.deps(), missing).await.unwrap_err();
+        assert!(matches!(err, WriteError::VersionRequired), "{err:?}");
+
+        assert!(work.path().join("old/loc.md").exists());
+        assert!(!work.path().join("_archive").exists());
+        assert_eq!(head_sha(&work), head_before);
+    }
+
+    #[tokio::test]
+    async fn archive_without_the_document_index_is_refused() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        std::fs::write(work.path().join("old/loc.md"), ARCHIVE_SOURCE).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+        let harness = git_backed_harness(&work);
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        assert!(matches!(err, WriteError::Internal { .. }), "{err:?}");
+        assert!(work.path().join("old/loc.md").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_with_unlink_inbound_rewrites_links_in_the_same_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, head_before) = archive_fixture(&work, false).await;
+
+        let success = delete_document_with(
+            &harness.deps(),
+            "old/loc.md",
+            None,
+            Some(leak(document_version(ARCHIVE_SOURCE.as_bytes()))),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+        assert!(success.referencing_paths.is_empty());
+        assert!(!work.path().join("old/loc.md").exists());
+        let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert!(
+            referencing.ends_with("\nSee the page, Alias and old/loc.md or old/loc.md.\n"),
+            "{referencing}"
+        );
+        assert_eq!(commit_count_since(&work, &head_before), "1");
+        crate::reindex::test_support::assert_marked_dirty(
+            &harness.reindex_queue,
+            &["old/loc.md", "referencing.md"],
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_without_unlink_inbound_leaves_links_and_reports_them() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, _) = archive_fixture(&work, false).await;
+
+        let success = delete_document(
+            &harness.deps(),
+            "old/loc.md",
+            None,
+            Some(leak(document_version(ARCHIVE_SOURCE.as_bytes()))),
+        )
+        .await
+        .unwrap();
+
+        assert!(success.rewritten_paths.is_empty());
+        assert_eq!(
+            success.referencing_paths,
+            vec!["referencing.md".to_string()]
+        );
+        let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert_eq!(referencing, ARCHIVE_REFERENCER);
+    }
+
+    #[tokio::test]
+    async fn delete_with_unlink_inbound_and_a_stale_version_is_refused() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, head_before) = archive_fixture(&work, false).await;
+
+        let err = delete_document_with(
+            &harness.deps(),
+            "old/loc.md",
+            None,
+            Some(leak(document_version(b"older"))),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, WriteError::EditedElsewhere), "{err:?}");
+        assert!(work.path().join("old/loc.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("referencing.md")).unwrap(),
+            ARCHIVE_REFERENCER
+        );
+        assert_eq!(head_sha(&work), head_before);
+    }
+
+    #[test]
+    fn unlink_occurrences_covers_every_link_syntax_and_skips_code() {
+        let body = "a [x](p.md \"t\") b [[p.md]] c [[p.md|al]] d <p.md> e `[c](p.md)` f\n\
+                    ```\n[f](p.md)\n```\n[r][ref]\n[ref]: p.md\nend\n";
+        let occ: Vec<_> = crate::ingest::find_markdown_link_occurrences(body, "q.md")
+            .into_iter()
+            .filter(|o| o.resolved == "p.md")
+            .collect();
+        let out = unlink_occurrences(body, &occ);
+        assert_eq!(
+            out,
+            "a x b p.md c al d p.md e `[c](p.md)` f\n```\n[f](p.md)\n```\n[r][ref]\nend\n"
+        );
+    }
+
+    #[test]
+    fn archive_destination_prefixes_and_refuses_the_archive_itself() {
+        assert_eq!(
+            archive_destination("/_archive/", "a/b.md").unwrap(),
+            "_archive/a/b.md"
+        );
+        assert_eq!(
+            archive_destination("old/stuff", "a.md").unwrap(),
+            "old/stuff/a.md"
+        );
+        assert!(archive_destination("_archive", "_archive/a.md").is_err());
+        assert!(archive_destination("../x", "a.md").is_err());
+        assert!(archive_destination("  ", "a.md").is_err());
     }
 
     #[tokio::test]
