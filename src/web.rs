@@ -1478,6 +1478,61 @@ async fn history_handler(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/changes (#358)
+// ---------------------------------------------------------------------------
+//
+// The REST twin of the `changes_since` MCP tool: the documents that changed
+// across the whole KB since a timestamp or commit id, as one net change per
+// document. Same projection (`retrieval::changes_since_json`), same read-only
+// no-`GitLock` posture as `/api/history`. A `since` that names no commit, or a
+// malformed `cursor`, is a 400.
+
+#[derive(Debug, Deserialize)]
+struct ChangesQueryParams {
+    /// A timestamp or a commit id; required unless `cursor` is given.
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    path_prefix: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+async fn changes_handler(
+    State(state): State<UiState>,
+    Query(params): Query<ChangesQueryParams>,
+) -> Response {
+    let data_path = state.canonical_data_path.to_string_lossy().into_owned();
+    let indexing = state.config().indexing.clone();
+    match retrieval::changes_since_json(
+        &data_path,
+        &indexing,
+        params.since.as_deref(),
+        params.path_prefix.as_deref(),
+        params.limit,
+        params.cursor.as_deref(),
+    )
+    .await
+    {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(retrieval::ChangesSinceError::Invalid(msg)) => {
+            warn!("changes_since rejected: {msg:?}");
+            bad_request(msg)
+        }
+        Err(retrieval::ChangesSinceError::Git(e)) => {
+            error!("changes_since failed: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to read git history"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // POST/DELETE /api/doc/{*path}
 // ---------------------------------------------------------------------------
 
@@ -2017,6 +2072,7 @@ pub fn ui_router_with_api_auth(state: UiState, api_auth: Option<AuthLayer>) -> R
         .route("/api/enumerate", get(enumerate_handler))
         .route("/api/schema/{*path}", get(get_schema_handler))
         .route("/api/history", get(history_handler))
+        .route("/api/changes", get(changes_handler))
         .merge(doc_router)
         .with_state(state.clone());
     if let Some(auth) = api_auth {
@@ -2779,6 +2835,37 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn changes_handler_lists_net_changes_and_rejects_bad_input() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        history_commit_tool_authored(&work, "docs/a.md", "# A content\n");
+        let state = test_state(&work.path().canonicalize().unwrap());
+        let app = ui_router(state);
+
+        let req = Request::builder()
+            .uri("/api/changes?since=2000-01-01")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["changes"][0]["path"], "docs/a.md");
+        assert_eq!(body["changes"][0]["status"], "added");
+        assert!(body["head"].as_str().is_some());
+
+        for uri in [
+            "/api/changes?since=0123456789abcdef0123456789abcdef01234567",
+            "/api/changes?since=not-a-rev",
+            "/api/changes",
+            "/api/changes?cursor=garbage",
+        ] {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
     }
 
     // ------------------------------------------------------------------

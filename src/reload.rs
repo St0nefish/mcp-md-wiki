@@ -1717,6 +1717,7 @@ mod tests {
         // `descriptions::TOOL_NAMES`.
         new.mcp.disabled_tools = vec![
             "get_document".to_string(),
+            "changes_since".to_string(),
             "write_document".to_string(),
             "delete_document".to_string(),
             "get_schema".to_string(),
