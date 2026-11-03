@@ -5696,8 +5696,10 @@ mod tests {
         // Pins the exact registered set: `list_documents` merged into `search` (one
         // tool covers both semantic retrieval and exhaustive enumeration now), and
         // `create_document`/`edit_document`/`move_directory` merged into
-        // `write_document` earlier — so this must be exactly six, not "at least".
+        // `write_document` earlier, and `changes_since` (#358) added as a separate
+        // read — so this must be exactly seven, not "at least".
         let mut expected = vec![
+            "changes_since",
             "delete_document",
             "get_document",
             "get_schema",
@@ -5708,7 +5710,7 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(
             names, expected,
-            "registered tool set must be exactly these six"
+            "registered tool set must be exactly these seven"
         );
 
         // Every tool's description reaches the real `tools/list` response

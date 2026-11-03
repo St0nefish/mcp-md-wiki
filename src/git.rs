@@ -914,6 +914,243 @@ pub enum CommitDiffError {
     Git(#[from] anyhow::Error),
 }
 
+// ---------------------------------------------------------------------------
+// Corpus-wide net changes (#358)
+// ---------------------------------------------------------------------------
+//
+// The functions below back `changes_since`. They are read-only history calls
+// in the sense of the "Read-only history surface" section above and take no
+// [`GitLock`] for the same reason: every one is a `git rev-parse`, `rev-list`,
+// `diff` between two already-named commits, or `log -n 1` over a bounded
+// range — none touches the index, the working tree or a ref, and an
+// immutable object store cannot be corrupted by a concurrent writer. The cost
+// argument differs slightly from `log -n <limit>`: `git diff base head` is
+// bounded by the size of the change between the two trees rather than by a
+// row count, which is why the caller (`retrieval::changes_since_json`) caps
+// and paginates what it reports. Taking the lock would queue the read behind
+// an in-flight write for up to `GIT_TIMEOUT`, the contention #236 was filed
+// against. A repository held mid-rebase reads as a transiently reverted view
+// (HEAD detached), never an error, as for the history reads above.
+
+/// How a document differs between two commits, net of every commit in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+/// One path's net change from [`net_changes`]. `old_path` is set only for a
+/// rename (`path` is then the new path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetChange {
+    pub kind: NetChangeKind,
+    pub path: String,
+    pub old_path: Option<String>,
+}
+
+/// Parse `git diff --name-status -M -z` output: `<status>\0<path>\0` per entry,
+/// `<status>\0<old>\0<new>\0` for a rename or copy (`R100`/`C75`). A type change
+/// (`T`) reads as a modification; anything unrecognised is skipped.
+fn parse_net_changes(raw: &[u8]) -> Vec<NetChange> {
+    let mut tokens = raw
+        .split(|&b| b == 0)
+        .map(|t| String::from_utf8_lossy(t).into_owned());
+    let mut out = Vec::new();
+    while let Some(status) = tokens.next() {
+        if status.is_empty() {
+            continue;
+        }
+        match status.chars().next() {
+            Some(c @ ('R' | 'C')) => {
+                let (Some(old), Some(new)) = (tokens.next(), tokens.next()) else {
+                    break;
+                };
+                if c == 'R' {
+                    out.push(NetChange {
+                        kind: NetChangeKind::Renamed,
+                        path: new,
+                        old_path: Some(old),
+                    });
+                } else {
+                    out.push(NetChange {
+                        kind: NetChangeKind::Added,
+                        path: new,
+                        old_path: None,
+                    });
+                }
+            }
+            Some(c @ ('A' | 'M' | 'D' | 'T')) => {
+                let Some(path) = tokens.next() else { break };
+                let kind = match c {
+                    'A' => NetChangeKind::Added,
+                    'D' => NetChangeKind::Deleted,
+                    _ => NetChangeKind::Modified,
+                };
+                out.push(NetChange {
+                    kind,
+                    path,
+                    old_path: None,
+                });
+            }
+            _ => {
+                // Unknown status letter: consume its path so the stream stays aligned.
+                let _ = tokens.next();
+            }
+        }
+    }
+    out
+}
+
+/// Run a read-only `git` command in `data_path` and return its output.
+async fn git_read(data_path: &str, args: &[&str], what: &str) -> Result<std::process::Output> {
+    let safe_dir = format!("safe.directory={}", data_path);
+    let mut full: Vec<&str> = vec!["-c", &safe_dir];
+    full.extend_from_slice(args);
+    timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args(&full)
+            .current_dir(data_path)
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git {what} timed out after {:?}", GIT_TIMEOUT))?
+    .with_context(|| format!("Failed to spawn git {what}"))
+}
+
+/// The commit `HEAD` names, or `None` for a repository with no commits yet.
+pub async fn head_commit(data_path: &str) -> Result<Option<String>> {
+    let out = git_read(
+        data_path,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        "rev-parse",
+    )
+    .await?;
+    if out.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ));
+    }
+    // An unborn HEAD is `--verify --quiet`'s plain "no such commit" (exit 1).
+    if out.status.code() == Some(1) {
+        return Ok(None);
+    }
+    let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+    anyhow::bail!("git rev-parse failed ({}): {}", out.status, stderr)
+}
+
+/// Resolve a commit id the caller named to its full sha:
+/// [`CommitDiffError::UnknownRevision`] when it names no commit (bad input,
+/// #265), otherwise a git failure.
+pub async fn resolve_commit_id(data_path: &str, commit: &str) -> Result<String, CommitDiffError> {
+    let safe_dir = format!("safe.directory={}", data_path);
+    resolve_commit(data_path, &safe_dir, commit).await
+}
+
+/// The base of a "changes since a point in time" range: the newest commit
+/// reachable from `head` whose committer time is at or before `unix_ts`, or
+/// `None` when every commit is newer (the range then starts from the empty tree).
+pub async fn changes_base_at(data_path: &str, head: &str, unix_ts: i64) -> Result<Option<String>> {
+    let min_age = format!("--min-age={unix_ts}");
+    let out = git_read(
+        data_path,
+        &["rev-list", "-n", "1", &min_age, "--end-of-options", head],
+        "rev-list",
+    )
+    .await?;
+    if !out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!("git rev-list failed ({}): {}", out.status, stderr);
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok((!sha.is_empty()).then_some(sha))
+}
+
+/// Each path that differs between `base` (`None` = the empty tree) and `head`,
+/// as one net change per path: add-then-modify is `Added`, add-then-delete does
+/// not appear, and `-M` pairs a delete and an add of similar content into a
+/// rename. Unsorted; the caller orders and filters.
+pub async fn net_changes(
+    data_path: &str,
+    base: Option<&str>,
+    head: &str,
+) -> Result<Vec<NetChange>> {
+    let base_tree = match base {
+        Some(b) => b.to_string(),
+        None => {
+            let out = git_read(
+                data_path,
+                &["hash-object", "-t", "tree", "--stdin"],
+                "hash-object",
+            )
+            .await?;
+            if !out.status.success() {
+                let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+                anyhow::bail!("git hash-object failed: {}", stderr);
+            }
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+    };
+    let out = git_read(
+        data_path,
+        &[
+            "diff",
+            "--name-status",
+            "-M",
+            "-z",
+            "--no-ext-diff",
+            &base_tree,
+            head,
+            "--",
+        ],
+        "diff",
+    )
+    .await?;
+    if !out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!("git diff failed ({}): {}", out.status, stderr);
+    }
+    Ok(parse_net_changes(&out.stdout))
+}
+
+/// The newest commit in `base..head` (`head` alone when `base` is `None`) that
+/// touched `rel_path`, or `None` if none did. For a deleted path this is the
+/// deleting commit; for a renamed one, pass the new path.
+pub async fn last_commit_touching(
+    data_path: &str,
+    base: Option<&str>,
+    head: &str,
+    rel_path: &str,
+) -> Result<Option<CommitInfo>> {
+    let range = match base {
+        Some(b) => format!("{b}..{head}"),
+        None => head.to_string(),
+    };
+    let out = git_read(
+        data_path,
+        &[
+            "log",
+            "-n",
+            "1",
+            "--format=%H%x1f%an%x1f%ae%x1f%at%x1f%B",
+            "-z",
+            &range,
+            "--",
+            rel_path,
+        ],
+        "log",
+    )
+    .await?;
+    if !out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!("git log failed ({}): {}", out.status, stderr);
+    }
+    Ok(parse_commit_log(&out.stdout).into_iter().next())
+}
+
 /// The outcome of a failed [`commit_and_sync`] call, split by what became of the commit.
 ///
 /// `commit_and_sync` runs five git operations in sequence — add, commit, fetch,

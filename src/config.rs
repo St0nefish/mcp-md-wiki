@@ -3416,6 +3416,7 @@ mcp:
         assert_eq!(
             cfg.mcp.disabled_tools,
             vec![
+                "changes_since".to_string(),
                 "write_document".to_string(),
                 "delete_document".to_string(),
                 "get_schema".to_string(),

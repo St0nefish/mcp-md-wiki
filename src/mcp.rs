@@ -1471,6 +1471,27 @@ pub struct GetSchemaParams {
     pub values_in_use: Option<bool>,
 }
 
+/// Parameters for `changes_since`.
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct ChangesSinceParams {
+    /// A timestamp (RFC 3339, `2026-03-01`, or `2026-03-01T12:30Z`; UTC) or the
+    /// `head` an earlier call returned. Required unless `cursor` is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+
+    /// Only documents under this folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+
+    /// Changes per page (default 50, max 200), ordered by path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+
+    /// The `next_cursor` of a truncated page; continues that same range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
 /// Parameters for `update_schema`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UpdateSchemaParams {
@@ -4166,6 +4187,37 @@ impl KbSearchServer {
             (true, Granularity::Chunk) => ctx.search_chunks(&params).await,
             (true, Granularity::Document) => ctx.search_grouped(&params).await,
             (true, Granularity::Section) => ctx.search_sections(&params).await,
+        }
+    }
+
+    #[tool(annotations(read_only_hint = true))]
+    async fn changes_since(
+        &self,
+        Parameters(params): Parameters<ChangesSinceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let data_path = self.canonical_data_path.to_string_lossy().into_owned();
+        let indexing = self.config().indexing.clone();
+        match retrieval::changes_since_json(
+            &data_path,
+            &indexing,
+            params.since.as_deref(),
+            params.path_prefix.as_deref(),
+            params.limit,
+            params.cursor.as_deref(),
+        )
+        .await
+        {
+            Ok(body) => Ok(CallToolResult::structured(body)),
+            Err(retrieval::ChangesSinceError::Invalid(msg)) => {
+                Err(McpError::invalid_params(msg, None))
+            }
+            Err(retrieval::ChangesSinceError::Git(e)) => {
+                error!("changes_since failed: {e:#}");
+                Err(McpError::internal_error(
+                    "the change listing is unavailable".to_string(),
+                    None,
+                ))
+            }
         }
     }
 
