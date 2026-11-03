@@ -3,8 +3,8 @@
 mcp-md-wiki can act as an **OAuth 2.1 resource server**: MCP clients get an access
 token from your identity provider (the *authorization server*, AS) and present it on
 every request, and the server verifies it locally against the provider's published
-signing keys. This is the recommended way to protect `/mcp`, `/status`, `/metrics`
-and `POST /admin/reload`.
+signing keys. This is the recommended way to protect `/mcp`, `/status`, `/metrics`,
+`/status/links`, `POST /admin/reload` and `POST /admin/sync`.
 
 The validator, JWKS handling, RFC 9728 metadata, `WWW-Authenticate` challenges and
 the auth middleware itself live in a separate, general-purpose crate,
@@ -30,15 +30,24 @@ keeps working alongside OAuth. If you run with only the static token, the server
 logs a startup warning recommending OAuth. Nothing about an existing deployment
 changes until you edit its config.
 
-> **Scope enforcement is coarse.** A token must carry every scope in
+> **Write tools need `mcp:write`.** A token must carry every scope in
 > `mcp.oauth.required_scope`/`required_scopes` (default: just `mcp:read`) to get in
-> at all. There is no per-tool check yet, so any accepted token can also call the
-> write tools (`write_document`, `delete_document`, `update_schema`). Only grant the
-> scope to people you would let edit the knowledge base. The match is exact, with
-> no scope hierarchy: a token carrying only `mcp:write` does not satisfy
-> `mcp:read`, so grant `mcp:read` to everyone who should get in, writers
-> included. (The MCP spec asks servers to account for a broader scope implying
-> narrower ones; this server does not yet.)
+> at all, and `write_document`, `delete_document` and `update_schema` additionally
+> require the fixed scope `mcp:write` (mcp-md-wiki#360). A token without it is
+> answered `403 insufficient_scope` whose `WWW-Authenticate` challenge
+> names `mcp:write`; the read tools (`search`,
+> `get_document`, `get_schema`, `changes_since`) need only the required scope. The
+> match is exact, with no scope hierarchy: `mcp:write` does not imply `mcp:read`, so
+> grant `mcp:read` to everyone who should get in and add `mcp:write` for the people
+> you would let edit the knowledge base. **Upgrade note:** tokens that carry only
+> `mcp:read` could write before this check existed and now cannot, so make the
+> authorization server issue `mcp:write` to your writers. The scope name is not
+> configurable. The check is on for OAuth deployments only: a static bearer token
+> keeps full access (including when OAuth is on as well), and a static-only or
+> unauthenticated deployment has no scopes to enforce. At startup the server warns
+> when `mcp.oauth.scopes_supported` omits `mcp:write`, since clients are then never
+> told to request it. (The MCP spec asks servers to account for a broader scope
+> implying narrower ones; this server does not yet.)
 
 ## How it works
 
@@ -191,12 +200,14 @@ and is covered in full in the crate's `docs/providers.md`.
 What's specific to this server:
 
 - **Grant the required scope** (`mcp:read` by default) to the users who should get
-  in. Remember that write access currently comes with it.
+  in, and `mcp:write` to the ones who may edit the knowledge base.
 - **Register the MCP client.** Most self-hosted authorization servers have no
   dynamic client registration, so create a public client with PKCE and give its
   client id to the MCP client. For Claude Code, that is `claude mcp add --transport
   http --client-id <id> --callback-port <port> <name> <url>`. The redirect URI must
   be registered exactly.
+- **`ui.api_auth`** (default `false`, restart required) puts this same authentication
+  in front of the web UI's `/api/*` routes (mcp-md-wiki#297); `/` and `/assets/*` stay open.
 - **Hosted clients** (claude.ai, Claude Desktop, the mobile apps) can only connect
   to a remote MCP server through the OAuth authorization-code flow — the static
   bearer token does not work for them. See [README.md](../README.md#authentication-oauth-recommended).

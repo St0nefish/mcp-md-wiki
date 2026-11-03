@@ -266,6 +266,21 @@ embedding:
   # /admin/reload cannot change this on a running server.
   batch_concurrency: 4
 
+  # Text prepended to the text sent for embedding, for asymmetric models that
+  # expect different prefixes for queries and documents (e.g. nomic-embed:
+  # "search_query: " / "search_document: "; e5: "query: " / "passage: ").
+  # Empty (the default) sends the text unchanged. Match the model's own
+  # convention — a wrong prefix degrades retrieval.
+  # `query_prefix` applies to search queries. `document_prefix` applies to
+  # chunk text at index time and to the write dedup / related-documents query.
+  # Changing `document_prefix` re-embeds the whole corpus on the next
+  # reconcile (it is part of each file's fingerprint); changing only
+  # `query_prefix` needs no reindex.
+  # RESTART REQUIRED: POST /admin/reload cannot change either on a running
+  # server (the running values are kept).
+  query_prefix: ""
+  document_prefix: ""
+
 
 # ----------------------------------------------------------------------------
 # qdrant — moved entirely to ENV (QDRANT_URL, QDRANT_COLLECTION)
@@ -562,8 +577,8 @@ mcp:
   # MCP tool names to disable at the server level: hidden from tools/list,
   # tools/get returns nothing for them, and tools/call refuses them with the
   # same error as an unknown tool name. Valid names are search, get_document,
-  # write_document, delete_document, get_schema, update_schema — every entry
-  # must be one of these, with no duplicates, and the list may not name every
+  # write_document, delete_document, get_schema, update_schema, changes_since —
+  # every entry must be one of these, with no duplicates, and the list may not name every
   # tool (config load fails otherwise). The web UI's own /api/doc/* write
   # routes call write::write_document/delete_document directly rather than
   # going through MCP dispatch, so they are unaffected by this setting.
@@ -869,9 +884,20 @@ reranking:
 # ui — knowledge-base web UI tuning
 # ----------------------------------------------------------------------------
 # Pure YAML tuning knobs for the web UI served by this same binary (see
-# README.md's "Web UI" section). No secrets, no bootstrap wiring — everything
-# here is live-reloadable via POST /admin/reload.
+# README.md's "Web UI" section). No secrets, no bootstrap wiring. Everything
+# here is live-reloadable via POST /admin/reload except `api_auth`, which is
+# read once at startup.
 ui:
+
+  # Put the same authentication that guards /mcp (static bearer token and/or
+  # OAuth) in front of every /api/* route of the web UI. The static shell
+  # ("/" and /assets/*) stays open either way so a browser can load it.
+  # Off by default: the web UI is normally reached through an SSO proxy, and
+  # its routes are open. Note a browser calling /api/* then needs to send the
+  # credential itself.
+  # RESTART REQUIRED: the auth layer is built once at startup — POST
+  # /admin/reload cannot change this on a running server.
+  api_auth: false
 
   # Precomputed semantic (kNN) graph edges shown alongside markdown-link edges
   # in the web UI's graph view, in addition to the links already discovered

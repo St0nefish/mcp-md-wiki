@@ -14,6 +14,74 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+### Added
+
+- **`changes_since` MCP tool (the seventh) and `GET /api/changes`** (#358). Read-only,
+  corpus-wide listing of the documents that changed since a commit id (the `head` a
+  previous call returned) or a timestamp: `path`, net `status` (`added`, `modified`,
+  `deleted`, `renamed`, with `old_path`), the last change's `commit`, `date`, `author`,
+  `subject` and `operation`. Parameters `since`, `path_prefix`, `limit` (default 50,
+  max 200) and `cursor`. Like `get_document`'s `history` (#257), a deliberate exception
+  to "nothing git-related reaches a tool caller". `mcp.disabled_tools` /
+  `mcp.enabled_tools` accept the new name.
+- **Archive flow and `unlink_inbound`** (#357). `write_document` takes `archive: true`
+  (and `archive_links: repoint|unlink`): one commit moves the document under
+  `write.archive_prefix`, sets `status: archived` when the destination schema's
+  `status` field allows it (otherwise the result carries `status_note`), and rewrites
+  inbound links. `delete_document` takes `unlink_inbound`, which unlinks referencing
+  documents in the same commit instead of reporting `referencing_paths`. New config
+  `write.archive_prefix` (default `_archive`; must not be excluded by
+  `indexing.exclude`) and `write.archive_links` (default `repoint`), both applied on
+  reload. Known limitation: `repoint` drops a markdown link's `"title"` suffix, as a
+  move already did.
+- **Related documents on create** (#356). A `write_document` create returns
+  `related: [{path, score}]` (nearest first) from the same query as the duplicate
+  check. New `write.related_min_score` (default 0.50) and `write.related_limit`
+  (default 5, `0` turns it off, max 20), applied on reload, and overridable per
+  directory in the `.schema.yaml` `dedup:` block; `get_schema` reports the override.
+- **`mcp:write` scope for write tools** (#360). With `mcp.oauth` configured,
+  `write_document`, `delete_document` and `update_schema` require the `mcp:write` scope
+  (403 `insufficient_scope`, `WWW-Authenticate` naming it); read tools need only the
+  configured required scope. Static bearer tokens keep full access; static-only and
+  unauthenticated deployments are unaffected. The scope name is fixed. A startup
+  warning fires when `mcp.oauth.scopes_supported` omits `mcp:write`.
+- **`ui.api_auth`** (#297, default `false`, `restart_required`): puts the same auth
+  layer as `/mcp` in front of the web UI's `/api/*` routes (not `/` or `/assets/*`).
+- **`GET /api/enumerate`; `GET /api/search` parity** (#295, #296). `/api/enumerate`
+  is the REST face of `search` without a query (`filters`, `path_prefix`, `limit`
+  default 100 / 1-1000, `offset`; `{total, has_more, documents}`). `/api/search` gains
+  `granularity` (`chunk`/`section`/`document`), `filters`, `path_prefix` and repeatable
+  `heading_prefix`; chunk rows carry `text_truncated` (always `false` here).
+- **`embedding.query_prefix` / `embedding.document_prefix`** (#306, default empty,
+  YAML-only, `restart_required`) for asymmetric embedding models. The document prefix
+  applies to chunk text and the write dedup gate.
+- **On-demand sync** (#300). `POST /admin/sync` (same auth as `/admin/reload`) and the
+  `mcp-md-wiki git-pull` subcommand run the webhook's fetch, fast-forward, diff, filter
+  and mark-dirty sequence (`sync.rs`) for instances with no webhook.
+- **Dead-link report** (#354, milestone 1 only). `mcp-md-wiki lint [--check dead-links]
+  [--json] [--limit N]` (default 200, max 5000; exits 0 unless there is no state DB)
+  and `GET /status/links?limit=N` (behind the `/status` auth; 503 before the first
+  index). The report can list slightly fewer links than the per-document
+  `broken_links`: it also skips targets that exist on disk but are excluded from
+  indexing.
+
+### Changed
+
+- **Writes to an excluded path are refused** (#312). A `write_document` create, edit or
+  move destination that matches `indexing.include` but is also excluded by `exclude` /
+  `exclude_files` (for example `README.md`) now fails with an "excluded from indexing"
+  error instead of committing a document that is never indexed. A move source and a
+  delete need only match `include`, so documents already in an excluded directory can
+  still be moved out or deleted.
+- **Upgrade: OAuth tokens that carry only `mcp:read` can no longer write** (#360).
+  Authorization servers must issue `mcp:write` to the users who edit the knowledge
+  base. Static bearer tokens are unaffected.
+- **Upgrade: setting or changing `embedding.document_prefix` re-embeds the corpus on
+  the next reconcile** (#306): the prefix is folded into each file's fingerprint
+  (equal to the chunking fingerprint while it is empty, so existing indexes do not
+  re-embed on upgrade). Changing only `query_prefix` needs no reindex. Match the
+  prefixes to the model's conventions.
+
 ## [0.2.1] - 2026-10-09
 
 ### Release process
