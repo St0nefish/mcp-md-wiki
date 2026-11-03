@@ -14,6 +14,8 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-03
+
 ### Added
 
 - **`changes_since` MCP tool (the seventh) and `GET /api/changes`** (#358). Read-only,
@@ -1087,7 +1089,8 @@ operator upgrading an old deployment needs to know happened at some point:
   upgrade note](deploy/USAGE.md#backward-compatibility-and-upgrade-note) in
   `deploy/USAGE.md` for the full detail.
 
-[Unreleased]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.2...v0.1.3
