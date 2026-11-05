@@ -2,6 +2,7 @@
 name = "mcp-md-wiki"
 version = "0.2.3"
 edition = "2024"
+license = "AGPL-3.0-or-later"
 # Keep in lockstep with `channel` in rust-toolchain.toml and `RUST_VERSION`
 # in Dockerfile (#235) -- this makes cargo itself refuse a too-old local
 # toolchain with a clear "package requires rustc X but Y is installed"
