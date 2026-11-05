@@ -692,3 +692,7 @@ cargo run -- serve
 ```
 
 Typical workflow: develop locally, push to a feature branch, CI builds and tests, merge via PR. See [deploy/USAGE.md](deploy/USAGE.md) for full setup walkthrough.
+
+## License
+
+AGPL-3.0-or-later. See [`LICENSE`](LICENSE).
