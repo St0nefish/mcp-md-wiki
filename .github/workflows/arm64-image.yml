@@ -47,7 +47,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5 # zizmor: ignore[artipacked] read-only token; the next step fetches, and nothing uploads the workspace
+      - uses: actions/checkout@v7 # zizmor: ignore[artipacked] read-only token; the next step fetches, and nothing uploads the workspace
         with:
           fetch-depth: 0
 
@@ -151,14 +151,14 @@ jobs:
 
       - name: Set up Docker Buildx
         if: steps.existing.outputs.digest == ''
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Pushed under a staging tag only; it gets the tags anything reads after the smoke
       # test. provenance: false keeps it a single image manifest.
       - name: Build and push
         id: build
         if: steps.existing.outputs.digest == ''
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile

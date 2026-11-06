@@ -82,7 +82,7 @@ jobs:
     steps:
       # Merge mode checks out the pinned master commit, so the merge script that runs
       # next is master's copy, not one the PR could have edited.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
@@ -180,7 +180,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
@@ -253,7 +253,7 @@ jobs:
     #     reporting "7 passed; 0 failed". It is required from that point on,
     #     not on the strength of local runs.
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
