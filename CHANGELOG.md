@@ -74,6 +74,65 @@ nothing; add a root schema file to keep deriving.
 - The server instructions still say nothing about derived fields; the write-time
   refusal is what tells a model.
 
+### Explicit cascade semantics and batched `update_schema` ops (#348)
+
+**Deploy order:** the new schema keys `removed` and `exclude_values` (like `items`
+from #346) are unknown to older servers, whose schema files are
+`deny_unknown_fields`: an older server refuses the whole schema over one. Deploy
+this version before any `.schema.yaml` uses them, and if you roll back afterwards,
+take them out of the knowledge base first — otherwise the older server refuses the
+schema rebuild and fails to start.
+
+- **`removed: true`** in a directory's schema deletes an inherited field, with
+  everything nested under it, from that directory and every directory below it; a
+  deeper directory may declare it again from scratch. It works at any depth
+  (`planning.effort`, `npcs[]`). A removing declaration may carry no other key (the
+  file is invalid otherwise).
+- **`exclude_values: [...]`** takes inherited values out of a field's set in that
+  directory: applied after the declaration's own `values` (and its `$values`
+  splice), so a value in both is excluded. `$`-prefixed entries make the file
+  invalid.
+- **Same-kind type changes.** A directory may retype an inherited field within one
+  kind (`text`/`enum`/`date`/`timestamp`; `integer`/`number`); a change to another
+  kind (scalar ↔ `list`/`object`, `list` ↔ `object`, to or from `boolean`) is now a
+  **lint warning**, not yet an error — logged and returned in `update_schema`'s
+  `warnings`, never a refusal. Also warned: `removed: true` on a field nothing above
+  declares, `exclude_values` naming a value the field does not have there (or on a
+  field with no value set — such a declaration also declares no field), a value in
+  both `values` and `exclude_values`, and `values`/`exclude_values` that no longer
+  permit the default the field inherits (documents omitting it would be given an
+  invalid value).
+- **`update_schema` takes `ops`**: a list of `{operation, field, values?,
+  definition?}` applied in order and **atomically** — validated once on the result
+  and written as **one commit**, or not at all if any op fails (the error names it:
+  `ops[2] (remove_field 'x'): …`); at most 50 per call. `operation` is a closed enum
+  (`add_values`, `remove_values`, `set_field`, `patch_field`, `remove_field`). The
+  root-edit guard applies when any op in the batch needs it. A multi-op `dry_run`
+  returns `ops: [{operation, field, summary, definition?}]` and one combined
+  `would_invalidate`; a single op keeps the old `field`/`definition` shape.
+- **Deprecated:** the flat `operation`/`field`/`values`/`definition` parameters.
+  They still work for this release, as a one-op batch with the same result and
+  response shape, and will be removed in the next; passing them together with `ops`
+  is refused. The new `patch_field` is only available through `ops` (the flat
+  `definition` cannot carry its `null`s). No parameter is marked required in the
+  advertised schema any more.
+- `add_values`, `remove_values` and `patch_field` on a field the directory itself
+  removes (`removed: true`) are refused; re-declare it with `set_field` first.
+- **`patch_field`** changes only the keys it is given (nested `fields` merge per
+  child, `items` likewise; any other key replaces), `null` for a key drops the
+  directory's own setting so it is inherited again, and the written declaration is
+  minimized against the inherited one — attributes equal to what it inherits are
+  not written, and a declaration left saying nothing is removed.
+- **`remove_values` of an inherited value** now writes `exclude_values` in the
+  directory instead of failing with "not declared in this scope" / "has no value
+  list"; `add_values` of an excluded value drops the exclusion.
+- **`get_schema` `compact: true`** (opt-in; the default output is unchanged) names
+  each declaring directory once, in a top-level `declared_in` map of directory →
+  field names, instead of on every field.
+- **Reindex:** none on upgrade. The new keys change the schema fingerprint only
+  through what they remove or exclude, and only for the directories that use them,
+  so a knowledge base that does not use them hashes exactly as before.
+
 ### Security
 
 - **Symlinks and `.git` paths are refused on write and read, and skipped by

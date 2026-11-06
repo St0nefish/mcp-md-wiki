@@ -195,6 +195,26 @@ pub enum NumericValue {
     Boolean,
 }
 
+/// The kind of value a [`FieldType`] describes, for the cascade's same-kind rule
+/// (#348): a scope may retype an inherited field only within its family, and a
+/// change across families is a [`lint_cascade`] warning.
+///
+/// Conservative by design. `text`, `enum`, `date` and `timestamp` are all a single
+/// string scalar (an `enum` is a text field with a closed set, a date a text field
+/// with a format), and `integer`/`number` are one numeric kind; a list, an object and
+/// a boolean are each their own kind, so scalar↔list, scalar↔object and
+/// list↔object changes all warn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindFamily {
+    /// A string scalar: `text`, `enum`, `date`, `timestamp`.
+    String,
+    /// `integer`, `number`.
+    Numeric,
+    Boolean,
+    List,
+    Object,
+}
+
 /// Everything a declared [`FieldType`] means to the layers that interpret it (#346):
 /// what a value must look like (validation), how its type is named and described,
 /// which Qdrant payload index serves it (and so which range filters work on it:
@@ -207,6 +227,10 @@ pub enum NumericValue {
 pub struct FieldKind {
     /// The lowercase name; matches the type's serde spelling.
     pub name: &'static str,
+    /// Which types a scope may change this one to down the cascade (#348): a change
+    /// within one family is a narrowing or widening of the same kind of value; one
+    /// across families makes documents valid above invalid below.
+    pub family: KindFamily,
     /// The expected value in a type-mismatch message ("expected an integer").
     pub describe: &'static str,
     /// Whether a value satisfies the type ([`check_type`]).
@@ -227,6 +251,7 @@ pub struct FieldKind {
 pub static FIELD_KINDS: [FieldKind; 9] = [
     FieldKind {
         name: "text",
+        family: KindFamily::String,
         describe: "text",
         accepts: Value::is_string,
         index: IndexKind::Keyword,
@@ -235,6 +260,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
     },
     FieldKind {
         name: "integer",
+        family: KindFamily::Numeric,
         describe: "an integer",
         accepts: accepts_integer,
         index: IndexKind::Integer,
@@ -243,6 +269,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
     },
     FieldKind {
         name: "number",
+        family: KindFamily::Numeric,
         describe: "a number",
         accepts: Value::is_number,
         index: IndexKind::Float,
@@ -251,6 +278,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
     },
     FieldKind {
         name: "boolean",
+        family: KindFamily::Boolean,
         describe: "a boolean",
         accepts: Value::is_boolean,
         index: IndexKind::Bool,
@@ -259,6 +287,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
     },
     FieldKind {
         name: "enum",
+        family: KindFamily::String,
         describe: "a scalar value",
         accepts: accepts_enum,
         index: IndexKind::Keyword,
@@ -267,6 +296,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
     },
     FieldKind {
         name: "list",
+        family: KindFamily::List,
         describe: "a list",
         accepts: Value::is_array,
         index: IndexKind::Keyword,
@@ -275,6 +305,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
     },
     FieldKind {
         name: "date",
+        family: KindFamily::String,
         describe: "a date (YYYY-MM-DD)",
         accepts: accepts_date,
         index: IndexKind::Keyword,
@@ -283,6 +314,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
     },
     FieldKind {
         name: "timestamp",
+        family: KindFamily::String,
         describe: "an RFC 3339 timestamp",
         accepts: accepts_timestamp,
         index: IndexKind::Keyword,
@@ -291,6 +323,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
     },
     FieldKind {
         name: "object",
+        family: KindFamily::Object,
         describe: "an object",
         accepts: Value::is_object,
         index: IndexKind::Keyword,
@@ -491,6 +524,28 @@ pub struct RawFieldDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(description = "For type list: the definition of each element.")]
     pub items: Option<Box<RawFieldDef>>,
+    /// Inherited values this scope no longer permits (#348): the resolved set is the
+    /// inherited one (after this declaration's own `values`, `$values` splice
+    /// included) minus these. Like a `values` entry, no item may start with `$`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Inherited values this directory no longer permits.")]
+    pub exclude_values: Option<Vec<String>>,
+    /// Removes an inherited field, with everything below it, from this scope and its
+    /// descendants (#348); a deeper scope may declare it again. A removing
+    /// declaration carries no other attribute (`validate_raw`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[schemars(
+        description = "Removes the inherited field here and below; nothing else \
+                              may be set with it."
+    )]
+    pub removed: bool,
+}
+
+impl RawFieldDef {
+    /// Whether this declaration says nothing at all — no attribute, no children.
+    fn is_empty(&self) -> bool {
+        *self == RawFieldDef::default()
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -612,6 +667,15 @@ impl FieldDef {
             self.values = Self::merge_values(raw, self.values.as_deref(), origin, path);
             self.set_by.values = label();
         }
+        // After the local `values` (#348): an exclusion narrows whatever this scope
+        // ends up with. An unconstrained field has nothing to exclude from
+        // (`lint_cascade` says so).
+        if let Some(excluded) = &raw.exclude_values
+            && let Some(values) = self.values.as_mut()
+        {
+            values.retain(|v| !excluded.contains(v));
+            self.set_by.values = label();
+        }
         if let Some(default) = &raw.default {
             self.default = Some(default.clone());
             self.set_by.default = label();
@@ -624,6 +688,13 @@ impl FieldDef {
 
         for (key, child) in raw.fields.iter().flatten() {
             let steps = FieldPath::parse(key);
+            if child.removed {
+                remove_node(&mut self.fields, steps.steps());
+                continue;
+            }
+            if excludes_from_nothing(child, &self.fields, steps.steps()) {
+                continue;
+            }
             node_in_children(&mut self.fields, steps.steps(), origin).merge_node(
                 child,
                 origin,
@@ -631,11 +702,19 @@ impl FieldDef {
             );
         }
         if let Some(items) = &raw.items {
-            self.items.get_or_insert_with(Default::default).merge_node(
-                items,
-                origin,
-                &format!("{path}[]"),
-            );
+            let undeclared = self.items.as_ref().is_none_or(|n| n.declared_in.is_none());
+            if items.removed {
+                self.items = None;
+            } else if is_exclusion_only(items) && undeclared {
+                // Nothing inherited to exclude from: no node (see
+                // `excludes_from_nothing`).
+            } else {
+                self.items.get_or_insert_with(Default::default).merge_node(
+                    items,
+                    origin,
+                    &format!("{path}[]"),
+                );
+            }
         }
     }
 
@@ -689,65 +768,133 @@ impl FieldDef {
         origin: &str,
         path: &str,
     ) -> Option<Vec<String>> {
-        let tokens: Vec<String> = if raw.extend {
+        if raw.extend {
             warn!(
                 scope = %origin,
                 field = %path,
                 "'extend: true' is deprecated; write 'values: [{VALUES_SENTINEL}, ...]' \
                  instead (see deploy/USAGE.md)"
             );
-            std::iter::once(VALUES_SENTINEL.to_string())
-                .chain(raw.values.iter().flatten().cloned())
-                .collect()
-        } else {
-            match &raw.values {
-                Some(list) => list.clone(),
-                // Not mentioned at all: inherit the parent's set verbatim, no splicing
-                // involved.
-                None => return inherited_values.map(<[String]>::to_vec),
-            }
-        };
+        }
+        let splices = raw.extend || raw.values.iter().flatten().any(|v| v == VALUES_SENTINEL);
+        // Loud, not silent (see module docs on the project's general stance): a
+        // sentinel with nothing to splice most often means the author expected an
+        // ancestor to declare values for this field and it doesn't (a typo'd path, a
+        // missing intermediate schema, etc). Resolving to "no values contributed" here
+        // — rather than treating the whole `values:` as absent — keeps the field
+        // CLOSED (nothing permitted) instead of silently making it unconstrained, so a
+        // document that sets this field fails validation immediately and visibly
+        // instead of the check quietly stopping enforcement.
+        if splices && inherited_values.is_none_or(<[String]>::is_empty) {
+            warn!(
+                scope = %origin,
+                field = %path,
+                "'{VALUES_SENTINEL}' has nothing to inherit here (no ancestor \
+                 scope declares values for this field); it contributes no \
+                 values, so any other literals in this list are the complete \
+                 permitted set — declare values on an ancestor, or drop the \
+                 sentinel if this list is meant to stand alone"
+            );
+        }
+        splice_values(raw, inherited_values)
+    }
+}
 
-        let mut out: Vec<String> = Vec::with_capacity(tokens.len());
-        let push_dedup = |out: &mut Vec<String>, v: &str| {
-            if !out.iter().any(|existing| existing == v) {
-                out.push(v.to_string());
+/// [`FieldDef::merge_values`]'s result without its warnings: `raw`'s `values` (and the
+/// deprecated `extend`) resolved against the inherited set, before `exclude_values`.
+/// Pure, so the cascade lint and `update_schema`'s patch minimization can ask what a
+/// declaration resolves to without logging.
+fn splice_values(raw: &RawFieldDef, inherited_values: Option<&[String]>) -> Option<Vec<String>> {
+    let tokens: Vec<String> = if raw.extend {
+        std::iter::once(VALUES_SENTINEL.to_string())
+            .chain(raw.values.iter().flatten().cloned())
+            .collect()
+    } else {
+        match &raw.values {
+            Some(list) => list.clone(),
+            // Not mentioned at all: inherit the parent's set verbatim, no splicing
+            // involved.
+            None => return inherited_values.map(<[String]>::to_vec),
+        }
+    };
+
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let push_dedup = |out: &mut Vec<String>, v: &str| {
+        if !out.iter().any(|existing| existing == v) {
+            out.push(v.to_string());
+        }
+    };
+    for token in &tokens {
+        if token == VALUES_SENTINEL {
+            for v in inherited_values.into_iter().flatten() {
+                push_dedup(&mut out, v);
             }
-        };
-        for token in &tokens {
-            if token == VALUES_SENTINEL {
-                match inherited_values {
-                    Some(values) if !values.is_empty() => {
-                        for v in values {
-                            push_dedup(&mut out, v);
-                        }
-                    }
-                    // Loud, not silent (see module docs on the project's general
-                    // stance): a sentinel with nothing to splice most often means the
-                    // author expected an ancestor to declare values for this field and
-                    // it doesn't (a typo'd path, a missing intermediate schema, etc).
-                    // Resolving to "no values contributed" here — rather than treating
-                    // the whole `values:` as absent — keeps the field CLOSED (nothing
-                    // permitted) instead of silently making it unconstrained, so a
-                    // document that sets this field fails validation immediately and
-                    // visibly instead of the check quietly stopping enforcement.
-                    _ => {
-                        warn!(
-                            scope = %origin,
-                            field = %path,
-                            "'{VALUES_SENTINEL}' has nothing to inherit here (no ancestor \
-                             scope declares values for this field); it contributes no \
-                             values, so any other literals in this list are the complete \
-                             permitted set — declare values on an ancestor, or drop the \
-                             sentinel if this list is meant to stand alone"
-                        );
-                    }
-                }
-            } else {
-                push_dedup(&mut out, token);
+        } else {
+            push_dedup(&mut out, token);
+        }
+    }
+    Some(out)
+}
+
+/// Whether `raw` says nothing but `exclude_values`.
+fn is_exclusion_only(raw: &RawFieldDef) -> bool {
+    raw.exclude_values.is_some()
+        && RawFieldDef {
+            exclude_values: None,
+            ..raw.clone()
+        }
+        .is_empty()
+}
+
+/// Whether `raw` (at `steps` under `children`) only excludes values from a field
+/// nothing above declares (#348). Such a declaration has nothing to act on, so it
+/// creates no node — no declared field, no fingerprint change — and is only
+/// [`lint_cascade`]-warned, like a `removed: true` of nothing.
+fn excludes_from_nothing(
+    raw: &RawFieldDef,
+    children: &BTreeMap<String, FieldDef>,
+    steps: &[PathStep],
+) -> bool {
+    if !is_exclusion_only(raw) {
+        return false;
+    }
+    let declared = match steps.split_first() {
+        Some((PathStep::Field(name), rest)) => children
+            .get(name)
+            .and_then(|node| node.descendant(rest))
+            .is_some_and(|node| node.declared_in.is_some()),
+        _ => false,
+    };
+    !declared
+}
+
+/// Drop the node at `steps` (a parsed [`FieldPath`]) under `children`, with its
+/// subtree — what a `removed: true` declaration does (#348). A path that reaches
+/// nothing removes nothing; no implicit node is created on the way.
+fn remove_node(children: &mut BTreeMap<String, FieldDef>, steps: &[PathStep]) {
+    let Some((PathStep::Field(name), rest)) = steps.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        children.remove(name);
+        return;
+    }
+    if let Some(node) = children.get_mut(name) {
+        remove_below(node, rest);
+    }
+}
+
+/// [`remove_node`] below `node`, for the non-empty `rest` of a path.
+fn remove_below(node: &mut FieldDef, rest: &[PathStep]) {
+    match rest {
+        [] => {}
+        [PathStep::Items] => node.items = None,
+        [PathStep::Items, tail @ ..] => {
+            if let Some(items) = node.items.as_deref_mut() {
+                remove_below(items, tail);
             }
         }
-        Some(out)
+        [PathStep::Field(_), ..] => remove_node(&mut node.fields, rest),
     }
 }
 
@@ -1062,6 +1209,32 @@ impl SchemaFile {
 /// Reject definitions that contradict themselves, so a schema file carrying one never
 /// loads.
 fn validate_raw(path: &str, raw: &RawFieldDef) -> Result<(), String> {
+    // `removed` and `exclude_values` are new keys (#348), so a malformed use is refused
+    // outright rather than linted: no existing schema file can be carrying one.
+    if raw.removed
+        && *raw
+            != (RawFieldDef {
+                removed: true,
+                ..RawFieldDef::default()
+            })
+    {
+        return Err(format!(
+            "field '{path}' sets 'removed: true' alongside other attributes; a removed \
+             field is gone from this directory, so it carries nothing else"
+        ));
+    }
+    if let Some(bad) = raw
+        .exclude_values
+        .iter()
+        .flatten()
+        .find(|v| v.starts_with('$'))
+    {
+        return Err(format!(
+            "field '{path}' lists '{bad}' in exclude_values; '$'-prefixed tokens are \
+             reserved, and excluding the inherited set as a whole is 'values: []'"
+        ));
+    }
+
     if raw.fields.is_some()
         && let Some(ty) = raw.ty
         && ty != FieldType::Object
@@ -1234,6 +1407,130 @@ pub fn lint_raw(file: &SchemaFile, is_root: bool) -> Vec<String> {
     warnings
 }
 
+/// Cascade-aware warnings for one schema file (#348): what its declarations do to
+/// what the directory inherits, `inherited` being what its ancestors alone resolve to
+/// (an empty schema for the root file, which replaces the config-derived root). Like
+/// [`lint_raw`], warnings only — the series rule for new strictness checks. Checks:
+///
+/// - `removed: true` on a field no ancestor declares (it removes nothing);
+/// - `exclude_values` on a field that has no value set to exclude from, or naming a
+///   value the field does not have at that point (after its own `values`);
+/// - `values`/`exclude_values` that no longer permit the default the field inherits
+///   (every document omitting the field would be given an invalid value);
+/// - a `type` that changes the inherited one to a different [`KindFamily`] — only
+///   same-kind changes (`enum` → `text`, `integer` → `number`) are meant to cascade;
+///   a scalar becoming a list or an object, or the reverse, makes documents valid
+///   above the directory invalid in it.
+pub fn lint_cascade(inherited: &ResolvedSchema, file: &SchemaFile) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (key, raw) in &file.fields {
+        lint_cascade_field(inherited, key, raw, &mut warnings);
+    }
+    warnings
+}
+
+fn lint_cascade_field(
+    inherited: &ResolvedSchema,
+    path: &str,
+    raw: &RawFieldDef,
+    warnings: &mut Vec<String>,
+) {
+    let parent = inherited.fields.lookup(path);
+    if raw.removed {
+        if parent.is_none() {
+            warnings.push(format!(
+                "field '{path}': 'removed: true' removes nothing — no parent directory \
+                 declares this field"
+            ));
+        }
+        return;
+    }
+
+    let ty = raw.ty.or(if raw.fields.is_some() {
+        Some(FieldType::Object)
+    } else if raw.items.is_some() {
+        Some(FieldType::List)
+    } else {
+        None
+    });
+    if let (Some(new), Some(old)) = (ty, parent.and_then(|p| p.ty))
+        && new.kind().family != old.kind().family
+    {
+        let from = parent
+            .and_then(|p| p.set_by.ty.as_deref())
+            .map(|scope| format!(" (set in {scope})"))
+            .unwrap_or_default();
+        warnings.push(format!(
+            "field '{path}': changes the inherited type '{}'{from} to '{}', a different \
+             kind of value; only same-kind changes (text/enum/date/timestamp, \
+             integer/number) are meant to cascade — documents valid in the parent \
+             directory can fail here. This will become an error",
+            old.name(),
+            new.name()
+        ));
+    }
+
+    if let Some(excluded) = &raw.exclude_values {
+        let parent_values = parent.and_then(|p| p.values.as_deref());
+        match splice_values(raw, parent_values) {
+            None => warnings.push(format!(
+                "field '{path}': exclude_values has no effect — the field has no value \
+                 set to exclude from"
+            )),
+            Some(values) => {
+                let missing: Vec<&str> = excluded
+                    .iter()
+                    .filter(|v| !values.contains(v))
+                    .map(String::as_str)
+                    .collect();
+                if !missing.is_empty() {
+                    warnings.push(format!(
+                        "field '{path}': exclude_values names {} the field does not \
+                         permit here: {}",
+                        if missing.len() == 1 {
+                            "a value"
+                        } else {
+                            "values"
+                        },
+                        missing.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+
+    // An inherited default this scope's values no longer permit (#348): every
+    // document that omits the field would get an invalid value filled in. A default
+    // written here is `lint_raw`'s to check.
+    if raw.default.is_none()
+        && (raw.values.is_some() || raw.extend || raw.exclude_values.is_some())
+        && let Some(default) = parent.and_then(|p| p.default.as_ref())
+        && let Some(mut values) = splice_values(raw, parent.and_then(|p| p.values.as_deref()))
+    {
+        if let Some(excluded) = &raw.exclude_values {
+            values.retain(|v| !excluded.contains(v));
+        }
+        let check = match ty.or(parent.and_then(|p| p.ty)) {
+            None => check_values_lenient(default, Some(&values)),
+            Some(_) => check_values(default, &values),
+        };
+        if check.is_err() {
+            warnings.push(format!(
+                "field '{path}': the inherited default {default} is no longer a permitted \
+                 value here, so every document that omits the field gets an invalid one; \
+                 set a default this directory permits"
+            ));
+        }
+    }
+
+    for (name, child) in raw.fields.iter().flatten() {
+        lint_cascade_field(inherited, &format!("{path}.{name}"), child, warnings);
+    }
+    if let Some(items) = &raw.items {
+        lint_cascade_field(inherited, &format!("{path}[]"), items, warnings);
+    }
+}
+
 fn lint_field(path: &str, raw: &RawFieldDef, warnings: &mut Vec<String>) {
     // The type this declaration gives the field, as `FieldDef::merge_node` resolves
     // it: nested `fields` mean object, `items` mean list.
@@ -1261,6 +1558,15 @@ fn lint_field(path: &str, raw: &RawFieldDef, warnings: &mut Vec<String>) {
         warnings.push(format!(
             "field '{path}': a default inside a list's items is never applied to its \
              elements; every element must set this field itself"
+        ));
+    }
+
+    if let (Some(values), Some(excluded)) = (&raw.values, &raw.exclude_values)
+        && let Some(both) = values.iter().find(|v| excluded.contains(v))
+    {
+        warnings.push(format!(
+            "field '{path}': '{both}' is listed in both values and exclude_values; the \
+             exclusion wins"
         ));
     }
 
@@ -1567,9 +1873,12 @@ fn remove_path_below(raw: &mut RawFieldDef, rest: &[PathStep]) -> bool {
 /// server renders the YAML.
 #[derive(Debug, Clone)]
 pub enum SchemaEdit {
-    /// Add values to a field's permitted set, creating the field if absent.
+    /// Add values to a field's permitted set, creating the field if absent. A value
+    /// this scope excludes (`exclude_values`) is permitted again by dropping the
+    /// exclusion (#348).
     AddValues { field: String, values: Vec<String> },
-    /// Remove values from a field's permitted set.
+    /// Remove values from a field's permitted set: a value in this scope's own list
+    /// is dropped from it, an inherited one is excluded (`exclude_values`, #348).
     RemoveValues { field: String, values: Vec<String> },
     /// Declare or replace a field definition outright.
     SetField {
@@ -1578,6 +1887,15 @@ pub enum SchemaEdit {
     },
     /// Remove a field declaration from this scope.
     RemoveField { field: String },
+    /// Merge-patch this scope's declaration of a field (#348): only the keys in
+    /// `patch` change, nested `fields` (and `items`) patch recursively, and a `null`
+    /// drops the local setting so the attribute is inherited again. The result is
+    /// minimized against the inherited definition — see
+    /// [`SchemaFile::apply_inheriting`].
+    PatchField {
+        field: String,
+        patch: serde_json::Map<String, Value>,
+    },
 }
 
 impl SchemaEdit {
@@ -1587,7 +1905,146 @@ impl SchemaEdit {
             SchemaEdit::AddValues { field, .. }
             | SchemaEdit::RemoveValues { field, .. }
             | SchemaEdit::SetField { field, .. }
+            | SchemaEdit::PatchField { field, .. }
             | SchemaEdit::RemoveField { field } => field,
+        }
+    }
+
+    /// The operation's name, as `update_schema` spells it.
+    pub fn operation(&self) -> &'static str {
+        match self {
+            SchemaEdit::AddValues { .. } => "add_values",
+            SchemaEdit::RemoveValues { .. } => "remove_values",
+            SchemaEdit::SetField { .. } => "set_field",
+            SchemaEdit::RemoveField { .. } => "remove_field",
+            SchemaEdit::PatchField { .. } => "patch_field",
+        }
+    }
+}
+
+/// Apply a field-definition merge patch to `target` (a definition as JSON), for
+/// [`SchemaEdit::PatchField`]: each key in `patch` replaces the same key, `null`
+/// removes it, and `fields` (per child) and `items` patch recursively instead of
+/// being replaced. Shapes are checked when the result is read back as a
+/// [`RawFieldDef`].
+fn patch_definition(
+    target: &mut serde_json::Map<String, Value>,
+    patch: &serde_json::Map<String, Value>,
+) {
+    for (key, value) in patch {
+        match (key.as_str(), value) {
+            (_, Value::Null) => {
+                target.remove(key);
+            }
+            ("fields", Value::Object(children)) => {
+                let entry = target
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Default::default()));
+                if !entry.is_object() {
+                    *entry = Value::Object(Default::default());
+                }
+                let existing = entry.as_object_mut().expect("made an object above");
+                for (name, child) in children {
+                    match child {
+                        Value::Null => {
+                            existing.remove(name);
+                        }
+                        Value::Object(child_patch) => {
+                            let slot = existing
+                                .entry(name.clone())
+                                .or_insert_with(|| Value::Object(Default::default()));
+                            if !slot.is_object() {
+                                *slot = Value::Object(Default::default());
+                            }
+                            patch_definition(
+                                slot.as_object_mut().expect("made an object above"),
+                                child_patch,
+                            );
+                        }
+                        other => {
+                            existing.insert(name.clone(), other.clone());
+                        }
+                    }
+                }
+            }
+            ("items", Value::Object(items_patch)) => {
+                let entry = target
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Default::default()));
+                if !entry.is_object() {
+                    *entry = Value::Object(Default::default());
+                }
+                patch_definition(
+                    entry.as_object_mut().expect("made an object above"),
+                    items_patch,
+                );
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Drop from `def` every attribute that resolves to what `inherited` already has
+/// (#348), recursively through `fields` and `items`, so a patched declaration states
+/// only what this scope changes. `inherited` is the field as the scope's ancestors
+/// resolve it (`None`: nothing inherited, compared against a field no scope declares).
+/// The resolved definition is unchanged by construction: every dropped attribute is
+/// inherited with the same value. A child that ends up saying nothing and is
+/// inherited anyway is dropped too. `removed`, `extend` and `exclude_values` are left
+/// as written (an empty `exclude_values` excepted, which excludes nothing).
+fn minimize_against(def: &mut RawFieldDef, inherited: Option<&FieldDef>) {
+    if def.removed {
+        return;
+    }
+    let fallback = FieldDef::default();
+    let inh = inherited.unwrap_or(&fallback);
+
+    if def.ty.is_some() && def.ty == inh.ty {
+        def.ty = None;
+    }
+    if def.required == Some(inh.required) {
+        def.required = None;
+    }
+    if def.indexed == Some(inh.indexed) {
+        def.indexed = None;
+    }
+    if def.open == Some(inh.open) {
+        def.open = None;
+    }
+    if def.default.is_some() && def.default == inh.default {
+        def.default = None;
+    }
+    if def.exclude_values.as_ref().is_some_and(Vec::is_empty) {
+        def.exclude_values = None;
+    }
+    if def.values.is_some() && !def.extend && def.exclude_values.is_none() {
+        let as_set = |v: Option<Vec<String>>| v.map(|v| v.into_iter().collect::<BTreeSet<_>>());
+        if as_set(splice_values(def, inh.values.as_deref())) == as_set(inh.values.clone()) {
+            def.values = None;
+        }
+    }
+
+    if let Some(children) = def.fields.as_mut() {
+        children.retain(|key, child| {
+            let path = FieldPath::parse(key);
+            let child_inh = inh
+                .descendant(path.steps())
+                .filter(|n| n.declared_in.is_some());
+            minimize_against(child, child_inh);
+            !(child.is_empty() && child_inh.is_some())
+        });
+        // An emptied `fields:` only still matters as what makes this an object.
+        if children.is_empty() && (def.ty.is_some() || inh.ty == Some(FieldType::Object)) {
+            def.fields = None;
+        }
+    }
+    if let Some(items) = def.items.as_deref_mut() {
+        let items_inh = inh.items.as_deref().filter(|n| n.declared_in.is_some());
+        minimize_against(items, items_inh);
+        if items.is_empty() && items_inh.is_some() {
+            def.items = None;
         }
     }
 }
@@ -1608,7 +2065,10 @@ impl SchemaFile {
     /// `values`, the new list starts with [`VALUES_SENTINEL`], and a field created
     /// here keeps the inherited `type` instead of being forced to `enum` — unless no
     /// ancestor gives it a type or values, in which case it is `enum`, as a brand-new
-    /// field is.
+    /// field is. `RemoveValues` uses it to tell a value this scope lists from one it
+    /// inherits, which it excludes (`exclude_values`) instead (#348). `PatchField`
+    /// minimizes the patched declaration against it: an attribute equal to the
+    /// inherited one is dropped, and a declaration left saying nothing is removed.
     pub fn apply_inheriting(
         &mut self,
         edit: &SchemaEdit,
@@ -1616,12 +2076,28 @@ impl SchemaFile {
     ) -> Result<String, String> {
         let path = FieldPath::parse(edit.field());
         let steps = path.steps();
+        // A field this scope removes (`removed: true`, #348) inherits nothing here, so
+        // a values edit or a patch has nothing to act on: treating the declaration as
+        // an ordinary one would read its absent `values` as "inherits the set" (and a
+        // patch would drop `removed` silently). Re-declaring it is a `set_field`.
+        if matches!(
+            edit,
+            SchemaEdit::AddValues { .. }
+                | SchemaEdit::RemoveValues { .. }
+                | SchemaEdit::PatchField { .. }
+        ) && find_field_mut(&mut self.fields, steps).is_some_and(|def| def.removed)
+        {
+            return Err(format!(
+                "'{}' is removed in this scope; re-declare it with set_field first",
+                edit.field()
+            ));
+        }
         match edit {
             SchemaEdit::AddValues { field, values } => {
                 // What this scope inherits for the field. A local list only carries it
                 // when it splices it in (a sentinel or the deprecated `extend`); one
                 // without replaces the inherited set outright.
-                let (local_exists, local_values, inherits) =
+                let (local_exists, local_values, inherits, local_excluded) =
                     match find_field_mut(&mut self.fields, steps) {
                         Some(def) => (
                             true,
@@ -1631,8 +2107,9 @@ impl SchemaFile {
                                     .values
                                     .as_ref()
                                     .is_none_or(|l| l.iter().any(|v| v == VALUES_SENTINEL)),
+                            def.exclude_values.clone().unwrap_or_default(),
                         ),
-                        None => (false, None, true),
+                        None => (false, None, true, Vec::new()),
                     };
                 let inherited_values: &[String] = inherited
                     .and_then(|d| d.values.as_deref())
@@ -1641,10 +2118,12 @@ impl SchemaFile {
                 // A value already permitted through inheritance needs no local entry:
                 // writing one would only add a redundant declaration. With nothing
                 // else to add, a scope that declares nothing yet is left alone (the
-                // caller would otherwise commit an empty schema file).
+                // caller would otherwise commit an empty schema file). A value this
+                // scope excludes is not permitted, whatever it inherits.
                 if values.iter().all(|v| {
-                    local_values.as_ref().is_some_and(|l| l.contains(v))
-                        || inherited_values.contains(v)
+                    (local_values.as_ref().is_some_and(|l| l.contains(v))
+                        || inherited_values.contains(v))
+                        && !local_excluded.contains(v)
                 }) {
                     return if local_exists {
                         Ok(format!(
@@ -1681,27 +2160,54 @@ impl SchemaFile {
                 // splices that set in first. `extend: true` already means a leading
                 // sentinel, and `validate_raw` refuses the two together.
                 let splice_inherited = !def.extend && !inherited_values.is_empty();
-                let existing = def.values.get_or_insert_with(|| {
-                    if splice_inherited {
-                        vec![VALUES_SENTINEL.to_string()]
-                    } else {
-                        Vec::new()
-                    }
-                });
                 let mut added = Vec::new();
                 for value in values {
-                    if !existing.contains(value) && !inherited_values.contains(value) {
-                        existing.push(value.clone());
-                        added.push(value.clone());
+                    // Permitting a value this scope excludes drops the exclusion
+                    // (#348); one it already lists or inherits needs nothing more.
+                    let was_excluded = def.exclude_values.as_mut().is_some_and(|excluded| {
+                        let before = excluded.len();
+                        excluded.retain(|v| v != value);
+                        excluded.len() != before
+                    });
+                    if def.values.as_ref().is_some_and(|l| l.contains(value))
+                        || inherited_values.contains(value)
+                    {
+                        if was_excluded {
+                            added.push(value.clone());
+                        }
+                        continue;
+                    }
+                    // No local list: a fresh one would REPLACE the inherited set, so
+                    // it splices that set in first. `extend: true` already means a
+                    // leading sentinel, and `validate_raw` refuses the two together.
+                    def.values
+                        .get_or_insert_with(|| {
+                            if splice_inherited {
+                                vec![VALUES_SENTINEL.to_string()]
+                            } else {
+                                Vec::new()
+                            }
+                        })
+                        .push(value.clone());
+                    added.push(value.clone());
+                }
+                if def.exclude_values.as_ref().is_some_and(Vec::is_empty) {
+                    def.exclude_values = None;
+                    // A declaration that only excluded values now says nothing.
+                    if def.is_empty() {
+                        remove_field_path(&mut self.fields, steps);
+                        return Ok(format!("added to '{}': {}", field, added.join(", ")));
                     }
                 }
-                // Sort only what follows the sentinel, so the inherited values keep
-                // their position in the spliced result.
-                let start = existing
-                    .iter()
-                    .position(|v| v == VALUES_SENTINEL)
-                    .map_or(0, |i| i + 1);
-                existing[start..].sort();
+                if let Some(existing) = def.values.as_mut() {
+                    // Sort only what follows the sentinel, so the inherited values keep
+                    // their position in the spliced result.
+                    let start = existing
+                        .iter()
+                        .position(|v| v == VALUES_SENTINEL)
+                        .map_or(0, |i| i + 1);
+                    existing[start..].sort();
+                }
                 if added.is_empty() {
                     Ok(format!(
                         "'{}' already permitted every requested value",
@@ -1712,19 +2218,75 @@ impl SchemaFile {
                 }
             }
             SchemaEdit::RemoveValues { field, values } => {
-                let def = find_field_mut(&mut self.fields, steps)
-                    .ok_or_else(|| format!("field '{}' is not declared in this scope", field))?;
-                let existing = def
-                    .values
-                    .as_mut()
-                    .ok_or_else(|| format!("field '{}' has no value list", field))?;
-                let before = existing.len();
-                existing.retain(|v| !values.contains(v));
-                Ok(format!(
-                    "removed {} value(s) from '{}'",
-                    before - existing.len(),
-                    field
-                ))
+                // What this scope inherits for the field: only when its own list (if
+                // any) splices the inherited set in, as for `AddValues`.
+                let local = find_field_mut(&mut self.fields, steps);
+                let local_exists = local.is_some();
+                let (inherits, local_has_list, already_excluded) = match &local {
+                    Some(def) => (
+                        def.extend
+                            || def
+                                .values
+                                .as_ref()
+                                .is_none_or(|l| l.iter().any(|v| v == VALUES_SENTINEL)),
+                        def.values.is_some(),
+                        def.exclude_values.clone().unwrap_or_default(),
+                    ),
+                    None => (true, false, Vec::new()),
+                };
+                let inherited_values: &[String] = inherited
+                    .and_then(|d| d.values.as_deref())
+                    .filter(|_| inherits)
+                    .unwrap_or(&[]);
+                if !local_exists && inherited_values.is_empty() {
+                    return Err(format!("field '{}' is not declared in this scope", field));
+                }
+                if !local_has_list && inherited_values.is_empty() {
+                    return Err(format!("field '{}' has no value list", field));
+                }
+                // An inherited value is not in this file to delete: excluding it is how
+                // this scope stops permitting it (#348).
+                let to_exclude: Vec<String> = values
+                    .iter()
+                    .filter(|v| inherited_values.contains(v) && !already_excluded.contains(v))
+                    .cloned()
+                    .collect();
+                let def = match local {
+                    Some(def) => def,
+                    None if to_exclude.is_empty() => {
+                        return Ok(format!("removed 0 value(s) from '{}'", field));
+                    }
+                    None => field_entry_mut(&mut self.fields, steps, field, RawFieldDef::default)?,
+                };
+                // Each requested value counts once, whether it left this scope's own
+                // list, was excluded, or both (listed here and spliced in).
+                let mut gone: BTreeSet<String> = BTreeSet::new();
+                if let Some(existing) = def.values.as_mut() {
+                    existing.retain(|v| {
+                        let drop = v != VALUES_SENTINEL && values.contains(v);
+                        if drop {
+                            gone.insert(v.clone());
+                        }
+                        !drop
+                    });
+                }
+                let newly_excluded = to_exclude.len();
+                if !to_exclude.is_empty() {
+                    gone.extend(to_exclude.iter().cloned());
+                    let excluded = def.exclude_values.get_or_insert_with(Vec::new);
+                    excluded.extend(to_exclude);
+                    excluded.sort();
+                    excluded.dedup();
+                }
+                if newly_excluded > 0 {
+                    Ok(format!(
+                        "removed {} value(s) from '{field}' ({newly_excluded} inherited, now \
+                         excluded here)",
+                        gone.len()
+                    ))
+                } else {
+                    Ok(format!("removed {} value(s) from '{field}'", gone.len()))
+                }
             }
             SchemaEdit::SetField { field, definition } => {
                 // The placeholder is overwritten immediately; only the slot's location
@@ -1732,6 +2294,42 @@ impl SchemaFile {
                 let slot = field_entry_mut(&mut self.fields, steps, field, empty_container)?;
                 *slot = definition.as_ref().clone();
                 Ok(format!("declared '{}'", field))
+            }
+            SchemaEdit::PatchField { field, patch } => {
+                let current = find_field_mut(&mut self.fields, steps).map(|def| def.clone());
+                let mut merged = match &current {
+                    Some(def) => match serde_json::to_value(def) {
+                        Ok(Value::Object(map)) => map,
+                        _ => return Err(unreachable_lookup(field)),
+                    },
+                    None => serde_json::Map::new(),
+                };
+                patch_definition(&mut merged, patch);
+                let mut patched: RawFieldDef = serde_json::from_value(Value::Object(merged))
+                    .map_err(|e| format!("invalid patch for '{field}': {e}"))?;
+                minimize_against(&mut patched, inherited);
+
+                if patched.is_empty() && inherited.is_some() {
+                    // Everything this scope said is now what it inherits anyway.
+                    return if current.is_some() {
+                        remove_field_path(&mut self.fields, steps);
+                        Ok(format!(
+                            "'{field}' now inherits its whole definition (local declaration \
+                             removed)"
+                        ))
+                    } else {
+                        Err(format!(
+                            "'{field}' already resolves to this through an ancestor's \
+                             schema; there is nothing to change here"
+                        ))
+                    };
+                }
+                if current.as_ref() == Some(&patched) {
+                    return Ok(format!("'{field}' unchanged"));
+                }
+                let slot = field_entry_mut(&mut self.fields, steps, field, empty_container)?;
+                *slot = patched;
+                Ok(format!("patched '{field}'"))
             }
             SchemaEdit::RemoveField { field } => {
                 if !remove_field_path(&mut self.fields, steps) {
@@ -2009,6 +2607,13 @@ impl ResolvedSchema {
         let mut tree = self.fields.tree.clone();
         for (key, raw) in &child.fields {
             let path = FieldPath::parse(key);
+            if raw.removed {
+                remove_node(&mut tree, path.steps());
+                continue;
+            }
+            if excludes_from_nothing(raw, &tree, path.steps()) {
+                continue;
+            }
             node_in_children(&mut tree, path.steps(), origin).merge_node(raw, origin, key);
         }
 
@@ -2055,6 +2660,11 @@ impl ResolvedSchema {
     /// hashed only when present, so a schema that uses none hashes exactly as it did
     /// before `items` existed (#346) — changing the bytes of a field without `items`
     /// would re-validate (and re-embed) the whole corpus.
+    ///
+    /// `removed` and `exclude_values` (#348) are not hashed as attributes: they act
+    /// on the resolved model (a removed field is absent from it, an excluded value
+    /// from its `values`), which is what is hashed, so a schema that uses neither
+    /// hashes exactly as before, and one that does changes only where its effect is.
     ///
     /// Deliberately excludes `dedup_enabled`/`dedup_threshold` (#272): the near-duplicate
     /// gate affects neither validation nor indexing, so changing it must not mark a
@@ -2931,13 +3541,26 @@ impl SchemaCache {
 
     /// [`lint_raw`] over every schema file this cache was built from, by governing
     /// directory (#347).
+    /// Includes [`lint_cascade`]'s findings for each file against what its parent
+    /// directory resolves to (#348).
     pub fn lint_findings(&self) -> Vec<LintFinding> {
+        let empty = ResolvedSchema::default();
         self.raw
             .iter()
             .flat_map(|(rel_dir, file)| {
-                lint_raw(file, rel_dir.as_os_str().is_empty())
+                let is_root = rel_dir.as_os_str().is_empty();
+                // The root file replaces the config-derived root: it inherits nothing.
+                let inherited = if is_root {
+                    &empty
+                } else {
+                    let parent = rel_dir.parent().unwrap_or(Path::new(""));
+                    nearest_schema(&self.scopes, parent).unwrap_or(&self.root)
+                };
+                lint_raw(file, is_root)
                     .into_iter()
+                    .chain(lint_cascade(inherited, file))
                     .map(move |warning| (rel_dir.clone(), warning))
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -6757,5 +7380,567 @@ mod tests {
         assert_eq!(declared.fields["tags"].ty, None);
         assert_eq!(declared.origin()["tags"], "/");
         assert!(declared.fields["tags"].required);
+    }
+
+    // -- explicit cascade semantics (#348) ------------------------------------
+
+    const CASCADE_ROOT: &str = "fields:
+  status:
+    type: enum
+    values: [draft, active, archived]
+    required: true
+  planning:
+    fields:
+      method:
+        type: text
+      effort:
+        type: integer
+  npcs:
+    type: list
+    items:
+      fields:
+        name:
+          type: text
+";
+
+    #[test]
+    fn removed_hides_an_inherited_field_in_the_scope_and_below_until_redeclared() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_schema(root, "", CASCADE_ROOT);
+        write_schema(root, "games", "fields:\n  status:\n    removed: true\n");
+        write_schema(root, "games/rpg", "fields:\n  notes:\n    type: text\n");
+        write_schema(
+            root,
+            "games/rpg/campaign",
+            "fields:\n  status:\n    type: text\n",
+        );
+        let cache = SchemaCache::build_for_test(root, &empty_config());
+
+        let games = cache.resolve_for(Path::new("games/a.md"));
+        assert!(!games.fields.contains_key("status"), "removed in the scope");
+        let rpg = cache.resolve_for(Path::new("games/rpg/a.md"));
+        assert!(!rpg.fields.contains_key("status"), "and in its descendants");
+        assert!(rpg.fields.contains_key("notes"));
+        // Sibling scopes and the root are untouched.
+        assert!(cache.resolve_for(Path::new("a.md")).fields["status"].required);
+
+        // A deeper scope declares it afresh: nothing of the removed definition comes
+        // back with it.
+        let campaign = cache.resolve_for(Path::new("games/rpg/campaign/a.md"));
+        let status = &campaign.fields["status"];
+        assert_eq!(status.ty, Some(FieldType::Text));
+        assert!(!status.required);
+        assert_eq!(status.values, None);
+        assert_eq!(campaign.origin()["status"], "games/rpg/campaign/");
+    }
+
+    #[test]
+    fn removed_reaches_nested_fields_and_list_items() {
+        let resolved = ResolvedSchema::default()
+            .merged_with(&file(CASCADE_ROOT), "/")
+            .merged_with(
+                &file(
+                    "fields:\n  planning.effort:\n    removed: true\n  npcs[]:\n    removed: true\n",
+                ),
+                "x/",
+            );
+        assert!(resolved.fields.contains_key("planning.method"));
+        assert!(!resolved.fields.contains_key("planning.effort"));
+        assert!(resolved.fields["npcs"].items.is_none());
+        assert!(resolved.fields.lookup("npcs[].name").is_none());
+        // The nested spelling removes the same node.
+        let nested = ResolvedSchema::default()
+            .merged_with(&file(CASCADE_ROOT), "/")
+            .merged_with(
+                &file("fields:\n  planning:\n    fields:\n      effort:\n        removed: true\n"),
+                "x/",
+            );
+        assert!(!nested.fields.contains_key("planning.effort"));
+        assert!(nested.fields.contains_key("planning.method"));
+    }
+
+    #[test]
+    fn a_removed_declaration_carries_nothing_else() {
+        let err = serde_yaml_ng::from_str::<SchemaFile>(
+            "fields:\n  status:\n    removed: true\n    required: true\n",
+        )
+        .unwrap()
+        .validate_self()
+        .unwrap_err();
+        assert!(
+            err.contains("'removed: true' alongside other attributes"),
+            "{err}"
+        );
+        // `removed: false` is the same as not writing it.
+        file("fields:\n  status:\n    removed: false\n    required: true\n");
+    }
+
+    #[test]
+    fn exclude_values_narrow_the_inherited_set_after_the_local_values() {
+        let parent = ResolvedSchema::default().merged_with(&file(CASCADE_ROOT), "/");
+        let excluded = parent.merged_with(
+            &file("fields:\n  status:\n    exclude_values: [archived]\n"),
+            "x/",
+        );
+        assert_eq!(
+            excluded.fields["status"].values,
+            Some(vec!["draft".into(), "active".into()])
+        );
+        assert_eq!(
+            excluded.fields["status"].set_by.values.as_deref(),
+            Some("x/")
+        );
+        // Everything else is still inherited.
+        assert!(excluded.fields["status"].required);
+        assert_eq!(excluded.fields["status"].ty, Some(FieldType::Enum));
+
+        // Applied after the splice: the local values extend, then the exclusion
+        // narrows — a value in both lists is excluded.
+        let both = parent.merged_with(
+            &file(
+                "fields:\n  status:\n    values: [$values, paused, gone]\n    \
+                 exclude_values: [draft, gone]\n",
+            ),
+            "x/",
+        );
+        assert_eq!(
+            both.fields["status"].values,
+            Some(vec!["active".into(), "archived".into(), "paused".into()])
+        );
+
+        // An unconstrained field has nothing to exclude from.
+        let open = parent.merged_with(
+            &file("fields:\n  planning.method:\n    exclude_values: [x]\n"),
+            "x/",
+        );
+        assert_eq!(open.fields["planning.method"].values, None);
+
+        let err = serde_yaml_ng::from_str::<SchemaFile>(
+            "fields:\n  status:\n    exclude_values: [$values]\n",
+        )
+        .unwrap()
+        .validate_self()
+        .unwrap_err();
+        assert!(err.contains("exclude_values"), "{err}");
+    }
+
+    #[test]
+    fn new_cascade_syntax_changes_the_fingerprint_only_where_it_has_an_effect() {
+        let parent = ResolvedSchema::default().merged_with(&file(CASCADE_ROOT), "/");
+        let plain = parent.merged_with(&file("fields:\n  notes:\n    type: text\n"), "x/");
+        let excluded = parent.merged_with(
+            &file("fields:\n  notes:\n    type: text\n  status:\n    exclude_values: [archived]\n"),
+            "x/",
+        );
+        let removed = parent.merged_with(
+            &file("fields:\n  notes:\n    type: text\n  status:\n    removed: true\n"),
+            "x/",
+        );
+        assert_ne!(plain.fingerprint(), excluded.fingerprint());
+        assert_ne!(plain.fingerprint(), removed.fingerprint());
+        // Excluding nothing, or removing what is not there, changes nothing.
+        let no_op = parent.merged_with(
+            &file(
+                "fields:\n  notes:\n    type: text\n  status:\n    exclude_values: []\n  \
+                 ghost:\n    removed: true\n  phantom:\n    exclude_values: [x]\n  \
+                 planning.ghost:\n    exclude_values: [x]\n  npcs[].ghost:\n    \
+                 exclude_values: [x]\n",
+            ),
+            "x/",
+        );
+        assert_eq!(plain.fingerprint(), no_op.fingerprint());
+        // Excluding from a field nothing above declares creates no field at all.
+        // (`status`'s empty exclusion still moves its provenance to `x/`.)
+        assert!(no_op.fields.keys().eq(plain.fields.keys()));
+        assert!(!no_op.fields.contains_key("phantom"));
+        assert!(!no_op.fields.contains_key("planning.ghost"));
+        assert!(no_op.fields.lookup("npcs[].ghost").is_none());
+    }
+
+    #[test]
+    fn values_edits_and_patches_refuse_a_field_this_scope_removes() {
+        let parent = ResolvedSchema::default().merged_with(&file(CASCADE_ROOT), "/");
+        let inherited = parent.fields.lookup("status").cloned();
+        let removed = file("fields:\n  status:\n    removed: true\n");
+        for edit in [
+            SchemaEdit::AddValues {
+                field: "status".into(),
+                values: vec!["draft".into()],
+            },
+            SchemaEdit::RemoveValues {
+                field: "status".into(),
+                values: vec!["draft".into()],
+            },
+            patch(json!({"required": true})),
+        ] {
+            let mut child = removed.clone();
+            let err = child
+                .apply_inheriting(&edit, inherited.as_ref())
+                .unwrap_err();
+            assert!(
+                err.contains("'status' is removed in this scope; re-declare it with set_field"),
+                "{err}"
+            );
+            assert!(child.fields["status"].removed, "left as it was");
+        }
+        // The same within one batch: removing, then adding values, is refused.
+        let mut child = SchemaFile::default();
+        child
+            .apply_inheriting(
+                &SchemaEdit::SetField {
+                    field: "status".into(),
+                    definition: Box::new(RawFieldDef {
+                        removed: true,
+                        ..RawFieldDef::default()
+                    }),
+                },
+                inherited.as_ref(),
+            )
+            .unwrap();
+        assert!(
+            child
+                .apply_inheriting(
+                    &SchemaEdit::AddValues {
+                        field: "status".into(),
+                        values: vec!["draft".into()],
+                    },
+                    inherited.as_ref(),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn excluding_or_replacing_the_inherited_default_warns() {
+        let parent = "fields:\n  status:\n    type: enum\n    values: [draft, active]\n    \
+                      default: draft\n";
+        for child in [
+            "fields:\n  status:\n    exclude_values: [draft]\n",
+            "fields:\n  status:\n    values: [active, paused]\n",
+        ] {
+            let warnings = cascade_lint(parent, child);
+            assert_eq!(warnings.len(), 1, "{child}: {warnings:?}");
+            assert!(
+                warnings[0].contains("inherited default \"draft\" is no longer a permitted"),
+                "{warnings:?}"
+            );
+        }
+        // Still permitted, or a default of the scope's own: no warning here.
+        for child in [
+            "fields:\n  status:\n    exclude_values: [active]\n",
+            "fields:\n  status:\n    values: [$values, paused]\n",
+            "fields:\n  status:\n    exclude_values: [draft]\n    default: active\n",
+        ] {
+            assert!(cascade_lint(parent, child).is_empty(), "{child}");
+        }
+    }
+
+    #[test]
+    fn kind_families_group_types_by_the_value_they_describe() {
+        use KindFamily as F;
+        let expected = [
+            (FieldType::Text, F::String),
+            (FieldType::Integer, F::Numeric),
+            (FieldType::Number, F::Numeric),
+            (FieldType::Boolean, F::Boolean),
+            (FieldType::Enum, F::String),
+            (FieldType::List, F::List),
+            (FieldType::Date, F::String),
+            (FieldType::Timestamp, F::String),
+            (FieldType::Object, F::Object),
+        ];
+        assert_eq!(expected.len(), FieldType::ALL.len());
+        for (ty, family) in expected {
+            assert_eq!(ty.kind().family, family, "{}", ty.name());
+        }
+    }
+
+    fn cascade_lint(parent_yaml: &str, child_yaml: &str) -> Vec<String> {
+        let parent = ResolvedSchema::default().merged_with(&file(parent_yaml), "/");
+        lint_cascade(&parent, &file(child_yaml))
+    }
+
+    #[test]
+    fn a_cross_kind_type_change_warns_and_a_same_kind_one_does_not() {
+        let warnings = cascade_lint(CASCADE_ROOT, "fields:\n  status:\n    type: list\n");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("'enum' (set in /) to 'list'"),
+            "{warnings:?}"
+        );
+        // Nested, and implied by `fields:`.
+        let warnings = cascade_lint(
+            CASCADE_ROOT,
+            "fields:\n  planning:\n    fields:\n      effort:\n        type: boolean\n  \
+             npcs:\n    fields:\n      x:\n        type: text\n",
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("'planning.effort'")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'list'") && w.contains("'object'"))
+        );
+
+        for same_kind in [
+            "fields:\n  status:\n    type: text\n",
+            "fields:\n  planning.effort:\n    type: number\n",
+            "fields:\n  planning.method:\n    type: enum\n    values: [a]\n",
+            "fields:\n  npcs[].name:\n    type: date\n",
+        ] {
+            assert!(
+                cascade_lint(CASCADE_ROOT, same_kind).is_empty(),
+                "{same_kind}"
+            );
+        }
+        // A brand-new field, or one whose type is not inherited, is no change.
+        assert!(cascade_lint(CASCADE_ROOT, "fields:\n  other:\n    type: list\n").is_empty());
+    }
+
+    #[test]
+    fn removing_or_excluding_what_is_not_inherited_warns() {
+        let warnings = cascade_lint(
+            CASCADE_ROOT,
+            "fields:
+  ghost:
+    removed: true
+  status:
+    exclude_values: [archived, nope]
+  planning.method:
+    exclude_values: [x]
+",
+        );
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'ghost'") && w.contains("removes nothing"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'status'") && w.contains(": nope"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'planning.method'") && w.contains("no effect"))
+        );
+    }
+
+    #[test]
+    fn cascade_lint_findings_reach_the_cache_and_never_stop_a_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_schema(root, "", CASCADE_ROOT);
+        write_schema(root, "a", "fields:\n  status:\n    type: list\n");
+        write_schema(root, "a/b", "fields:\n  status:\n    type: object\n");
+        let cache = SchemaCache::build_for_test(root, &empty_config());
+        let findings = cache.lint_findings();
+        // `a/` against the root, `a/b/` against `a/` (a list becoming an object).
+        assert!(
+            findings
+                .iter()
+                .any(|(dir, w)| dir == Path::new("a") && w.contains("'enum'")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|(dir, w)| dir == Path::new("a/b") && w.contains("'list'")),
+            "{findings:?}"
+        );
+        // The root file inherits nothing, so it never gets a cascade finding.
+        assert!(findings.iter().all(|(dir, _)| !dir.as_os_str().is_empty()));
+    }
+
+    #[test]
+    fn remove_values_on_an_inherited_value_excludes_it_and_add_values_brings_it_back() {
+        let parent = ResolvedSchema::default().merged_with(&file(CASCADE_ROOT), "/");
+        let inherited = parent.fields.lookup("status").cloned();
+        let mut child = SchemaFile::default();
+
+        let summary = child
+            .apply_inheriting(
+                &SchemaEdit::RemoveValues {
+                    field: "status".into(),
+                    values: vec!["archived".into(), "nope".into()],
+                },
+                inherited.as_ref(),
+            )
+            .unwrap();
+        assert!(summary.contains("removed 1 value(s)"), "{summary}");
+        assert!(summary.contains("now excluded here"), "{summary}");
+        let def = &child.fields["status"];
+        assert_eq!(def.exclude_values, Some(vec!["archived".into()]));
+        assert_eq!(def.values, None, "the inherited list is not copied");
+        child.validate_self().unwrap();
+        let resolved = parent.merged_with(&child, "x/");
+        assert_eq!(
+            resolved.fields["status"].values,
+            Some(vec!["draft".into(), "active".into()])
+        );
+
+        // Round trip: the exclusion survives YAML, and adding the value back drops it.
+        let mut child: SchemaFile = serde_yaml_ng::from_str(&child.to_yaml().unwrap()).unwrap();
+        let summary = child
+            .apply_inheriting(
+                &SchemaEdit::AddValues {
+                    field: "status".into(),
+                    values: vec!["archived".into()],
+                },
+                inherited.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(summary, "added to 'status': archived");
+        assert!(
+            !child.fields.contains_key("status"),
+            "a declaration that only excluded is gone"
+        );
+        assert_eq!(
+            parent.merged_with(&child, "x/").fields["status"],
+            parent.fields["status"]
+        );
+
+        // A value this scope lists itself is just deleted from its list.
+        let mut own = file("fields:\n  status:\n    values: [$values, paused]\n");
+        own.apply_inheriting(
+            &SchemaEdit::RemoveValues {
+                field: "status".into(),
+                values: vec!["paused".into()],
+            },
+            inherited.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(own.fields["status"].values, Some(vec!["$values".into()]));
+        assert_eq!(own.fields["status"].exclude_values, None);
+
+        // With nothing inherited and nothing declared, it is still an error.
+        let err = SchemaFile::default()
+            .apply_inheriting(
+                &SchemaEdit::RemoveValues {
+                    field: "status".into(),
+                    values: vec!["x".into()],
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(err.contains("not declared in this scope"), "{err}");
+    }
+
+    fn patch(json: Value) -> SchemaEdit {
+        SchemaEdit::PatchField {
+            field: "status".into(),
+            patch: json.as_object().unwrap().clone(),
+        }
+    }
+
+    #[test]
+    fn patch_field_changes_only_the_given_keys_and_minimizes_against_the_parent() {
+        let parent = ResolvedSchema::default().merged_with(&file(CASCADE_ROOT), "/");
+        let inherited = parent.fields.lookup("status").cloned();
+        let mut child = file("fields:\n  status:\n    indexed: true\n    default: draft\n");
+
+        // Every patched key repeats what the parent already says, so none is
+        // written: only what differs from the inherited definition is.
+        let summary = child
+            .apply_inheriting(
+                &patch(json!({"type": "enum", "required": true, "values": ["draft", "active", "archived"], "open": true})),
+                inherited.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(summary, "'status' unchanged");
+        assert_eq!(
+            child.fields["status"],
+            RawFieldDef {
+                indexed: Some(true),
+                default: Some(json!("draft")),
+                ..RawFieldDef::default()
+            }
+        );
+
+        child
+            .apply_inheriting(&patch(json!({"required": false})), inherited.as_ref())
+            .unwrap();
+        let status = &child.fields["status"];
+        assert_eq!(status.required, Some(false));
+        assert_eq!(status.indexed, Some(true), "untouched keys stay");
+
+        // `null` drops the local setting: the attribute is inherited again.
+        child
+            .apply_inheriting(
+                &patch(json!({"required": null, "default": null})),
+                inherited.as_ref(),
+            )
+            .unwrap();
+        let status = &child.fields["status"];
+        assert_eq!(status.required, None);
+        assert_eq!(status.default, None);
+        assert!(parent.merged_with(&child, "x/").fields["status"].required);
+
+        // Patching the last local attribute back to the inherited value removes the
+        // declaration altogether.
+        let summary = child
+            .apply_inheriting(&patch(json!({"indexed": false})), inherited.as_ref())
+            .unwrap();
+        assert!(
+            summary.contains("now inherits its whole definition"),
+            "{summary}"
+        );
+        assert!(!child.fields.contains_key("status"));
+
+        // And on a scope that never declared it, a no-op patch is refused rather than
+        // writing an empty file.
+        let err = child
+            .apply_inheriting(&patch(json!({"required": true})), inherited.as_ref())
+            .unwrap_err();
+        assert!(err.contains("nothing to change"), "{err}");
+    }
+
+    #[test]
+    fn patch_field_merges_nested_fields_recursively() {
+        let parent = ResolvedSchema::default().merged_with(&file(CASCADE_ROOT), "/");
+        let inherited = parent.fields.lookup("planning").cloned();
+        let mut child = file(
+            "fields:\n  planning:\n    fields:\n      method:\n        required: true\n      \
+             extra:\n        type: text\n",
+        );
+        let edit = SchemaEdit::PatchField {
+            field: "planning".into(),
+            patch: json!({
+                "open": false,
+                "fields": {
+                    "method": {"indexed": true},
+                    "effort": {"type": "integer"},
+                    "extra": null
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        child.apply_inheriting(&edit, inherited.as_ref()).unwrap();
+        child.validate_self().unwrap();
+        let planning = &child.fields["planning"];
+        assert_eq!(planning.open, Some(false));
+        let children = planning.fields.as_ref().unwrap();
+        assert_eq!(children["method"].required, Some(true), "kept");
+        assert_eq!(children["method"].indexed, Some(true), "added");
+        // `effort` says exactly what it inherits, so it is not written at all.
+        assert!(!children.contains_key("effort"), "{children:?}");
+        assert!(!children.contains_key("extra"), "null removed the child");
+
+        // A shape error in the merged definition is a refusal, not a corrupt file.
+        let err = child
+            .apply_inheriting(
+                &SchemaEdit::PatchField {
+                    field: "planning".into(),
+                    patch: json!({"typ": "text"}).as_object().unwrap().clone(),
+                },
+                inherited.as_ref(),
+            )
+            .unwrap_err();
+        assert!(err.contains("invalid patch for 'planning'"), "{err}");
     }
 }
