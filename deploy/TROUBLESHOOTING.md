@@ -420,7 +420,8 @@ version keep their frontmatter at the top level, which no query-mode filter (nor
 CLI/web `domain`/`type`/`tags` filters) reads any more, so filtered searches with a
 `query` miss those documents. Unfiltered search and searches without a `query`
 (SQLite) are unaffected, and `section`/`heading_prefix` results say "results may be
-incomplete" meanwhile.
+incomplete" meanwhile. Result titles and `type`/`tags` still show for old-shape
+points: a payload with no `fm` key is read at its top level.
 
 **Fix:** none needed — watch `/status` (`phase`, `chunks_total`) until the run
 completes. A run that fails is retried with backoff and by the next periodic sweep.

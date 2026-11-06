@@ -250,14 +250,18 @@ pub fn payload_key(field: &str) -> String {
 /// The value of top-level frontmatter field `field` in a chunk payload — under
 /// [`FRONTMATTER_KEY`] (#350). The one reader of frontmatter off a search result
 /// (`title`, `type`, `tags` in the MCP, web and CLI search results).
+///
+/// A payload with no [`FRONTMATTER_KEY`] at all is a point written before #350,
+/// which kept frontmatter at the top level; it is read there instead, so results
+/// keep their titles while the upgrade's re-embed has not reached them yet.
 pub fn frontmatter_value<'a>(
     payload: &'a HashMap<String, serde_json::Value>,
     field: &str,
 ) -> Option<&'a serde_json::Value> {
-    payload
-        .get(FRONTMATTER_KEY)
-        .and_then(|fm| fm.as_object())
-        .and_then(|fm| fm.get(field))
+    match payload.get(FRONTMATTER_KEY) {
+        Some(fm) => fm.as_object().and_then(|fm| fm.get(field)),
+        None => payload.get(field),
+    }
 }
 
 /// A payload field to index, and how. `name` is the field path filters name
@@ -3814,6 +3818,26 @@ mod tests {
             Some(&serde_json::json!("T"))
         );
         assert_eq!(frontmatter_value(&HashMap::new(), "title"), None);
+    }
+
+    /// A point written before #350 (frontmatter at the top level, no `fm` key) still
+    /// reads its title until the re-embed rewrites it; a point with `fm` never falls
+    /// back, even for a key `fm` lacks.
+    #[test]
+    fn frontmatter_value_falls_back_to_the_pre_fm_shape() {
+        let legacy = HashMap::from([
+            ("title".to_string(), serde_json::json!("Old")),
+            ("file_path".to_string(), serde_json::json!("/kb/a.md")),
+        ]);
+        assert_eq!(
+            frontmatter_value(&legacy, "title"),
+            Some(&serde_json::json!("Old"))
+        );
+        let current = HashMap::from([
+            (FRONTMATTER_KEY.to_string(), serde_json::json!({})),
+            ("title".to_string(), serde_json::json!("stray")),
+        ]);
+        assert_eq!(frontmatter_value(&current, "title"), None);
     }
 
     #[test]

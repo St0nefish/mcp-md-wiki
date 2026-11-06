@@ -270,14 +270,23 @@ impl StatusState {
     /// config as a `SharedConfig` that nothing else ever writes to.
     pub fn for_cli(config: Arc<ResolvedConfig>) -> anyhow::Result<Self> {
         // Only for the breakdown's derived-field exclusion: an invalid schema tree
-        // must not stop `status` from reporting, so a failed build is just `None`.
-        let schema_cache = SchemaCache::build(
+        // must not stop `status` from reporting, so a failed build is just `None`,
+        // said once on stderr so the unfiltered breakdown has an explanation.
+        let schema_cache = match SchemaCache::build(
             &config.canonical_data_path(),
             &config.frontmatter,
             &config.indexing,
-        )
-        .ok()
-        .map(|cache| Arc::new(RwLock::new(Arc::new(cache))));
+        ) {
+            Ok(cache) => Some(Arc::new(RwLock::new(Arc::new(cache)))),
+            Err(e) => {
+                eprintln!(
+                    "warning: {} schema file(s) are invalid (run `validate` for details); \
+                     the field breakdown does not leave out derived fields",
+                    e.invalid.len()
+                );
+                None
+            }
+        };
         Ok(Self {
             schema_cache,
             qdrant: Arc::new(QdrantStore::new(&config.qdrant)?),

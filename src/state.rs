@@ -657,9 +657,10 @@ impl StateDb {
 
         // Payload-shape fingerprint (#351, `ingest::payload_hash_for`). Unlike the
         // columns above, '' here does NOT force anything: it means "unknown", which
-        // ingest treats as current while `schema_hash` still matches. Upgrading is
-        // therefore a no-op reindex — no re-embed, no Qdrant write — and a later
-        // schema edit refreshes the payload in place rather than re-embedding.
+        // ingest treats as current while `schema_hash` still matches, so adding the
+        // column re-embeds nothing by itself (the release that added it re-embeds
+        // anyway, through #350's `CHUNKER_VERSION` bump), and a later schema edit
+        // refreshes the payload in place rather than re-embedding.
         add_column_if_missing(
             &pool,
             "indexed_files",

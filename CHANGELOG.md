@@ -32,6 +32,8 @@ dropping the collection). No operator step is needed to start it. While it runs:
   behind `IndexStatus::is_bulk_indexing` is set by the reconcile scan and stays set
   through retries until a run completes, so `section` and `heading_prefix` results
   carry the "results may be incomplete" note for the whole transition;
+- result titles, `type` and `tags` still render for old-shape points: a payload
+  with no `fm` key is read at its top level (`qdrant::frontmatter_value`);
 - `/status` shows the run's progress (`chunks_total`, `phase`).
 
 Rolling back to an older binary afterwards would face the opposite mismatch and
@@ -184,7 +186,9 @@ schema rebuild and fails to start.
   removes (`removed: true`) are refused; re-declare it with `set_field` first.
 - **`patch_field`** changes only the keys it is given (nested `fields` merge per
   child, `items` likewise; any other key replaces), `null` for a key drops the
-  directory's own setting so it is inherited again, and the written declaration is
+  directory's own setting so it is inherited again — or, for a client that enforces
+  the advertised schema (which carries no `null` arms), the op's `reinherit` array
+  names those keys (`"reinherit": ["required"]`) — and the written declaration is
   minimized against the inherited one — attributes equal to what it inherits are
   not written, and a declaration left saying nothing is removed.
 - **`remove_values` of an inherited value** now writes `exclude_values` in the
@@ -219,11 +223,12 @@ schema rebuild and fails to start.
   `/status`, `/metrics` and the run summary gain a `refreshed` count.
 - A schema edit no longer lights the "results may be incomplete" note on `section`
   and `heading_prefix` results: the chunks those come from are unchanged.
-- **Reindex:** none. The upgrade is a **no-op reindex** — existing rows get an
-  empty `payload_hash`, read as "current" while `schema_hash` matches, so nothing is
-  re-embedded and nothing is written to Qdrant. The first schema edit after the
-  upgrade refreshes the payload of the documents it governs once (their payload hash
-  was unknown), still without re-embedding.
+- **Reindex:** the new column forces nothing by itself — existing rows get an
+  empty `payload_hash`, read as "current" while `schema_hash` matches. **This
+  release re-embeds the whole corpus anyway**, because #350 bumps
+  `CHUNKER_VERSION` (see the top of this section); that re-embed writes every row's
+  `payload_hash`, so later schema edits refresh payloads in place without
+  re-embedding.
 - Since #350 (same release) the frontmatter is one `fm` payload key, which the
   refresh sets as a whole, so a frontmatter key named like a heading/section payload
   key (`section_key`, …) no longer meets the chunk's own key in either mode.

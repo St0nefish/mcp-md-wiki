@@ -2758,16 +2758,7 @@ impl ResolvedSchema {
         }
         if !self.derived.is_empty() {
             hasher.update([0xfcu8]);
-            for (name, rule) in &self.derived {
-                hasher.update(name.as_bytes());
-                hasher.update([0u8]);
-                hasher.update(match rule.from {
-                    DerivedFrom::PathSegment => b"path_segment".as_slice(),
-                });
-                hasher.update([0u8]);
-                hasher.update((rule.index as u64).to_le_bytes());
-                hasher.update([0xffu8]);
-            }
+            hash_derived(&mut hasher, &self.derived);
         }
         hex::encode(hasher.finalize())
     }
@@ -2783,8 +2774,9 @@ impl ResolvedSchema {
     /// schema edit that moves `fingerprint` but not this — tightening `required`,
     /// narrowing `values`, marking a field `indexed` — revalidates and reprojects the
     /// document without touching Qdrant; one that moves this too also refreshes the
-    /// payload in place. Neither re-embeds. Every input here is also an input of
-    /// `fingerprint`, so a change here always moves both.
+    /// payload in place. Neither re-embeds. Every schema input here is also an input
+    /// of `fingerprint`, so a schema change here always moves both; the one input
+    /// that is not, [`PAYLOAD_SHAPE_VERSION`], moves only this hash.
     ///
     /// Since #350 the payload's `fm` object is coerced by each declared field's type
     /// ([`FieldKind::payload`]), so the coercion of every typed node of the tree —
@@ -2813,17 +2805,24 @@ impl ResolvedSchema {
             hasher.update([0xffu8]);
         }
         hasher.update([0xfcu8]);
-        for (name, rule) in &self.derived {
-            hasher.update(name.as_bytes());
-            hasher.update([0u8]);
-            hasher.update(match rule.from {
-                DerivedFrom::PathSegment => b"path_segment".as_slice(),
-            });
-            hasher.update([0u8]);
-            hasher.update((rule.index as u64).to_le_bytes());
-            hasher.update([0xffu8]);
-        }
+        hash_derived(&mut hasher, &self.derived);
         hex::encode(hasher.finalize())
+    }
+}
+
+/// The `derived:` rules' bytes, as both [`ResolvedSchema::fingerprint`] and
+/// [`ResolvedSchema::payload_fingerprint`] hash them (each behind its own marker).
+fn hash_derived(hasher: &mut sha2::Sha256, derived: &BTreeMap<String, DerivedField>) {
+    use sha2::Digest;
+    for (name, rule) in derived {
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(match rule.from {
+            DerivedFrom::PathSegment => b"path_segment".as_slice(),
+        });
+        hasher.update([0u8]);
+        hasher.update((rule.index as u64).to_le_bytes());
+        hasher.update([0xffu8]);
     }
 }
 

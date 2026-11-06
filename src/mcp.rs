@@ -171,6 +171,21 @@ fn normalize_scope_path(raw: &str) -> Result<std::path::PathBuf, McpError> {
 const FIELD_DEFINITION_KEYS: &str = "`type`, `required`, `indexed`, `values`, `default`, \
      `open`, `fields`, `items`, `exclude_values`, `removed`";
 
+/// The keys of [`FIELD_DEFINITION_KEYS`] as names: what a `patch_field` op's
+/// `reinherit` may list (#348). A test keeps the two in step.
+const FIELD_DEFINITION_KEY_NAMES: &[&str] = &[
+    "type",
+    "required",
+    "indexed",
+    "values",
+    "default",
+    "open",
+    "fields",
+    "items",
+    "exclude_values",
+    "removed",
+];
+
 /// Most operations one `update_schema` call's `ops` may carry (#348). Each op is
 /// bounded on its own (`MAX_SCHEMA_VALUES`, `MAX_SCHEMA_DEFINITION_LEN`); this bounds
 /// the batch, and with it the work done under the git lock.
@@ -225,9 +240,16 @@ pub struct SchemaOpInput {
     pub values: Option<Vec<String>>,
 
     /// For set_field: the whole definition. For patch_field: only the keys to change
-    /// (`fields` merge per child); `null` for a key inherits it again.
+    /// (`fields` merge per child); to make a key inherit again, name it in
+    /// `reinherit` (a literal `null` for the key also works).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<FieldPatchInput>,
+
+    /// For patch_field: definition keys to drop from this directory's declaration so
+    /// they inherit again (`required`, `values`, ...). A key may not also be set in
+    /// `definition`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reinherit: Option<Vec<String>>,
 }
 
 /// A field definition (or `patch_field` merge patch) as an `ops` entry delivers it:
@@ -543,6 +565,7 @@ fn build_schema_edits(
                 &op.field,
                 op.values.as_deref(),
                 op.definition.as_ref().map(|d| &d.0),
+                op.reinherit.as_deref(),
             )
             .map_err(|e| {
                 if ops.len() > 1 {
@@ -581,6 +604,7 @@ fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::Schem
         &params.field,
         params.values.as_deref(),
         definition.as_ref(),
+        None,
     )
 }
 
@@ -591,9 +615,40 @@ fn build_schema_op(
     field: &str,
     values: Option<&[String]>,
     definition: Option<&serde_json::Map<String, serde_json::Value>>,
+    reinherit: Option<&[String]>,
 ) -> Result<crate::schema::SchemaEdit, McpError> {
     use crate::schema::SchemaEdit;
     let invalid = |msg: String| McpError::invalid_params(msg, None);
+    let operation_name = operation.trim().to_ascii_lowercase();
+
+    // `reinherit` is the way to send a patch's "inherit again" without a JSON `null`,
+    // which the advertised (compacted, #288) definition schema cannot carry.
+    let reinherit = reinherit.unwrap_or_default();
+    if !reinherit.is_empty() {
+        if operation_name != "patch_field" {
+            return Err(invalid(format!(
+                "`reinherit` applies only to patch_field, not '{operation_name}'"
+            )));
+        }
+        if let Some(unknown) = reinherit
+            .iter()
+            .find(|k| !FIELD_DEFINITION_KEY_NAMES.contains(&k.as_str()))
+        {
+            return Err(invalid(format!(
+                "`reinherit` names unknown key '{unknown}': expected one of \
+                 {FIELD_DEFINITION_KEYS}"
+            )));
+        }
+        if let Some(both) = reinherit.iter().find(|k| {
+            definition
+                .and_then(|d| d.get(k.as_str()))
+                .is_some_and(|v| !v.is_null())
+        }) {
+            return Err(invalid(format!(
+                "'{both}' is both set in `definition` and listed in `reinherit`; pick one"
+            )));
+        }
+    }
 
     // A schema file is committed, pushed, and re-parsed on every cache build, so an
     // oversized one is a durable cost rather than a transient one. Bound the inputs
@@ -667,7 +722,7 @@ fn build_schema_op(
     };
     let field = field.to_string();
 
-    match operation.trim().to_ascii_lowercase().as_str() {
+    match operation_name.as_str() {
         "add_values" => Ok(SchemaEdit::AddValues {
             field,
             values: values()?,
@@ -687,12 +742,17 @@ fn build_schema_op(
             })
         }
         "patch_field" => {
-            let patch = definition
-                .filter(|d| !d.is_empty())
-                .ok_or_else(|| {
-                    invalid("'patch_field' requires a definition holding the keys to change".into())
-                })?
-                .clone();
+            let mut patch = definition.cloned().unwrap_or_default();
+            for key in reinherit {
+                patch.insert(key.clone(), serde_json::Value::Null);
+            }
+            if patch.is_empty() {
+                return Err(invalid(
+                    "'patch_field' requires a definition holding the keys to change, or \
+                     `reinherit` naming keys to inherit again"
+                        .into(),
+                ));
+            }
             Ok(SchemaEdit::PatchField { field, patch })
         }
         "remove_field" => Ok(SchemaEdit::RemoveField { field }),
@@ -5058,6 +5118,17 @@ impl KbSearchServer {
                      parses."
                 ))
             })?;
+            // The root-edit guard again, on the root file as it is under the lock: the
+            // check above reads the shared cache, which a `root_edit:` block the sync
+            // just pulled in reaches only after the worker's next rebuild (#345).
+            if is_root
+                && is_gated_op
+                && !dry_run
+                && !acknowledged
+                && let Some(policy) = file.root_edit.as_ref().filter(|p| p.require_ack)
+            {
+                return Err(invalid(root_edit_refusal(policy)));
+            }
             let inherited = inherited_schema(&schemas);
             let summaries = match apply_all(&mut file, &inherited) {
                 Ok(summaries) => summaries,
@@ -10381,6 +10452,44 @@ mod tests {
         }
     }
 
+    /// A `root_edit` block that is on disk but not yet in the shared cache (it arrived
+    /// through git, and the worker has not rebuilt the cache) still guards: the root
+    /// file read under the lock is checked too (#345).
+    #[tokio::test]
+    async fn update_schema_root_guard_applies_before_the_cache_sees_it() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+        assert!(
+            crate::schema::load_shared(&server.schema_cache)
+                .root()
+                .root_edit
+                .is_none()
+        );
+        write_schema_file(&work, "", GUARDED_ROOT);
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "guard root edits");
+
+        let msg = format!(
+            "{:?}",
+            server
+                .update_schema(Parameters(root_add_values(None)))
+                .await
+                .expect_err("the on-disk guard must refuse an unacknowledged root edit")
+        );
+        assert!(
+            msg.contains("root schema changes are guarded"),
+            "got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap(),
+            GUARDED_ROOT
+        );
+        server
+            .update_schema(Parameters(root_add_values(Some(true))))
+            .await
+            .expect("acknowledged, the same edit lands");
+    }
+
     #[tokio::test]
     async fn update_schema_root_set_field_and_remove_field_are_refused_without_acknowledgment() {
         let tmp = tempfile::tempdir().unwrap();
@@ -12193,6 +12302,17 @@ mod tests {
                 "an op's definition is missing '{key}': {op_definition}"
             );
         }
+        // `reinherit` is how a schema-enforcing client re-inherits a key: compaction
+        // strips the `null` arm of every definition property, so a literal `null` is
+        // not something such a client can send. It must survive as a string array.
+        let reinherit = &op["properties"]["reinherit"];
+        assert_eq!(reinherit["type"], serde_json::json!("array"), "{op}");
+        assert_eq!(
+            reinherit["items"]["type"],
+            serde_json::json!("string"),
+            "{op}"
+        );
+        assert!(reinherit["description"].is_string(), "{op}");
         // The flat parameters are still advertised, marked deprecated.
         for key in ["operation", "field", "values", "definition"] {
             assert!(
@@ -19496,6 +19616,91 @@ mod tests {
         ]})))
         .unwrap_err();
         assert!(err.message.contains("typ"), "{}", err.message);
+    }
+
+    #[test]
+    fn reinherit_is_the_null_free_way_to_inherit_a_key_again() {
+        let edits = |args: serde_json::Value| build_schema_edits(&schema_args(args));
+        // `reinherit` lowers to exactly the patch a literal `null` gives, alone or
+        // next to keys being set.
+        let via_list = edits(serde_json::json!({"ops": [
+            {"operation": "patch_field", "field": "x", "reinherit": ["required"]},
+            {"operation": "patch_field", "field": "y", "definition": {"indexed": true},
+             "reinherit": ["values", "open"]}
+        ]}))
+        .unwrap();
+        let via_null = edits(serde_json::json!({"ops": [
+            {"operation": "patch_field", "field": "x", "definition": {"required": null}},
+            {"operation": "patch_field", "field": "y",
+             "definition": {"indexed": true, "values": null, "open": null}}
+        ]}))
+        .unwrap();
+        assert_eq!(format!("{via_list:?}"), format!("{via_null:?}"));
+
+        let msg = |args: serde_json::Value| edits(args).unwrap_err().message;
+        let not_patch = msg(serde_json::json!({"ops": [
+            {"operation": "set_field", "field": "x", "definition": {"type": "text"},
+             "reinherit": ["required"]}
+        ]}));
+        assert!(not_patch.contains("only to patch_field"), "{not_patch}");
+        let unknown = msg(serde_json::json!({"ops": [
+            {"operation": "patch_field", "field": "x", "reinherit": ["requird"]}
+        ]}));
+        assert!(
+            unknown.contains("requird") && unknown.contains(FIELD_DEFINITION_KEYS),
+            "{unknown}"
+        );
+        let both = msg(serde_json::json!({"ops": [
+            {"operation": "patch_field", "field": "x", "definition": {"required": true},
+             "reinherit": ["required"]}
+        ]}));
+        assert!(both.contains("both set"), "{both}");
+        // An empty list with no definition still has nothing to change.
+        assert!(
+            msg(serde_json::json!({"ops": [
+                {"operation": "patch_field", "field": "x", "reinherit": []}
+            ]}))
+            .contains("requires a definition")
+        );
+    }
+
+    #[test]
+    fn field_definition_key_names_match_the_listed_keys() {
+        let listed: Vec<&str> = FIELD_DEFINITION_KEYS
+            .split(',')
+            .map(|k| k.trim().trim_matches('`'))
+            .collect();
+        assert_eq!(listed, FIELD_DEFINITION_KEY_NAMES);
+    }
+
+    #[tokio::test]
+    async fn reinherit_through_the_tool_drops_the_local_key() {
+        let (_bare, work, server, _config) = batch_server();
+        write_schema_file(
+            &work,
+            "notes",
+            "fields:\n  status:\n    required: true\n    indexed: true\n",
+        );
+        git_commit_all(
+            &work,
+            &format!("notes/{}", crate::schema::SCHEMA_FILE_NAME),
+            "notes schema",
+        );
+        server
+            .update_schema(Parameters(schema_args(serde_json::json!({
+                "path": "notes",
+                "ops": [{"operation": "patch_field", "field": "status",
+                         "reinherit": ["required"]}]
+            }))))
+            .await
+            .unwrap();
+        assert_eq!(
+            notes_schema(&work).unwrap().fields["status"],
+            crate::schema::RawFieldDef {
+                indexed: Some(true),
+                ..Default::default()
+            }
+        );
     }
 
     #[tokio::test]
