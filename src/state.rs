@@ -1467,6 +1467,36 @@ impl StateDb {
         Ok(rows)
     }
 
+    /// Every distinct author-written (`kind = 'markdown'`) edge as
+    /// `(source_path, target_path)`, ordered. Backs `lint`'s orphan check, which
+    /// must not count precomputed `semantic` neighbours as inbound links.
+    pub async fn markdown_link_pairs(&self) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT source_path, target_path FROM document_links
+             WHERE kind = 'markdown' ORDER BY source_path, target_path",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// `(file_path, size)` of every indexed file that has a `documents` row, ordered
+    /// by path. `size` is the byte length recorded at the last index run
+    /// (`indexed_files.size`), which `lint`'s oversize check uses to decide which
+    /// files are worth reading for a line count.
+    pub async fn indexed_document_sizes(&self) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT i.file_path, i.size FROM indexed_files i
+             JOIN documents d ON d.file_path = i.file_path
+             ORDER BY i.file_path",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Remove every edge originating from `path`, in either direction of kind.
     ///
     /// Called when a document is deleted/purged (from [`Self::delete_document`]) so a

@@ -1245,6 +1245,120 @@ const DIFF_TABLE: &[DiffField] = &[
                    layer is never rebuilt.",
         }],
     },
+    // ── lint ─────────────────────────────────────────────────────────────────
+    // Every `lint.*` key is read from the live config on each `lint` run and each
+    // `GET /status/lint` request (`lint::run_health_checks`'s callers load a fresh
+    // snapshot), so a reload applies to the next one. No indexing is involved.
+    DiffField {
+        path: "lint.dead_links",
+        get: |c| Some(d(&c.lint.dead_links)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.dead_links",
+            note: "read fresh by the next lint run / GET /status/lint request when no check is named.",
+        }],
+    },
+    DiffField {
+        path: "lint.orphans",
+        get: |c| Some(d(&c.lint.orphans)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.orphans",
+            note: "read fresh by the next lint run / GET /status/lint request when no check is named.",
+        }],
+    },
+    DiffField {
+        path: "lint.stale",
+        get: |c| Some(d(&c.lint.stale)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.stale",
+            note: "read fresh by the next lint run / GET /status/lint request when no check is named.",
+        }],
+    },
+    DiffField {
+        path: "lint.oversize",
+        get: |c| Some(d(&c.lint.oversize)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.oversize",
+            note: "read fresh by the next lint run / GET /status/lint request when no check is named.",
+        }],
+    },
+    DiffField {
+        path: "lint.tags",
+        get: |c| Some(d(&c.lint.tags)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.tags",
+            note: "read fresh by the next lint run / GET /status/lint request when no check is named.",
+        }],
+    },
+    DiffField {
+        path: "lint.orphan_entry_points",
+        get: |c| Some(d(&c.lint.orphan_entry_points)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.orphan_entry_points",
+            note: "read fresh by the next orphan check (lint.rs).",
+        }],
+    },
+    DiffField {
+        path: "lint.stale_after_days",
+        get: |c| Some(d(&c.lint.stale_after_days)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.stale_after_days",
+            note: "read fresh by the next stale check (lint.rs).",
+        }],
+    },
+    DiffField {
+        path: "lint.draft_stale_after_days",
+        get: |c| Some(d(&c.lint.draft_stale_after_days)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.draft_stale_after_days",
+            note: "read fresh by the next stale check (lint.rs).",
+        }],
+    },
+    DiffField {
+        path: "lint.stale_field",
+        get: |c| Some(d(&c.lint.stale_field)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.stale_field",
+            note: "read fresh by the next stale check (lint.rs); the frontmatter is read from \
+                   the state DB, so no reindex is needed.",
+        }],
+    },
+    DiffField {
+        path: "lint.max_lines",
+        get: |c| Some(d(&c.lint.max_lines)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.max_lines",
+            note: "read fresh by the next oversize check (lint.rs).",
+        }],
+    },
+    DiffField {
+        path: "lint.max_bytes",
+        get: |c| Some(d(&c.lint.max_bytes)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.max_bytes",
+            note: "read fresh by the next oversize check (lint.rs); unset falls back to \
+                   search.section_max_bytes.",
+        }],
+    },
+    DiffField {
+        path: "lint.tags_field",
+        get: |c| Some(d(&c.lint.tags_field)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.tags_field",
+            note: "read fresh by the next tag audit (lint.rs).",
+        }],
+    },
 ];
 
 /// Compare every YAML-reloadable setting between `old` and `new`, recording each one
@@ -1750,6 +1864,34 @@ mod tests {
         assert_eq!(report.applied[0].setting, "search.phrase");
         assert!(report.restart_required.is_empty());
         assert!(report.reindex_required.is_empty());
+    }
+
+    #[test]
+    fn lint_settings_are_reported_as_applied() {
+        let mut old = base_config();
+        let mut new = base_config();
+        old.lint.orphans = true;
+        new.lint.orphans = false;
+        old.lint.stale_after_days = 365;
+        new.lint.stale_after_days = 30;
+        new.lint.max_bytes = Some(5000);
+        new.lint.orphan_entry_points = vec!["index.md".into()];
+
+        let report = diff(&old, &new);
+        let mut applied: Vec<&str> = report.applied.iter().map(|c| c.setting.as_str()).collect();
+        applied.sort_unstable();
+        assert_eq!(
+            applied,
+            [
+                "lint.max_bytes",
+                "lint.orphan_entry_points",
+                "lint.orphans",
+                "lint.stale_after_days"
+            ]
+        );
+        assert!(report.restart_required.is_empty());
+        assert!(report.reindex_required.is_empty());
+        assert!(report.reindex_scheduled.is_empty());
     }
 
     #[test]

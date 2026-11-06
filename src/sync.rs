@@ -384,6 +384,7 @@ mod tests {
             search: Default::default(),
             reranking: None,
             ui: Default::default(),
+            lint: Default::default(),
             provenance: Default::default(),
         }
     }

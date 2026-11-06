@@ -340,6 +340,22 @@ schema rebuild and fails to start.
 
 ### Added
 
+- **Corpus health checks** (#354, milestone 2). `mcp-md-wiki lint` gains `orphans`,
+  `stale`, `oversize` and `tags` next to `dead-links`, driven by a new `lint:` config
+  section (per-check switches, `orphan_entry_points`, `stale_after_days` /
+  `draft_stale_after_days` / `stale_field`, `max_lines` / `max_bytes`, `tags_field`;
+  all live-reloadable, defaults in `deploy/config.example.yaml`), and the same report
+  is served at `GET /status/lint?check=&limit=` (behind the `/status` auth; 503 before
+  the first index) for an external scheduler to poll. Severities are fixed: dead links
+  and tags outside a declared enum are `error`, orphans / stale / oversize are
+  `warning`, singleton tags are `info`. Read-only over the state DB, the schema tree
+  and (oversize only) the larger files; no reindex, no schema or state change.
+  **Behavior change:** `lint` with no `--check` now runs every check `lint:` enables
+  (all five by default) instead of dead links only, `--check` is repeatable, and
+  `--json` prints a new envelope (`{"checks": [{check, severity, count, findings,
+  ...}]}`) rather than the old dead-link document list; `--limit` now caps findings
+  per check. The exit code is unchanged (0 unless there is no state DB), and
+  `GET /status/links` is unchanged.
 - **Schema list element definitions (`items`) and one path grammar** (#346). A
   `.schema.yaml` field (and `update_schema`'s `set_field` `definition`) accepts
   `items:`, the definition of each element of a list — a scalar, or an `object` with

@@ -748,6 +748,102 @@ async fn links_handler(
     }
 }
 
+/// The `check` names and `limit` of a `GET /status/lint` query string. `check` may be
+/// repeated and each value may list several names separated by commas (a `%2C`
+/// escape included); anything else in the query is ignored. Only plain ASCII names
+/// and digits are meaningful, so no general percent-decoding is done.
+fn parse_lint_query(raw: Option<&str>) -> Result<(Vec<String>, Option<usize>), String> {
+    let mut checks = Vec::new();
+    let mut limit = None;
+    for pair in raw.unwrap_or("").split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "check" => checks.push(value.replace("%2C", ",").replace("%2c", ",")),
+            "limit" => {
+                limit =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        format!("limit must be a non-negative integer, got '{value}'")
+                    })?);
+            }
+            _ => {}
+        }
+    }
+    Ok((checks, limit))
+}
+
+/// `GET /status/lint?check=&limit=`: the corpus health report (`lint`, #354),
+/// read-only, behind the same auth as `/status`. `check` (repeatable or
+/// comma-separated: `dead-links`, `orphans`, `stale`, `oversize`, `tags`) names the
+/// checks to run, else the ones the `lint:` config section enables; `limit` caps the
+/// findings listed per check, defaulting to `lint::DEFAULT_DEAD_LINK_LIMIT` and
+/// clamped to `1..=lint::MAX_DEAD_LINK_LIMIT`. 400 on an unknown check, 503 when no
+/// index exists yet.
+async fn lint_handler(
+    State(state): State<StatusState>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Response {
+    let (names, limit) = match parse_lint_query(raw.as_deref()) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response();
+        }
+    };
+    let named = match crate::lint::parse_check_names(names.iter().map(String::as_str)) {
+        Ok(named) => named,
+        Err(message) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response();
+        }
+    };
+    let cfg = config::load_shared_config(&state.config);
+    if !Path::new(&cfg.state_db_path()).exists() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no index yet"})),
+        )
+            .into_response();
+    }
+    let checks = if named.is_empty() {
+        crate::lint::enabled_checks(&cfg.lint)
+    } else {
+        named
+    };
+    let limit = limit
+        .unwrap_or(crate::lint::DEFAULT_DEAD_LINK_LIMIT)
+        .clamp(1, crate::lint::MAX_DEAD_LINK_LIMIT);
+    let result = async {
+        let db = state.state_db().await?;
+        // The live cache: `None` only for `StatusState::for_cli` on an invalid tree.
+        let schemas = state.schema_cache.as_ref().map(schema::load_shared);
+        let ctx = crate::lint::HealthContext::new(
+            db,
+            &cfg,
+            schemas.as_deref(),
+            crate::lint::now_epoch_seconds(),
+        );
+        crate::lint::run_health_checks(&ctx, &checks, limit).await
+    }
+    .await;
+    match result {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => {
+            error!("lint report failed: {e:#}");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "lint report failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn metrics_handler(State(state): State<StatusState>) -> Response {
     let status = cached_status(&state).await;
     let retrieval = crate::status::QUERY_METRICS.snapshot();
@@ -1851,6 +1947,7 @@ async fn wait_for_indexing_to_settle(is_indexing: impl Fn() -> bool) {
 const STATUS_PATH: &str = "/status";
 const METRICS_PATH: &str = "/metrics";
 const STATUS_LINKS_PATH: &str = "/status/links";
+const STATUS_LINT_PATH: &str = "/status/lint";
 const ADMIN_RELOAD_PATH: &str = "/admin/reload";
 const ADMIN_SYNC_PATH: &str = "/admin/sync";
 const MCP_PATH: &str = "/mcp";
@@ -1953,10 +2050,11 @@ fn unauthenticated_mcp_warning(bearer_token_env: &str) -> String {
     format!(
         "SECURITY: bearer token env var '{bearer_token_env}' (or '{bearer_token_env}_FILE') is \
          not set — {MCP_PATH}, \
-         {STATUS_PATH}, {STATUS_LINKS_PATH}, {METRICS_PATH}, {ADMIN_RELOAD_PATH} and {ADMIN_SYNC_PATH} are all reachable WITHOUT \
+         {STATUS_PATH}, {STATUS_LINKS_PATH}, {STATUS_LINT_PATH}, {METRICS_PATH}, {ADMIN_RELOAD_PATH} and {ADMIN_SYNC_PATH} are all reachable WITHOUT \
          authentication. {MCP_PATH} will serve full document content to any caller; \
          {STATUS_PATH} and {METRICS_PATH} expose tag vocabularies, area names and document \
-         counts; {ADMIN_RELOAD_PATH} lets any caller force a config reload and an \
+         counts; {STATUS_LINKS_PATH} and {STATUS_LINT_PATH} list document paths and what \
+         is wrong with them; {ADMIN_RELOAD_PATH} lets any caller force a config reload and an \
          unconditional full reindex reconcile; {ADMIN_SYNC_PATH} lets any caller trigger \
          a fetch from the remote. Set the env var or restrict network access. \
          (allow_unauthenticated is enabled in config)"
@@ -2055,6 +2153,7 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
         .route(STATUS_PATH, axum::routing::get(status_handler))
         .route(METRICS_PATH, axum::routing::get(metrics_handler))
         .route(STATUS_LINKS_PATH, axum::routing::get(links_handler))
+        .route(STATUS_LINT_PATH, axum::routing::get(lint_handler))
         .with_state(deps.status_state)
         .route_layer(middleware::from_fn_with_state(
             deps.auth.clone(),
@@ -3222,6 +3321,7 @@ mod tests {
             search: Default::default(),
             reranking: None,
             ui: Default::default(),
+            lint: Default::default(),
             provenance: Default::default(),
         })
     }
@@ -5089,6 +5189,8 @@ mod tests {
         for path in [
             MCP_PATH,
             STATUS_PATH,
+            STATUS_LINKS_PATH,
+            STATUS_LINT_PATH,
             METRICS_PATH,
             ADMIN_RELOAD_PATH,
             ADMIN_SYNC_PATH,
@@ -5111,6 +5213,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lint_query_takes_repeated_and_comma_separated_checks() {
+        assert_eq!(parse_lint_query(None).unwrap(), (vec![], None));
+        let (checks, limit) =
+            parse_lint_query(Some("check=orphans,stale&check=tags&limit=7&other=1")).unwrap();
+        assert_eq!(checks, ["orphans,stale", "tags"]);
+        assert_eq!(limit, Some(7));
+        let (checks, _) = parse_lint_query(Some("check=orphans%2Cstale")).unwrap();
+        assert_eq!(
+            crate::lint::parse_check_names(checks.iter().map(String::as_str)).unwrap(),
+            [crate::lint::Check::Orphans, crate::lint::Check::Stale]
+        );
+        assert!(parse_lint_query(Some("limit=many")).is_err());
+    }
+
     #[tokio::test]
     async fn router_assembly_rejects_unauthenticated_requests_on_every_protected_route() {
         let dir = tempfile::tempdir().unwrap();
@@ -5123,6 +5240,7 @@ mod tests {
             ("GET", STATUS_PATH),
             ("GET", METRICS_PATH),
             ("GET", STATUS_LINKS_PATH),
+            ("GET", STATUS_LINT_PATH),
             ("POST", ADMIN_RELOAD_PATH),
             ("POST", ADMIN_SYNC_PATH),
             ("POST", MCP_PATH),
@@ -5616,6 +5734,7 @@ mod tests {
             ("GET", STATUS_PATH),
             ("GET", METRICS_PATH),
             ("GET", STATUS_LINKS_PATH),
+            ("GET", STATUS_LINT_PATH),
             ("POST", ADMIN_RELOAD_PATH),
             ("POST", ADMIN_SYNC_PATH),
             ("POST", MCP_PATH),

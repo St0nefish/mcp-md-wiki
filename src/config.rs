@@ -37,6 +37,8 @@ pub struct Config {
     pub reranking: RerankingConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub lint: LintConfig,
 }
 
 /// `source` — YAML side. Every setting is either a secret name-indirection field
@@ -1329,6 +1331,98 @@ fn default_semantic_edges_min_score() -> f32 {
     0.6
 }
 
+/// `lint` — which corpus health checks run when none is named (#354), and their
+/// thresholds. Pure YAML tuning, no secrets, so like `ui` and `search` the parsed
+/// struct is copied straight onto `ResolvedConfig`. Every value is read fresh on
+/// each `lint` run / `GET /status/lint` request, so a reload applies at once.
+/// Naming a check explicitly (`lint --check X`, `?check=X`) runs it whatever its
+/// enable flag says.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LintConfig {
+    /// Enable the dead-link check.
+    #[serde(default = "default_true")]
+    pub dead_links: bool,
+    /// Enable the orphan check (documents no other document links to).
+    #[serde(default = "default_true")]
+    pub orphans: bool,
+    /// Enable the stale-document check.
+    #[serde(default = "default_true")]
+    pub stale: bool,
+    /// Enable the oversize-document check.
+    #[serde(default = "default_true")]
+    pub oversize: bool,
+    /// Enable the tag audit (singleton tags and tags outside a declared enum).
+    #[serde(default = "default_true")]
+    pub tags: bool,
+    /// Documents exempt from the orphan check (hubs, indexes, home pages):
+    /// KB-relative paths or globs, matched like `indexing.include`.
+    #[serde(default)]
+    pub orphan_entry_points: Vec<String>,
+    /// A document not updated for this many days is stale.
+    #[serde(default = "default_lint_stale_after_days")]
+    pub stale_after_days: u64,
+    /// The shorter threshold for a document whose `status` is `draft`.
+    #[serde(default = "default_lint_draft_stale_after_days")]
+    pub draft_stale_after_days: u64,
+    /// Frontmatter date/timestamp field read for a document's last update. A
+    /// document without a parseable value falls back to its file's modification
+    /// time as of the last index run, which resets on a fresh clone or pull and is
+    /// the weaker signal.
+    #[serde(default = "default_lint_stale_field")]
+    pub stale_field: String,
+    /// A document with more lines than this is oversize.
+    #[serde(default = "default_lint_max_lines")]
+    pub max_lines: u64,
+    /// A document larger than this many bytes is oversize. Unset: use
+    /// `search.section_max_bytes`, the size past which a whole-document read
+    /// degrades to an outline.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    /// Frontmatter field audited by the tag check.
+    #[serde(default = "default_lint_tags_field")]
+    pub tags_field: String,
+}
+
+impl Default for LintConfig {
+    fn default() -> Self {
+        Self {
+            dead_links: true,
+            orphans: true,
+            stale: true,
+            oversize: true,
+            tags: true,
+            orphan_entry_points: Vec::new(),
+            stale_after_days: default_lint_stale_after_days(),
+            draft_stale_after_days: default_lint_draft_stale_after_days(),
+            stale_field: default_lint_stale_field(),
+            max_lines: default_lint_max_lines(),
+            max_bytes: None,
+            tags_field: default_lint_tags_field(),
+        }
+    }
+}
+
+fn default_lint_stale_after_days() -> u64 {
+    365
+}
+
+fn default_lint_draft_stale_after_days() -> u64 {
+    90
+}
+
+fn default_lint_stale_field() -> String {
+    "updated".into()
+}
+
+fn default_lint_max_lines() -> u64 {
+    2000
+}
+
+fn default_lint_tags_field() -> String {
+    "tags".into()
+}
+
 /// Resolved embedding config — all required fields are guaranteed present.
 #[derive(Debug, Clone)]
 pub struct ResolvedEmbeddingConfig {
@@ -1517,6 +1611,18 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("ui.semantic_edges.k", "ui"),
     ("ui.semantic_edges.min_score", "ui"),
     ("ui.api_auth", "ui"),
+    ("lint.dead_links", "lint"),
+    ("lint.orphans", "lint"),
+    ("lint.stale", "lint"),
+    ("lint.oversize", "lint"),
+    ("lint.tags", "lint"),
+    ("lint.orphan_entry_points", "lint"),
+    ("lint.stale_after_days", "lint"),
+    ("lint.draft_stale_after_days", "lint"),
+    ("lint.stale_field", "lint"),
+    ("lint.max_lines", "lint"),
+    ("lint.max_bytes", "lint"),
+    ("lint.tags_field", "lint"),
 ];
 
 /// Recursively flattens a `serde_yaml_ng::Value` tree into dot-joined leaf paths,
@@ -1596,6 +1702,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "search",
     "reranking",
     "ui",
+    "lint",
 ];
 
 /// Whether `content` sets `search.granularities` itself, as opposed to leaving it
@@ -1695,6 +1802,7 @@ pub struct ResolvedConfig {
     pub search: SearchConfig,
     pub reranking: Option<ResolvedRerankingConfig>,
     pub ui: UiConfig,
+    pub lint: LintConfig,
     /// Where every resolved setting's value came from — see [`ConfigProvenance`].
     pub provenance: ConfigProvenance,
 }
@@ -2098,6 +2206,26 @@ impl Config {
         if self.indexing.reconcile_interval_secs == 0 {
             anyhow::bail!("indexing.reconcile_interval_secs must be >= 1");
         }
+        if self.lint.stale_after_days == 0 {
+            anyhow::bail!("lint.stale_after_days must be >= 1");
+        }
+        if self.lint.draft_stale_after_days == 0 {
+            anyhow::bail!("lint.draft_stale_after_days must be >= 1");
+        }
+        if self.lint.max_lines == 0 {
+            anyhow::bail!("lint.max_lines must be >= 1");
+        }
+        if self.lint.max_bytes == Some(0) {
+            anyhow::bail!(
+                "lint.max_bytes must be >= 1 (leave it unset to use search.section_max_bytes)"
+            );
+        }
+        if self.lint.stale_field.trim().is_empty() {
+            anyhow::bail!("lint.stale_field must not be empty");
+        }
+        if self.lint.tags_field.trim().is_empty() {
+            anyhow::bail!("lint.tags_field must not be empty");
+        }
         if self.ui.semantic_edges.k == 0 {
             anyhow::bail!("ui.semantic_edges.k must be >= 1");
         }
@@ -2250,6 +2378,7 @@ impl Config {
                 None
             },
             ui: self.ui,
+            lint: self.lint,
             provenance: ConfigProvenance(
                 provenance
                     .into_iter()
@@ -2981,6 +3110,7 @@ mcp:
             search: SearchConfig::default(),
             reranking: None,
             ui: UiConfig::default(),
+            lint: LintConfig::default(),
             provenance: ConfigProvenance::default(),
         };
 
@@ -3163,6 +3293,51 @@ mcp:
         // The example's reranking.max_document_bytes must stay in sync with the
         // compiled default (#307).
         assert_eq!(cfg.reranking.max_document_bytes, 6144);
+        // The example's lint section must stay in sync with the compiled defaults
+        // (#354); `max_bytes` is left unset there.
+        assert!(cfg.lint.dead_links && cfg.lint.orphans && cfg.lint.stale);
+        assert!(cfg.lint.oversize && cfg.lint.tags);
+        assert!(cfg.lint.orphan_entry_points.is_empty());
+        assert_eq!(cfg.lint.stale_after_days, 365);
+        assert_eq!(cfg.lint.draft_stale_after_days, 90);
+        assert_eq!(cfg.lint.stale_field, "updated");
+        assert_eq!(cfg.lint.max_lines, 2000);
+        assert_eq!(cfg.lint.max_bytes, None);
+        assert_eq!(cfg.lint.tags_field, "tags");
+    }
+
+    #[test]
+    fn lint_config_defaults_and_validation() {
+        let cfg = Config::from_str_raw("{}").unwrap();
+        assert!(cfg.lint.dead_links && cfg.lint.orphans && cfg.lint.stale);
+        assert_eq!(cfg.lint.stale_after_days, 365);
+        assert_eq!(cfg.lint.max_bytes, None);
+        // An unknown key is a schema error like every other section.
+        assert!(Config::from_str_raw("lint:\n  nope: 1\n").is_err());
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        for (yaml, needle) in [
+            ("lint:\n  stale_after_days: 0\n", "lint.stale_after_days"),
+            (
+                "lint:\n  draft_stale_after_days: 0\n",
+                "lint.draft_stale_after_days",
+            ),
+            ("lint:\n  max_lines: 0\n", "lint.max_lines"),
+            ("lint:\n  max_bytes: 0\n", "lint.max_bytes"),
+            ("lint:\n  stale_field: ''\n", "lint.stale_field"),
+            ("lint:\n  tags_field: ''\n", "lint.tags_field"),
+        ] {
+            let err = Config::from_str(&format!("{MINIMAL_CONFIG}\n{yaml}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{yaml}: {err}");
+        }
+        let ok = format!("{MINIMAL_CONFIG}\nlint:\n  max_bytes: 5000\n  orphans: false\n");
+        let cfg = Config::from_str(&ok).unwrap();
+        assert_eq!(cfg.lint.max_bytes, Some(5000));
+        assert!(!cfg.lint.orphans);
+        clear_required_env();
     }
 
     #[test]
@@ -3590,6 +3765,7 @@ mcp:
             search: SearchConfig::default(),
             reranking: None,
             ui: UiConfig::default(),
+            lint: LintConfig::default(),
             provenance: ConfigProvenance::default(),
         }
     }

@@ -139,13 +139,6 @@ struct GetArgs {
     end_line: Option<usize>,
 }
 
-/// Checks the `lint` subcommand can run.
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum LintCheck {
-    /// Broken internal markdown links across the corpus
-    DeadLinks,
-}
-
 #[derive(Subcommand)]
 enum Commands {
     /// Start the server (MCP + webhook endpoints) [default]
@@ -181,20 +174,26 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Run corpus-wide lint checks against the last indexed state (#354)
+    /// Run corpus health checks against the last indexed state (#354)
     ///
-    /// Read-only: reads the state DB, never creates it. Findings are reported, not
-    /// failed on: the exit code is 0 whether or not anything is found, and non-zero
-    /// only when there is no state DB to read (run `index` first). That keeps the
-    /// command safe to run from cron or CI without turning link rot into an outage.
+    /// Checks: dead-links, orphans, stale, oversize and tags (singleton tags and tags
+    /// outside a declared enum). With no `--check`, every check the `lint:` config
+    /// section enables runs; naming checks runs exactly those, whatever the config
+    /// says. Read-only: reads the state DB (never creates it), the schema tree and,
+    /// for oversize, the larger files; no Qdrant, no embeddings. Findings are
+    /// reported, not failed on: the exit code is 0 whether or not anything is found,
+    /// and non-zero only when there is no state DB to read (run `index` first). That
+    /// keeps the command safe to run from cron or CI without turning link rot into an
+    /// outage.
     Lint {
-        /// Which check to run (more will be added; dead-links is the default)
-        #[arg(long, value_enum, default_value_t = LintCheck::DeadLinks)]
-        check: LintCheck,
-        /// Emit the report as JSON on stdout
+        /// Which check to run; repeatable (default: the checks `lint:` enables)
+        #[arg(long, value_enum)]
+        check: Vec<lint::Check>,
+        /// Emit the report as JSON on stdout: {"checks": [{check, severity, count,
+        /// findings, ...}]}
         #[arg(long)]
         json: bool,
-        /// Maximum broken links to list (the true count is always reported)
+        /// Maximum findings to list per check (the true count is always reported)
         #[arg(long, default_value_t = lint::DEFAULT_DEAD_LINK_LIMIT)]
         limit: usize,
     },
@@ -467,17 +466,39 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("no index at {state_db_path}; run `mcp-md-wiki index` first");
             }
             let state = state::StateDb::new(std::path::Path::new(&state_db_path)).await?;
-            match check {
-                LintCheck::DeadLinks => {
-                    let limit = limit.clamp(1, lint::MAX_DEAD_LINK_LIMIT);
-                    let report =
-                        lint::dead_links(&state, Path::new(cfg.data_path()), limit).await?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
-                    } else {
-                        lint::write_dead_links(&mut std::io::stdout().lock(), &report)?;
+            let checks = if check.is_empty() {
+                lint::enabled_checks(&cfg.lint)
+            } else {
+                check
+            };
+            // The schema tree gives the tag check its permitted values. An invalid
+            // tree must not stop the other checks: the tag check says it was skipped.
+            let schemas = if checks.contains(&lint::Check::Tags) {
+                match schema::SchemaCache::build(
+                    &cfg.canonical_data_path(),
+                    &cfg.frontmatter,
+                    &cfg.indexing,
+                ) {
+                    Ok(schemas) => Some(schemas),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: {} schema file(s) are invalid (run `validate` for \
+                             details); tags outside a declared enum are not checked",
+                            e.invalid.len()
+                        );
+                        None
                     }
                 }
+            } else {
+                None
+            };
+            let ctx =
+                lint::HealthContext::new(&state, &cfg, schemas.as_ref(), lint::now_epoch_seconds());
+            let report = lint::run_health_checks(&ctx, &checks, limit).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                lint::write_health(&mut std::io::stdout().lock(), &report)?;
             }
         }
         Commands::Status { json, files } => {

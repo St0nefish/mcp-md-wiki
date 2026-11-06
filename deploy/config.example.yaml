@@ -933,6 +933,56 @@ ui:
     min_score: 0.6
 
 
+# ----------------------------------------------------------------------------
+# lint — corpus health checks (`mcp-md-wiki lint`, GET /status/lint)
+# ----------------------------------------------------------------------------
+# Read-only checks over the state DB as of the last index run (#354). The
+# per-check booleans choose what runs when a caller names no check; naming one
+# (`lint --check orphans`, `/status/lint?check=orphans`) runs it regardless.
+# Pure YAML tuning, live-reloadable via POST /admin/reload.
+lint:
+
+  # Per-check enable flags (all on by default).
+  #   dead_links — author-written links whose target is not indexed (error)
+  #   orphans    — documents no other document links to (warning)
+  #   stale      — documents not updated within the thresholds below (warning)
+  #   oversize   — documents past max_lines / max_bytes (warning)
+  #   tags       — tags used once (info) and tags outside a declared enum (error)
+  dead_links: true
+  orphans: true
+  stale: true
+  oversize: true
+  tags: true
+
+  # Documents the orphan check skips (hubs, indexes, home pages): KB-relative
+  # paths or globs, matched like indexing.include. Default: none.
+  orphan_entry_points: []
+  #  - index.md
+  #  - "*/README.md"
+
+  # A document not updated for this many days is stale; a document whose
+  # `status` is `draft` uses the shorter threshold.
+  stale_after_days: 365
+  draft_stale_after_days: 90
+
+  # Frontmatter date/timestamp field that records the last update. A document
+  # without a parseable value falls back to its file's modification time as of
+  # the last index run — which resets on a fresh clone or pull, so keep this
+  # field in your frontmatter for a reliable signal.
+  stale_field: updated
+
+  # A document with more lines than this is oversize.
+  max_lines: 2000
+
+  # A document larger than this many bytes is oversize. Unset by default, which
+  # uses search.section_max_bytes (the size past which a whole-document read
+  # degrades to an outline).
+  # max_bytes: 16000
+
+  # Frontmatter field the tag check audits.
+  tags_field: tags
+
+
 # ============================================================================
 # ENV-only settings — cannot be set here; setting any of these under the
 # matching YAML section above is a schema error (unknown field)
