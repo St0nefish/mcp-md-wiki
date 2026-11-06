@@ -36,6 +36,34 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   `/api/doc/{*path}` used to try an absolute path literally on the host first, so the
   error told a caller whether a file existed outside the KB. A leading `/` now always
   means the KB root, as it already did for the write tools.
+- **The web UI's `/api/*` routes check `Host` and `Origin`.** With
+  `mcp.allowed_hosts` set, a request whose `Host` is not listed is refused with `403`
+  (matched the way `/mcp` matches it), closing DNS rebinding against the UI API, which
+  had no Host check before. A `POST`/`PUT`/`PATCH`/`DELETE` carrying an `Origin` must
+  come from the request's own host (host-only comparison) or a listed host; a request
+  without `Origin` passes. `mcp.allowed_hosts` is still restart-required; its docs now
+  say it guards the UI API too. Behavior change: with `mcp.allowed_hosts` set, a
+  browser or script reaching the UI under a hostname not in the list now gets `403`
+  on `/api/*` — add that hostname.
+- **UI responses carry browser hardening headers.** `/`, `/assets/*` and `/api/*`
+  send a `Content-Security-Policy` (`script-src 'self'`, `frame-ancestors 'none'`,
+  `base-uri 'none'`, `object-src 'none'`; inline styles and external images stay
+  allowed for rendered markdown), `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`. `/mcp`, `/health` and
+  `/metrics` are unchanged.
+- **Startup warning when the UI write API is unauthenticated.** With `ui.api_auth`
+  off, `serve` logs that `POST`/`DELETE /api/doc` are unauthenticated and the
+  deployment must sit behind an authenticating proxy or set `ui.api_auth: true`.
+- **Compose files publish port 8001 on loopback by default.** `docker-compose.yml`
+  and `deploy/templates/compose-*.yml` now map
+  `"${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8001}:8001"` (`MCP_BIND` and `MCP_PORT` are
+  documented in `deploy/.env.example`). A Traefik on the same Docker network reaches
+  the container port directly and is unaffected. Behavior change: agents or devices
+  on other hosts connecting directly to `:8001` must set `MCP_BIND=0.0.0.0`.
+  `deploy/templates/traefik-labels.yml` now warns that without an auth middleware
+  the UI write API is open, and carries a commented-out forward-auth (Authentik
+  outpost) example applied to the UI router only, with `/mcp` and the other
+  self-authenticating routes on a separate router.
 
 ## [0.2.2] - 2026-11-03
 

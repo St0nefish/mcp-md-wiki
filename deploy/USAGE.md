@@ -512,14 +512,14 @@ This is a sound default, and it's the only posture worth reaching for on any net
 
 If you're content treating LAN reachability itself as the access control for the routes that carry no in-process gate — a single trusted subnet, a homelab, a tailnet where every peer is a device you already own — you can publish the port directly to a specific interface instead of routing everything through a proxy. This is a second supported posture, not a workaround for skipping Posture A's setup.
 
-The change is in the compose file's `ports:` mapping. Every GPU-backend template (`deploy/templates/compose-cpu.yml:61`, and the `-nvidia`/`-rocm`/`-vulkan`/`-apple-silicon` variants at the equivalent line) ships the same default:
+The change is in the compose file's `ports:` mapping. Every GPU-backend template (the `ports:` key of the `mcp-md-wiki` service in `deploy/templates/compose-cpu.yml`, and the same key in the `-nvidia`/`-rocm`/`-vulkan`/`-apple-silicon` variants) and the root `docker-compose.yml` ship the same default, which publishes on loopback only:
 
 ```yaml
 ports:
-  - "${MCP_PORT:-8001}:8001"
+  - "${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8001}:8001"
 ```
 
-With no host address before the first colon, Docker binds to `0.0.0.0` — every interface the host has, including anything routable from outside the LAN. Naming an address is what actually confines the binding:
+A reverse proxy on the same Docker network (Traefik, say) reaches the container port directly and needs no published port at all. For Posture B you must name the interface the LAN can reach. Setting the host address to `0.0.0.0` binds every interface the host has, including anything routable from outside the LAN, so prefer a specific address:
 
 ```yaml
 ports:
@@ -528,14 +528,7 @@ ports:
   - "100.101.102.103:8001:8001"
 ```
 
-If you want the address configurable per host rather than hardcoded, follow the same `${VAR:-default}` pattern the template already uses for `MCP_PORT`:
-
-```yaml
-ports:
-  - "${MCP_BIND_ADDR:-192.168.1.50}:${MCP_PORT:-8001}:8001"
-```
-
-and set `MCP_BIND_ADDR` in `.env` alongside the variables from [Set up environment variables](#3-set-up-environment-variables) — this is a `docker compose` host-side substitution, not something the binary itself reads, so any name works.
+The templates already read the address from `MCP_BIND`, so you do not need to edit the file: set `MCP_BIND=192.168.1.50` (or `0.0.0.0`) in `.env` alongside the variables from [Set up environment variables](#3-set-up-environment-variables). This is a `docker compose` host-side substitution, not something the binary itself reads.
 
 #### Exactly what publishing the port grants access to
 

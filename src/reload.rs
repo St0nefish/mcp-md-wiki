@@ -624,7 +624,9 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.allowed_hosts",
             note: "baked into the StreamableHttpServerConfig when the MCP service is \
-                   built (server.rs mcp_transport_config, invoked once from run_server).",
+                   built (server.rs mcp_transport_config, invoked once from run_server), \
+                   and into the web UI's /api/* Host/Origin guard when the router is \
+                   assembled.",
         }],
     },
     DiffField {

@@ -529,12 +529,18 @@ mcp:
   # rebinding, and a bearer-authenticated server already refuses those requests
   # at auth. Worth setting mainly when allow_unauthenticated is true.
   #
+  # The same list also guards the web UI's /api/* routes (unauthenticated
+  # unless ui.api_auth is on), where it is worth setting in any deployment:
+  # a request whose Host is not listed gets 403, and a cross-origin POST/DELETE
+  # is accepted only from a listed host (or the request's own Host).
+  #
   # Behind a reverse proxy, list the PUBLIC hostname clients connect to — the
   # proxy forwards the original Host header, not the container's address.
   # Include a port only if clients send one.
   #
-  # RESTART REQUIRED: baked into the MCP transport when it is built at
-  # startup — POST /admin/reload cannot change this on a running server.
+  # RESTART REQUIRED: baked into the MCP transport and the web UI router when
+  # they are built at startup — POST /admin/reload cannot change this on a
+  # running server.
   # allowed_hosts:
   #   - "kb.example.com"
 

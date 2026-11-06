@@ -75,7 +75,11 @@ services:
       - HOME=/tmp
       - RUST_LOG=${RUST_LOG:-info}
     ports:
-      - "${MCP_PORT:-8001}:8001"
+      # Loopback by default: a reverse proxy on the same Docker network reaches the
+      # container port directly. Set MCP_BIND=0.0.0.0 only for direct access from
+      # other hosts — the web UI write API (POST/DELETE /api/doc) is unauthenticated
+      # by default.
+      - "${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8001}:8001"
     healthcheck:
       test: ["CMD", "mcp-md-wiki", "health"]
       interval: 10s

@@ -32,6 +32,9 @@ cp deploy/config.example.yaml config.yaml
 
 # Start the stack (CPU mode by default)
 # With git_url set, the server auto-clones the repo and runs a full index on first start
+# Port 8001 is published on 127.0.0.1 only: set MCP_BIND=0.0.0.0 in .env for
+# clients on other hosts (the web UI's write API is unauthenticated by default —
+# see "Web UI" below)
 docker compose up -d
 
 # Add MCP to Claude Code
@@ -475,7 +478,7 @@ Server and tool descriptions are assembled from three layers, in order: mechanic
 
 ## Web UI
 
-The server also ships a browser UI, served at `/` on the same port as MCP (8001) — no separate service, no separate port. Point a browser at `http://your-host:8001/` (or wherever it sits behind your reverse proxy).
+The server also ships a browser UI, served at `/` on the same port as MCP (8001) — no separate service, no separate port. Point a browser at your reverse proxy's hostname, or at `http://localhost:8001/` on the Docker host — the shipped compose files publish the port on `127.0.0.1` only (`MCP_BIND`, see `deploy/.env.example`).
 
 It's docs-first: a sidebar document tree and a semantic-search results panel (backed by the same `search` retrieval core as the MCP tool) are the primary views. A Cytoscape.js graph view is available alongside them — either a whole-knowledge-base view or, from any open document, its link neighborhood — and a full document editor lets you create, edit, move, and delete documents directly from the browser.
 
@@ -485,7 +488,9 @@ Besides the shell and `/api/doc/{*path}`, the UI's JSON routes are `GET /api/gra
 
 **By default the web UI has no authentication of its own, on any of its routes, including the write and delete ones.** This is deliberate, not an oversight: `MCP_BEARER_TOKEN` (and `mcp.allow_unauthenticated`) gate `/mcp`, `/status`, `/metrics`, `POST /admin/reload` and `POST /admin/sync` — they do **not** gate `/`, `/api/graph`, `/api/search`, `/api/enumerate`, `/api/schema/{*path}`, `/api/changes` or `/api/doc/{*path}` (GET, POST, *or* DELETE). Setting a bearer token does not add a credential requirement to the web UI in any way; it remains exactly as open as `/health`. The opt-in exception is `ui.api_auth: true` (restart required), which puts the same authentication layer as `/mcp` (the static token and/or an OAuth access token) in front of every `/api/*` route; `/` and `/assets/*` stay open so the page can load, and a browser then has to present the credential itself, so it suits API clients and proxies that inject a header better than a plain browser session. The intended deployment shape puts an identity-aware reverse proxy — Authentik via Traefik, in the reference deployment this project targets — in front of the whole port, and relies on that proxy for the web UI's access control entirely.
 
-**Practical consequence:** if you publish port 8001 directly (a bare `docker run -p 8001:8001`, a cloud load balancer with no auth in front, a home-lab port-forward) without a reverse-proxy auth layer ahead of it, anyone who can reach that port can read, create, edit, and delete every document in the knowledge base through the web UI — regardless of whether `MCP_BEARER_TOKEN` is set. Put an authenticating reverse proxy in front of port 8001 for any deployment reachable beyond a fully trusted network; the MCP bearer token alone does not cover this surface.
+**Practical consequence:** if you publish port 8001 directly (a bare `docker run -p 8001:8001`, a cloud load balancer with no auth in front, a home-lab port-forward) without a reverse-proxy auth layer ahead of it, anyone who can reach that port can read, create, edit, and delete every document in the knowledge base through the web UI — regardless of whether `MCP_BEARER_TOKEN` is set. Put an authenticating reverse proxy in front of port 8001 for any deployment reachable beyond a fully trusted network; the MCP bearer token alone does not cover this surface. The server logs a startup warning whenever `ui.api_auth` is off. The shipped compose files bind the published port to `127.0.0.1` by default (`MCP_BIND`); a Traefik on the same Docker network reaches the container port directly and is unaffected, while clients on other hosts connecting straight to `:8001` need `MCP_BIND=0.0.0.0`. `deploy/templates/traefik-labels.yml` carries a commented-out forward-auth (Authentik outpost) example that protects the UI while leaving `/mcp` and the other self-authenticating routes on their own router.
+
+**Browser-side guards.** Every `/api/*` route checks where a request came from, independent of `ui.api_auth`: with `mcp.allowed_hosts` set, a request whose `Host` is not in the list is refused with `403` (the same matching `/mcp` uses — an entry without a port matches any port, case-insensitive), which defeats DNS rebinding; and a `POST`/`PUT`/`PATCH`/`DELETE` that carries an `Origin` header must come from the request's own host (compared host-only, since a TLS-terminating proxy changes the scheme and port) or from a host in `mcp.allowed_hosts`, else `403`. A request with no `Origin` (curl, scripts) passes. Every UI response — the shell, `/assets/*` and `/api/*` — carries `Content-Security-Policy` (scripts from this server only, no framing, external images allowed for document markdown), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`.
 
 ## `.schema.yaml` Directory Schemas
 
