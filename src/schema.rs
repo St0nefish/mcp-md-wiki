@@ -811,6 +811,190 @@ pub struct SchemaFile {
     /// schema error like any other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedup: Option<RawDedup>,
+    /// Frontmatter fields ingest sets from the document's location rather than reads
+    /// (#345), by field name. Root schema file only — anywhere else it has no effect
+    /// and [`lint_raw`] warns. Absent means nothing is derived. Hand-edited like
+    /// `dedup`: `update_schema` never writes it but preserves it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_derived"
+    )]
+    pub derived: Option<BTreeMap<String, DerivedField>>,
+    /// Whether `update_schema` edits to the root scope need an explicit
+    /// acknowledgement (#345). Root schema file only, like `derived`; absent means
+    /// root edits are not guarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_edit: Option<RootEditPolicy>,
+}
+
+/// A present `derived:` block, refusing a field named twice: the YAML parser would
+/// otherwise keep the last entry and silently drop the other. A null value is
+/// absent.
+fn deserialize_derived<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, DerivedField>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct UniqueMap(BTreeMap<String, DerivedField>);
+    impl<'de> Deserialize<'de> for UniqueMap {
+        fn deserialize<D2: serde::Deserializer<'de>>(d: D2) -> Result<Self, D2::Error> {
+            d.deserialize_map(Unique).map(UniqueMap)
+        }
+    }
+    struct Unique;
+    impl<'de> serde::de::Visitor<'de> for Unique {
+        type Value = BTreeMap<String, DerivedField>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of derived field names to rules")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some((name, rule)) = map.next_entry::<String, DerivedField>()? {
+                if out.contains_key(&name) {
+                    return Err(serde::de::Error::custom(format!(
+                        "derived field '{name}' is declared more than once (duplicate key)"
+                    )));
+                }
+                out.insert(name, rule);
+            }
+            Ok(out)
+        }
+    }
+    // A YAML null (`derived:` with nothing after it, or `derived: ~`) reads as
+    // absent, as it does for every other optional block.
+    Ok(Option::<UniqueMap>::deserialize(deserializer)?.map(|m| m.0))
+}
+
+/// Where a derived field's value comes from (#345).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DerivedFrom {
+    /// The document's `index`-th directory segment, counted from the top-level
+    /// folder (index 0). The file name is never a segment.
+    PathSegment,
+}
+
+/// One entry of a root schema's `derived:` block (#345), e.g.
+/// `domain: {from: path_segment, index: 0}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedField {
+    pub from: DerivedFrom,
+    pub index: usize,
+}
+
+impl DerivedField {
+    /// A `path_segment` rule at `index`.
+    #[cfg(test)]
+    pub fn path_segment(index: usize) -> Self {
+        Self {
+            from: DerivedFrom::PathSegment,
+            index,
+        }
+    }
+
+    /// The value this rule gives a document at KB-relative `rel_path`, or `None`
+    /// when the path has no such directory segment (a document at the corpus root,
+    /// or one not that deep).
+    pub fn derive(&self, rel_path: &str) -> Option<String> {
+        match self.from {
+            DerivedFrom::PathSegment => {
+                let components: Vec<_> = Path::new(rel_path).components().collect();
+                // The last component is the file name, never a segment.
+                let (_, dirs) = components.split_last()?;
+                match dirs.get(self.index)? {
+                    std::path::Component::Normal(name) => name.to_str().map(str::to_string),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
+/// A root schema's `root_edit:` block (#345).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootEditPolicy {
+    /// Refuse a root-scope `update_schema` edit unless the call passes
+    /// `acknowledge_root_change: true`.
+    pub require_ack: bool,
+    /// A document in the knowledge base that states the root schema's policy, named
+    /// in the refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_doc: Option<String>,
+}
+
+/// Most entries a `derived:` block may hold.
+pub const MAX_DERIVED_FIELDS: usize = 16;
+/// Highest `index` a `path_segment` rule may name.
+pub const MAX_DERIVED_SEGMENT_INDEX: usize = 32;
+/// Longest derived field name, in bytes.
+pub const MAX_DERIVED_FIELD_NAME_LEN: usize = 64;
+/// Longest `root_edit.policy_doc`, in bytes.
+pub const MAX_POLICY_DOC_LEN: usize = 256;
+
+/// Check a `derived:` block: a bounded number of plain top-level field names (ASCII
+/// letters, digits, `_`, `-`), none of them a name the index stores its own value
+/// under or promotes (`title`, `description`), each with a bounded segment index.
+fn validate_derived(derived: &BTreeMap<String, DerivedField>) -> Result<(), String> {
+    if derived.len() > MAX_DERIVED_FIELDS {
+        return Err(format!(
+            "derived declares {} fields; at most {MAX_DERIVED_FIELDS} are allowed",
+            derived.len()
+        ));
+    }
+    for (name, rule) in derived {
+        if name.is_empty()
+            || name.len() > MAX_DERIVED_FIELD_NAME_LEN
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!(
+                "derived field '{name}' must be a top-level field name of 1 to \
+                 {MAX_DERIVED_FIELD_NAME_LEN} ASCII letters, digits, '_' or '-'"
+            ));
+        }
+        if RESERVED_PAYLOAD_NAMES.contains(&name.as_str())
+            || matches!(name.as_str(), "title" | "description")
+        {
+            return Err(format!(
+                "derived field '{name}' is reserved — the index stores its own value \
+                 under that name"
+            ));
+        }
+        if rule.index > MAX_DERIVED_SEGMENT_INDEX {
+            return Err(format!(
+                "derived field '{name}': index must be at most \
+                 {MAX_DERIVED_SEGMENT_INDEX}, got {}",
+                rule.index
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check a `root_edit:` block's `policy_doc`: non-empty, bounded, no control
+/// characters (it is quoted in a refusal a model reads).
+fn validate_root_edit(root_edit: &RootEditPolicy) -> Result<(), String> {
+    if let Some(doc) = &root_edit.policy_doc
+        && (doc.trim().is_empty()
+            || doc.len() > MAX_POLICY_DOC_LEN
+            || doc.chars().any(char::is_control))
+    {
+        return Err(format!(
+            "root_edit.policy_doc must be a non-empty path of at most \
+             {MAX_POLICY_DOC_LEN} bytes with no control characters"
+        ));
+    }
+    Ok(())
 }
 
 /// The `dedup:` block of a schema file. Each key is independently optional;
@@ -855,6 +1039,12 @@ impl SchemaFile {
                 "dedup.related_limit must be at most {}, got {limit}",
                 crate::write::MAX_RELATED_LIMIT
             ));
+        }
+        if let Some(derived) = &self.derived {
+            validate_derived(derived)?;
+        }
+        if let Some(root_edit) = &self.root_edit {
+            validate_root_edit(root_edit)?;
         }
         for (name, raw) in &self.fields {
             validate_raw(name, raw)?;
@@ -1012,12 +1202,23 @@ pub const RESERVED_PAYLOAD_NAMES: &[&str] = &[
 ///   field (where it is at best a roundabout way to forbid one of the two values);
 /// - a `default` anywhere under a list's `items` (a `[]` path), which is never
 ///   applied to list elements;
-/// - a top-level field whose name is one of [`RESERVED_PAYLOAD_NAMES`].
-///
-/// `_is_root` says whether the file is the knowledge base's root schema; no check
-/// depends on it yet, but root-only blocks will (#345).
-pub fn lint_raw(file: &SchemaFile, _is_root: bool) -> Vec<String> {
+/// - a top-level field whose name is one of [`RESERVED_PAYLOAD_NAMES`];
+/// - a root-only block (`derived`, `root_edit`) in a file that is not the knowledge
+///   base's root schema (`is_root` false), where it has no effect (#345).
+pub fn lint_raw(file: &SchemaFile, is_root: bool) -> Vec<String> {
     let mut warnings = Vec::new();
+    if !is_root {
+        for (block, present) in [
+            ("derived", file.derived.is_some()),
+            ("root_edit", file.root_edit.is_some()),
+        ] {
+            if present {
+                warnings.push(format!(
+                    "'{block}' only takes effect in the root schema; here it is ignored"
+                ));
+            }
+        }
+    }
     for (key, raw) in &file.fields {
         if let Some(PathStep::Field(name)) = FieldPath::parse(key).steps().first()
             && RESERVED_PAYLOAD_NAMES.contains(&name.as_str())
@@ -1696,9 +1897,24 @@ pub struct ResolvedSchema {
     pub related_min_score: Option<f32>,
     /// As `dedup_enabled`, for `write.related_limit` (#356).
     pub related_limit: Option<usize>,
+    /// The root schema file's `derived:` block (#345), inherited unchanged by every
+    /// scope below it; empty when there is no root schema file or it declares none.
+    pub derived: BTreeMap<String, DerivedField>,
+    /// The root schema file's `root_edit:` block (#345), inherited like `derived`.
+    pub root_edit: Option<RootEditPolicy>,
 }
 
 impl ResolvedSchema {
+    /// The fields ingest derives from a document's location (#345) rather than reads.
+    pub fn derived_field_names(&self) -> impl Iterator<Item = &str> {
+        self.derived.keys().map(String::as_str)
+    }
+
+    /// Whether ingest derives `field` (#345).
+    pub fn is_derived(&self, field: &str) -> bool {
+        self.derived.contains_key(field)
+    }
+
     /// Which scope last declared each flat-view field — the scope that contributed its
     /// current definition (the [`FieldDef::declared_in`] of each entry). Drives error
     /// messages and `get_schema` provenance.
@@ -1797,7 +2013,20 @@ impl ResolvedSchema {
         }
 
         let dedup = child.dedup.as_ref();
+        // Root-only blocks (#345): the root schema file sets them, every other scope
+        // inherits its parent's, and one written anywhere else is ignored (and linted).
+        let is_root = origin == scope_label(Path::new(""));
+        let (derived, root_edit) = if is_root {
+            (
+                child.derived.clone().unwrap_or_default(),
+                child.root_edit.clone(),
+            )
+        } else {
+            (self.derived.clone(), self.root_edit.clone())
+        };
         Self {
+            derived,
+            root_edit,
             fields: ResolvedFields::from_tree(tree),
             dedup_enabled: dedup.and_then(|d| d.enabled).or(self.dedup_enabled),
             dedup_threshold: dedup.and_then(|d| d.threshold).or(self.dedup_threshold),
@@ -1830,7 +2059,12 @@ impl ResolvedSchema {
     /// Deliberately excludes `dedup_enabled`/`dedup_threshold` (#272): the near-duplicate
     /// gate affects neither validation nor indexing, so changing it must not mark a
     /// subtree's documents for revalidation. Provenance (`origin`, `set_by`) is not
-    /// hashed either.
+    /// hashed either, nor is `root_edit`, which governs only `update_schema`.
+    ///
+    /// `derived` (#345) is hashed after the fields, behind a `0xfc` marker, and only
+    /// when non-empty, so a schema without one hashes as it did before the block
+    /// existed. It changes the frontmatter ingest stores, so a change must reprocess
+    /// the documents it governs.
     pub fn fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -1839,6 +2073,19 @@ impl ResolvedSchema {
             hasher.update([0u8]);
             hash_attributes(&mut hasher, def);
             hasher.update([0xffu8]);
+        }
+        if !self.derived.is_empty() {
+            hasher.update([0xfcu8]);
+            for (name, rule) in &self.derived {
+                hasher.update(name.as_bytes());
+                hasher.update([0u8]);
+                hasher.update(match rule.from {
+                    DerivedFrom::PathSegment => b"path_segment".as_slice(),
+                });
+                hasher.update([0u8]);
+                hasher.update((rule.index as u64).to_le_bytes());
+                hasher.update([0xffu8]);
+            }
         }
         hex::encode(hasher.finalize())
     }
@@ -4887,6 +5134,228 @@ mod tests {
         let b = base.merged_with_for_test(&with_dedup, "x");
         assert_ne!(a, b);
         assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+
+    // -- corpus policy: derived fields and the root-edit guard (#345) ---------
+
+    fn root_resolved(yaml: &str) -> ResolvedSchema {
+        let file: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+        file.validate_self().unwrap();
+        ResolvedSchema::default().merged_with_for_test(&file, "/")
+    }
+
+    #[test]
+    fn fingerprint_changes_with_derived_but_not_with_root_edit() {
+        let fields = "fields:\n  t:\n    required: true\n";
+        let plain = root_resolved(fields);
+        let derived = root_resolved(&format!(
+            "{fields}derived:\n  domain: {{from: path_segment, index: 0}}\n"
+        ));
+        let other_index = root_resolved(&format!(
+            "{fields}derived:\n  domain: {{from: path_segment, index: 1}}\n"
+        ));
+        let other_name = root_resolved(&format!(
+            "{fields}derived:\n  area: {{from: path_segment, index: 0}}\n"
+        ));
+        let guarded = root_resolved(&format!(
+            "{fields}root_edit:\n  require_ack: true\n  policy_doc: meta/p.md\n"
+        ));
+        let empty_derived = root_resolved(&format!("{fields}derived: {{}}\n"));
+
+        assert_ne!(plain.fingerprint(), derived.fingerprint());
+        assert_ne!(derived.fingerprint(), other_index.fingerprint());
+        assert_ne!(derived.fingerprint(), other_name.fingerprint());
+        assert_ne!(plain, guarded);
+        assert_eq!(plain.fingerprint(), guarded.fingerprint());
+        assert_eq!(
+            plain.fingerprint(),
+            empty_derived.fingerprint(),
+            "an empty derived block hashes like an absent one"
+        );
+    }
+
+    #[test]
+    fn root_only_blocks_are_inherited_by_every_scope() {
+        let dir = TempDir::new().unwrap();
+        write_schema(
+            dir.path(),
+            "",
+            "derived:\n  domain: {from: path_segment, index: 0}\n\
+             root_edit:\n  require_ack: true\n",
+        );
+        write_schema(dir.path(), "food", "fields:\n  tags:\n    type: list\n");
+        // A non-root block has no effect: food/recipes still sees the root's.
+        write_schema(
+            dir.path(),
+            "food/recipes",
+            "derived:\n  dish: {from: path_segment, index: 2}\nroot_edit:\n  require_ack: false\n",
+        );
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+
+        for doc in ["a.md", "food/a.md", "food/recipes/a.md", "other/a.md"] {
+            let schema = cache.resolve_for(Path::new(doc));
+            assert_eq!(
+                schema.derived_field_names().collect::<Vec<_>>(),
+                vec!["domain"],
+                "{doc}"
+            );
+            assert!(
+                schema.root_edit.as_ref().is_some_and(|p| p.require_ack),
+                "{doc}"
+            );
+        }
+        assert_eq!(
+            cache.resolve_for(Path::new("food/a.md")).fingerprint(),
+            cache
+                .resolve_for(Path::new("food/recipes/a.md"))
+                .fingerprint(),
+            "an ignored non-root derived block does not change the fingerprint"
+        );
+
+        let findings = cache.lint_findings();
+        let in_recipes: Vec<&String> = findings
+            .iter()
+            .filter(|(dir, _)| dir == Path::new("food/recipes"))
+            .map(|(_, w)| w)
+            .collect();
+        assert_eq!(in_recipes.len(), 2, "{findings:?}");
+        assert!(in_recipes.iter().any(|w| w.contains("'derived'")));
+        assert!(in_recipes.iter().any(|w| w.contains("'root_edit'")));
+        assert!(
+            findings.iter().all(|(dir, _)| dir != Path::new("")),
+            "the root's own blocks are not linted: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_root_schema_file_means_nothing_is_derived() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "food", "fields:\n  tags:\n    type: list\n");
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+        assert!(cache.root().derived.is_empty());
+        assert!(cache.resolve_for(Path::new("food/a.md")).derived.is_empty());
+        assert!(cache.root().root_edit.is_none());
+    }
+
+    #[test]
+    fn resolve_from_disk_and_candidates_carry_the_root_blocks() {
+        let dir = TempDir::new().unwrap();
+        write_schema(
+            dir.path(),
+            "",
+            "derived:\n  domain: {from: path_segment, index: 0}\n",
+        );
+        let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
+        let from_disk = cache.resolve_from_disk(Path::new("food"), None).unwrap();
+        assert!(from_disk.is_derived("domain"));
+        let candidate: SchemaFile = serde_yaml_ng::from_str("fields: {}\n").unwrap();
+        let resolved = cache
+            .resolve_with_candidate(Path::new("food/a.md"), Path::new("food"), &candidate)
+            .unwrap();
+        assert!(resolved.is_derived("domain"));
+    }
+
+    #[test]
+    fn root_only_blocks_round_trip_through_to_yaml() {
+        let yaml = "derived:\n  domain: {from: path_segment, index: 0}\n  campaign: {from: path_segment, index: 1}\n\
+                    root_edit:\n  require_ack: true\n  policy_doc: meta/p.md\n\
+                    fields:\n  t:\n    required: true\n";
+        let file = parse_schema_text(yaml).unwrap();
+        let again = parse_schema_text(&file.to_yaml().unwrap()).unwrap();
+        assert_eq!(again.derived, file.derived);
+        assert_eq!(again.root_edit, file.root_edit);
+        assert_eq!(
+            again.derived.as_ref().unwrap()["campaign"],
+            DerivedField::path_segment(1)
+        );
+
+        let none = parse_schema_text("fields: {}\n")
+            .unwrap()
+            .to_yaml()
+            .unwrap();
+        assert!(
+            !none.contains("derived") && !none.contains("root_edit"),
+            "{none}"
+        );
+    }
+
+    #[test]
+    fn a_null_root_only_block_reads_as_absent() {
+        for yaml in [
+            "derived:\nroot_edit:\n",
+            "derived: ~\nroot_edit: ~\n",
+            "derived: null\nroot_edit: null\nfields: {}\n",
+        ] {
+            let file = parse_schema_text(yaml).unwrap_or_else(|e| panic!("{yaml:?}: {e}"));
+            assert!(file.derived.is_none(), "{yaml:?}");
+            assert!(file.root_edit.is_none(), "{yaml:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_root_only_blocks_are_schema_errors() {
+        for (yaml, needle) in [
+            (
+                "derived:\n  domain: {from: file_name, index: 0}\n",
+                "file_name",
+            ),
+            ("derived:\n  domain: {from: path_segment}\n", "index"),
+            ("derived:\n  domain: {from: path_segment, index: -1}\n", ""),
+            (
+                "derived:\n  domain: {from: path_segment, index: 33}\n",
+                "at most 32",
+            ),
+            (
+                "derived:\n  domain: {from: path_segment, index: 0, x: 1}\n",
+                "x",
+            ),
+            (
+                "derived:\n  a.b: {from: path_segment, index: 0}\n",
+                "top-level field name",
+            ),
+            (
+                "derived:\n  '': {from: path_segment, index: 0}\n",
+                "top-level field name",
+            ),
+            (
+                "derived:\n  file_path: {from: path_segment, index: 0}\n",
+                "reserved",
+            ),
+            (
+                "derived:\n  title: {from: path_segment, index: 0}\n",
+                "reserved",
+            ),
+            (
+                "derived:\n  d: {from: path_segment, index: 0}\n  d: {from: path_segment, index: 1}\n",
+                "duplicate",
+            ),
+            ("root_edit:\n  policy_doc: meta/p.md\n", "require_ack"),
+            ("root_edit:\n  require_ack: true\n  extra: 1\n", "extra"),
+            (
+                "root_edit:\n  require_ack: true\n  policy_doc: ''\n",
+                "policy_doc",
+            ),
+            (
+                "root_edit:\n  require_ack: true\n  policy_doc: \"a\\nb\"\n",
+                "policy_doc",
+            ),
+        ] {
+            let err = parse_schema_text(yaml).expect_err(yaml);
+            assert!(err.contains(needle), "{yaml}: {err}");
+        }
+        let long = format!(
+            "derived:\n  {}: {{from: path_segment, index: 0}}\n",
+            "f".repeat(MAX_DERIVED_FIELD_NAME_LEN + 1)
+        );
+        assert!(parse_schema_text(&long).is_err());
+        let many: String = (0..=MAX_DERIVED_FIELDS)
+            .map(|i| format!("  f{i}: {{from: path_segment, index: 0}}\n"))
+            .collect();
+        assert!(
+            parse_schema_text(&format!("derived:\n{many}"))
+                .unwrap_err()
+                .contains("at most")
+        );
     }
 
     // -- indexed field union ------------------------------------------------

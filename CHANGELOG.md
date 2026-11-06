@@ -14,6 +14,66 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+### Breaking: `domain` derivation and the root-edit guard are opt-in (#345)
+
+**Upgrade action required right after deploying.** Two policies that were
+hard-coded for one knowledge base now come from two new root-only blocks in the root
+`.schema.yaml`, and both are **absent by default**: no `derived:` block means no
+field is derived (`domain` included), and no `root_edit:` block means `update_schema`
+edits to the root need no acknowledgement. A knowledge base that relies on either
+must add, to its root `.schema.yaml`, **as soon as the new version is running —
+never before**: an older binary rejects the unknown `derived:`/`root_edit:` keys,
+so a commit that lands first makes the running old server refuse the schema
+rebuild (and fail to start if it restarts). Commit:
+
+```yaml
+derived:
+  domain: { from: path_segment, index: 0 }
+root_edit:
+  require_ack: true
+  policy_doc: meta/schema-tag-policy.md   # the owner KB's policy document
+```
+
+Until the blocks are committed, `domain` derivation and the root-edit guard
+**silently stop**. The gap is harmless to the existing index — without a `derived:`
+block every fingerprint is unchanged, so nothing is reindexed — but a document
+written or reindexed in the gap is stored without `domain` (or with whatever it
+authors) until the block lands and reprocesses it, and root schema edits go through
+unacknowledged meanwhile. Keep the gap short. A deployment with no root
+`.schema.yaml` (rules only in `config.yaml`'s `frontmatter` block) derives
+nothing; add a root schema file to keep deriving.
+
+- **`derived:`** maps a field name to `{from: path_segment, index: n}`: the
+  document's `n`-th directory (0 = the top-level folder; the file name never counts),
+  so other corpora can derive other fields (`campaign: {from: path_segment, index:
+  1}`) or none. A document with no such directory gets no value. Everything that
+  used to be special-cased for `domain` now follows the configured names: the value
+  is written to the Qdrant payload and the metadata index, overriding an authored
+  one; a write that authors a derived field is refused (`rule: "derived"`, now
+  worded "`<field>` is set from the document's folder; remove it from the
+  frontmatter"); a schema `required`/`default` on it is ignored; `get_schema` never
+  lists it; `search` accepts it as a filter and leaves it out of a row's
+  `frontmatter` unless named in `fields`. Invalid entries (another `from`, an `index`
+  over 32, a name that is not a plain top-level field name of up to 64 characters,
+  a reserved name such as `file_path` or `title`, more than 16 fields, a field named
+  twice) make the file invalid.
+- **`root_edit:`** `{require_ack: true}` refuses a root `add_values`/`set_field`/
+  `remove_field` without `acknowledge_root_change: true` (`dry_run` and
+  `remove_values` stay exempt). The refusal names `policy_doc` only when set and no
+  longer carries this KB's wording ("tag vocabulary is identity-only").
+- Both blocks take effect only in the root schema and are inherited by every
+  directory; in any other schema file they are ignored with a lint warning.
+  `update_schema` cannot write them but preserves them when it rewrites the root
+  file.
+- **Reindex:** `derived` is part of the schema fingerprint (only when non-empty, so
+  every existing schema hashes exactly as before and the upgrade alone reindexes
+  nothing). Adding the `derived:` block above therefore changes every document's
+  fingerprint, and the next reconcile reprocesses — today fully re-chunks and
+  re-embeds — the whole corpus, as does any later change to the block. Adding,
+  changing or removing `root_edit:` reindexes nothing.
+- The server instructions still say nothing about derived fields; the write-time
+  refusal is what tells a model.
+
 ### Security
 
 - **Symlinks and `.git` paths are refused on write and read, and skipped by

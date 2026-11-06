@@ -899,11 +899,11 @@ fn capped_list(items: &[String]) -> String {
 }
 
 /// Filter keys that need no schema declaration: the promoted `title` and
-/// `description`, the fields ingest derives (`ingest::DERIVED_FIELDS`), and
-/// the configured indexed fields.
-fn builtin_filter_field(field: &str, config: &ResolvedConfig) -> bool {
+/// `description`, the fields ingest derives (the root schema's `derived:` block,
+/// #345), and the configured indexed fields.
+fn builtin_filter_field(field: &str, config: &ResolvedConfig, schemas: &SchemaCache) -> bool {
     matches!(field, "title" | "description")
-        || crate::ingest::DERIVED_FIELDS.contains(&field)
+        || schemas.root().is_derived(field)
         || config.effective_indexed_fields().iter().any(|f| f == field)
 }
 
@@ -1573,7 +1573,10 @@ pub struct UpdateSchemaParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force: Option<bool>,
 
-    /// Must be true to change the root schema.
+    /// Confirms a deliberate root schema change, where the knowledge base guards
+    /// root edits.
+    // Enforced only when the root schema sets `root_edit: {require_ack: true}`
+    // (#345); dry runs and `remove_values` never need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acknowledge_root_change: Option<bool>,
 }
@@ -2946,6 +2949,16 @@ impl<'a> SearchCtx<'a> {
         &self.deps
     }
 
+    /// The fields ingest derives (the root schema's `derived:` block, #345), which
+    /// a document row leaves out of its `frontmatter` unless asked for by name.
+    fn derived_fields(&self) -> Vec<String> {
+        crate::schema::load_shared(self.schema_cache)
+            .root()
+            .derived_field_names()
+            .map(str::to_string)
+            .collect()
+    }
+
     /// The document metadata index, opened on first use.
     pub(crate) async fn state_db(&self) -> anyhow::Result<&StateDb> {
         self.state_db
@@ -3011,7 +3024,7 @@ impl<'a> SearchCtx<'a> {
 
         for (field, filter) in &filters {
             let known = declared.contains(field)
-                || builtin_filter_field(field, &config)
+                || builtin_filter_field(field, &config, &schemas)
                 || index.field_in_use(field).await.unwrap_or(true);
             if !known {
                 let mut names: std::collections::BTreeSet<String> = declared.clone();
@@ -3019,7 +3032,7 @@ impl<'a> SearchCtx<'a> {
                     config
                         .effective_indexed_fields()
                         .into_iter()
-                        .chain(crate::ingest::DERIVED_FIELDS.iter().map(|f| f.to_string())),
+                        .chain(schemas.root().derived_field_names().map(str::to_string)),
                 );
                 if let Ok(in_use) = index.fields_in_use(None, 500).await {
                     names.extend(in_use.into_iter().map(|(name, _)| name));
@@ -3382,6 +3395,7 @@ impl<'a> SearchCtx<'a> {
         let mut response = build_grouped_search_payload(
             &documents,
             params.fields.as_deref(),
+            &self.derived_fields(),
             path_prefix_truncated,
             offset_truncated,
         );
@@ -3533,6 +3547,7 @@ impl<'a> SearchCtx<'a> {
         // `total` always; `has_more` only when another page exists. A row
         // carries `mtime` only when the listing is ordered by it.
         let fields = params.fields.as_deref();
+        let derived = self.derived_fields();
         let with_mtime = query.order_by == crate::state::OrderBy::Mtime;
         let mut response = serde_json::json!({
             "total": result.total,
@@ -3541,7 +3556,7 @@ impl<'a> SearchCtx<'a> {
                 .documents
                 .iter()
                 .map(|d| {
-                    let mut row = document_row(d, fields);
+                    let mut row = document_row(d, fields, &derived);
                     if with_mtime {
                         row.insert("mtime".into(), serde_json::json!(d.mtime));
                     }
@@ -4341,10 +4356,11 @@ impl KbSearchServer {
         let mut reported = serde_json::Map::new();
         let mut omitted = 0usize;
         for (field, def) in &schema.fields {
-            // A derived field (`domain`) can be declared — a deployment lists it in
-            // `indexed_fields` to filter on it — but ingest sets it from the folder and
-            // a write that authors it is refused, so it is never offered as one to write.
-            if crate::ingest::DERIVED_FIELDS.contains(&field.as_str()) {
+            // A derived field (the root schema's `derived:` block, #345) can be
+            // declared — a deployment lists it in `indexed_fields` to filter on it —
+            // but ingest sets it from the folder and a write that authors it is
+            // refused, so it is never offered as one to write.
+            if schema.is_derived(field) {
                 continue;
             }
             if let Some(wanted) = &params.fields
@@ -4412,7 +4428,7 @@ impl KbSearchServer {
             // uses — not just absent from this one: a field a deeper scope declares
             // would otherwise be offered here as one nothing governs.
             let declared = schemas.declared_field_paths();
-            let excluded = declared.len() + crate::ingest::DERIVED_FIELDS.len();
+            let excluded = declared.len() + schema.derived.len();
             if let Ok(fields) = index
                 .fields_in_use(dir, (excluded + MAX_FILTER_OPTIONS_LISTED) as i64)
                 .await
@@ -4420,10 +4436,7 @@ impl KbSearchServer {
                 other_fields_in_use = fields
                     .into_iter()
                     .map(|(name, _)| name)
-                    .filter(|name| {
-                        !declared.contains(name)
-                            && !crate::ingest::DERIVED_FIELDS.contains(&name.as_str())
-                    })
+                    .filter(|name| !declared.contains(name) && !schema.is_derived(name))
                     .take(MAX_FILTER_OPTIONS_LISTED)
                     .map(|name| crate::server::sanitize_facet_value(&name))
                     .collect();
@@ -4518,25 +4531,25 @@ impl KbSearchServer {
             }
         };
 
-        // Root-scope mutations need an explicit opt-in (see `acknowledge_root_change`'s
-        // doc comment). `remove_values` is exempt — shrinking the root vocabulary is the
-        // policy-aligned direction, and the casualty check below already guards it — and
-        // `dry_run` is exempt everywhere, since it writes nothing. This must run before
-        // `file.apply()` below: the point is to refuse before any edit is computed or
-        // written, not merely before the commit.
+        // Root-scope mutations need an explicit opt-in when the root schema's
+        // `root_edit: {require_ack: true}` asks for one (#345; see
+        // `acknowledge_root_change`'s doc comment). `remove_values` is exempt —
+        // shrinking the root vocabulary is never the change the guard is for, and the
+        // casualty check below already guards it — and `dry_run` is exempt everywhere,
+        // since it writes nothing. This must run before `file.apply()` below: the
+        // point is to refuse before any edit is computed or written, not merely before
+        // the commit.
         let is_root = rel_dir.as_os_str().is_empty();
         let is_gated_op = !matches!(edit, crate::schema::SchemaEdit::RemoveValues { .. });
         let dry_run_requested = params.dry_run.unwrap_or(false);
         let acknowledged = params.acknowledge_root_change.unwrap_or(false);
-        if is_root && is_gated_op && !dry_run_requested && !acknowledged {
-            return Err(McpError::invalid_params(
-                "root schema changes are guarded: the root tag vocabulary is \
-                 identity-only by policy (see meta/schema-tag-policy.md in this \
-                 knowledge base). Pass acknowledge_root_change=true only if this change \
-                 is a deliberate design decision consistent with that policy."
-                    .to_string(),
-                None,
-            ));
+        if is_root
+            && is_gated_op
+            && !dry_run_requested
+            && !acknowledged
+            && let Some(policy) = schemas.root().root_edit.as_ref().filter(|p| p.require_ack)
+        {
+            return Err(McpError::invalid_params(root_edit_refusal(policy), None));
         }
 
         // What this scope's ancestors alone resolve the field to, so `add_values` in a
@@ -5779,19 +5792,44 @@ pub(crate) fn round_score(score: f64) -> serde_json::Value {
 /// The longest search snippet, in characters, before it is cut with `…`.
 const SNIPPET_CHARS: usize = 800;
 
+/// `update_schema`'s refusal of an unacknowledged root edit under a root schema's
+/// `root_edit: {require_ack: true}` (#345). Names `policy_doc` only when the
+/// root schema sets one.
+fn root_edit_refusal(policy: &crate::schema::RootEditPolicy) -> String {
+    let mut msg = String::from(
+        "root schema changes are guarded: the root schema governs every document in \
+         this knowledge base.",
+    );
+    msg.push_str(
+        " Pass acknowledge_root_change=true only if this change is a deliberate design decision",
+    );
+    // `policy_doc` is bounded and free of control characters (`validate_self`).
+    match &policy.policy_doc {
+        Some(doc) => msg.push_str(&format!(
+            " consistent with the policy in {doc} (a document in this knowledge base)."
+        )),
+        None => msg.push('.'),
+    }
+    msg
+}
+
 /// A row's frontmatter as `search` reports it: without the keys already promoted
-/// to the row itself (`title`, `description`) or derived from the path
-/// (`domain`, unless the caller named it in `fields`). `None` when nothing is
-/// left.
+/// to the row itself (`title`, `description`) or derived from the path (the root
+/// schema's `derived:` fields, #345 — each kept only when the caller named it in
+/// `fields`), since the row's `file_path` already says what they hold. `None` when
+/// nothing is left.
 fn row_frontmatter(
     frontmatter: &serde_json::Value,
     fields: Option<&[String]>,
+    derived: &[String],
 ) -> Option<serde_json::Value> {
     let mut map = frontmatter.as_object()?.clone();
     map.remove("title");
     map.remove("description");
-    if !fields.is_some_and(|f| f.iter().any(|k| k == "domain")) {
-        map.remove("domain");
+    for name in derived {
+        if !fields.is_some_and(|f| f.contains(name)) {
+            map.remove(name);
+        }
     }
     (!map.is_empty()).then_some(serde_json::Value::Object(map))
 }
@@ -5801,6 +5839,7 @@ fn row_frontmatter(
 fn document_row(
     summary: &crate::state::DocumentSummary,
     fields: Option<&[String]>,
+    derived: &[String],
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut row = serde_json::Map::new();
     row.insert("file_path".into(), serde_json::json!(summary.file_path));
@@ -5810,7 +5849,7 @@ fn document_row(
     if let Some(description) = &summary.description {
         row.insert("description".into(), serde_json::json!(description));
     }
-    if let Some(frontmatter) = row_frontmatter(&summary.frontmatter, fields) {
+    if let Some(frontmatter) = row_frontmatter(&summary.frontmatter, fields, derived) {
         row.insert("frontmatter".into(), frontmatter);
     }
     row
@@ -5936,6 +5975,7 @@ fn build_chunk_search_payload(
 fn build_grouped_search_payload(
     documents: &[retrieval::GroupedDocument],
     fields: Option<&[String]>,
+    derived: &[String],
     path_prefix_truncated: bool,
     offset_truncated: bool,
 ) -> serde_json::Value {
@@ -5945,7 +5985,7 @@ fn build_grouped_search_payload(
         documents
             .iter()
             .map(|d| {
-                let mut row = document_row(&d.summary, fields);
+                let mut row = document_row(&d.summary, fields, derived);
                 row.insert("score".into(), round_score(f64::from(d.score)));
                 serde_json::Value::Object(row)
             })
@@ -8491,7 +8531,8 @@ mod tests {
         write_schema_file(
             &tmp,
             "",
-            "fields:\n  tags:\n    type: list\n  status:\n    type: enum\n    values: [active]\n",
+            "derived:\n  domain: {from: path_segment, index: 0}\n\
+             fields:\n  tags:\n    type: list\n  status:\n    type: enum\n    values: [active]\n",
         );
         let server = schema_tool_server(&tmp);
         seed_document(
@@ -8592,9 +8633,57 @@ mod tests {
 
     #[tokio::test]
     async fn get_schema_never_lists_a_derived_field() {
-        // A deployment that filters on `domain` lists it in `indexed_fields`, which
-        // declares it. Ingest still derives it from the folder and a write that
-        // authors it is refused, so it must not be offered as a field to fill in.
+        // A deployment that filters on a derived `domain` declares it `indexed`.
+        // Ingest still derives it from the folder and a write that authors it is
+        // refused, so it must not be offered as a field to fill in — anywhere below
+        // the root that derives it (#345).
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "derived:\n  domain: {from: path_segment, index: 0}\n\
+             fields:\n  domain:\n    indexed: true\n  status:\n    indexed: true\n",
+        );
+        write_schema_file(&tmp, "notes", "fields:\n  tags:\n    type: list\n");
+        let server = schema_tool_server(&tmp);
+
+        for path in [None, Some("notes".to_string())] {
+            let all = server
+                .get_schema(Parameters(GetSchemaParams {
+                    path: path.clone(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            let names: Vec<&str> = all["fields"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert!(!names.contains(&"domain"), "{path:?}: {all}");
+            assert!(names.contains(&"status"), "{path:?}: {all}");
+            assert!(all.get("omitted_fields").is_none(), "{all}");
+        }
+
+        let named = server
+            .get_schema(Parameters(GetSchemaParams {
+                fields: Some(vec!["domain".into()]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert!(named["fields"].as_object().unwrap().is_empty(), "{named}");
+    }
+
+    /// Without a `derived:` block (#345) `domain` is an ordinary field: listed
+    /// like any other declared one.
+    #[tokio::test]
+    async fn get_schema_lists_domain_when_nothing_derives_it() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = (*make_test_resolved_config(tmp.path())).clone();
         config.frontmatter.indexed_fields = vec!["domain".into(), "status".into()];
@@ -8612,19 +8701,7 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(names, vec!["status"], "{all}");
-        assert!(all.get("omitted_fields").is_none(), "{all}");
-
-        let named = server
-            .get_schema(Parameters(GetSchemaParams {
-                fields: Some(vec!["domain".into()]),
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .structured_content
-            .unwrap();
-        assert!(named["fields"].as_object().unwrap().is_empty(), "{named}");
+        assert_eq!(names, vec!["domain", "status"], "{all}");
     }
 
     #[tokio::test]
@@ -8673,7 +8750,8 @@ mod tests {
         write_schema_file(
             &tmp,
             "",
-            "fields:\n  status:\n    type: enum\n    values: [active]\n",
+            "derived:\n  domain: {from: path_segment, index: 0}\n\
+             fields:\n  status:\n    type: enum\n    values: [active]\n",
         );
         let server = schema_tool_server(&tmp);
         seed_document(&server, "notes/a.md", serde_json::json!({ "owner": "me" })).await;
@@ -9406,22 +9484,32 @@ mod tests {
         assert!(format!("{:?}", err).contains(".."));
     }
 
+    /// A root schema guarding root edits (#345), naming the owner KB's policy
+    /// document as its example.
+    const GUARDED_ROOT: &str =
+        "root_edit:\n  require_ack: true\n  policy_doc: meta/schema-tag-policy.md\n";
+
+    fn root_add_values(acknowledge: Option<bool>) -> UpdateSchemaParams {
+        UpdateSchemaParams {
+            path: None,
+            operation: "add_values".into(),
+            field: "tags".into(),
+            values: Some(vec!["x".into()]),
+            definition: None,
+            dry_run: None,
+            force: None,
+            acknowledge_root_change: acknowledge,
+        }
+    }
+
     #[tokio::test]
     async fn update_schema_root_add_values_refused_without_acknowledgment() {
         let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "", GUARDED_ROOT);
         let server = schema_tool_server(&tmp);
 
         let err = server
-            .update_schema(Parameters(UpdateSchemaParams {
-                path: None,
-                operation: "add_values".into(),
-                field: "tags".into(),
-                values: Some(vec!["x".into()]),
-                definition: None,
-                dry_run: None,
-                force: None,
-                acknowledge_root_change: None,
-            }))
+            .update_schema(Parameters(root_add_values(None)))
             .await
             .expect_err("root add_values must be refused without acknowledge_root_change");
 
@@ -9432,10 +9520,59 @@ mod tests {
         );
         assert!(msg.contains("meta/schema-tag-policy.md"), "got: {msg}");
         assert!(msg.contains("acknowledge_root_change"), "got: {msg}");
-        assert!(
-            !tmp.path().join(crate::schema::SCHEMA_FILE_NAME).exists(),
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap(),
+            GUARDED_ROOT,
             "a refused change must leave the filesystem untouched"
         );
+    }
+
+    /// `require_ack` with no `policy_doc`: still refused, and the refusal names no
+    /// document at all.
+    #[tokio::test]
+    async fn update_schema_root_guard_without_a_policy_doc_names_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "", "root_edit:\n  require_ack: true\n");
+        let server = schema_tool_server(&tmp);
+
+        let msg = format!(
+            "{:?}",
+            server
+                .update_schema(Parameters(root_add_values(None)))
+                .await
+                .expect_err("require_ack alone still guards")
+        );
+        assert!(
+            msg.contains("root schema changes are guarded"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("acknowledge_root_change"), "got: {msg}");
+        assert!(!msg.contains("policy in"), "got: {msg}");
+        assert!(!msg.contains(".md"), "got: {msg}");
+    }
+
+    /// No `root_edit` block (or `require_ack: false`): root edits need no
+    /// acknowledgement (#345).
+    #[tokio::test]
+    async fn update_schema_root_edits_are_unguarded_without_root_edit() {
+        for root in [None, Some("root_edit:\n  require_ack: false\n")] {
+            let bare = crate::git::tests::create_bare_repo("master");
+            let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+            if let Some(yaml) = root {
+                write_schema_file(&work, "", yaml);
+                git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
+            }
+            let (server, _config) = make_git_backed_server(&work);
+
+            server
+                .update_schema(Parameters(root_add_values(None)))
+                .await
+                .expect("an unguarded root edit needs no acknowledgement");
+            let yaml =
+                std::fs::read_to_string(work.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap();
+            let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(reparsed.fields["tags"].values, Some(vec!["x".to_string()]));
+        }
     }
 
     #[tokio::test]
@@ -9444,7 +9581,7 @@ mod tests {
         write_schema_file(
             &tmp,
             "",
-            "fields:\n  tags:\n    type: enum\n    values: [x]\n",
+            &format!("{GUARDED_ROOT}fields:\n  tags:\n    type: enum\n    values: [x]\n"),
         );
         let server = schema_tool_server(&tmp);
 
@@ -9479,10 +9616,18 @@ mod tests {
         assert!(format!("{:?}", err).contains("root schema changes are guarded"));
     }
 
+    /// Also pins that an `update_schema` rewrite of the root file keeps its
+    /// hand-edited root-only blocks (#345).
     #[tokio::test]
     async fn update_schema_root_add_values_allowed_with_acknowledgment() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        write_schema_file(
+            &work,
+            "",
+            &format!("{GUARDED_ROOT}derived:\n  domain: {{from: path_segment, index: 0}}\n"),
+        );
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
         let (server, _config) = make_git_backed_server(&work);
 
         server
@@ -9499,15 +9644,36 @@ mod tests {
             .await
             .expect("root add_values must succeed once acknowledged");
 
-        assert!(
-            work.path().join(crate::schema::SCHEMA_FILE_NAME).exists(),
+        let yaml =
+            std::fs::read_to_string(work.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap();
+        let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            reparsed.fields["tags"].values,
+            Some(vec!["identity".to_string()]),
             "the acknowledged change must actually be written"
+        );
+        assert_eq!(
+            reparsed.root_edit,
+            Some(crate::schema::RootEditPolicy {
+                require_ack: true,
+                policy_doc: Some("meta/schema-tag-policy.md".into()),
+            }),
+            "{yaml}"
+        );
+        assert_eq!(
+            reparsed.derived,
+            Some(std::collections::BTreeMap::from([(
+                "domain".to_string(),
+                crate::schema::DerivedField::path_segment(0),
+            )])),
+            "{yaml}"
         );
     }
 
     #[tokio::test]
     async fn update_schema_root_add_values_allowed_with_dry_run() {
         let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "", GUARDED_ROOT);
         let server = schema_tool_server(&tmp);
 
         let result = server
@@ -9532,8 +9698,9 @@ mod tests {
             "the dry-run result must be exactly what the same edit against a non-root \
              scope would report — the root guard must not alter dry-run behavior"
         );
-        assert!(
-            !tmp.path().join(crate::schema::SCHEMA_FILE_NAME).exists(),
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap(),
+            GUARDED_ROOT,
             "a dry run must not touch the filesystem"
         );
     }
@@ -9545,7 +9712,7 @@ mod tests {
         write_schema_file(
             &work,
             "",
-            "fields:\n  tags:\n    type: enum\n    values: [x, y]\n",
+            &format!("{GUARDED_ROOT}fields:\n  tags:\n    type: enum\n    values: [x, y]\n"),
         );
         git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
         let (server, _config) = make_git_backed_server(&work);
@@ -9577,6 +9744,8 @@ mod tests {
         // the property the root guard must not regress: the gate is root-only.
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        write_schema_file(&work, "", GUARDED_ROOT);
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
         let (server, _config) = make_git_backed_server(&work);
 
         server
@@ -9638,6 +9807,11 @@ mod tests {
     #[tokio::test]
     async fn search_enumerate_rows_omit_promoted_derived_and_default_fields() {
         let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "derived:\n  domain: {from: path_segment, index: 0}\n",
+        );
         let server = schema_tool_server(&tmp);
         seed_document(
             &server,
@@ -14923,6 +15097,12 @@ mod tests {
     async fn write_document_refuses_an_authored_derived_field() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        write_schema_file(
+            &work,
+            "",
+            "derived:\n  domain: {from: path_segment, index: 0}\n",
+        );
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
         let (server, _config) = make_git_backed_server(&work);
 
         let err = server
@@ -14936,7 +15116,7 @@ mod tests {
             .unwrap_err();
         let text = format!("{err:?}");
         assert!(
-            text.contains("`domain` is set by the document's top-level folder"),
+            text.contains("`domain` is set from the document's folder"),
             "{text}"
         );
         assert!(!work.path().join("docs/fresh.md").exists());
@@ -18131,7 +18311,7 @@ mod tests {
             payload_grouped_document("notes/a.md", "A", 0.9),
             payload_grouped_document("notes/b.md", "B", 0.5),
         ];
-        let structured = build_grouped_search_payload(&documents, None, false, false);
+        let structured = build_grouped_search_payload(&documents, None, &[], false, false);
         let obj = structured.as_object().unwrap();
         assert!(
             !obj.contains_key("total"),
@@ -18154,7 +18334,7 @@ mod tests {
 
     #[test]
     fn build_grouped_search_payload_empty_reports_zero() {
-        let structured = build_grouped_search_payload(&[], None, false, false);
+        let structured = build_grouped_search_payload(&[], None, &[], false, false);
         assert_eq!(
             structured,
             serde_json::json!({"returned": 0, "documents": []})
@@ -18164,18 +18344,19 @@ mod tests {
     #[test]
     fn build_grouped_search_payload_truncation_flags_appear_only_when_set() {
         let documents = vec![payload_grouped_document("notes/a.md", "A", 0.9)];
-        let structured = build_grouped_search_payload(&documents, None, true, true);
+        let structured = build_grouped_search_payload(&documents, None, &[], true, true);
         assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
         assert_eq!(structured["offset_truncated"], serde_json::json!(true));
-        let plain = build_grouped_search_payload(&documents, None, false, false);
+        let plain = build_grouped_search_payload(&documents, None, &[], false, false);
         assert!(plain.get("path_prefix_truncated").is_none(), "{plain}");
         assert!(plain.get("offset_truncated").is_none(), "{plain}");
     }
 
     /// A document row's `frontmatter` drops what the row already promotes
-    /// (`title`, `description`) and what the path derives (`domain`), keeping
-    /// `domain` only when the caller asked for it by name; `mtime` is not on a
-    /// grouped row at all.
+    /// (`title`, `description`) and what the path derives (the root schema's
+    /// `derived:` fields, #345), keeping a derived field only when the caller asked
+    /// for it by name; `mtime` is not on a grouped row at all. A field nothing
+    /// derives stays.
     #[test]
     fn document_rows_drop_promoted_and_derived_frontmatter_keys() {
         let mut doc = payload_grouped_document("notes/a.md", "A", 0.9);
@@ -18183,20 +18364,28 @@ mod tests {
         doc.summary.frontmatter = serde_json::json!({
             "title": "A", "description": "About A", "domain": "notes", "tags": ["x"],
         });
+        let derived = vec!["domain".to_string()];
         let structured =
-            build_grouped_search_payload(std::slice::from_ref(&doc), None, false, false);
+            build_grouped_search_payload(std::slice::from_ref(&doc), None, &derived, false, false);
         let row = &structured["documents"][0];
         assert_eq!(row["frontmatter"], serde_json::json!({"tags": ["x"]}));
         assert_eq!(row["description"], "About A");
         assert!(row.get("mtime").is_none(), "{row}");
 
+        let not_derived =
+            build_grouped_search_payload(std::slice::from_ref(&doc), None, &[], false, false);
+        assert_eq!(
+            not_derived["documents"][0]["frontmatter"]["domain"], "notes",
+            "derivation off: domain is an authored field"
+        );
+
         let fields = vec!["domain".to_string()];
-        let asked = build_grouped_search_payload(&[doc], Some(&fields), false, false);
+        let asked = build_grouped_search_payload(&[doc], Some(&fields), &derived, false, false);
         assert_eq!(asked["documents"][0]["frontmatter"]["domain"], "notes");
 
         let mut bare = payload_grouped_document("notes/b.md", "B", 0.5);
         bare.summary.frontmatter = serde_json::json!({"title": "B"});
-        let structured = build_grouped_search_payload(&[bare], None, false, false);
+        let structured = build_grouped_search_payload(&[bare], None, &[], false, false);
         assert!(
             structured["documents"][0].get("frontmatter").is_none(),
             "an empty projection is omitted: {structured}"

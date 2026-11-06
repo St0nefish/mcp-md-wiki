@@ -1573,20 +1573,22 @@ async fn validate_document<E: QueryEmbedder, Q: RetrievalStore>(
                     msg: format!("Failed to validate content: {}", e),
                 }
             })?;
-    // A field ingest derives (`ingest::DERIVED_FIELDS`) would be silently
-    // overridden at index time, so authoring one is refused here rather than
-    // announced up front in the server instructions. Write path only: ingest
+    // A field ingest derives (the root schema's `derived:` block, #345) would be
+    // silently overridden at index time, so authoring one is refused here rather
+    // than announced up front in the server instructions. Write path only: ingest
     // and the CLI `validate` keep accepting existing documents that carry one.
     // Judged on the frontmatter as written, before schema defaults (which never
     // fill a derived field anyway), and whether or not other rules failed too.
     if deps.validation.enabled
-        && let Some((field, message)) =
-            crate::ingest::authored_derived_field(&validate::parse_frontmatter_raw(content).0)
+        && let Some((field, message)) = crate::ingest::authored_derived_field(
+            &validate::parse_frontmatter_raw(content).0,
+            schema,
+        )
     {
         result.valid = false;
         result.errors.push(message.clone());
         result.field_errors.push(validate::FieldError {
-            field: field.to_string(),
+            field,
             rule: "derived".to_string(),
             message,
             got: None,
@@ -7373,28 +7375,27 @@ mod tests {
         assert!(work.path().join("docs/gone.md").exists());
     }
 
-    /// `domain` is derived from the folder: a schema `default:` for it is not the
-    /// author writing it, and `required` on it is never asked of the author. Only
-    /// a `domain` the author actually wrote is refused — also when other rules
-    /// fail alongside it.
+    /// A harness over a fresh directory whose root `.schema.yaml` holds `yaml`.
+    fn harness_with_root_schema(yaml: &str) -> (tempfile::TempDir, Harness) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".schema.yaml"), yaml).unwrap();
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+        (tmp, harness)
+    }
+
+    /// A field the root schema's `derived:` block declares (#345) is set from the
+    /// folder: a schema `default:` for it is not the author writing it, and
+    /// `required` on it is never asked of the author. Only a value the author
+    /// actually wrote is refused — also when other rules fail alongside it.
     #[tokio::test]
     async fn a_default_or_required_derived_field_does_not_block_writes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let with_default = {
-            let mut config = crate::mcp::make_test_resolved_config(tmp.path());
-            Arc::get_mut(&mut config)
-                .unwrap()
-                .frontmatter
-                .defaults
-                .insert("domain".into(), "x".into());
-            Harness::new(&tmp, config)
-        };
-        let with_required = {
-            let mut config = crate::mcp::make_test_resolved_config(tmp.path());
-            Arc::get_mut(&mut config).unwrap().frontmatter.required =
-                vec!["title".into(), "domain".into()];
-            Harness::new(&tmp, config)
-        };
+        const DERIVED: &str = "derived:\n  domain: {from: path_segment, index: 0}\n";
+        let (_d, with_default) =
+            harness_with_root_schema(&format!("{DERIVED}fields:\n  domain:\n    default: x\n"));
+        let (_r, with_required) = harness_with_root_schema(&format!(
+            "{DERIVED}fields:\n  title:\n    required: true\n  domain:\n    required: true\n"
+        ));
 
         for harness in [&with_default, &with_required] {
             let deps = harness.deps();
@@ -7420,6 +7421,46 @@ mod tests {
                 assert!(rules.contains(&("domain", "derived")), "{rules:?}");
                 assert!(rules.contains(&("title", "required")), "{rules:?}");
                 assert!(!rules.contains(&("domain", "required")), "{rules:?}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// The refusal is built from the configured names (#345): with no `derived:`
+    /// block an authored `domain` is an ordinary field, and a configured
+    /// `campaign` is refused by name.
+    #[tokio::test]
+    async fn the_authored_derived_field_refusal_follows_the_root_schema() {
+        let (_n, none) = harness_with_root_schema("fields: {}\n");
+        validate_document(&none.deps(), "docs/a.md", "---\ndomain: docs\n---\n# A\n")
+            .await
+            .expect("derivation off: domain is just a field");
+
+        let (_c, campaign) =
+            harness_with_root_schema("derived:\n  campaign: {from: path_segment, index: 1}\n");
+        validate_document(
+            &campaign.deps(),
+            "c/x/a.md",
+            "---\ndomain: docs\n---\n# A\n",
+        )
+        .await
+        .expect("domain is not derived here");
+        match validate_document(
+            &campaign.deps(),
+            "c/x/a.md",
+            "---\ncampaign: other\n---\n# A\n",
+        )
+        .await
+        .unwrap_err()
+        {
+            WriteError::Validation { result } => {
+                let err = result
+                    .field_errors
+                    .iter()
+                    .find(|e| e.rule == "derived")
+                    .expect("a derived refusal");
+                assert_eq!(err.field, "campaign");
+                assert!(err.message.contains("`campaign`"), "{}", err.message);
             }
             other => panic!("expected Validation, got {other:?}"),
         }

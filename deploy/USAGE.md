@@ -32,7 +32,7 @@ The chunker splits at heading boundaries, so each major section
 becomes part of a chunk.
 ```
 
-A complete sample file is available at [`docs/sample-document.md`](../docs/sample-document.md). Note there's no `domain:` key — `domain` isn't author-written frontmatter; see the note below.
+A complete sample file is available at [`docs/sample-document.md`](../docs/sample-document.md). Note there's no `domain:` key — in a knowledge base whose root schema derives `domain`, it isn't author-written frontmatter; see the note below.
 
 **Frontmatter fields used by the system:**
 
@@ -41,10 +41,10 @@ A complete sample file is available at [`docs/sample-document.md`](../docs/sampl
 | `title` | Document title (stored as Qdrant payload) |
 | `description` | Summary text; optionally prepended to every chunk for better embedding context |
 | `type` | Document type (e.g. `guide`, `reference`, `runbook`); filterable in MCP search |
-| `domain` | **Not a frontmatter field.** Derived automatically from the document's top-level folder — see below. Still filterable in MCP search |
+| `domain` | **Not a frontmatter field when the root schema derives it** (`derived: {domain: {from: path_segment, index: 0}}`): then it is set from the document's top-level folder — see below. Filterable in MCP search either way |
 | `tags` | List of tags; filterable in MCP search (match-any) |
 
-**`domain` is derived, not authored.** `domain` is computed from the document's top-level folder name (e.g. a file at `infrastructure/docker-compose.md` gets `domain: infrastructure`) and written into both the Qdrant payload and the SQLite metadata index — it is *not* read from a `domain:` key in frontmatter. If a document carries one anyway, it's overwritten on the next index run and the server logs a warning when the two disagree. Documents sitting directly at the knowledge-base root (no top-level folder) have no domain at all. This only changes where the value comes from: `search(filters={"domain": ...})` — whether ranking or enumerating — and the CLI's `--domain` flag all still work exactly as before. A write whose frontmatter carries `domain` is refused (`rule: "derived"`), while indexing and `validate` still accept existing documents that have one; a schema rule that makes `domain` `required`, or gives it a `default`, is ignored, so it is never demanded of an author nor filled in.
+**Derived fields are set from the path, not authored.** Derivation is opt-in: the root `.schema.yaml`'s `derived:` block names the fields (see [Root-only blocks](#root-only-blocks-derived-and-root_edit)). With `derived: {domain: {from: path_segment, index: 0}}`, `domain` is computed from the document's top-level folder name (e.g. a file at `infrastructure/docker-compose.md` gets `domain: infrastructure`) and written into both the Qdrant payload and the SQLite metadata index — it is *not* read from a `domain:` key in frontmatter. If a document carries one anyway, it's overwritten on the next index run and the server logs a warning when the two disagree. Documents with no such folder (sitting directly at the knowledge-base root, for index 0) get no value at all. Filtering works as for any field: `search(filters={"domain": ...})` — whether ranking or enumerating — and the CLI's `--domain` flag. A write whose frontmatter carries a derived field is refused (`rule: "derived"`), while indexing and `validate` still accept existing documents that have one; a schema rule that makes a derived field `required`, or gives it a `default`, is ignored, so it is never demanded of an author nor filled in. Without a `derived:` block nothing is derived.
 
 You can add any other fields you like. Only fields listed in `frontmatter.indexed_fields` are stored as Qdrant payload for filtering by `search`. All frontmatter fields, however, are stored (as JSON, and projected into a filterable dot-path index) in the state DB, so any field — indexed or not — can be filtered, ranged, and sorted on via `search`'s enumeration mode (omit `query`).
 
@@ -102,7 +102,8 @@ frontmatter:
     - type
 
   # These fields become filterable Qdrant payload fields.
-  # The MCP search tool can filter on domain, type, and tags.
+  # The MCP search tool can filter on domain, type, and tags (domain is derived
+  # from the folder only when a root .schema.yaml declares it under `derived:`).
   indexed_fields:
     - type
     - domain
@@ -116,9 +117,10 @@ frontmatter:
   # Closed-set (enum) enforcement. Maps a field to its exhaustive list of
   # allowed values; a present field whose value isn't in the list fails
   # validation. Absent fields are governed by `required`, not here. Leave a
-  # field out of this map to keep it open-ended (e.g. tags). `domain` isn't
-  # author-set at all — it's derived from the folder — so it never belongs here
-  # (nor in `required` or `defaults`, which are ignored for it).
+  # field out of this map to keep it open-ended (e.g. tags). A field a root
+  # .schema.yaml derives (`derived:`, e.g. domain) isn't author-set at all, so
+  # it never belongs here (nor in `required` or `defaults`, which are ignored
+  # for it).
   allowed:
     type: [guide, reference, research, config, troubleshooting, architecture, project, decision-record, migration]
     status: [active, draft, archived]
@@ -136,7 +138,7 @@ validation:
 
 With `validation.enabled: false`, frontmatter is still parsed — just not checked against `required`/`allowed`/lint rules — so Qdrant and the state DB's metadata index still reflect each file's actual frontmatter, rather than treating unvalidated files as fieldless.
 
-`frontmatter.allowed` is enforced by both `mcp-md-wiki validate` and the MCP write tools. When a write tool rejects a document, it returns a structured error (`field_errors`) naming the offending field, the rule it broke (`required` / `allowed_value` / `lint` / `type_mismatch` / `closed_object`, or `derived` for an authored `domain`; past 100 errors, one final `too_many_errors` entry counts the rest), and — for closed-set fields — the value it `got` versus the values it `expected`, so an agent can fix and retry without guessing.
+`frontmatter.allowed` is enforced by both `mcp-md-wiki validate` and the MCP write tools. When a write tool rejects a document, it returns a structured error (`field_errors`) naming the offending field, the rule it broke (`required` / `allowed_value` / `lint` / `type_mismatch` / `closed_object`, or `derived` for an authored derived field such as `domain`; past 100 errors, one final `too_many_errors` entry counts the rest), and — for closed-set fields — the value it `got` versus the values it `expected`, so an agent can fix and retry without guessing.
 
 Run `mcp-md-wiki validate` to check all files without indexing — useful for CI or pre-commit hooks.
 
@@ -184,7 +186,7 @@ Declaring the same path twice in one file — once under a nested `fields:` and 
 - The **set** of fields unions across levels.
 - **Merging is per attribute, not per field.** A field redefined at a deeper level overrides only the attributes it explicitly writes (`type`, `required`, `indexed`, `default`, `open`, `values`) — every attribute it leaves unwritten still inherits from the nearest ancestor that declared this same field. A `recipes/` scope that writes only `values: [recipe]` for `type` does not reset that field's `required`/`indexed`/`default` to nothing; it only changes `values`. This is deliberate: the previous rule (a redefinition replacing the whole definition wholesale) meant a deeper scope narrowing one attribute silently discarded every other attribute the root had set for that field, with nothing reported — a real footgun for a field like `tags` that nearly every domain redeclares just to set its own `values`.
 - **`values` is the one attribute with an in-band way to request a merge instead of a plain override**, via a `$values` placeholder inside the list — see below. Every other attribute either inherits wholesale (unwritten) or overrides wholesale (written); there is no partial merge for them.
-- Top-level folder names are the KB's areas (this is also what `domain` is derived from — see [Sample Document](#sample-document) above); the MCP server's dynamic instructions list them from a directory read. Filtering on `domain` with a query needs it indexed — either via `frontmatter.indexed_fields` (deprecated fallback) or an `indexed: true` entry for `domain` in a root `.schema.yaml`. `domain` isn't author-written frontmatter (see the note above), so if you migrate off `config.yaml`, remember to declare it explicitly — it does not carry over automatically.
+- Top-level folder names are the KB's areas (what a `domain` derived with `index: 0` holds — see [Root-only blocks](#root-only-blocks-derived-and-root_edit)); the MCP server's dynamic instructions list them from a directory read. Filtering on a derived field with a query needs it indexed — either via `frontmatter.indexed_fields` (deprecated fallback) or an `indexed: true` entry for it in a root `.schema.yaml`. If you migrate off `config.yaml`, remember to declare it explicitly — it does not carry over automatically.
 
 #### Per-directory near-duplicate override (`dedup:`)
 
@@ -197,6 +199,23 @@ dedup:
 ```
 
 Both keys are optional and cascade independently, nearest scope winning; a key no schema in the chain sets falls back to the global `write.*` value. A threshold outside 0.0–1.0, a wrong-typed value, or an unknown key under `dedup:` makes the file invalid like any other schema error (see [Invalid schema files](#invalid-schema-files)). The block is hand-edited — `update_schema` has no operation for it, but it preserves an existing block when it rewrites the file — and `get_schema` reports the effective override when one is set. It applies to creates only (edits and moves never run the check) and, unlike `fields:`, does not affect the schema fingerprint, so changing it revalidates nothing.
+
+#### Root-only blocks: `derived` and `root_edit`
+
+Two blocks set corpus-wide policy, and only in the **root** `.schema.yaml` (anywhere else they are ignored, with a lint warning). Both are absent by default, both are hand-edited (`update_schema` preserves them but cannot write them), and every directory inherits the root's:
+
+```yaml
+derived:
+  domain: { from: path_segment, index: 0 }   # set `domain` from the top-level folder
+root_edit:
+  require_ack: true                           # root edits need acknowledge_root_change: true
+  policy_doc: meta/schema-tag-policy.md       # optional; named in the refusal
+```
+
+- **`derived`** — fields set from the document's path rather than its frontmatter: `index: n` is the `n`-th directory, 0 being the top-level folder (the file name never counts); a document with no such directory gets no value. See [Sample Document](#sample-document) for how a derived field behaves on write, in validation and in search. It is part of the schema fingerprint (only when non-empty), so adding or changing it reprocesses every document — today a full re-embed of the affected documents.
+- **`root_edit`** — with `require_ack: true`, `update_schema` refuses `add_values`/`set_field`/`remove_field` on the root unless `acknowledge_root_change: true` is passed (`remove_values` and `dry_run` are exempt). Without the block root edits are not guarded. Not part of the fingerprint.
+
+The README's [schema reference](../README.md#root-only-blocks-derived-and-root_edit) lists the validation limits.
 
 #### The `$values` placeholder
 
@@ -353,7 +372,8 @@ Either way, `get_schema` (omit `path` for the root) tells you exactly what's in 
 
 Under the hood, each indexed file now also tracks a `schema_hash` fingerprint (a new `indexed_files` column, added automatically via a guarded `ALTER TABLE ... ADD COLUMN` — no manual migration step). The incremental indexer skips a file only when both its content hash *and* schema fingerprint are unchanged, since editing a schema doesn't touch a document's bytes. Two practical consequences:
 
-- The **first index run after upgrading** to a version with schema support revalidates every file once, to backfill the fingerprint. This is also the run where every document's `domain` gets (re)computed from its folder and written to Qdrant and the state DB — see [Sample Document](#sample-document) above. If a document's old, hand-authored `domain:` disagreed with its folder, its effective `domain` value changes at that point, and any saved `search` filters built around the old value will need updating. Remove now-redundant `domain:` keys from your frontmatter — they're ignored either way.
+- The **first index run after upgrading** to a version with schema support revalidates every file once, to backfill the fingerprint.
+- **Derivation is opt-in (#345).** Earlier versions always derived `domain` from the top-level folder and always guarded root `update_schema` edits. Both now come only from the root `.schema.yaml`'s [`derived:` and `root_edit:` blocks](#root-only-blocks-derived-and-root_edit); a knowledge base that relied on either must add them (`derived: {domain: {from: path_segment, index: 0}}`, and `root_edit: {require_ack: true}` with its own `policy_doc` if it has one) right after the new version is running — never before, since an older binary rejects the unknown keys, refusing the schema rebuild and failing to start on restart. Until they land, `domain` derivation and the guard silently stop: nothing is reindexed in the gap (without `derived` the fingerprint is unchanged), but a document written or reindexed meanwhile is stored without its derived `domain` until the block lands, and root edits are unguarded. Adding or changing `derived` changes the schema fingerprint, so every document it governs is reprocessed on the next reconcile, which is when its derived fields get (re)computed from its folder and written to Qdrant and the state DB — see [Sample Document](#sample-document) above. If a document's old, hand-authored `domain:` disagreed with its folder, its effective value changes at that point, and any saved `search` filters built around the old value will need updating. Remove now-redundant `domain:` keys from your frontmatter — they're overridden either way.
 - Editing a **root-level** schema revalidates the entire knowledge base on the next run.
 
 If you only need to rebuild the document metadata projection backing `search`'s enumeration mode (e.g. after changing a field-projection rule) without a full reindex, `mcp-md-wiki reproject-fields` does that from the frontmatter JSON already stored in the state DB — no markdown re-read, no re-embedding. It's safe to run against a live server: each document's frontmatter is re-read inside the same transaction that rewrites it, so it retries past contention with a running index or write tool rather than reverting a concurrent update. A document whose stored frontmatter is unparseable is skipped with a warning instead of aborting the run, and the command reports how many documents were reprojected. Note also that a full reindex (`index --full`) clears the metadata index along with the vector collection, so a file deleted from disk since the last full run can't leave a phantom entry behind in that projection.
@@ -393,8 +413,8 @@ Each tool returns one compact JSON object: `path`, `action`, the document's new 
 
 Two more MCP tools let a connected agent inspect and evolve the [directory schema cascade](#directory-schemas-schemayaml) itself, rather than working around it:
 
-- **`get_schema`** — shows the fully merged rules governing a path (directory or document; omit `path` for the root), with per-field provenance naming the directory whose schema declared each field (`food/recipes/`, the root as `/`) — schemas are named by directory, never by file, in everything a model reads. Optional `fields` restricts the report to specific dot-paths; `values_only` limits it to fields with a closed value set; `values_in_use` adds the 20 most-used values (with document counts) of each open field and the fields documents under the path carry that no scope declares — the on-demand replacement for the vocabulary lines the server instructions used to carry. A derived field (`domain`) is never listed, even when a scope declares it (to index it, say).
-- **`update_schema`** — edits a directory's `.schema.yaml` through constrained operations (`add_values`, `remove_values`, `set_field`, `remove_field`) rather than free-form text. `add_values` in a subdirectory whose schema has no `values` of its own for the field writes `[$values, ...new]`, so it extends the inherited set instead of replacing it, and keeps the inherited `type` (`enum` when no ancestor gives a type or values); a value the scope already inherits is not written again. A directory still on the legacy `.kb-schema.yaml` name is migrated by the same commit (see [Legacy file name](#directory-schemas-schemayaml)). Before writing anything, the change is validated against every document already indexed under that scope, using the frontmatter stored in the metadata index — no markdown re-read. If any document would fail the new rules, the change is refused and they're listed; pass `force` to apply anyway, or `dry_run` to see the effect without writing. The rendered YAML is re-parsed before writing, so an unparseable schema can never be committed. Like the document write tools, the file is written temp-then-rename and committed and pushed; a full reconcile is then queued, which re-validates the documents the schema governs. Changing the root schema with `add_values`, `set_field` or `remove_field` needs `acknowledge_root_change: true` (`remove_values` and `dry_run` are exempt).
+- **`get_schema`** — shows the fully merged rules governing a path (directory or document; omit `path` for the root), with per-field provenance naming the directory whose schema declared each field (`food/recipes/`, the root as `/`) — schemas are named by directory, never by file, in everything a model reads. Optional `fields` restricts the report to specific dot-paths; `values_only` limits it to fields with a closed value set; `values_in_use` adds the 20 most-used values (with document counts) of each open field and the fields documents under the path carry that no scope declares — the on-demand replacement for the vocabulary lines the server instructions used to carry. A derived field (the root schema's `derived:` block, e.g. `domain`) is never listed, even when a scope declares it (to index it, say).
+- **`update_schema`** — edits a directory's `.schema.yaml` through constrained operations (`add_values`, `remove_values`, `set_field`, `remove_field`) rather than free-form text. `add_values` in a subdirectory whose schema has no `values` of its own for the field writes `[$values, ...new]`, so it extends the inherited set instead of replacing it, and keeps the inherited `type` (`enum` when no ancestor gives a type or values); a value the scope already inherits is not written again. A directory still on the legacy `.kb-schema.yaml` name is migrated by the same commit (see [Legacy file name](#directory-schemas-schemayaml)). Before writing anything, the change is validated against every document already indexed under that scope, using the frontmatter stored in the metadata index — no markdown re-read. If any document would fail the new rules, the change is refused and they're listed; pass `force` to apply anyway, or `dry_run` to see the effect without writing. The rendered YAML is re-parsed before writing, so an unparseable schema can never be committed. Like the document write tools, the file is written temp-then-rename and committed and pushed; a full reconcile is then queued, which re-validates the documents the schema governs. When the root schema sets `root_edit: {require_ack: true}` (see [Root-only blocks](#root-only-blocks-derived-and-root_edit)), changing it with `add_values`, `set_field` or `remove_field` needs `acknowledge_root_change: true` (`remove_values` and `dry_run` are exempt), and the refusal names the block's `policy_doc` when one is set; without the block, root edits need no acknowledgement. A rewrite keeps the root file's `derived:` and `root_edit:` blocks as they are.
 
 Both tools accept a partial directory for `path`, matching on trailing segments — e.g. `recipes` resolves to `lifestyle/kitchen/recipes` if that's the only scope ending in `recipes`. A unique match resolves silently; several matches are refused with the candidates listed rather than guessed at. Zero matches is not an error: the literal path is used, so `get_schema` reports whichever ancestor's rules govern it and `update_schema` introduces a schema for a directory that doesn't have one yet, which is the normal way to start one. Either tool takes `.` or `./` for the root and ignores a `.` segment or a doubled `/`.
 

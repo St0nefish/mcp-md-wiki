@@ -165,15 +165,15 @@ const MAX_VALUES_PER_BREAKDOWN: i64 = 50;
 /// nor a vocabulary listing can say anything useful about them —
 /// the latter would list one value per document (#333).
 const FREE_TEXT_FIELDS: [&str; 2] = ["title", "description"];
-/// Fields never broken down, in addition to [`FREE_TEXT_FIELDS`].
+/// Fields never broken down, in addition to [`FREE_TEXT_FIELDS`] and the root
+/// schema's derived fields (#345) — a field set from the path restates the path, and
+/// `domain: {from: path_segment, index: 0}` is the synthetic `area` breakdown
+/// itself, so reporting both prints the same histogram twice.
 ///
-/// - `domain` is *derived* from the top-level folder, making it identical to the
-///   synthetic `area` breakdown by construction — reporting both prints the same
-///   histogram twice.
 /// - `timestamp`/`date` are instants. Grouping documents by exact instant produces a
 ///   near-unique list that crowds out real vocabularies; recency is a range query, not
 ///   a category.
-const BREAKDOWN_EXCLUDED: [&str; 4] = ["file_path", "domain", "timestamp", "date"];
+const BREAKDOWN_EXCLUDED: [&str; 3] = ["file_path", "timestamp", "date"];
 /// Cap on a single reported value's length. Frontmatter values are uncapped at ingest.
 const MAX_VALUE_LEN: usize = 200;
 /// How long a collected status is reused. Short enough that `/status` still reads as
@@ -249,6 +249,10 @@ pub struct StatusState {
     /// see that constructor's doc comment for why idle is correct there, not a
     /// simplification.
     reindex_queue: Arc<crate::reindex::ReindexQueue>,
+    /// The schema cache, read for the root schema's derived field names, which the
+    /// metadata breakdown leaves out (#345). `None` when no cache could be built
+    /// (`for_cli` on an invalid schema tree): nothing is excluded as derived.
+    schema_cache: Option<schema::SharedSchemaCache>,
 }
 
 impl StatusState {
@@ -265,7 +269,17 @@ impl StatusState {
     /// The CLI has no reload endpoint of its own, so this just wraps the one-off
     /// config as a `SharedConfig` that nothing else ever writes to.
     pub fn for_cli(config: Arc<ResolvedConfig>) -> anyhow::Result<Self> {
+        // Only for the breakdown's derived-field exclusion: an invalid schema tree
+        // must not stop `status` from reporting, so a failed build is just `None`.
+        let schema_cache = SchemaCache::build(
+            &config.canonical_data_path(),
+            &config.frontmatter,
+            &config.indexing,
+        )
+        .ok()
+        .map(|cache| Arc::new(RwLock::new(Arc::new(cache))));
         Ok(Self {
+            schema_cache,
             qdrant: Arc::new(QdrantStore::new(&config.qdrant)?),
             config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
@@ -447,8 +461,21 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
 
             // Fetch a few extra rows so an excluded field cannot eat a slot that a
             // reportable one would have used.
-            let fetch =
-                (MAX_BREAKDOWN_FIELDS + BREAKDOWN_EXCLUDED.len() + FREE_TEXT_FIELDS.len()) as i64;
+            let derived: Vec<String> = state
+                .schema_cache
+                .as_ref()
+                .map(|cache| {
+                    schema::load_shared(cache)
+                        .root()
+                        .derived_field_names()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let fetch = (MAX_BREAKDOWN_FIELDS
+                + BREAKDOWN_EXCLUDED.len()
+                + FREE_TEXT_FIELDS.len()
+                + derived.len()) as i64;
             match db.breakdown_fields(MAX_DISTINCT_FOR_BREAKDOWN, fetch).await {
                 Err(e) => store.errors.push(store_error("breakdown fields", &e)),
                 Ok(fields) => {
@@ -457,6 +484,7 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
                         .filter(|(name, _)| {
                             !BREAKDOWN_EXCLUDED.contains(&name.as_str())
                                 && !FREE_TEXT_FIELDS.contains(&name.as_str())
+                                && !derived.contains(name)
                         })
                         .take(MAX_BREAKDOWN_FIELDS)
                         .collect();
@@ -2548,6 +2576,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
             state_db: Arc::clone(&shared_state_db),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
             reindex_queue: Arc::clone(&reindex_queue),
+            schema_cache: Some(Arc::clone(&shared_schema_cache)),
         },
         admin_state: AdminState {
             shared_config: Arc::clone(&shared_config),
@@ -3196,6 +3225,7 @@ mod tests {
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
             reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
+            schema_cache: None,
         };
 
         let status = collect_status(&state).await;
@@ -3247,6 +3277,7 @@ mod tests {
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
             reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
+            schema_cache: None,
         };
 
         let status = collect_status(&state).await;
@@ -3278,6 +3309,7 @@ mod tests {
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
             reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
+            schema_cache: None,
         };
 
         let status = collect_status(&state).await;
@@ -3377,6 +3409,7 @@ mod tests {
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
             reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
+            schema_cache: None,
         };
 
         // Must degrade, not panic or 500: if this branch regresses into an unwrap,
@@ -3417,24 +3450,41 @@ mod tests {
             .await
             .unwrap();
 
-        let state = StatusState {
-            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
-            config: config::shared_config(config),
-            state_db: Arc::new(tokio::sync::OnceCell::new()),
-            cache: Arc::new(tokio::sync::Mutex::new(None)),
-            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
-        };
+        // The root schema's derived names are what is left out (#345): with
+        // `domain` derived it is excluded; with nothing derived it is an ordinary
+        // field and broken down like one.
+        let schemas = tempfile::tempdir().unwrap();
+        std::fs::write(
+            schemas.path().join(crate::schema::SCHEMA_FILE_NAME),
+            "derived:\n  domain: {from: path_segment, index: 0}\n",
+        )
+        .unwrap();
+        let deriving = SchemaCache::build_for_test(schemas.path(), &Default::default());
+        for (schema_cache, derives) in [
+            (Some(Arc::new(RwLock::new(Arc::new(deriving)))), true),
+            (None, false),
+        ] {
+            let state = StatusState {
+                qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+                config: config::shared_config(config.clone()),
+                state_db: Arc::new(tokio::sync::OnceCell::new()),
+                cache: Arc::new(tokio::sync::Mutex::new(None)),
+                reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
+                schema_cache,
+            };
 
-        let status = collect_status(&state).await;
-        let fields: Vec<&str> = status.breakdown.iter().map(|b| b.field.as_str()).collect();
+            let status = collect_status(&state).await;
+            let fields: Vec<&str> = status.breakdown.iter().map(|b| b.field.as_str()).collect();
 
-        assert!(fields.contains(&"type"), "{fields:?}");
-        assert!(fields.contains(&"area"), "{fields:?}");
-        assert!(
-            !fields.contains(&"domain"),
-            "domain duplicates area by construction: {fields:?}"
-        );
-        assert!(!fields.contains(&"timestamp"), "{fields:?}");
+            assert!(fields.contains(&"type"), "{fields:?}");
+            assert!(fields.contains(&"area"), "{fields:?}");
+            assert_eq!(
+                fields.contains(&"domain"),
+                !derives,
+                "a derived domain duplicates area by construction: {fields:?}"
+            );
+            assert!(!fields.contains(&"timestamp"), "{fields:?}");
+        }
     }
 
     #[tokio::test]
@@ -3465,6 +3515,7 @@ mod tests {
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
             reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
+            schema_cache: None,
         };
 
         let status = collect_status(&state).await;
@@ -3495,6 +3546,7 @@ mod tests {
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
             reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
+            schema_cache: None,
         };
 
         let first = cached_status(&state).await;
@@ -3567,6 +3619,7 @@ mod tests {
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
             reindex_queue: Arc::clone(&queue),
+            schema_cache: None,
         };
 
         // `queue` is private to this test, so the assertions below can be exact
@@ -4970,6 +5023,7 @@ mod tests {
                 state_db: Arc::clone(&state_db),
                 cache: Arc::new(tokio::sync::Mutex::new(None)),
                 reindex_queue: Arc::clone(&reindex_queue),
+                schema_cache: None,
             },
             admin_state: AdminState {
                 shared_config: Arc::clone(&shared_config),

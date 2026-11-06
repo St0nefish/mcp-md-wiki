@@ -914,6 +914,10 @@ struct PendingFile {
     schema_hash: String,
     /// [`chunking_fingerprint`] of the config this file's chunks were produced under.
     chunking_fingerprint: String,
+    /// The `derived:` rules (#345) of the schema this file was validated against —
+    /// part of `schema_hash` — applied to both the Qdrant payload and the metadata
+    /// index by [`with_derived_fields`].
+    derived: std::collections::BTreeMap<String, crate::schema::DerivedField>,
 }
 
 /// An empty document's state-row baseline, held until its old index entries are
@@ -935,11 +939,7 @@ enum FileOutcome {
     /// (#139) — without this, a file whose bytes are unchanged but whose mtime moved
     /// (git checkout, cherry-pick, restore, plain `touch`) is re-detected as dirty and
     /// re-read/re-hashed by every subsequent reconcile sweep, forever.
-    Skipped {
-        hash: String,
-        mtime: i64,
-        size: i64,
-    },
+    Skipped { hash: String, mtime: i64, size: i64 },
     /// The document itself failed validation (non-strict mode) or chunking.
     /// `validation.strict: false` documents an invalid file as skipped, which is what
     /// a `--full` run does with it, so `index_paths_generic` purges whatever an
@@ -960,12 +960,9 @@ enum FileOutcome {
     /// delete — its old points, metadata and links are purged — but recorded in
     /// `indexed_files` with `chunk_count` 0 and the stat/hash baseline below, so the
     /// reconcile does not re-read it on every sweep. Carries what that row needs.
-    Empty {
-        hash: String,
-        mtime: i64,
-        size: i64,
-    },
-    Ready(PendingFile),
+    Empty { hash: String, mtime: i64, size: i64 },
+    /// Boxed: a `PendingFile` is far larger than every other variant.
+    Ready(Box<PendingFile>),
     /// A `validation.strict` rejection: the content-level validation errors branch
     /// (`Ok((result, None))`) or the validation-engine error branch (`Err(e)`), when
     /// `config.validation.strict` is set, both land here instead of propagating an
@@ -1012,9 +1009,7 @@ enum FileOutcome {
     ///     `indexing.reconcile_interval_secs` — so it self-heals on the very next
     ///     sweep once the transient condition clears, just on that cadence instead
     ///     of the tighter retry-with-backoff one.
-    Rejected {
-        reason: String,
-    },
+    Rejected { reason: String },
 }
 
 /// Process a single file: hash, skip-if-unchanged, validate, chunk.
@@ -1101,7 +1096,7 @@ async fn process_file(
 
                 debug!("  {} chunks from: {}", chunks.len(), file_path);
 
-                Ok(FileOutcome::Ready(PendingFile {
+                Ok(FileOutcome::Ready(Box::new(PendingFile {
                     file_path,
                     frontmatter: validated.frontmatter,
                     chunks,
@@ -1113,7 +1108,8 @@ async fn process_file(
                     display_mtime,
                     schema_hash: schema_hash.to_string(),
                     chunking_fingerprint: chunking_fp.to_string(),
-                }))
+                    derived: schema.derived.clone(),
+                })))
             }
             Ok((result, None)) => {
                 for err in &result.errors {
@@ -1188,7 +1184,7 @@ async fn process_file(
             return Ok(FileOutcome::Empty { hash, mtime, size });
         }
 
-        Ok(FileOutcome::Ready(PendingFile {
+        Ok(FileOutcome::Ready(Box::new(PendingFile {
             file_path,
             frontmatter,
             chunks,
@@ -1200,7 +1196,8 @@ async fn process_file(
             display_mtime,
             schema_hash: schema_hash.to_string(),
             chunking_fingerprint: chunking_fp.to_string(),
-        }))
+            derived: schema.derived.clone(),
+        })))
     }
 }
 
@@ -1256,7 +1253,7 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     for (pf, (start, count)) in pending.iter().zip(file_boundaries.iter()) {
         let embeddings = &all_embeddings[*start..*start + *count];
 
-        let mut base_payload = with_derived_domain(&pf.frontmatter, &pf.file_path);
+        let mut base_payload = with_derived_fields(&pf.frontmatter, &pf.file_path, &pf.derived);
         // #130: every point for this file carries the same ancestor-path array —
         // computed once per file, not per chunk, same as `base_payload` itself.
         base_payload.insert(
@@ -1424,7 +1421,7 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
         if let Err(e) = state
             .upsert_document_metadata(
                 &pf.file_path,
-                &with_derived_domain(&pf.frontmatter, &pf.file_path),
+                &with_derived_fields(&pf.frontmatter, &pf.file_path, &pf.derived),
                 // #164: same rationale as the Qdrant payload above — this is the
                 // user/search-facing mtime, so it must be the git-derived value, not
                 // the fs-stat pre-filter baseline.
@@ -1881,98 +1878,77 @@ async fn remove_orphans<Q: VectorStore>(
     Ok(removed)
 }
 
-/// The frontmatter key [`with_derived_domain`] sets from a document's
-/// top-level folder.
-pub const DERIVED_DOMAIN_FIELD: &str = "domain";
-
-/// Every frontmatter key ingest derives rather than reads — the one list the
-/// write path's refusal of an authored value ([`authored_derived_field`]) and
-/// `search`'s filter vocabulary are keyed on.
-pub const DERIVED_FIELDS: &[&str] = &[DERIVED_DOMAIN_FIELD];
-
-/// The first derived field `frontmatter` sets, with the validation message a
-/// write that authors it is refused with. Ingest overrides an authored value
-/// anyway, so writing one is never what the caller meant.
+/// The first derived field (per `schema`'s `derived:` block, #345) that
+/// `frontmatter` sets, with the validation message a write that authors it is
+/// refused with. Ingest overrides an authored value anyway, so writing one is never
+/// what the caller meant.
 pub fn authored_derived_field(
     frontmatter: &HashMap<String, serde_json::Value>,
-) -> Option<(&'static str, String)> {
-    DERIVED_FIELDS
-        .iter()
-        .find(|field| frontmatter.contains_key(**field))
+    schema: &ResolvedSchema,
+) -> Option<(String, String)> {
+    schema
+        .derived_field_names()
+        .find(|field| frontmatter.contains_key(*field))
         .map(|field| {
             (
-                *field,
+                field.to_string(),
                 format!(
-                    "`{field}` is set by the document's top-level folder; remove it from \
-                     the frontmatter"
+                    "`{field}` is set from the document's folder; remove it from the \
+                     frontmatter"
                 ),
             )
         })
 }
 
-/// Frontmatter with `domain` set from the document's top-level folder.
+/// Frontmatter with every field `derived` declares (#345) set from the document's
+/// location.
 ///
-/// Applied identically to the Qdrant payload and the metadata index so a `domain`
-/// filter behaves the same through `search` and `list_documents`. Any `domain:` key an
-/// author wrote in frontmatter is overridden — location is the single source of truth.
-fn with_derived_domain(
+/// Applied identically to the Qdrant payload and the metadata index so a filter on
+/// a derived field behaves the same through `search` in both modes. A key an author
+/// wrote in frontmatter is overridden — location is the single source of truth — and
+/// dropped when the path yields no value (a document at the corpus root, or one
+/// shallower than the rule's segment). An empty `derived` returns the frontmatter
+/// unchanged.
+fn with_derived_fields(
     frontmatter: &HashMap<String, serde_json::Value>,
     rel_path: &str,
+    derived: &std::collections::BTreeMap<String, crate::schema::DerivedField>,
 ) -> HashMap<String, serde_json::Value> {
     let mut out = frontmatter.clone();
-    let authored = frontmatter
-        .get(DERIVED_DOMAIN_FIELD)
-        .and_then(|v| v.as_str());
-
-    match derive_domain(rel_path) {
-        Some(domain) => {
-            // Authors migrating from the old convention may still carry a `domain:`
-            // key. Overriding it silently would make `search(domain=…)` stop finding
-            // their document with no indication why, so say so once per index.
-            if let Some(authored) = authored
-                && authored != domain
-            {
-                warn!(
-                    file = rel_path,
-                    "frontmatter says domain '{}' but the folder says '{}'; using the \
-                     folder. Remove the frontmatter key — domain is derived from \
-                     location now.",
-                    authored,
-                    domain
-                );
+    for (field, rule) in derived {
+        let authored = frontmatter.get(field).and_then(|v| v.as_str());
+        match rule.derive(rel_path) {
+            Some(value) => {
+                // Authors migrating from an authored convention may still carry the
+                // key. Overriding it silently would make a filter on it stop finding
+                // their document with no indication why, so say so once per index.
+                if let Some(authored) = authored
+                    && authored != value
+                {
+                    warn!(
+                        file = rel_path,
+                        "frontmatter says {field} '{}' but the folder says '{}'; using \
+                         the folder. Remove the frontmatter key — {field} is derived \
+                         from location.",
+                        authored,
+                        value
+                    );
+                }
+                out.insert(field.clone(), serde_json::Value::String(value));
             }
-            out.insert(
-                DERIVED_DOMAIN_FIELD.to_string(),
-                serde_json::Value::String(domain),
-            );
-        }
-        None => {
-            if authored.is_some() {
-                warn!(
-                    file = rel_path,
-                    "dropping frontmatter 'domain': documents at the knowledge-base \
-                     root belong to no area"
-                );
+            None => {
+                if authored.is_some() {
+                    warn!(
+                        file = rel_path,
+                        "dropping frontmatter '{field}': the document's path has no \
+                         folder to derive it from"
+                    );
+                }
+                out.remove(field);
             }
-            out.remove(DERIVED_DOMAIN_FIELD);
         }
     }
     out
-}
-
-/// Top-level folder of a KB-relative path, which is what `domain` now means.
-///
-/// Returns `None` for a document sitting directly at the knowledge-base root, which
-/// belongs to no area.
-pub(crate) fn derive_domain(rel_path: &str) -> Option<String> {
-    let mut components = Path::new(rel_path).components();
-    let first = components.next()?;
-    // Only a real directory component counts, and only when something follows it.
-    components.next()?;
-    match first {
-        std::path::Component::Normal(name) => name.to_str().map(str::to_string),
-        _ => None,
-    }
 }
 
 /// Derive the ancestor-path keyword array (#130) stored under
@@ -2008,7 +1984,7 @@ pub(crate) fn derive_domain(rel_path: &str) -> Option<String> {
 /// `LIKE prefix%` in `state.rs` — untouched by this change).
 ///
 /// For a document at the knowledge-base root there are no ancestor directories to
-/// record (mirroring `derive_domain`'s "no area" case), so the result is the
+/// record (mirroring a `path_segment` derived field's "no segment" case), so the result is the
 /// one-element vector holding just the document's own path — a root-level document
 /// is a legitimate `path_prefix` target too.
 ///
@@ -2884,7 +2860,7 @@ async fn backfill_document_metadata(
         let hash = compute_hash_from_bytes(content.as_bytes());
         let schema = schemas.resolve_for(Path::new(rel_key));
         let (frontmatter, body) = validate::parse_frontmatter(&content, schema);
-        let frontmatter = with_derived_domain(&frontmatter, rel_key);
+        let frontmatter = with_derived_fields(&frontmatter, rel_key, &schema.derived);
         // #164: same git-derived-with-fs-fallback mtime `process_file`/`upsert_pending`
         // use for the user-facing value — `documents.mtime` is the only thing this
         // function writes, so there is no fs-stat-pre-filter baseline to keep separate
@@ -3777,7 +3753,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
                 // level infrastructure problem (Qdrant/embeddings unreachable), unrelated
                 // to this file's validity, and is retried at the run level regardless.
                 INDEX_STATUS.record_strict_rejection(rel_key, None);
-                pending.push(pf);
+                pending.push(*pf);
 
                 // #160: flush as soon as `pending` reaches the bounded batch size,
                 // rather than letting it grow for the rest of the scan loop. This is
@@ -6900,24 +6876,84 @@ mod tests {
         );
     }
 
-    // -- domain derivation ---------------------------------------------------
+    // -- derived fields (#345) -----------------------------------------------
+
+    fn segment(index: usize) -> crate::schema::DerivedField {
+        crate::schema::DerivedField {
+            from: crate::schema::DerivedFrom::PathSegment,
+            index,
+        }
+    }
+
+    fn derived_spec(
+        entries: &[(&str, usize)],
+    ) -> std::collections::BTreeMap<String, crate::schema::DerivedField> {
+        entries
+            .iter()
+            .map(|(name, index)| (name.to_string(), segment(*index)))
+            .collect()
+    }
 
     #[test]
     fn domain_comes_from_the_top_level_folder() {
         assert_eq!(
-            derive_domain("food/recipes/chili.md").as_deref(),
+            segment(0).derive("food/recipes/chili.md").as_deref(),
             Some("food")
         );
         assert_eq!(
-            derive_domain("sysadmin/zfs.md").as_deref(),
+            segment(0).derive("sysadmin/zfs.md").as_deref(),
             Some("sysadmin")
         );
     }
 
     #[test]
     fn documents_at_the_root_have_no_domain() {
-        assert_eq!(derive_domain("README.md"), None);
-        assert_eq!(derive_domain(""), None);
+        assert_eq!(segment(0).derive("README.md"), None);
+        assert_eq!(segment(0).derive(""), None);
+        // Only a real directory segment counts.
+        assert_eq!(segment(0).derive("/abs.md"), None);
+        assert_eq!(segment(0).derive("./x.md"), None);
+    }
+
+    #[test]
+    fn a_segment_index_past_the_directories_yields_nothing() {
+        // The file name is never a segment.
+        assert_eq!(segment(1).derive("food/chili.md"), None);
+        assert_eq!(
+            segment(1)
+                .derive("campaigns/curse/npcs/strahd.md")
+                .as_deref(),
+            Some("curse")
+        );
+        assert_eq!(
+            segment(2)
+                .derive("campaigns/curse/npcs/strahd.md")
+                .as_deref(),
+            Some("npcs")
+        );
+        assert_eq!(segment(3).derive("campaigns/curse/npcs/strahd.md"), None);
+    }
+
+    #[test]
+    fn with_no_derived_rules_frontmatter_is_untouched() {
+        let mut fm: HashMap<String, serde_json::Value> = HashMap::new();
+        fm.insert("domain".into(), serde_json::json!("lifestyle"));
+        let out = with_derived_fields(&fm, "food/recipes/chili.md", &derived_spec(&[]));
+        assert_eq!(out, fm, "derivation is opt-in: an authored domain stands");
+    }
+
+    #[test]
+    fn a_non_domain_field_derives_from_its_own_segment() {
+        let fm: HashMap<String, serde_json::Value> = HashMap::new();
+        let spec = derived_spec(&[("campaign", 1), ("area", 0)]);
+        let out = with_derived_fields(&fm, "campaigns/curse/npcs/strahd.md", &spec);
+        assert_eq!(out["campaign"], serde_json::json!("curse"));
+        assert_eq!(out["area"], serde_json::json!("campaigns"));
+        assert!(!out.contains_key("domain"));
+
+        let shallow = with_derived_fields(&fm, "campaigns/index.md", &spec);
+        assert!(!shallow.contains_key("campaign"), "{shallow:?}");
+        assert_eq!(shallow["area"], serde_json::json!("campaigns"));
     }
 
     // -- path-ancestor derivation (#130) --------------------------------------
@@ -6992,7 +7028,11 @@ mod tests {
             "domain".into(),
             serde_json::Value::String("lifestyle".into()),
         );
-        let out = with_derived_domain(&fm, "food/recipes/chili.md");
+        let out = with_derived_fields(
+            &fm,
+            "food/recipes/chili.md",
+            &derived_spec(&[("domain", 0)]),
+        );
         assert_eq!(out["domain"], serde_json::json!("food"));
     }
 
@@ -7000,7 +7040,7 @@ mod tests {
     fn root_documents_lose_a_stale_domain_key() {
         let mut fm: HashMap<String, serde_json::Value> = HashMap::new();
         fm.insert("domain".into(), serde_json::Value::String("old".into()));
-        let out = with_derived_domain(&fm, "README.md");
+        let out = with_derived_fields(&fm, "README.md", &derived_spec(&[("domain", 0)]));
         assert!(
             !out.contains_key("domain"),
             "a document in no folder belongs to no domain"
@@ -8772,6 +8812,7 @@ mod tests {
         PendingFile {
             schema_hash: String::new(),
             chunking_fingerprint: String::new(),
+            derived: Default::default(),
             file_path: file_path.to_string(),
             frontmatter: HashMap::new(),
             chunks,
@@ -9015,6 +9056,46 @@ mod tests {
         }
     }
 
+    /// #345: the schema's `derived:` rules carried on the pending file reach both
+    /// the Qdrant payload and the metadata index, overriding an authored value;
+    /// without rules the authored value is kept in both.
+    #[tokio::test]
+    async fn upsert_pending_applies_the_derived_rules_to_payload_and_metadata() {
+        for derive in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let state = test_state_db(&dir).await;
+            let mut pf = make_pending("sysadmin/nodes/efi.md", 1, 0);
+            pf.frontmatter
+                .insert("domain".into(), serde_json::json!("authored"));
+            if derive {
+                pf.derived = derived_spec(&[("domain", 0), ("node", 1)]);
+            }
+            let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]]);
+            let store = MockVectorStore::all_ok();
+            upsert_pending(&[pf], &embedder, &store, &state, "test-col", false)
+                .await
+                .unwrap();
+
+            let (domain, node) = if derive {
+                (
+                    serde_json::json!("sysadmin"),
+                    Some(serde_json::json!("nodes")),
+                )
+            } else {
+                (serde_json::json!("authored"), None)
+            };
+            {
+                let points = store.upserted_points.lock().unwrap();
+                assert_eq!(points[0].payload.get("domain"), Some(&domain));
+                assert_eq!(points[0].payload.get("node"), node.as_ref());
+            }
+
+            let summaries = state.all_document_summaries().await.unwrap();
+            assert_eq!(summaries[0].frontmatter["domain"], domain);
+            assert_eq!(summaries[0].frontmatter.get("node"), node.as_ref());
+        }
+    }
+
     /// #286: `heading_path`/`heading_level`/`heading_prefixes`/
     /// `section_key`/`section_line_start`/`section_line_end` are written to the
     /// Qdrant payload only when `chunking.heading_metadata` is on — and, when
@@ -9066,6 +9147,7 @@ mod tests {
             display_mtime: 1,
             schema_hash: String::new(),
             chunking_fingerprint: String::new(),
+            derived: Default::default(),
         };
         let pending = vec![pf];
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);

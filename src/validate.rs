@@ -153,15 +153,10 @@ pub(crate) fn parse_frontmatter_raw(content: &str) -> (HashMap<String, Value>, S
     (frontmatter, parsed.content)
 }
 
-/// Whether `field` is one ingest derives rather than reads (`ingest::DERIVED_FIELDS`):
-/// never required of an author, and never filled from a schema default — ingest
-/// sets it from the document's location whatever the frontmatter says.
-fn is_derived_field(field: &str) -> bool {
-    crate::ingest::DERIVED_FIELDS.contains(&field)
-}
-
 /// Fill in schema-declared defaults for fields the document omitted. A default
-/// declared for a derived field is ignored.
+/// declared for a derived field (the root schema's `derived:` block, #345) is
+/// ignored: ingest sets it from the document's location whatever the frontmatter
+/// says.
 ///
 /// Walks the flat view, so it reaches nested object fields (`planning.effort`) but
 /// never a list's element schema: a default declared under `items` is not applied
@@ -175,7 +170,7 @@ pub(crate) fn apply_defaults(frontmatter: &mut HashMap<String, Value>, schema: &
         let Some(default) = &def.default else {
             continue;
         };
-        if is_derived_field(path) {
+        if schema.is_derived(path) {
             continue;
         }
         if schema::get_by_dotpath(frontmatter, path).is_none() {
@@ -209,7 +204,15 @@ pub fn validate_frontmatter(
 ) -> Vec<FieldError> {
     let mut field_errors: Vec<FieldError> = Vec::new();
     for (name, def) in schema.fields.tree() {
-        check_field(name, def, frontmatter.get(name), &mut field_errors);
+        // A derived field (#345) is never required of an author: ingest sets it.
+        let required = def.required && !schema.is_derived(name);
+        check_field(
+            name,
+            def,
+            required,
+            frontmatter.get(name),
+            &mut field_errors,
+        );
     }
     cap_field_errors(&mut field_errors);
     field_errors
@@ -243,14 +246,21 @@ fn cap_field_errors(errors: &mut Vec<FieldError>) {
 }
 
 /// Check one field (a node of the schema tree at rendered path `path`) whose parent is
-/// present. `value` is `None` when the parent has no such key.
-fn check_field(path: &str, def: &FieldDef, value: Option<&Value>, errors: &mut Vec<FieldError>) {
+/// present. `value` is `None` when the parent has no such key. `required` is the
+/// node's own `required`, unless the caller exempts it (a derived field).
+fn check_field(
+    path: &str,
+    def: &FieldDef,
+    required: bool,
+    value: Option<&Value>,
+    errors: &mut Vec<FieldError>,
+) {
     // An empty string satisfies "present" for lookup purposes but not for the
     // required check — matching the pre-cascade behavior exactly.
     let empty_string = value.and_then(Value::as_str) == Some("");
     let absent = matches!(value, None | Some(Value::Null));
 
-    if (absent || empty_string) && def.required && !is_derived_field(path) {
+    if (absent || empty_string) && required {
         let (schema_origin, suffix) = origin_suffix(def);
         errors.push(FieldError {
             field: path.to_string(),
@@ -311,6 +321,7 @@ fn check_value(path: &str, def: &FieldDef, value: &Value, errors: &mut Vec<Field
         check_field(
             &format!("{path}.{name}"),
             child,
+            child.required,
             object.and_then(|map| map.get(name)),
             errors,
         );
@@ -845,8 +856,9 @@ mod tests {
         );
     }
 
-    /// `domain` is derived from the document's folder at index time: a rule that
-    /// requires it, or a default for it, is never applied to the frontmatter.
+    /// A field the root schema's `derived:` block declares (#345) is set from the
+    /// document's folder at index time: a rule that requires it, or a default for it,
+    /// is never applied to the frontmatter. Without the block it is an ordinary field.
     #[tokio::test]
     async fn a_derived_field_is_never_required_nor_defaulted() {
         let required = FrontmatterConfig {
@@ -857,15 +869,32 @@ mod tests {
             defaults: HashMap::from([("domain".into(), "x".into())]),
             ..default_fm_config()
         };
-        for config in [required, defaulted] {
-            let (result, validated) = validate_content(
-                Path::new("docs/a.md"),
-                "---\ntitle: Test\ntype: guide\n---\nBody",
-                &as_schema(&config),
-                &default_val_config(),
-            )
-            .await
-            .unwrap();
+        for (config, is_required) in [(required, true), (defaulted, false)] {
+            let mut schema = as_schema(&config);
+            let validate = |schema: ResolvedSchema| async move {
+                validate_content(
+                    Path::new("docs/a.md"),
+                    "---\ntitle: Test\ntype: guide\n---\nBody",
+                    &schema,
+                    &default_val_config(),
+                )
+                .await
+                .unwrap()
+            };
+
+            // Not derived: the rule applies as written.
+            let (result, validated) = validate(schema.clone()).await;
+            if is_required {
+                assert!(!result.valid, "domain is required when not derived");
+            } else {
+                assert_eq!(validated.unwrap().frontmatter["domain"], "x");
+            }
+
+            schema.derived.insert(
+                "domain".into(),
+                crate::schema::DerivedField::path_segment(0),
+            );
+            let (result, validated) = validate(schema).await;
             assert!(result.valid, "{:?}", result.errors);
             assert!(!validated.unwrap().frontmatter.contains_key("domain"));
         }
