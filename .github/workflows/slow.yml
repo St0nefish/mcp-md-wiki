@@ -63,7 +63,7 @@ jobs:
           echo "::error::slow.yml runs only from master (this run: ${GITHUB_REF})."
           exit 1
 
-      - uses: actions/checkout@v5 # zizmor: ignore[artipacked] read-only token; merge-tree.sh fetches, and nothing uploads the workspace
+      - uses: actions/checkout@v7 # zizmor: ignore[artipacked] read-only token; merge-tree.sh fetches, and nothing uploads the workspace
         with:
           fetch-depth: 0
 
@@ -185,7 +185,7 @@ jobs:
       statuses: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           sparse-checkout: .github/scripts
           persist-credentials: false
