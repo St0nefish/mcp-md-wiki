@@ -1894,21 +1894,49 @@ where
 /// to that test, without depending on any process-global state shared with the
 /// rest of the suite.
 async fn reconcile_loop(shared_config: SharedConfig, ct: CancellationToken, on_fire: impl Fn()) {
+    periodic_job_loop(
+        shared_config,
+        ct,
+        |config| config.indexing.reconcile_interval_secs,
+        || {
+            debug!("Periodic reconcile sweep: marking a full reconcile");
+            on_fire();
+            std::future::ready(())
+        },
+    )
+    .await;
+}
+
+/// Generic periodic-job loop: sleep for the interval `interval_secs` extracts from
+/// the live config, then run `run` to completion, and repeat until `ct` is cancelled.
+///
+/// The interval is read from `shared_config` on every iteration (not captured once),
+/// so a `POST /admin/reload` that changes it governs the very next sleep. Cancellation
+/// interrupts the sleep only: a `run` already in flight is awaited to completion, so a
+/// job that must stop promptly checks `ct.is_cancelled()` itself between its units of
+/// work. A job that is configured off still gets its tick — `run` is where it re-reads
+/// its own `enabled` flag, which is what lets a reload switch it on without a restart.
+async fn periodic_job_loop<F, Fut>(
+    shared_config: SharedConfig,
+    ct: CancellationToken,
+    interval_secs: impl Fn(&config::ResolvedConfig) -> u64,
+    mut run: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     loop {
         // Read fresh every iteration (not captured once) so a reload's new
         // interval governs the very next sleep this task schedules, not just
         // sleeps scheduled after a restart.
-        let reconcile_secs = config::load_shared_config(&shared_config)
-            .indexing
-            .reconcile_interval_secs;
+        let secs = interval_secs(&config::load_shared_config(&shared_config));
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(reconcile_secs)) => {}
+            () = tokio::time::sleep(Duration::from_secs(secs)) => {}
             () = ct.cancelled() => {
                 break;
             }
         }
-        debug!("Periodic reconcile sweep: marking a full reconcile");
-        on_fire();
+        run().await;
     }
 }
 
@@ -4335,6 +4363,48 @@ mod tests {
             fires.load(Ordering::SeqCst),
             0,
             "a cancelled loop must never fire"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_job_loop_awaits_an_async_run_and_reads_its_own_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        // The interval comes from the extractor, not from `indexing.*`: a 7s
+        // reconcile interval must be ignored by a job that reads another key.
+        let shared = reconcile_config(dir.path(), 7);
+        let ct = CancellationToken::new();
+        let finished = Arc::new(AtomicU32::new(0));
+        let finished_for_run = Arc::clone(&finished);
+
+        let handle = tokio::spawn(periodic_job_loop(
+            shared,
+            ct.child_token(),
+            |_| 3,
+            move || {
+                let finished = Arc::clone(&finished_for_run);
+                async move {
+                    // A run that takes time: cancellation during it must not drop it.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(finished.load(Ordering::SeqCst), 0, "run is still in flight");
+
+        ct.cancel();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("loop must return once the in-flight run completes")
+            .unwrap();
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "an in-flight run is awaited to completion, not dropped by cancel"
         );
     }
 
