@@ -26,7 +26,7 @@ rmcp = { version = "1", features = ["transport-streamable-http-server", "server"
 qdrant-client = "1"
 
 # Frontmatter parsing
-gray_matter = "0.2"
+gray_matter = "0.3"
 
 # Markdown chunking. An upgrade that changes split points must bump
 # `ingest::CHUNKER_VERSION`, or the index silently mixes old and new chunks.
