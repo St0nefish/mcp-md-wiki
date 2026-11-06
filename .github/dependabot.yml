@@ -22,15 +22,22 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 2
     commit-message:
       prefix: "chore(deps)"
     groups:
-      # Minor and patch bumps land together in one PR. A major bump (qdrant-client,
-      # rmcp, sqlx, ...) is its own PR so its breakage is attributable.
+      # Two PRs at most per week. Minor and patch bumps land together; every major
+      # bump (a 0.x minor such as tower-http 0.6 -> 0.7 counts as one) lands in a
+      # second PR, so a major that does not compile never holds up the routine
+      # bumps. If one breaks the major PR, `@dependabot ignore this major version`
+      # on it (or `@dependabot ignore <crate>`) drops that crate from the next PR
+      # and the rest proceed.
       cargo-minor-patch:
         patterns: ["*"]
         update-types: [minor, patch]
+      cargo-major:
+        patterns: ["*"]
+        update-types: [major]
 
   - package-ecosystem: github-actions
     directory: /
