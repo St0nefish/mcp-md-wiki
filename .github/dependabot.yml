@@ -1,8 +1,15 @@
-# Dependabot version updates, weekly and grouped to keep the PR volume low.
+# Dependabot version updates: monthly, one grouped PR per ecosystem, no major bumps.
 #
-# These PRs are not owner-authored, so auto-merge.yml never arms them (only
-# `St0nefish`'s PRs are). That is intended: the owner reads the grouped PR and arms it by
-# hand, which is also the approval for ci-slow to run on it.
+# Every Dependabot PR costs a manual arm (these PRs are not owner-authored, so
+# auto-merge.yml never arms them) and a ci-slow run, so the volume is kept to about
+# three PRs a month. Arming one is also the approval for ci-slow to run on it.
+#
+# Cargo major bumps are not proposed at all (a 0.x minor such as tower-http 0.6 -> 0.7
+# counts as one). A major is a migration, not a merge: it changes APIs and needs code
+# edits, which a bot PR cannot make, and grouping several into one PR only produces a
+# PR that cannot build. Do them by hand, one crate at a time, when there is a reason.
+# `cargo audit` and `cargo deny` in the lint job still fail CI on a vulnerable or
+# unsound version, whatever the bump policy.
 #
 # Not covered, deliberately:
 #   - the Qdrant image pin: it is repeated in docker-compose.yml and every
@@ -20,31 +27,23 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
-      # Two PRs at most per week. Minor and patch bumps land together; every major
-      # bump (a 0.x minor such as tower-http 0.6 -> 0.7 counts as one) lands in a
-      # second PR, so a major that does not compile never holds up the routine
-      # bumps. If one breaks the major PR, `@dependabot ignore this major version`
-      # on it (or `@dependabot ignore <crate>`) drops that crate from the next PR
-      # and the rest proceed.
       cargo-minor-patch:
         patterns: ["*"]
         update-types: [minor, patch]
-      cargo-major:
-        patterns: ["*"]
-        update-types: [major]
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     commit-message:
       prefix: "chore(ci)"
     groups:
@@ -54,9 +53,8 @@ updates:
   - package-ecosystem: docker
     directory: /
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     commit-message:
       prefix: "chore(docker)"
     groups:
