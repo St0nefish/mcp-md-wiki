@@ -381,6 +381,109 @@ fn walk_dir(
 }
 
 // ---------------------------------------------------------------------------
+// KB path safety: the one definition of "a real entry under the KB root"
+// ---------------------------------------------------------------------------
+
+/// What [`inspect_kb_path`] found at a KB-relative path, none of whose existing
+/// components is a symlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KbEntry {
+    /// Nothing there (or an ancestor is missing or not a directory).
+    Missing,
+    /// A regular file.
+    File,
+    /// A directory (the KB root itself, for an empty path).
+    Dir,
+    /// Something else: a FIFO, socket or device node.
+    Other,
+}
+
+/// Why [`inspect_kb_path`] refused a KB-relative path outright.
+#[derive(Debug)]
+pub(crate) enum KbPathError {
+    /// A component other than a plain name or `.`: `..`, a root or a prefix.
+    NotRelative,
+    /// A `.git` component, compared case-insensitively. A `.git` directory is
+    /// never knowledge-base content, whatever `indexing.include` says.
+    GitDir,
+    /// An existing component — the leaf included, a dangling link included — is
+    /// a symbolic link. Git materializes tracked symlinks on checkout, so a
+    /// pushed `leak.md -> /proc/self/environ` (or a directory `d -> /etc`, or a
+    /// link to `.git/config` inside the root) is refused rather than followed.
+    Symlink,
+    /// A component could not be stat'ed (permission denied, say).
+    Io(std::io::Error),
+}
+
+/// True when `name` is a `.git` path component, ignoring ASCII case (a
+/// case-insensitive filesystem resolves `.GIT` to the same directory).
+pub(crate) fn is_git_component(name: &std::ffi::OsStr) -> bool {
+    name.eq_ignore_ascii_case(".git")
+}
+
+/// Inspect `rel` under `root` without following any symlink: every component
+/// must be a plain name (no `..`, no root), none may be `.git`, and every one
+/// that exists on disk is checked with `symlink_metadata` — a symlink anywhere
+/// is refused. With no symlink below `root`, the path cannot resolve outside
+/// it, so no separate canonical-prefix check is needed. `root` itself is not
+/// inspected (callers pass the configured or canonicalized data path).
+///
+/// The one definition shared by the indexer (`index_paths_generic`,
+/// `scan_for_dirty`), the write pipeline (`write::resolve_safe_write_path`) and
+/// the read path (`retrieval::resolve_within_data`).
+pub(crate) fn inspect_kb_path(root: &Path, rel: &Path) -> Result<KbEntry, KbPathError> {
+    let mut names: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => {
+                if is_git_component(name) {
+                    return Err(KbPathError::GitDir);
+                }
+                names.push(name);
+            }
+            _ => return Err(KbPathError::NotRelative),
+        }
+    }
+
+    let mut current = root.to_path_buf();
+    for (i, name) in names.iter().enumerate() {
+        current.push(name);
+        let meta = match std::fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(KbEntry::Missing);
+            }
+            Err(e) => return Err(KbPathError::Io(e)),
+        };
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            return Err(KbPathError::Symlink);
+        }
+        let is_leaf = i + 1 == names.len();
+        if !is_leaf {
+            if !file_type.is_dir() {
+                return Ok(KbEntry::Missing);
+            }
+            continue;
+        }
+        return Ok(if file_type.is_file() {
+            KbEntry::File
+        } else if file_type.is_dir() {
+            KbEntry::Dir
+        } else {
+            KbEntry::Other
+        });
+    }
+    Ok(KbEntry::Dir)
+}
+
+// ---------------------------------------------------------------------------
 // Hashing
 // ---------------------------------------------------------------------------
 
@@ -2938,12 +3041,16 @@ pub async fn scan_for_dirty(
                 // deleted, or it is now excluded (#266).
                 // A file that is really gone is reported at once; one still on disk is
                 // an exclusion purge, decided after the scan. An unknown stat result
-                // counts as present.
-                let abs = data_path.join(&row.file_path);
-                if tokio::fs::try_exists(&abs).await.unwrap_or(true) {
-                    excluded_present.push(row.file_path.clone());
-                } else {
-                    dirty.insert(PathBuf::from(&row.file_path));
+                // counts as present. A path that became a symlink (or now sits under
+                // one) is not a document any more: it is reported as gone, and
+                // `index_paths` purges it the way it purges a deleted file.
+                match inspect_kb_path(&data_path, Path::new(&row.file_path)) {
+                    Ok(KbEntry::File) | Err(KbPathError::Io(_)) => {
+                        excluded_present.push(row.file_path.clone());
+                    }
+                    _ => {
+                        dirty.insert(PathBuf::from(&row.file_path));
+                    }
                 }
                 continue;
             }
@@ -3450,9 +3557,34 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         // `exclude`/`exclude_files` (#266): treat as a delete, purged in a single
         // batch below rather than one Qdrant round trip per path. Only the paths
         // this run was given are ever considered.
-        if !abs_path.exists() {
-            missing.push(rel_key.clone());
-            continue;
+        //
+        // A path that is not a regular file reached without a symlink (a symlink
+        // leaf or ancestor, a `.git` component, a directory) is treated exactly as
+        // missing: the full walk (`walk_dir`) never yields one, and the paths a
+        // webhook, `/admin/sync` or a write's rebase hands in are only
+        // glob-filtered, so reading through it here would embed whatever it points
+        // at (`/proc/self/environ`, `.git/config`) and serve it from `search`.
+        match inspect_kb_path(&data_path, Path::new(rel_key.as_str())) {
+            Ok(KbEntry::File) => {}
+            Ok(KbEntry::Missing) => {
+                missing.push(rel_key.clone());
+                continue;
+            }
+            Ok(KbEntry::Dir | KbEntry::Other)
+            | Err(KbPathError::Symlink | KbPathError::GitDir | KbPathError::NotRelative) => {
+                warn!(
+                    "Not a regular file inside the knowledge base (symlink, .git path or \
+                     non-file), treating as deleted: {}",
+                    rel_key
+                );
+                missing.push(rel_key.clone());
+                continue;
+            }
+            Err(KbPathError::Io(e)) => {
+                error!("Failed to stat {}: {:#}", rel_key, e);
+                read_errors += 1;
+                continue;
+            }
         }
         if let Some(filter) = &exclusion_filter
             && !filter.is_indexable(rel_key)
@@ -4135,6 +4267,100 @@ mod tests {
             2,
             "changed.md + unchanged.md remain; missing.md's metadata is gone"
         );
+    }
+
+    /// A path handed to an incremental run (webhook, `/admin/sync`, a write's
+    /// rebase) that is a symlink, sits under a symlinked directory, or names
+    /// `.git` is never read or embedded: it is treated as deleted, so a row
+    /// indexed before it became a symlink is purged.
+    #[tokio::test]
+    async fn index_paths_generic_never_reads_through_a_symlink_and_purges_its_row() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+
+        std::fs::write(outside.path().join("secret.md"), "# Secret\n\nToken.").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.md"), dir.path().join("leak.md"))
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "[core]").unwrap();
+        std::os::unix::fs::symlink(".git/config", dir.path().join("inside.md")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("d")).unwrap();
+
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+        let state = open_scan_test_db(&config).await;
+        state
+            .upsert(
+                "leak.md",
+                "old-hash",
+                1,
+                &schema_hash,
+                &chunking_fingerprint(&config.chunking),
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let paths = vec![
+            PathBuf::from("leak.md"),
+            PathBuf::from("inside.md"),
+            PathBuf::from("d/secret.md"),
+            PathBuf::from(".git/config"),
+        ];
+        // No embedding is expected at all: an attempted one fails the run on the
+        // embedding-count mismatch.
+        let embedder = MockEmbedClient::ok(vec![]);
+        let store = TrackingMockVectorStore::all_ok();
+
+        let result = index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        assert!(
+            store.upserted_points.lock().unwrap().is_empty(),
+            "nothing behind a symlink or under .git may be embedded"
+        );
+        let deletes = store.delete_by_files_calls.lock().unwrap().clone();
+        assert_eq!(deletes.len(), 1, "one purge batch: {deletes:?}");
+        assert!(deletes[0].contains(&"leak.md".to_string()), "{deletes:?}");
+        assert!(
+            state.get("leak.md").await.unwrap().is_none(),
+            "the row indexed before the path became a symlink is purged"
+        );
+    }
+
+    #[test]
+    fn inspect_kb_path_classifies_without_following_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/a.md"), "a").unwrap();
+        std::os::unix::fs::symlink("docs", root.join("alias")).unwrap();
+        std::os::unix::fs::symlink("docs/a.md", root.join("link.md")).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("dangling.md")).unwrap();
+
+        let check = |rel: &str| inspect_kb_path(root, Path::new(rel));
+        assert!(matches!(check("docs/a.md"), Ok(KbEntry::File)));
+        assert!(matches!(check("./docs/a.md"), Ok(KbEntry::File)));
+        assert!(matches!(check("docs"), Ok(KbEntry::Dir)));
+        assert!(matches!(check("docs/none.md"), Ok(KbEntry::Missing)));
+        assert!(matches!(check("docs/a.md/x.md"), Ok(KbEntry::Missing)));
+        assert!(matches!(check("link.md"), Err(KbPathError::Symlink)));
+        assert!(matches!(check("dangling.md"), Err(KbPathError::Symlink)));
+        assert!(matches!(check("alias/a.md"), Err(KbPathError::Symlink)));
+        assert!(matches!(check(".git/config"), Err(KbPathError::GitDir)));
+        assert!(matches!(check("x/.GIT"), Err(KbPathError::GitDir)));
+        assert!(matches!(check("../x.md"), Err(KbPathError::NotRelative)));
+        assert!(matches!(check("/x.md"), Err(KbPathError::NotRelative)));
     }
 
     /// #156: before the fix, `process_file` returned `Err` for a `validation.strict`

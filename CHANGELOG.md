@@ -14,6 +14,29 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+### Security
+
+- **Symlinks and `.git` paths are refused on write and read, and skipped by
+  incremental indexing.** A path with a `.git` component (any case) or a symlink
+  anywhere along it, leaf included, is refused by `write_document`, `delete_document`
+  and directory moves (`write::resolve_safe_write_path`) and by `get_document` and
+  `GET /api/doc` (`retrieval::resolve_within_data`), whatever `indexing.include`
+  says. Before, a leaf symlink to a file inside the KB (`x.md -> .git/config`) passed
+  the write check and the write landed in its target, and a broad include such as
+  `**/*` made `.git/config` readable. A path the webhook, `POST /admin/sync` or a
+  write's rebase hands the indexer is now checked the same way
+  (`ingest::inspect_kb_path`, the one shared definition): a symlink (or a path under
+  a symlinked directory, or a `.git` path) is treated as deleted and its index row
+  purged, never read — before, a pushed `leak.md -> /proc/self/environ` was embedded
+  and served from `search`. The full reconcile walk already skipped symlinks; a
+  previously indexed file that became one is now purged on the next reconcile.
+  Behavior change: a symlinked document or directory that used to be readable or
+  writable through the link is refused; replace the link with the real file.
+- **An absolute path no longer probes the host filesystem.** `get_document` and
+  `/api/doc/{*path}` used to try an absolute path literally on the host first, so the
+  error told a caller whether a file existed outside the KB. A leading `/` now always
+  means the KB root, as it already did for the write tools.
+
 ## [0.2.2] - 2026-11-03
 
 ### Added

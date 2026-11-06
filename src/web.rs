@@ -4844,19 +4844,18 @@ mod tests {
 
     #[tokio::test]
     async fn post_doc_resolve_error_hides_absolute_path_in_response_body() {
-        // Concrete trigger: `existing.md/x` treats an existing *file* as a path
-        // component, so `canonicalize()` fails with `NotADirectory` — not
-        // `NotFound` or `PermissionDenied`, so `resolve_within_data` returns
-        // `ResolveErr::Other`, whose message embeds the canonicalized absolute
-        // path (e.g. `/tmp/.../existing.md/x`). The response body must not leak
-        // that path or the data-directory prefix (F4).
+        // Concrete trigger: `locked/` has no permissions, so stat'ing
+        // `locked/x.md` fails with `PermissionDenied` and `resolve_within_data`
+        // returns `ResolveErr::Other`, whose message embeds the absolute path
+        // (e.g. `/tmp/.../locked/x.md`). The response body must not leak that
+        // path or the data-directory prefix (F4).
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
-        std::fs::write(canonical.join("existing.md"), "hello").unwrap();
+        let _locked = LockedDir::new(&canonical.join("locked"));
 
         let app = ui_router(test_state(&canonical));
         let req = post_doc_request(
-            "existing.md/x",
+            "locked/x.md",
             serde_json::json!({
                 "content": "new content",
                 "create": false,
@@ -4871,22 +4870,41 @@ mod tests {
             "response body leaked the data directory path: {body_str}"
         );
         assert!(
-            !body_str.contains("existing.md/x"),
+            !body_str.contains("locked/x.md"),
             "response body should not embed the resolved absolute path: {body_str}"
         );
         assert_eq!(body["error"], "internal error resolving path");
+    }
+
+    /// A directory with mode 000, restored on drop so the tempdir can be removed.
+    struct LockedDir(PathBuf);
+
+    impl LockedDir {
+        fn new(path: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            LockedDir(path.to_path_buf())
+        }
+    }
+
+    impl Drop for LockedDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
     }
 
     #[tokio::test]
     async fn delete_doc_resolve_error_hides_absolute_path_in_response_body() {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
-        std::fs::write(canonical.join("existing.md"), "hello").unwrap();
+        let _locked = LockedDir::new(&canonical.join("locked"));
 
         let app = ui_router(test_state(&canonical));
         let req = Request::builder()
             .method("DELETE")
-            .uri("/api/doc/existing.md/x")
+            .uri("/api/doc/locked/x.md")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::json!({}).to_string()))
             .unwrap();

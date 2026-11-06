@@ -548,9 +548,11 @@ impl PathSafetyError {
 /// 1. Reject absolute paths.
 /// 2. Reject any `..` component.
 /// 3. Lexical `starts_with` check on the joined abs path.
-/// 4. Canonicalize the deepest *existing* ancestor of the target; verify it
-///    still `starts_with` the canonical data_root. This catches a symlinked
-///    ancestor directory that resolves to a location outside data_root.
+/// 4. Reject a `.git` component (any case) and any symlink among the existing
+///    components, leaf included ([`crate::ingest::inspect_kb_path`], the same
+///    check the indexer and the read path apply).
+/// 5. Canonicalize the deepest *existing* ancestor of the target; verify it
+///    still `starts_with` the canonical data_root (defense in depth behind 4).
 fn resolve_safe_write_path_detailed(
     data_root: &Path,
     rel_path: &str,
@@ -584,7 +586,49 @@ fn resolve_safe_write_path_detailed(
         ));
     }
 
-    // 4. Canonical-ancestor check: canonicalize data_root, then walk up from
+    // 4. No `.git` component, and no symlink anywhere along the existing part of
+    //    the path — the leaf included. Canonicalizing an ancestor (step 5) cannot
+    //    see a leaf symlink to a file inside the root (`x.md -> .git/config`,
+    //    `x.md -> state.db`), and writing through one lands in its target.
+    //    Independent of `indexing.include`: a widened include must not make a
+    //    `.git` directory writable. A directory leaf is allowed (directory moves
+    //    resolve their prefixes here); a FIFO, socket or device node is not.
+    match crate::ingest::inspect_kb_path(data_root, requested) {
+        Ok(
+            crate::ingest::KbEntry::Missing
+            | crate::ingest::KbEntry::File
+            | crate::ingest::KbEntry::Dir,
+        ) => {}
+        Ok(crate::ingest::KbEntry::Other) => {
+            return Err(PathSafetyError::Rejected(
+                "path is not a regular file or directory".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::GitDir) => {
+            return Err(PathSafetyError::Rejected(
+                "path must not contain a '.git' component".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::Symlink) => {
+            return Err(PathSafetyError::Rejected(
+                "path must not be or pass through a symlink".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::NotRelative) => {
+            return Err(PathSafetyError::Rejected(
+                "path must be relative to the knowledge base root".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::Io(e)) => {
+            return Err(PathSafetyError::Internal(format!(
+                "cannot inspect '{}': {}",
+                abs_path.display(),
+                e
+            )));
+        }
+    }
+
+    // 5. Canonical-ancestor check: canonicalize data_root, then walk up from
     //    abs_path to find the deepest ancestor that actually exists on disk,
     //    canonicalize it, and confirm it still sits under canonical data_root.
     let canonical_root = data_root.canonicalize().map_err(|e| {
@@ -5084,6 +5128,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn safe_write_path_rejects_a_leaf_symlink_to_an_in_root_file() {
+        // `x.md -> .git/config`: the canonical ancestor is inside the root, so only
+        // a leaf check stops the write landing in `.git/config`.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".git/config"), "[core]").unwrap();
+        std::fs::write(tmp.path().join("state.db"), "db").unwrap();
+        std::os::unix::fs::symlink(".git/config", tmp.path().join("x.md")).unwrap();
+        std::os::unix::fs::symlink("state.db", tmp.path().join("y.md")).unwrap();
+
+        for rel in ["x.md", "/x.md", "y.md"] {
+            let msg = resolve_safe_write_path(tmp.path(), rel).unwrap_err();
+            assert!(msg.contains("symlink"), "{rel}: {msg}");
+            assert!(!msg.contains("git"), "no git talk for MCP callers: {msg}");
+        }
+    }
+
+    #[test]
+    fn safe_write_path_rejects_a_leaf_symlink_to_an_outside_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), tmp.path().join("leak.md"))
+            .unwrap();
+        // A dangling one is refused too.
+        std::os::unix::fs::symlink("nowhere.md", tmp.path().join("dangling.md")).unwrap();
+
+        for rel in ["leak.md", "dangling.md"] {
+            let msg = resolve_safe_write_path(tmp.path(), rel).unwrap_err();
+            assert!(msg.contains("symlink"), "{rel}: {msg}");
+        }
+    }
+
+    #[test]
+    fn safe_write_path_rejects_a_symlinked_directory_inside_the_root() {
+        // `alias -> docs` stays inside the root canonically, but is still refused:
+        // no write goes through a link.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::os::unix::fs::symlink("docs", tmp.path().join("alias")).unwrap();
+
+        let msg = resolve_safe_write_path(tmp.path(), "alias/new.md").unwrap_err();
+        assert!(msg.contains("symlink"), "{msg}");
+        assert!(resolve_safe_write_path(tmp.path(), "docs/new.md").is_ok());
+    }
+
+    #[test]
+    fn safe_write_path_rejects_any_git_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        for rel in [
+            ".git/config",
+            "/.git/hooks/pre-commit",
+            "a/.GIT/x.md",
+            ".Git",
+        ] {
+            let msg = resolve_safe_write_path(tmp.path(), rel).unwrap_err();
+            assert!(msg.contains(".git"), "{rel}: {msg}");
+        }
+        // Only an exact `.git` component, not a name that merely contains it.
+        assert!(resolve_safe_write_path(tmp.path(), "notes/.gitignore.md").is_ok());
+        assert!(resolve_safe_write_path(tmp.path(), "my.git/x.md").is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // build_commit_message / render_unified_diff — pure unit tests
     // -----------------------------------------------------------------------
@@ -5956,6 +6064,53 @@ mod tests {
             document_version(b"hello\n"),
             "ce013625030ba8dba906f756967f9e9ca394464a"
         );
+    }
+
+    #[tokio::test]
+    async fn git_paths_and_symlinks_are_refused_by_every_write_even_with_a_widened_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let git_config = tmp.path().join(".git/config");
+        std::fs::write(&git_config, "[core]\n").unwrap();
+        std::os::unix::fs::symlink(".git/config", tmp.path().join("x.md")).unwrap();
+
+        let mut config = crate::mcp::make_test_resolved_config(tmp.path());
+        {
+            let c = Arc::get_mut(&mut config).unwrap();
+            c.write.dedup_enabled = false;
+            c.indexing.include = vec!["**/*".to_string()];
+            c.indexing.exclude = vec![];
+            c.indexing.exclude_files = vec![];
+        }
+        let mut harness = Harness::new(&tmp, config);
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/*").unwrap());
+        harness.include_patterns = builder.build().unwrap();
+
+        let content = "---\ntitle: T\ndescription: d\ntype: guide\ntags: [t]\n---\n# Body\n";
+        for (rel, create) in [
+            (".git/config", false),
+            (".git/new.md", true),
+            ("x.md", false),
+        ] {
+            let err = write_document(&harness.deps(), make_req(rel, content, create))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, WriteError::UnsafePath { .. }),
+                "{rel}: {err:?}"
+            );
+        }
+        let err = delete_document(&harness.deps(), "x.md", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WriteError::UnsafePath { .. }),
+            "delete: {err:?}"
+        );
+
+        assert_eq!(std::fs::read_to_string(&git_config).unwrap(), "[core]\n");
+        assert!(!tmp.path().join(".git/new.md").exists());
     }
 
     #[tokio::test]
@@ -9768,12 +9923,11 @@ mod tests {
         );
     }
 
-    /// A create whose target is taken by the time the batch writes it — here a
-    /// dangling symlink, which reads as missing but makes `create_new` fail —
-    /// fails the batch, and the rollback leaves that entry alone: only files
-    /// this batch created are removed.
+    /// A create onto a dangling symlink — which reads as missing — is refused
+    /// up front by the path check, before anything is written, and the link is
+    /// left alone.
     #[tokio::test]
-    async fn write_documents_batch_create_collision_does_not_remove_the_existing_entry() {
+    async fn write_documents_batch_create_onto_a_dangling_symlink_is_refused_and_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
         let link = tmp.path().join("docs/link.md");
@@ -9798,13 +9952,13 @@ mod tests {
         ];
         let err = write_documents_batch(&harness.deps(), &requests, None)
             .await
-            .expect_err("a create onto an existing entry must fail the batch");
+            .expect_err("a create onto a symlink must fail the batch");
         match err {
             BatchWriteError::Documents { failures } => {
                 assert_eq!(failures.len(), 1, "{failures:?}");
                 assert_eq!(failures[0].0, "docs/link.md");
                 assert!(
-                    matches!(failures[0].1, WriteError::AlreadyExists),
+                    matches!(failures[0].1, WriteError::UnsafePath { .. }),
                     "{:?}",
                     failures[0].1
                 );
@@ -9813,11 +9967,11 @@ mod tests {
         }
         assert!(
             std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()),
-            "the rollback must not remove an entry this batch did not create"
+            "the refused batch must not remove an entry it did not create"
         );
         assert!(
             !tmp.path().join("docs/first.md").exists(),
-            "the earlier create is rolled back"
+            "nothing is written when the pre-flight check fails"
         );
     }
 
