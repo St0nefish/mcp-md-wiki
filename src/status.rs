@@ -348,7 +348,7 @@ struct Inner {
     /// [`IndexStatus::clear_stale_chunking`] confirms none remain — either a
     /// later scan finds none, or the run that consumed a scan's worklist
     /// finishes successfully. Deliberately NOT tied to any single
-    /// [`ReconcileScan`] guard's lifetime (round-6 review, finding L1): a
+    /// [`ReconcileScan`] guard's lifetime (#286): a
     /// guard only spans one scan plus the one run right after it, which left
     /// the note dark during retry backoff, after a permanent give-up, and
     /// while a reload's queued reconcile waited for the worker to pick it up.
@@ -1066,7 +1066,7 @@ impl Drop for RunGuard<'_> {
 /// One reconcile scan in flight, from [`IndexStatus::begin_reconcile_scan`].
 /// [`Self::mark_rechunk`] sets [`IndexStatus`]'s sticky `stale_chunking`
 /// latch behind [`IndexStatus::is_bulk_indexing`] — deliberately NOT reversed
-/// when this guard drops (round-6 review, finding L1): only
+/// when this guard drops (#286): only
 /// [`IndexStatus::clear_stale_chunking`] clears it, so the note survives past
 /// this one scan-and-run cycle when the run fails or is still retrying. This
 /// guard's own [`Self::rechunk_detected`] is separate bookkeeping — whether
@@ -1190,7 +1190,7 @@ mod tests {
         run.finish(None);
         assert!(
             s.is_bulk_indexing(),
-            "round-6 L1: the scan/run finishing must NOT clear the note by itself — the \
+            "#286: the scan/run finishing must NOT clear the note by itself — the \
              run above could just as easily have failed, and only an explicit \
              `clear_stale_chunking` call may turn it off"
         );
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn stale_chunking_note_survives_a_failed_run_and_the_retry_backoff_after_it() {
-        // #286 round-6 L1: an indexing run failing (an embeddings outage, say)
+        // #286: an indexing run failing (an embeddings outage, say)
         // must not turn the note off — the files the scan found are still
         // chunked under stale settings, and `reindex::run_with_retry` may now
         // sleep for up to its backoff ceiling, or give up entirely, before

@@ -1948,6 +1948,9 @@ struct RouterAssemblyDeps {
     /// [`api_write_auth_layer`]'s layer, applied to the web write routes only when
     /// `api_auth` is on.
     api_write_auth: Option<AuthLayer>,
+    /// `mcp.allowed_hosts`, which also guards the web UI's `/api/*` routes
+    /// (`web::ui_router_with_api_auth`).
+    allowed_hosts: Vec<String>,
 }
 
 /// Per-tool scope enforcement for `/mcp` (#360): a write tool needs
@@ -2062,6 +2065,7 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
             deps.ui_state,
             deps.api_auth.then(|| deps.auth.clone()),
             deps.api_auth.then_some(deps.api_write_auth).flatten(),
+            deps.allowed_hosts,
         ));
 
     if let Some(webhook_state) = deps.webhook_state {
@@ -2416,7 +2420,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     )?;
 
     if !config.mcp.allowed_hosts.is_empty() {
-        info!(allowed_hosts = ?config.mcp.allowed_hosts, "MCP Host validation enabled");
+        info!(allowed_hosts = ?config.mcp.allowed_hosts, "Host validation enabled (/mcp and web UI /api/*)");
     } else if config.mcp.allow_unauthenticated {
         // Only worth flagging when nothing else is checking the caller. With a
         // bearer token required, a DNS-rebinding attempt is refused at auth
@@ -2548,6 +2552,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         ui_state,
         api_auth: config.ui.api_auth,
         api_write_auth,
+        allowed_hosts: config.mcp.allowed_hosts.clone(),
         webhook_state: webhook_secret.map(|secret| WebhookState {
             config: Arc::clone(&shared_config),
             secret,
@@ -2578,7 +2583,25 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     info!("  MCP endpoint: /mcp");
     info!("  Status endpoints: /status (JSON), /metrics (Prometheus)");
     info!("  Admin endpoint: POST /admin/reload (re-reads config.yaml without a restart)");
-    info!("  Web UI: / (unauthenticated — see web.rs's module doc)");
+    if config.ui.api_auth {
+        info!("  Web UI: / (shell open; /api/* behind the /mcp authentication — ui.api_auth)");
+    } else if config.mcp.allowed_hosts.is_empty() {
+        // The server cannot see an authenticating proxy in front of it, so this
+        // fires for a proxied deployment too; setting `mcp.allowed_hosts` (which
+        // such a deployment should anyway) drops it to `info`.
+        warn!(
+            "Web UI /api/* routes, including the write routes (POST/DELETE /api/doc), are \
+             unauthenticated, and with mcp.allowed_hosts unset the Host header is not \
+             checked, so a DNS-rebinding page can reach them if this port is reachable from \
+             the browser. Run behind an authenticating reverse proxy or set \
+             ui.api_auth: true, and set mcp.allowed_hosts to the hostname(s) clients use"
+        );
+    } else {
+        info!(
+            "  Web UI: / and /api/* unauthenticated, including writes (Host checked against \
+             mcp.allowed_hosts; set ui.api_auth: true to require authentication)"
+        );
+    }
     if let Some(oauth) = auth.oauth() {
         let suffixed = oauth.metadata_path();
         let paths = if suffixed == OAUTH_METADATA_ROOT_PATH {
@@ -4951,6 +4974,7 @@ mod tests {
             ui_state,
             api_auth: false,
             api_write_auth: test_api_write_auth(bearer_token.clone(), oauth.clone()),
+            allowed_hosts: Vec::new(),
             webhook_state: Some(WebhookState {
                 config: Arc::clone(&shared_config),
                 secret: "webhook-secret".into(),

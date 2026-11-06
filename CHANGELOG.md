@@ -14,6 +14,148 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+### Security
+
+- **Symlinks and `.git` paths are refused on write and read, and skipped by
+  incremental indexing.** A path with a `.git` component (any case) or a symlink
+  anywhere along it, leaf included, is refused by `write_document`, `delete_document`
+  and directory moves (`write::resolve_safe_write_path`) and by `get_document` and
+  `GET /api/doc` (`retrieval::resolve_within_data`), whatever `indexing.include`
+  says. Before, a leaf symlink to a file inside the KB (`x.md -> .git/config`) passed
+  the write check and the write landed in its target, and a broad include such as
+  `**/*` made `.git/config` readable. A path the webhook, `POST /admin/sync` or a
+  write's rebase hands the indexer is now checked the same way
+  (`ingest::inspect_kb_path`, the one shared definition): a symlink (or a path under
+  a symlinked directory, or a `.git` path) is treated as deleted and its index row
+  purged, never read — before, a pushed `leak.md -> /proc/self/environ` was embedded
+  and served from `search`. The full reconcile walk already skipped symlinks; a
+  previously indexed file that became one is now purged on the next reconcile.
+  Behavior change: a symlinked document or directory that used to be readable or
+  writable through the link is refused; replace the link with the real file.
+- **An absolute path no longer probes the host filesystem.** `get_document` and
+  `/api/doc/{*path}` used to try an absolute path literally on the host first, so the
+  error told a caller whether a file existed outside the KB. A leading `/` now always
+  means the KB root, as it already did for the write tools.
+- **The web UI's `/api/*` routes check `Host` and `Origin`.** With
+  `mcp.allowed_hosts` set, a request whose `Host` is not listed is refused with `403`
+  (matched the way `/mcp` matches it), closing DNS rebinding against the UI API, which
+  had no Host check before. A `POST`/`PUT`/`PATCH`/`DELETE` carrying an `Origin` must
+  come from the request's own host (host-only comparison) or a listed host; a request
+  without `Origin` passes. `mcp.allowed_hosts` is still restart-required; its docs now
+  say it guards the UI API too. Behavior change: with `mcp.allowed_hosts` set, a
+  browser or script reaching the UI under a hostname not in the list now gets `403`
+  on `/api/*` — add that hostname.
+- **UI responses carry browser hardening headers.** `/`, `/assets/*` and `/api/*`
+  send a `Content-Security-Policy` (`script-src 'self'`, `frame-ancestors 'none'`,
+  `base-uri 'none'`, `object-src 'none'`; inline styles and external images stay
+  allowed for rendered markdown), `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`. `/mcp`, `/health` and
+  `/metrics` are unchanged.
+- **Startup warning when the UI write API is unauthenticated.** With `ui.api_auth`
+  off and `mcp.allowed_hosts` unset, `serve` warns that `/api/*`, writes included, is
+  unauthenticated and has no `Host` check, so a DNS-rebinding page can reach it from a
+  browser that can reach the port; the remedies are an authenticating proxy or
+  `ui.api_auth: true`, and setting `mcp.allowed_hosts`. With `mcp.allowed_hosts` set,
+  the same fact is logged at `info`.
+- **Compose files publish port 8001 on loopback by default.** `docker-compose.yml`
+  and `deploy/templates/compose-*.yml` now map
+  `"${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8001}:8001"` (`MCP_BIND` and `MCP_PORT` are
+  documented in `deploy/.env.example`). A Traefik on the same Docker network reaches
+  the container port directly and is unaffected. Behavior change: agents or devices
+  on other hosts connecting directly to `:8001` must set `MCP_BIND=0.0.0.0`.
+  `deploy/templates/traefik-labels.yml` now warns that without an auth middleware
+  the UI write API is open, and carries a commented-out forward-auth (Authentik
+  outpost) example applied to the UI router only, with `/mcp` and the other
+  self-authenticating routes on a separate router.
+
+### Fixed
+
+- **Moving or archiving a document keeps link anchors and titles.** The link
+  rewrite behind a document move, a directory move and `archive` with
+  `archive_links: repoint` replaced a link's whole target with the new bare path, so
+  `[x](guide.md#install "Title")` became `[x](../guide.md)` and `[[guide#Setup]]`
+  lost its anchor — for every link in a moved document, even on a rename within one
+  directory. Only the path portion is replaced now (`ingest::LinkOccurrence::path_span`);
+  a `#fragment`, a `"title"` and a wiki `|alias` stay as written, for inline,
+  wiki-style, reference-definition and autolink syntax. Links without a fragment or
+  title are rewritten exactly as before. Links already rewritten by an earlier move
+  are not repaired.
+- **A timed-out git command no longer keeps running.** A fetch, push or other git
+  subprocess that hit the 120-second limit was abandoned but left running after the
+  git lock was released, so it could overwrite `FETCH_HEAD` or hold
+  `.git/index.lock` against the next write or webhook. It is now killed and reaped
+  before the lock is released (`git::run_bounded`). A rebase that times out during a
+  write's sync is also aborted, instead of leaving the clone mid-rebase until the
+  next restart.
+- **Webhooks and `POST /admin/sync` pull again after a failed push.** When a write's
+  push failed (the remote unreachable, say) the commit stayed local; once the remote
+  moved on, every pull's fast-forward failed until some write happened to run, so
+  remote pushes were neither pulled nor indexed. A pull that cannot fast-forward now
+  rebases the unpushed commits onto the remote (one that conflicts is saved under
+  `refs/mcp-md-wiki/unsynced/<sha>` and the clone reset to the remote tip), the same
+  sync a write runs first. The commits are still pushed by the next write.
+- **Files a write's rebase pulled in are indexed when its push then fails.** The
+  changes other commits brought in during a write's rebase were marked for
+  reindexing only when the push succeeded; after a failed push they waited for the
+  periodic reconcile. `CommitSyncError::PostCommit` now carries them and every write
+  path marks them dirty.
+- **An interrupted clone is reported at startup.** A `.git` left by a clone that
+  was killed part-way was accepted as a repository, and every later fetch and
+  rebase failed. Startup now refuses a `.git` that git cannot open, or one with no
+  commit while the remote branch has commits, with an error naming the data
+  directory. Nothing is deleted: move the directory aside and restart to clone
+  again. An empty repository whose remote is empty (or unreachable) still starts,
+  as does one whose remote has only a branch ending in the configured name
+  (`feature/main` for `main`). Once the check has reached a verdict the
+  repository is not checked again in that process (one that could not ask the
+  remote is retried), so a hanging remote no longer holds the git lock on each
+  indexing run. A
+  clone that fails or times out into a data directory that was empty beforehand now
+  removes what it left there (the directory itself stays), so the next start clones
+  again instead of refusing a partial `.git`; a non-empty directory is never touched.
+- **A document that becomes empty or invalid stops being served.** An indexed
+  document edited down to frontmatter only (no chunks), or one that fails
+  validation with `validation.strict: false`, kept its old chunks, metadata row and
+  links in the index indefinitely, and the reconcile re-read it on every sweep;
+  only `index --full` dropped it. Both are now purged like a deleted file. An empty
+  document keeps a zero-chunk state row, so the reconcile skips it until it
+  changes; an invalid one keeps none, so the next sweep re-validates it. This
+  includes a schema or `frontmatter` config change (with `validation.strict: false`,
+  the default): documents it makes invalid — a newly required field, say — drop out
+  of search on the next reconcile until the schema or the documents are fixed, and
+  fixing them re-indexes them on the next sweep. A failing, timed-out or unrunnable
+  `validation.lint_command` describes the tooling rather than the document, so when
+  the lint failure is the only error it purges nothing: a lint outage cannot empty
+  the index. A document with schema or frontmatter errors is invalid, and purged,
+  whether or not lint also failed. A strict-mode rejection is unchanged: the
+  last good version stays served and
+  `/status` lists the rejection. No reindex needed: an affected document's state
+  row never matched its content, so the first reconcile after upgrading cleans it
+  up.
+- **A frontmatter patch no longer duplicates the frontmatter.** A document whose
+  `---` delimiter line had trailing whitespace was read as having no frontmatter
+  by the write path (the indexer's parser accepts it), so `frontmatter_patch`, and
+  the `status: archived` step of `archive`, prepended a second block and left the
+  old one in the body. Both now share one delimiter rule
+  (`heading::is_frontmatter_delimiter_line`). Documents already affected are not
+  repaired.
+- **A failed move leaves no partial destination.** A single-document move whose
+  destination write failed part-way (a full disk, say) left the truncated file
+  behind, so every retry failed with "already exists" and the reconcile indexed the
+  truncated copy. The partial destination is removed again, as a create's is; the
+  source is untouched.
+- **`index --full` clears the link graph.** `StateDb::clear` emptied
+  `indexed_files` and the metadata index but not `document_links`, so a document
+  removed while no reconcile ran kept appearing as a `links_in` source after a full
+  reindex. All index tables are cleared now; run `index --full` once to drop
+  phantom links already there.
+- **Reload reports the embedding batching settings as applied.**
+  `embedding.batch_size` and `embedding.batch_concurrency` were reported as
+  `restart_required`, but only indexing uses them and each indexing run builds its
+  embedding client from the live config, so they apply to the next run.
+  `embedding.request_timeout_secs` is reported twice: `applied` for indexing,
+  `restart_required` for the search and write-dedup client built at startup.
+
 ## [0.2.2] - 2026-11-03
 
 ### Added

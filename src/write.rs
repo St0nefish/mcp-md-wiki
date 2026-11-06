@@ -548,9 +548,11 @@ impl PathSafetyError {
 /// 1. Reject absolute paths.
 /// 2. Reject any `..` component.
 /// 3. Lexical `starts_with` check on the joined abs path.
-/// 4. Canonicalize the deepest *existing* ancestor of the target; verify it
-///    still `starts_with` the canonical data_root. This catches a symlinked
-///    ancestor directory that resolves to a location outside data_root.
+/// 4. Reject a `.git` component (any case) and any symlink among the existing
+///    components, leaf included ([`crate::ingest::inspect_kb_path`], the same
+///    check the indexer and the read path apply).
+/// 5. Canonicalize the deepest *existing* ancestor of the target; verify it
+///    still `starts_with` the canonical data_root (defense in depth behind 4).
 fn resolve_safe_write_path_detailed(
     data_root: &Path,
     rel_path: &str,
@@ -584,7 +586,49 @@ fn resolve_safe_write_path_detailed(
         ));
     }
 
-    // 4. Canonical-ancestor check: canonicalize data_root, then walk up from
+    // 4. No `.git` component, and no symlink anywhere along the existing part of
+    //    the path — the leaf included. Canonicalizing an ancestor (step 5) cannot
+    //    see a leaf symlink to a file inside the root (`x.md -> .git/config`,
+    //    `x.md -> state.db`), and writing through one lands in its target.
+    //    Independent of `indexing.include`: a widened include must not make a
+    //    `.git` directory writable. A directory leaf is allowed (directory moves
+    //    resolve their prefixes here); a FIFO, socket or device node is not.
+    match crate::ingest::inspect_kb_path(data_root, requested) {
+        Ok(
+            crate::ingest::KbEntry::Missing
+            | crate::ingest::KbEntry::File
+            | crate::ingest::KbEntry::Dir,
+        ) => {}
+        Ok(crate::ingest::KbEntry::Other) => {
+            return Err(PathSafetyError::Rejected(
+                "path is not a regular file or directory".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::GitDir) => {
+            return Err(PathSafetyError::Rejected(
+                "path names a reserved directory".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::Symlink) => {
+            return Err(PathSafetyError::Rejected(
+                "path must not be or pass through a symlink".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::NotRelative) => {
+            return Err(PathSafetyError::Rejected(
+                "path must be relative to the knowledge base root".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::Io(e)) => {
+            return Err(PathSafetyError::Internal(format!(
+                "cannot inspect '{}': {}",
+                abs_path.display(),
+                e
+            )));
+        }
+    }
+
+    // 5. Canonical-ancestor check: canonicalize data_root, then walk up from
     //    abs_path to find the deepest ancestor that actually exists on disk,
     //    canonicalize it, and confirm it still sits under canonical data_root.
     let canonical_root = data_root.canonicalize().map_err(|e| {
@@ -821,24 +865,28 @@ pub enum FrontmatterEdit {
 /// the frontmatter block at all, structurally, rather than by carefully
 /// avoiding it.
 ///
-/// Delimiter convention: `content` must begin with a `---` line (`\n`- or
-/// `\r\n`-terminated); the block ends at the next line that is exactly `---`
-/// (optionally `\r`-terminated), found by scanning line-by-line so a literal
-/// `---` inside a YAML value (e.g. a horizontal-rule in a `description`
-/// string) can never be mistaken for the closing delimiter. Returns `None`
-/// when `content` has no opening delimiter, or an opening delimiter with no
-/// matching close — both read as "no frontmatter block", the same as
-/// `gray_matter` treats them.
+/// Delimiter convention: gray_matter's, through the one predicate the indexer
+/// uses too (`heading::is_frontmatter_delimiter_line`: `---` with trailing
+/// whitespace — `\r`, spaces, tabs — trimmed). `content`'s first line must be
+/// such a delimiter and be `\n`-terminated; the block ends at the next line that
+/// is one, found by scanning line-by-line so a literal `---` inside a YAML value
+/// (e.g. a horizontal-rule in a `description` string) can never be mistaken for
+/// the closing delimiter. A stricter rule here would see no frontmatter in a
+/// document whose opening line is `--- `, while the parser still reads its
+/// fields, so a frontmatter patch would prepend a second block and leave the old
+/// one in the body. Returns `None` when `content` has no opening delimiter, or
+/// an opening delimiter with no matching close — both read as "no frontmatter
+/// block" (gray_matter parses no fields from an unclosed one).
 fn split_frontmatter_bytes(content: &str) -> Option<(&str, &str)> {
-    let after_open = content
-        .strip_prefix("---\r\n")
-        .or_else(|| content.strip_prefix("---\n"))?;
+    let (first, after_open) = content.split_once('\n')?;
+    if !crate::heading::is_frontmatter_delimiter_line(first) {
+        return None;
+    }
 
     let mut offset = 0usize;
     for line in after_open.split_inclusive('\n') {
         let trimmed = line.strip_suffix('\n').unwrap_or(line);
-        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
-        if trimmed == "---" {
+        if crate::heading::is_frontmatter_delimiter_line(trimmed) {
             let close_end = offset + line.len();
             let fm_len = (content.len() - after_open.len()) + close_end;
             return Some((&content[..fm_len], &content[fm_len..]));
@@ -986,7 +1034,7 @@ fn splice_frontmatter_block(
     let lines: Vec<&str> = old_block.split_inclusive('\n').collect();
     let (open, rest) = lines.split_first()?;
     let (close, inner) = rest.split_last()?;
-    if !close.trim_end_matches(['\r', '\n']).eq("---") {
+    if !crate::heading::is_frontmatter_delimiter_line(close.trim_end_matches('\n')) {
         return None;
     }
 
@@ -1714,8 +1762,22 @@ async fn read_if_exists(abs_path: &Path) -> Result<Option<String>, WriteError> {
 /// caller moves on to `git add`.
 async fn write_and_flush(file: &mut tokio::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
+    #[cfg(test)]
+    if let Ok(written) = FAIL_WRITE_AFTER_BYTES.try_with(|n| *n) {
+        file.write_all(&bytes[..written.min(bytes.len())]).await?;
+        file.flush().await?;
+        return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+    }
     file.write_all(bytes).await?;
     file.flush().await
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only: inside this scope `write_and_flush` writes only this many bytes
+    /// and then fails the way ENOSPC part-way through would, leaving a partly
+    /// written file for the caller to clean up. A no-op outside tests.
+    static FAIL_WRITE_AFTER_BYTES: usize;
 }
 
 /// Run `write`, a document's one filesystem write, and when it fails undo what it
@@ -1998,13 +2060,23 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                 };
             }
 
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            Err(git::CommitSyncError::PostCommit {
+                sha,
+                source,
+                rebased_paths,
+            }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure for '{}', commit {} stands \
                      uncorrected: {:#}",
                     rel_path, sha, source
                 );
-                mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
+                mark_dirty(
+                    deps.queue,
+                    deps.indexing,
+                    std::iter::once(PathBuf::from(rel_path))
+                        .chain(rebased_paths)
+                        .collect(),
+                );
                 return Ok(WriteSuccess {
                     related: related.clone(),
                     outcome: WriteOutcome::CommittedPendingSync,
@@ -2227,14 +2299,14 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                         }
                     }
                 })?;
-            write_and_flush(&mut file, content_to_write.as_bytes())
-                .await
-                .map_err(|e| {
-                    error!("Failed to write file '{}': {}", abs_dest.display(), e);
-                    WriteError::Io {
-                        msg: format!("Failed to write file: {}", e),
-                    }
-                })?;
+            // A partly written destination (ENOSPC, EIO) is removed again, as a
+            // create's is: left behind, every retry of the move would fail
+            // `AlreadyExists` and the reconcile would index the truncated copy. The
+            // source is only removed below, so it is still intact here.
+            write_or_undo(&abs_dest, None, async {
+                write_and_flush(&mut file, content_to_write.as_bytes()).await
+            })
+            .await?;
         }
 
         let abs_source = safe_write_path(deps, source_rel)?;
@@ -2406,6 +2478,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
             Err(git::CommitSyncError::PostCommit {
                 sha,
                 source: source_err,
+                rebased_paths,
             }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure moving '{}' -> '{}', commit {} \
@@ -2418,6 +2491,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                     [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
                         .into_iter()
                         .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .chain(rebased_paths)
                         .collect(),
                 );
                 return Ok(WriteSuccess {
@@ -2776,7 +2850,9 @@ fn rewrite_outbound_links(
     apply_link_replacements_each(content, &replacements)
 }
 
-/// Apply a PER-OCCURRENCE text replacement at each occurrence's own span,
+/// Apply a PER-OCCURRENCE text replacement at each occurrence's own path span
+/// (`LinkOccurrence::path_span` — the replacement is a bare path, so a
+/// `#fragment`, `"title"` suffix or wiki `|alias` after it stays as written),
 /// back-to-front by span start so an earlier edit's byte-length change can
 /// never invalidate a later span still waiting to be applied. Every
 /// occurrence must have come from scanning `body` itself (e.g.
@@ -2801,7 +2877,7 @@ fn apply_link_replacements_each(
 ) -> String {
     let mut spans: Vec<(std::ops::Range<usize>, &str)> = replacements
         .iter()
-        .map(|(o, r)| (o.span.clone(), r.as_str()))
+        .map(|(o, r)| (o.path_span.clone(), r.as_str()))
         .collect();
     // Sort back-to-front (descending by start) so replacing an earlier-in-text
     // span never shifts the byte offsets a later-in-iteration-but-earlier-in-text
@@ -3356,7 +3432,11 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                 return Err(BatchWriteError::PreCommitFailed { rolled_back });
             }
 
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            Err(git::CommitSyncError::PostCommit {
+                sha,
+                source,
+                rebased_paths,
+            }) => {
                 warn!(
                     "write_documents_batch: commit_and_sync post-commit (sync) failure, commit {} \
                      stands uncorrected for {} document(s): {:#}",
@@ -3367,7 +3447,11 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                 mark_dirty(
                     deps.queue,
                     deps.indexing,
-                    written.iter().map(|(p, _)| PathBuf::from(p)).collect(),
+                    written
+                        .iter()
+                        .map(|(p, _)| PathBuf::from(p))
+                        .chain(rebased_paths)
+                        .collect(),
                 );
                 return Ok(BatchWriteSuccess {
                     documents: documents(&[]),
@@ -4610,6 +4694,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             Err(git::CommitSyncError::PostCommit {
                 sha,
                 source: source_err,
+                rebased_paths,
             }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure moving directory '{}' -> '{}', \
@@ -4627,6 +4712,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                         .iter()
                         .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
                         .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .chain(rebased_paths)
                         .collect(),
                 );
 
@@ -4887,7 +4973,11 @@ pub async fn delete_document_with<E: QueryEmbedder, Q: RetrievalStore>(
                 };
             }
 
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            Err(git::CommitSyncError::PostCommit {
+                sha,
+                source,
+                rebased_paths,
+            }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure deleting '{}', deletion commit \
                      {} stands uncorrected: {:#}",
@@ -4898,6 +4988,7 @@ pub async fn delete_document_with<E: QueryEmbedder, Q: RetrievalStore>(
                     deps.indexing,
                     std::iter::once(PathBuf::from(rel_path))
                         .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .chain(rebased_paths)
                         .collect(),
                 );
                 return Ok(WriteSuccess {
@@ -5084,6 +5175,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn safe_write_path_rejects_a_leaf_symlink_to_an_in_root_file() {
+        // `x.md -> .git/config`: the canonical ancestor is inside the root, so only
+        // a leaf check stops the write landing in `.git/config`.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".git/config"), "[core]").unwrap();
+        std::fs::write(tmp.path().join("state.db"), "db").unwrap();
+        std::os::unix::fs::symlink(".git/config", tmp.path().join("x.md")).unwrap();
+        std::os::unix::fs::symlink("state.db", tmp.path().join("y.md")).unwrap();
+
+        for rel in ["x.md", "/x.md", "y.md"] {
+            let msg = resolve_safe_write_path(tmp.path(), rel).unwrap_err();
+            assert!(msg.contains("symlink"), "{rel}: {msg}");
+            assert!(!msg.contains("git"), "no git talk for MCP callers: {msg}");
+        }
+    }
+
+    #[test]
+    fn safe_write_path_rejects_a_leaf_symlink_to_an_outside_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), tmp.path().join("leak.md"))
+            .unwrap();
+        // A dangling one is refused too.
+        std::os::unix::fs::symlink("nowhere.md", tmp.path().join("dangling.md")).unwrap();
+
+        for rel in ["leak.md", "dangling.md"] {
+            let msg = resolve_safe_write_path(tmp.path(), rel).unwrap_err();
+            assert!(msg.contains("symlink"), "{rel}: {msg}");
+        }
+    }
+
+    #[test]
+    fn safe_write_path_rejects_a_symlinked_directory_inside_the_root() {
+        // `alias -> docs` stays inside the root canonically, but is still refused:
+        // no write goes through a link.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::os::unix::fs::symlink("docs", tmp.path().join("alias")).unwrap();
+
+        let msg = resolve_safe_write_path(tmp.path(), "alias/new.md").unwrap_err();
+        assert!(msg.contains("symlink"), "{msg}");
+        assert!(resolve_safe_write_path(tmp.path(), "docs/new.md").is_ok());
+    }
+
+    #[test]
+    fn safe_write_path_rejects_any_git_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        for rel in [
+            ".git/config",
+            "/.git/hooks/pre-commit",
+            "a/.GIT/x.md",
+            ".Git",
+        ] {
+            let msg = resolve_safe_write_path(tmp.path(), rel).unwrap_err();
+            assert!(msg.contains("reserved directory"), "{rel}: {msg}");
+            // Nothing git-related reaches an MCP caller.
+            assert!(!msg.to_ascii_lowercase().contains("git"), "{rel}: {msg}");
+        }
+        // Only an exact `.git` component, not a name that merely contains it.
+        assert!(resolve_safe_write_path(tmp.path(), "notes/.gitignore.md").is_ok());
+        assert!(resolve_safe_write_path(tmp.path(), "my.git/x.md").is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // build_commit_message / render_unified_diff — pure unit tests
     // -----------------------------------------------------------------------
@@ -5160,6 +5317,84 @@ mod tests {
         let (fm, body) = split_frontmatter_bytes(content).unwrap();
         assert_eq!(fm, "---\ndescription: a---b\n---\n");
         assert_eq!(body, "\nBody\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_accepts_trailing_whitespace_on_both_delimiters() {
+        // gray_matter's rule (`heading::is_frontmatter_delimiter_line`): the indexer
+        // reads these as frontmatter, so the writer must too.
+        let content = "--- \ntitle: X\n---\t\n\nBody\n";
+        let (fm, body) = split_frontmatter_bytes(content).unwrap();
+        assert_eq!(fm, "--- \ntitle: X\n---\t\n");
+        assert_eq!(body, "\nBody\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_crlf_with_trailing_space_delimiters() {
+        let content = "---  \r\ntitle: X\r\n--- \r\n\r\nBody\r\n";
+        let (fm, body) = split_frontmatter_bytes(content).unwrap();
+        assert_eq!(fm, "---  \r\ntitle: X\r\n--- \r\n");
+        assert_eq!(body, "\r\nBody\r\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_leading_whitespace_is_not_a_delimiter() {
+        assert!(split_frontmatter_bytes(" ---\ntitle: X\n---\nBody\n").is_none());
+        // A ` ---` line inside the block does not close it either.
+        let (fm, _) = split_frontmatter_bytes("---\na: |\n ---\n---\nBody\n").unwrap();
+        assert_eq!(fm, "---\na: |\n ---\n---\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_agrees_with_body_line_offset() {
+        // One delimiter rule for the writer and the indexer: the frontmatter block
+        // the writer sees spans exactly the lines the indexer skips (no blank lines
+        // after the block in these inputs, which `body_line_offset` also skips).
+        for content in [
+            "---\ntitle: X\n---\nBody\n",
+            "--- \ntitle: X\n--- \nBody\n",
+            "---\r\ntitle: X\r\n---\t\r\nBody\r\n",
+            "---\ntitle: X\n---",
+        ] {
+            let (fm, _) = split_frontmatter_bytes(content).unwrap();
+            assert_eq!(
+                fm.split_inclusive('\n').count(),
+                crate::heading::body_line_offset(content),
+                "{content:?}"
+            );
+        }
+    }
+
+    /// A delimiter with trailing whitespace used to read as "no frontmatter" here
+    /// while the parser still found the fields, so the patch prepended a second
+    /// block and the old one became body text.
+    #[test]
+    fn apply_frontmatter_patch_trailing_space_delimiters_yield_one_block() {
+        for old in [
+            "--- \ntitle: X\nstatus: draft\n---  \n\n# Body\n",
+            "--- \r\ntitle: X\r\nstatus: draft\r\n--- \r\n\r\n# Body\r\n",
+        ] {
+            let new = apply_frontmatter_patch(
+                old,
+                &[FrontmatterEdit::SetField {
+                    field: "status".into(),
+                    value: serde_json::json!("archived"),
+                }],
+            )
+            .unwrap();
+            let delimiters = new
+                .lines()
+                .filter(|l| crate::heading::is_frontmatter_delimiter_line(l))
+                .count();
+            assert_eq!(delimiters, 2, "exactly one frontmatter block: {new:?}");
+            assert_eq!(new.matches("title: X").count(), 1, "{new:?}");
+            assert!(new.contains("status: archived"), "{new:?}");
+            assert!(!new.contains("draft"), "{new:?}");
+            assert!(new.trim_end().ends_with("\n# Body"), "{new:?}");
+            let (fm, body) = validate::parse_frontmatter_raw(&new);
+            assert_eq!(fm.get("status"), Some(&serde_json::json!("archived")));
+            assert_eq!(body.trim(), "# Body");
+        }
     }
 
     #[test]
@@ -5956,6 +6191,53 @@ mod tests {
             document_version(b"hello\n"),
             "ce013625030ba8dba906f756967f9e9ca394464a"
         );
+    }
+
+    #[tokio::test]
+    async fn git_paths_and_symlinks_are_refused_by_every_write_even_with_a_widened_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let git_config = tmp.path().join(".git/config");
+        std::fs::write(&git_config, "[core]\n").unwrap();
+        std::os::unix::fs::symlink(".git/config", tmp.path().join("x.md")).unwrap();
+
+        let mut config = crate::mcp::make_test_resolved_config(tmp.path());
+        {
+            let c = Arc::get_mut(&mut config).unwrap();
+            c.write.dedup_enabled = false;
+            c.indexing.include = vec!["**/*".to_string()];
+            c.indexing.exclude = vec![];
+            c.indexing.exclude_files = vec![];
+        }
+        let mut harness = Harness::new(&tmp, config);
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/*").unwrap());
+        harness.include_patterns = builder.build().unwrap();
+
+        let content = "---\ntitle: T\ndescription: d\ntype: guide\ntags: [t]\n---\n# Body\n";
+        for (rel, create) in [
+            (".git/config", false),
+            (".git/new.md", true),
+            ("x.md", false),
+        ] {
+            let err = write_document(&harness.deps(), make_req(rel, content, create))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, WriteError::UnsafePath { .. }),
+                "{rel}: {err:?}"
+            );
+        }
+        let err = delete_document(&harness.deps(), "x.md", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WriteError::UnsafePath { .. }),
+            "delete: {err:?}"
+        );
+
+        assert_eq!(std::fs::read_to_string(&git_config).unwrap(), "[core]\n");
+        assert!(!tmp.path().join(".git/new.md").exists());
     }
 
     #[tokio::test]
@@ -7955,6 +8237,47 @@ mod tests {
         );
     }
 
+    /// A move whose destination write fails part-way (ENOSPC, EIO) removes the
+    /// partly written destination again and leaves the source as it was, so a
+    /// retry does not fail `AlreadyExists` and the reconcile never indexes a
+    /// truncated copy.
+    #[tokio::test]
+    async fn move_whose_destination_write_fails_part_way_leaves_no_partial_destination() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        let original = "---\ntitle: T\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("docs/source.md"), original).unwrap();
+        git_commit_all(&work, "docs/source.md", "add docs/source.md");
+        let harness = git_backed_harness(&work);
+        let source_dir = work.path().join("docs");
+
+        let req = make_move_req("docs/source.md", "other/dest.md", original, original);
+        let err = FAIL_WRITE_AFTER_BYTES
+            .scope(5, write_document(&harness.deps(), req))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Io { .. }), "got {err:?}");
+        assert!(
+            !work.path().join("other/dest.md").exists(),
+            "the partly written destination must be removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_dir.join("source.md")).unwrap(),
+            original,
+            "the source must be untouched when the destination write fails"
+        );
+
+        // The retry is not blocked by a leftover destination.
+        let req = make_move_req("docs/source.md", "other/dest.md", original, original);
+        write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("other/dest.md")).unwrap(),
+            original
+        );
+        assert!(!work.path().join("docs/source.md").exists());
+    }
+
     #[tokio::test]
     async fn move_validates_against_the_destination_schema_not_the_sources() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9072,6 +9395,119 @@ mod tests {
         );
     }
 
+    /// Body text exercising every link syntax with a `#fragment` and, where the
+    /// syntax allows one, a `"title"` suffix or wiki alias; `{p}` is the path each
+    /// link spells (the wiki ones `{wiki}`). The reference label is the path's last
+    /// component, which a move keeps, so two bodies in one document never share one.
+    fn fragment_links_body(p: &str, wiki: &str) -> String {
+        let r = p.rsplit('/').next().unwrap();
+        format!(
+            "See [inline]({p}#install \"Title\"), [bare]({p}#top), [[{wiki}#Set up]], \
+             [[{wiki}#h|Alias]], <{p}#x> and [ref style][{r}].\n\n[{r}]: {p}#y \"Ref title\"\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn move_keeps_fragments_titles_and_aliases_on_outbound_links() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        std::fs::create_dir_all(work.path().join("shared")).unwrap();
+        std::fs::write(
+            work.path().join("shared/doc.md"),
+            "---\ntitle: Shared\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Shared\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "shared/doc.md", "add shared/doc.md");
+
+        let front = "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        let source_original = format!(
+            "{front}{}Self: [me](a.md#top \"Me\").\n",
+            fragment_links_body("../shared/doc.md", "../shared/doc")
+        );
+        std::fs::write(work.path().join("old/a.md"), &source_original).unwrap();
+        git_commit_all(&work, "old/a.md", "add old/a.md");
+
+        let harness = git_backed_harness(&work);
+        let req = make_move_req(
+            "old/a.md",
+            "new/deep/a.md",
+            &source_original,
+            &source_original,
+        );
+        write_document(&harness.deps(), req).await.unwrap();
+
+        let dest = std::fs::read_to_string(work.path().join("new/deep/a.md")).unwrap();
+        // The wiki links' bare `../shared/doc` gains `.md` exactly as it does
+        // without a fragment; only the path portion changes.
+        let expected = format!(
+            "{front}{}Self: [me](a.md#top \"Me\").\n",
+            fragment_links_body("../../shared/doc.md", "../../shared/doc.md")
+        );
+        assert_eq!(dest, expected);
+    }
+
+    #[tokio::test]
+    async fn same_directory_rename_keeps_the_fragment_on_a_self_link() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        let source_original = "---\ntitle: Rename Me\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nTop: [me](a.md#top \"Me\"), [[a#Intro|here]], <a.md#x>.\n";
+        std::fs::write(work.path().join("docs/a.md"), source_original).unwrap();
+        git_commit_all(&work, "docs/a.md", "add docs/a.md");
+
+        let harness = git_backed_harness(&work);
+        let req = make_move_req("docs/a.md", "docs/b.md", source_original, source_original);
+        write_document(&harness.deps(), req).await.unwrap();
+
+        let dest = std::fs::read_to_string(work.path().join("docs/b.md")).unwrap();
+        assert!(
+            dest.ends_with("\nTop: [me](b.md#top \"Me\"), [[b.md#Intro|here]], <b.md#x>.\n"),
+            "{dest}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_repoints_inbound_links_keeping_fragments_and_titles() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let front = "---\ntitle: Referencer\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        let referencing_original =
+            format!("{front}{}", fragment_links_body("old/loc.md", "old/loc"));
+        std::fs::write(work.path().join("referencing.md"), &referencing_original).unwrap();
+        git_commit_all(&work, "referencing.md", "add referencing.md");
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing.md",
+                "markdown",
+                &[("old/loc.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let req = make_move_req("old/loc.md", "new/loc.md", source_original, source_original);
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+
+        let after = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert_eq!(
+            after,
+            format!("{front}{}", fragment_links_body("new/loc.md", "new/loc.md"))
+        );
+    }
+
     #[tokio::test]
     async fn move_outbound_rewrite_skips_links_inside_fences_and_code_spans() {
         let bare = crate::git::tests::create_bare_repo("master");
@@ -9768,12 +10204,11 @@ mod tests {
         );
     }
 
-    /// A create whose target is taken by the time the batch writes it — here a
-    /// dangling symlink, which reads as missing but makes `create_new` fail —
-    /// fails the batch, and the rollback leaves that entry alone: only files
-    /// this batch created are removed.
+    /// A create onto a dangling symlink — which reads as missing — is refused
+    /// up front by the path check, before anything is written, and the link is
+    /// left alone.
     #[tokio::test]
-    async fn write_documents_batch_create_collision_does_not_remove_the_existing_entry() {
+    async fn write_documents_batch_create_onto_a_dangling_symlink_is_refused_and_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
         let link = tmp.path().join("docs/link.md");
@@ -9798,13 +10233,13 @@ mod tests {
         ];
         let err = write_documents_batch(&harness.deps(), &requests, None)
             .await
-            .expect_err("a create onto an existing entry must fail the batch");
+            .expect_err("a create onto a symlink must fail the batch");
         match err {
             BatchWriteError::Documents { failures } => {
                 assert_eq!(failures.len(), 1, "{failures:?}");
                 assert_eq!(failures[0].0, "docs/link.md");
                 assert!(
-                    matches!(failures[0].1, WriteError::AlreadyExists),
+                    matches!(failures[0].1, WriteError::UnsafePath { .. }),
                     "{:?}",
                     failures[0].1
                 );
@@ -9813,11 +10248,11 @@ mod tests {
         }
         assert!(
             std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()),
-            "the rollback must not remove an entry this batch did not create"
+            "the refused batch must not remove an entry it did not create"
         );
         assert!(
             !tmp.path().join("docs/first.md").exists(),
-            "the earlier create is rolled back"
+            "nothing is written when the pre-flight check fails"
         );
     }
 
@@ -10167,6 +10602,76 @@ mod tests {
         assert_eq!(
             occurrences[0].resolved, "new4/a.md",
             "the outside document's link must resolve to the moved document's new location"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_directory_keeps_fragments_titles_and_aliases_on_every_rewritten_link() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("frag/sub")).unwrap();
+        std::fs::create_dir_all(work.path().join("shared")).unwrap();
+        let front = "---\ntitle: T\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        // `frag/a.md` links to a document moving with it and to one staying put.
+        let a = format!(
+            "{front}{}{}",
+            fragment_links_body("sub/b.md", "sub/b"),
+            fragment_links_body("../shared/s.md", "../shared/s")
+        );
+        let b = format!("{front}# B\n");
+        let s = format!("{front}# S\n");
+        let referencing = format!(
+            "{front}{}",
+            fragment_links_body("frag/sub/b.md", "frag/sub/b")
+        );
+        std::fs::write(work.path().join("frag/a.md"), &a).unwrap();
+        std::fs::write(work.path().join("frag/sub/b.md"), &b).unwrap();
+        std::fs::write(work.path().join("shared/s.md"), &s).unwrap();
+        std::fs::write(work.path().join("referencing5.md"), &referencing).unwrap();
+        git_commit_paths(
+            &work,
+            &[
+                "frag/a.md",
+                "frag/sub/b.md",
+                "shared/s.md",
+                "referencing5.md",
+            ],
+            "add frag",
+        );
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing5.md",
+                "markdown",
+                &[("frag/sub/b.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        move_directory(&harness.deps(), "frag", "moved5/deep", None)
+            .await
+            .unwrap();
+
+        let a_after = std::fs::read_to_string(work.path().join("moved5/deep/a.md")).unwrap();
+        assert_eq!(
+            a_after,
+            format!(
+                "{front}{}{}",
+                fragment_links_body("sub/b.md", "sub/b.md"),
+                fragment_links_body("../../shared/s.md", "../../shared/s.md")
+            )
+        );
+        let ref_after = std::fs::read_to_string(work.path().join("referencing5.md")).unwrap();
+        assert_eq!(
+            ref_after,
+            format!(
+                "{front}{}",
+                fragment_links_body("moved5/deep/sub/b.md", "moved5/deep/sub/b.md")
+            )
         );
     }
 
@@ -11184,7 +11689,7 @@ mod tests {
 
         let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
         assert!(
-            referencing.contains("[the page](_archive/old/loc.md)"),
+            referencing.contains("[the page](_archive/old/loc.md \"T\")"),
             "{referencing}"
         );
         assert!(
@@ -11216,6 +11721,74 @@ mod tests {
         crate::reindex::test_support::assert_marked_dirty(
             &harness.reindex_queue,
             &["old/loc.md", "_archive/old/loc.md", "referencing.md"],
+        );
+    }
+
+    /// The archive's `status: archived` step goes through the frontmatter patch, so a
+    /// document whose delimiters carry trailing whitespace must still end up with one
+    /// frontmatter block, not a second one prepended above the old.
+    #[tokio::test]
+    async fn archive_status_patch_on_trailing_space_delimiters_keeps_one_block() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, _) = archive_fixture(&work, true).await;
+        let source = ARCHIVE_SOURCE
+            .replacen("---\n", "--- \n", 1)
+            .replace("active\n---\n", "active\n---  \n");
+        assert!(source.starts_with("--- \n") && source.contains("---  \n"));
+        std::fs::write(work.path().join("old/loc.md"), &source).unwrap();
+        git_commit_all(&work, "old/loc.md", "trailing-space delimiters");
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            &source,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert!(success.status_set);
+
+        let archived = std::fs::read_to_string(work.path().join("_archive/old/loc.md")).unwrap();
+        let delimiters = archived
+            .lines()
+            .filter(|l| crate::heading::is_frontmatter_delimiter_line(l))
+            .count();
+        assert_eq!(delimiters, 2, "{archived}");
+        assert_eq!(archived.matches("title: Old Page").count(), 1, "{archived}");
+        assert!(archived.contains("status: archived"), "{archived}");
+        assert!(!archived.contains("status: active"), "{archived}");
+        assert!(archived.ends_with("# Body\n"), "{archived}");
+    }
+
+    #[tokio::test]
+    async fn archive_repoint_keeps_fragments_titles_and_aliases() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, _) = archive_fixture(&work, true).await;
+        let front = "---\ntitle: Referencer\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        std::fs::write(
+            work.path().join("referencing.md"),
+            format!("{front}{}", fragment_links_body("old/loc.md", "old/loc")),
+        )
+        .unwrap();
+        git_commit_all(&work, "referencing.md", "fragment links");
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+
+        let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert_eq!(
+            referencing,
+            format!(
+                "{front}{}",
+                fragment_links_body("_archive/old/loc.md", "_archive/old/loc.md")
+            )
         );
     }
 

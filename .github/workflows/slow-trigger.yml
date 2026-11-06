@@ -10,7 +10,7 @@ name: CI slow trigger
 # GITHUB_TOKEN is the one GITHUB_TOKEN event that does start a run.
 
 on:
-  pull_request_target:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] deliberate, see the header: runs the default-branch copy, only dispatches slow.yml, never checks out PR code
     branches: [master]
     types: [auto_merge_enabled, synchronize, reopened]
 

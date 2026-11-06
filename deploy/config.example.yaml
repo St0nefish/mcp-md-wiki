@@ -243,8 +243,8 @@ embedding:
   # Number of texts to send per API request. Higher values are faster but
   # use more memory on the embedding server. Tune based on your model's
   # context window and available VRAM.
-  # RESTART REQUIRED: baked into the embedding client at startup — POST
-  # /admin/reload cannot change this on a running server.
+  # Only indexing batches, and each indexing run builds its embedding client
+  # from the live config, so POST /admin/reload applies this to the next run.
   batch_size: 32
 
   # Wall-clock timeout (seconds) for a single embedding HTTP request. A batch
@@ -252,8 +252,9 @@ embedding:
   # server, so this needs headroom above a typical API timeout — a request
   # that hangs past this becomes a retryable error instead of blocking
   # forever. Tuning knob, not a connection setting — no env var override.
-  # RESTART REQUIRED: baked into the embedding client's HTTP timeout at
-  # startup — POST /admin/reload cannot change this on a running server.
+  # POST /admin/reload applies this to the next indexing run (each run builds
+  # its embedding client from the live config). RESTART REQUIRED for search
+  # queries and write dedup: their client's HTTP timeout is baked in at startup.
   request_timeout_secs: 60
 
   # Max number of embedding batches sent concurrently during indexing. The
@@ -262,8 +263,8 @@ embedding:
   # 4 is a compromise that leaves headroom for a future GPU deployment with
   # more parallel slots. Tuning knob, not a connection setting — no env var
   # override.
-  # RESTART REQUIRED: baked into the embedding client at startup — POST
-  # /admin/reload cannot change this on a running server.
+  # Each indexing run builds its embedding client from the live config, so
+  # POST /admin/reload applies this to the next run.
   batch_concurrency: 4
 
   # Text prepended to the text sent for embedding, for asymmetric models that
@@ -302,9 +303,11 @@ validation:
   # regardless of their frontmatter.
   enabled: true
 
-  # Strict mode. When true, files that fail validation are treated as hard
-  # errors (indexing aborts). When false, invalid files are skipped with a
-  # warning and indexing continues.
+  # Strict mode. When true, a file that fails validation is rejected: indexing
+  # continues without it, the version indexed before the failing edit stays
+  # served, and /status lists the rejection. When false, invalid files are
+  # skipped with a warning and indexing continues; a previously indexed version
+  # is removed from the index, as a full reindex would leave it.
   strict: false
 
   # External lint command run on each markdown file before indexing. Specified
@@ -529,12 +532,18 @@ mcp:
   # rebinding, and a bearer-authenticated server already refuses those requests
   # at auth. Worth setting mainly when allow_unauthenticated is true.
   #
+  # The same list also guards the web UI's /api/* routes (unauthenticated
+  # unless ui.api_auth is on), where it is worth setting in any deployment:
+  # a request whose Host is not listed gets 403, and a cross-origin POST/DELETE
+  # is accepted only from a listed host (or the request's own Host).
+  #
   # Behind a reverse proxy, list the PUBLIC hostname clients connect to — the
   # proxy forwards the original Host header, not the container's address.
   # Include a port only if clients send one.
   #
-  # RESTART REQUIRED: baked into the MCP transport when it is built at
-  # startup — POST /admin/reload cannot change this on a running server.
+  # RESTART REQUIRED: baked into the MCP transport and the web UI router when
+  # they are built at startup — POST /admin/reload cannot change this on a
+  # running server.
   # allowed_hosts:
   #   - "kb.example.com"
 

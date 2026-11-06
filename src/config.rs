@@ -562,6 +562,10 @@ pub struct McpConfig {
     /// bearer-authenticated server already refuses those requests at auth. It
     /// earns its keep mainly when `allow_unauthenticated` is set.
     ///
+    /// The web UI's `/api/*` routes apply the same list (`web::api_request_guard`),
+    /// and there it matters whenever `ui.api_auth` is off: an unlisted `Host` is
+    /// refused, and a cross-origin write is accepted only from a listed host.
+    ///
     /// Behind a reverse proxy, list the public hostname clients use rather than
     /// the container's address — the proxy forwards the original `Host`.
     #[serde(default)]

@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -12,6 +12,91 @@ use tracing::{error, info, warn};
 /// Maximum time to wait for a git subprocess (clone) before treating it as
 /// hung and returning an error.
 pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A bounded git command ran past its time limit and was killed (see
+/// [`run_bounded`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimedOut;
+
+#[cfg(test)]
+tokio::task_local! {
+    /// A test's override of [`GIT_TIMEOUT`] for [`run_bounded`], scoped to one task.
+    pub(crate) static TEST_GIT_TIMEOUT: Duration;
+}
+
+/// The limit [`run_bounded`] applies: [`GIT_TIMEOUT`], or a test's override.
+fn git_timeout() -> Duration {
+    #[cfg(test)]
+    if let Ok(limit) = TEST_GIT_TIMEOUT.try_with(|d| *d) {
+        return limit;
+    }
+    GIT_TIMEOUT
+}
+
+/// A `git` command whose process is killed if the future driving it is dropped,
+/// so a cancelled caller (a dropped request, a timeout) never leaves a git process
+/// running against the clone after [`GIT_LOCK`] is released.
+pub(crate) fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+/// Run `cmd` to completion and collect its output, as `Command::output` does,
+/// bounded by [`GIT_TIMEOUT`]. On timeout the child is killed and reaped before
+/// this returns, so a caller that gives up and releases [`GIT_LOCK`] cannot leave
+/// a timed-out fetch or push behind to overwrite `FETCH_HEAD` or hold
+/// `.git/index.lock` against the next holder. Dropping the future kills the child
+/// too (`kill_on_drop`). Only the direct child is killed: a remote helper it
+/// spawned exits once its pipes close.
+///
+/// The outer `Err` is the timeout; the inner `io::Result` is a spawn or wait
+/// failure, as with `timeout(.., cmd.output())`.
+pub(crate) async fn run_bounded(
+    mut cmd: impl std::borrow::BorrowMut<Command>,
+) -> Result<std::io::Result<std::process::Output>, TimedOut> {
+    async fn read_all(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_end(&mut buf).await?;
+        }
+        Ok(buf)
+    }
+
+    let cmd = cmd.borrow_mut();
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return Ok(Err(e)),
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let finished = timeout(git_timeout(), async {
+        let (stdout, stderr, status) =
+            tokio::join!(read_all(stdout), read_all(stderr), child.wait());
+        Ok(std::process::Output {
+            status: status?,
+            stdout: stdout?,
+            stderr: stderr?,
+        })
+    })
+    .await;
+    match finished {
+        Ok(output) => Ok(output),
+        Err(_) => {
+            // SIGKILL, then wait for the exit so the process is gone (and reaped)
+            // before the caller releases the lock.
+            if let Err(e) = child.kill().await {
+                warn!("Failed to kill a timed-out git process: {e}");
+            }
+            Err(TimedOut)
+        }
+    }
+}
 
 /// Serializes every git invocation against the knowledge-base clone.
 ///
@@ -114,6 +199,12 @@ pub fn redact_url(s: &str) -> String {
 /// Ensure a git repository exists at `data_path`. If the path is not already a
 /// git repo and `git_url` is provided, performs a full single-branch clone.
 ///
+/// An existing `.git` is vetted by [`check_existing_repo`] the first time this
+/// process sees the directory; once that passes it is not asked again. A clone
+/// into a directory that was empty (or absent) on entry that fails or times out
+/// has everything it left removed, the directory itself kept; a directory that
+/// was not empty is never touched.
+///
 /// Returns `Ok(true)` if a fresh clone was performed, `Ok(false)` if the repo
 /// already existed.
 pub async fn ensure_repo(
@@ -123,10 +214,27 @@ pub async fn ensure_repo(
     data_path: &str,
     token: Option<&str>,
 ) -> Result<bool> {
-    // Already a git repo — nothing to do
+    // Already a git repo — nothing to do, once it is confirmed to be a usable one.
+    // The check runs at most once per directory per process: `ensure_repo` is
+    // called on every indexing run under `GIT_LOCK`, and on an empty knowledge
+    // base the check asks the remote (`ls-remote`), which would hold the lock for
+    // up to `GIT_TIMEOUT` on every run while the remote hangs.
     if std::path::Path::new(data_path).join(".git").exists() {
+        let key = repo_check_key(data_path);
+        if checked_repos().contains(&key) {
+            return Ok(false);
+        }
+        // Only a check that reached a verdict is remembered: one that could not ask the
+        // remote (unborn HEAD, `ls-remote` failed or timed out) is run again next time.
+        if check_existing_repo(git_url, branch, data_path, token).await? {
+            checked_repos().insert(key);
+        }
         return Ok(false);
     }
+
+    // `git clone` into `.` requires an empty (or absent) target, so only a
+    // directory that was empty here can hold nothing but what the clone wrote.
+    let empty_at_entry = dir_is_empty_or_absent(Path::new(data_path));
 
     tokio::fs::create_dir_all(data_path)
         .await
@@ -141,35 +249,228 @@ pub async fn ensure_repo(
         data_path
     );
 
-    // Full clone (no --depth): commit_and_sync needs history to fetch/rebase/push.
-    let output = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
-            .args([
-                "clone",
-                "--branch",
-                branch,
-                "--single-branch",
-                &clone_url,
-                ".",
-            ])
-            .current_dir(data_path)
-            .output(),
-    )
-    .await
-    .map_err(|_elapsed| {
-        error!("git clone timed out after {:?}", GIT_TIMEOUT);
-        anyhow::anyhow!("git clone timed out after {:?}", GIT_TIMEOUT)
-    })?
-    .context("Failed to run git clone")?;
+    let result = run_clone(&clone_url, branch, data_path).await;
+    if result.is_err() && empty_at_entry {
+        // A clone killed on timeout never runs git's own cleanup, and the `.git`
+        // it leaves would be refused as an interrupted clone on every later start.
+        // The directory itself stays: it may be a mount point.
+        match clear_dir_contents(Path::new(data_path)) {
+            Ok(0) => {}
+            Ok(n) => warn!(
+                "git clone failed; removed the {n} entr{} it left in {data_path}",
+                if n == 1 { "y" } else { "ies" }
+            ),
+            Err(e) => {
+                error!("git clone failed, and clearing what it left in {data_path} failed: {e}")
+            }
+        }
+    }
+    result?;
+
+    info!("Clone complete");
+    Ok(true)
+}
+
+/// The full clone behind [`ensure_repo`] (no `--depth`: `commit_and_sync` needs
+/// history to fetch, rebase and push).
+async fn run_clone(clone_url: &str, branch: &str, data_path: &str) -> Result<()> {
+    let mut cmd = git_command();
+    cmd.args([
+        "clone",
+        "--branch",
+        branch,
+        "--single-branch",
+        clone_url,
+        ".",
+    ])
+    .current_dir(data_path);
+    #[cfg(test)]
+    if let Ok(script) = TEST_CLONE_SCRIPT.try_with(|s| s.clone()) {
+        cmd = Command::new("sh");
+        cmd.arg("-c").arg(script).current_dir(data_path);
+    }
+
+    let output = run_bounded(&mut cmd)
+        .await
+        .map_err(|_elapsed| {
+            error!("git clone timed out after {:?}", GIT_TIMEOUT);
+            anyhow::anyhow!("git clone timed out after {:?}", GIT_TIMEOUT)
+        })?
+        .context("Failed to run git clone")?;
 
     if !output.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&output.stderr));
         anyhow::bail!("git clone failed: {}", stderr);
     }
+    Ok(())
+}
 
-    info!("Clone complete");
-    Ok(true)
+#[cfg(test)]
+tokio::task_local! {
+    /// A test's stand-in for the `git clone` in [`run_clone`]: a `sh -c` script run
+    /// in the target directory, to leave a deterministic partial clone behind.
+    static TEST_CLONE_SCRIPT: String;
+}
+
+/// Directories whose existing `.git` [`check_existing_repo`] has accepted in this
+/// process, keyed by [`repo_check_key`]. A failed check is not recorded.
+static CHECKED_REPOS: LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+fn checked_repos() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+    CHECKED_REPOS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `data_path` canonicalized, so two spellings of one directory share an entry.
+fn repo_check_key(data_path: &str) -> PathBuf {
+    std::fs::canonicalize(data_path).unwrap_or_else(|_| PathBuf::from(data_path))
+}
+
+/// True when `dir` does not exist or has no entries. An unreadable directory
+/// counts as non-empty, so nothing in it is ever cleared.
+fn dir_is_empty_or_absent(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Remove every entry inside `dir`, keeping `dir` itself. Symlinks are removed,
+/// never followed. Returns how many top-level entries were removed.
+fn clear_dir_contents(dir: &Path) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Whether `git ls-remote --heads <url> <branch>` output names exactly
+/// `refs/heads/<branch>`. `ls-remote` matches its pattern against the tail of
+/// each ref, so `refs/heads/feature/main` is listed for `main` too and must not
+/// count.
+fn ls_remote_lists_branch(stdout: &str, branch: &str) -> bool {
+    // `source.git_branch` may be given as a qualified ref.
+    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    let wanted = format!("refs/heads/{branch}");
+    stdout.lines().any(|line| {
+        line.split_once('\t')
+            .is_some_and(|(_, refname)| refname.trim_end() == wanted)
+    })
+}
+
+/// Refuse an existing `.git` that is not a usable repository, so startup fails
+/// with an error naming the directory instead of every later fetch, rebase and
+/// pull failing in odd ways.
+///
+/// A `git clone` killed part-way (a timeout, a crash, a container stop) leaves a
+/// `.git` behind. Two shapes are caught:
+///
+/// - `.git` is not a repository git can open at all (empty, or missing `HEAD` or
+///   `objects`).
+/// - The repository opens but HEAD has no commit while the remote branch has
+///   commits: a clone stopped before its checkout. A repository with no commit
+///   whose remote branch is also empty or absent (a freshly initialized knowledge
+///   base) is accepted as before, as is one whose remote cannot be reached to
+///   ask: an outage must not block startup.
+///
+/// Nothing is deleted: the directory may hold the only copy of someone's
+/// documents, so the operator decides whether to move it aside and re-clone.
+async fn check_existing_repo(
+    git_url: &str,
+    branch: &str,
+    data_path: &str,
+    token: Option<&str>,
+) -> Result<bool> {
+    let git_dir = Path::new(data_path).join(".git");
+    let git_dir_str = git_dir.to_string_lossy().into_owned();
+    // `--git-dir` pins the repository: without it git would walk up from a broken
+    // `.git` and could find an enclosing checkout instead.
+    let probe = |args: &[&str]| {
+        let mut cmd = git_command();
+        cmd.args(["-c", &format!("safe.directory={}", data_path)])
+            .arg(format!("--git-dir={git_dir_str}"))
+            .args(args)
+            .current_dir(data_path);
+        cmd
+    };
+    let refuse = |why: &str| {
+        let message = format!(
+            "{data_path} has a .git that is not a usable repository ({why}); it looks \
+             like an interrupted clone. Move {data_path} aside (or remove its .git if it \
+             holds nothing else of value) and restart to clone it again"
+        );
+        error!("{message}");
+        anyhow::anyhow!(message)
+    };
+
+    let opened = run_bounded(probe(&["rev-parse", "--git-dir"]))
+        .await
+        .map_err(|_| anyhow::anyhow!("git rev-parse timed out after {:?}", GIT_TIMEOUT))?
+        .context("Failed to run git rev-parse")?;
+    if !opened.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&opened.stderr));
+        return Err(refuse(stderr.trim()));
+    }
+
+    let head = run_bounded(probe(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "HEAD^{commit}",
+    ]))
+    .await
+    .map_err(|_| anyhow::anyhow!("git rev-parse timed out after {:?}", GIT_TIMEOUT))?
+    .context("Failed to run git rev-parse")?;
+    if head.status.success() {
+        return Ok(true);
+    }
+
+    // No commit yet. Fine for an empty knowledge base; an interrupted clone if the
+    // remote branch has commits.
+    let url = authenticated_url(git_url, token);
+    let remote = run_bounded(probe(&["ls-remote", "--heads", &url, branch])).await;
+    match remote {
+        Ok(Ok(out)) if out.status.success() => {
+            if !ls_remote_lists_branch(&String::from_utf8_lossy(&out.stdout), branch) {
+                Ok(true)
+            } else {
+                Err(refuse(&format!(
+                    "it has no commit, but the remote branch {branch} does"
+                )))
+            }
+        }
+        Ok(Ok(out)) => {
+            warn!(
+                "{data_path} has no commit yet and the remote could not be asked whether \
+                 branch {branch} has any; continuing: {}",
+                redact_url(&String::from_utf8_lossy(&out.stderr)).trim()
+            );
+            Ok(false)
+        }
+        Ok(Err(e)) => {
+            warn!("{data_path} has no commit yet; could not run git ls-remote: {e}");
+            Ok(false)
+        }
+        Err(TimedOut) => {
+            warn!("{data_path} has no commit yet; git ls-remote timed out, continuing");
+            Ok(false)
+        }
+    }
 }
 
 /// Outcome of [`commit_and_sync`]: the resulting commit SHA, plus any paths pulled in
@@ -193,17 +494,15 @@ pub struct CommitOutcome {
 /// fetch + ff-only merge it performs, the same way `commit_and_sync` does around its
 /// own fetch + rebase.
 pub(crate) async fn rev_parse_head(_lock: &GitLock, data_path: &str) -> anyhow::Result<String> {
-    let out = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
+    let out = run_bounded(
+        git_command()
             .args([
                 "-c",
                 &format!("safe.directory={}", data_path),
                 "rev-parse",
                 "HEAD",
             ])
-            .current_dir(data_path)
-            .output(),
+            .current_dir(data_path),
     )
     .await
     .map_err(|_| anyhow::anyhow!("git rev-parse timed out after {:?}", GIT_TIMEOUT))?
@@ -282,9 +581,8 @@ pub(crate) async fn git_diff_name_status(
     new: &str,
 ) -> anyhow::Result<Vec<std::path::PathBuf>> {
     let range = format!("{old}..{new}");
-    let out = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
+    let out = run_bounded(
+        git_command()
             .args([
                 "-c",
                 &format!("safe.directory={}", data_path),
@@ -294,8 +592,7 @@ pub(crate) async fn git_diff_name_status(
                 "-z",
                 &range,
             ])
-            .current_dir(data_path)
-            .output(),
+            .current_dir(data_path),
     )
     .await
     .map_err(|_| anyhow::anyhow!("git diff timed out after {:?}", GIT_TIMEOUT))?
@@ -521,16 +818,10 @@ async fn git_log_mtimes_chunk(
     ];
     args.extend(paths.iter().map(|p| p.as_str()));
 
-    let out = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
-            .args(&args)
-            .current_dir(data_path)
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("git log timed out after {:?}", GIT_TIMEOUT))?
-    .context("Failed to spawn git log")?;
+    let out = run_bounded(git_command().args(&args).current_dir(data_path))
+        .await
+        .map_err(|_| anyhow::anyhow!("git log timed out after {:?}", GIT_TIMEOUT))?
+        .context("Failed to spawn git log")?;
 
     if !out.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
@@ -755,16 +1046,10 @@ async fn log_commits(
         args.push(p);
     }
 
-    let out = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
-            .args(&args)
-            .current_dir(data_path)
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("git log timed out after {:?}", GIT_TIMEOUT))?
-    .context("Failed to spawn git log")?;
+    let out = run_bounded(git_command().args(&args).current_dir(data_path))
+        .await
+        .map_err(|_| anyhow::anyhow!("git log timed out after {:?}", GIT_TIMEOUT))?
+        .context("Failed to spawn git log")?;
 
     if !out.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
@@ -832,9 +1117,8 @@ pub async fn document_commit_diff(
     }
     let safe_dir = format!("safe.directory={}", data_path);
     let resolved = resolve_commit(data_path, &safe_dir, commit).await?;
-    let out = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
+    let out = run_bounded(
+        git_command()
             .args([
                 "-c",
                 &safe_dir,
@@ -845,8 +1129,7 @@ pub async fn document_commit_diff(
                 "--",
                 rel_path,
             ])
-            .current_dir(data_path)
-            .output(),
+            .current_dir(data_path),
     )
     .await
     .map_err(|_| anyhow::anyhow!("git show timed out after {:?}", GIT_TIMEOUT))?
@@ -870,9 +1153,8 @@ async fn resolve_commit(
     commit: &str,
 ) -> Result<String, CommitDiffError> {
     let spec = format!("{commit}^{{commit}}");
-    let out = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
+    let out = run_bounded(
+        git_command()
             .args([
                 "-c",
                 safe_dir,
@@ -882,8 +1164,7 @@ async fn resolve_commit(
                 "--end-of-options",
                 &spec,
             ])
-            .current_dir(data_path)
-            .output(),
+            .current_dir(data_path),
     )
     .await
     .map_err(|_| anyhow::anyhow!("git rev-parse timed out after {:?}", GIT_TIMEOUT))?
@@ -1008,13 +1289,11 @@ async fn git_read(data_path: &str, args: &[&str], what: &str) -> Result<std::pro
     let safe_dir = format!("safe.directory={}", data_path);
     let mut full: Vec<&str> = vec!["-c", &safe_dir];
     full.extend_from_slice(args);
-    timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
+    run_bounded(
+        git_command()
             .args(&full)
             .current_dir(data_path)
-            .stdin(std::process::Stdio::null())
-            .output(),
+            .stdin(std::process::Stdio::null()),
     )
     .await
     .map_err(|_| anyhow::anyhow!("git {what} timed out after {:?}", GIT_TIMEOUT))?
@@ -1200,8 +1479,17 @@ pub enum CommitSyncError {
     /// other than a conflict — so an outage never blocks writes: the commit syncs
     /// with a later write. The one exception is a [`CommitSyncError::Conflict`]
     /// whose commit could not be dropped: it is still HEAD, and the cause says so.
+    ///
+    /// `rebased_paths` is what [`CommitOutcome::rebased_paths`] would have been:
+    /// the paths this call's own rebase pulled in from other commits, which are
+    /// in the working tree and need reindexing even though the push then failed.
+    /// Empty when the failure came before the rebase finished.
     #[error("commit {sha} landed locally but syncing to the remote failed: {source:#}")]
-    PostCommit { sha: String, source: anyhow::Error },
+    PostCommit {
+        sha: String,
+        source: anyhow::Error,
+        rebased_paths: Vec<std::path::PathBuf>,
+    },
 
     /// The remote had moved in a way this commit could not be layered on: the
     /// rebase conflicted, or the push was rejected because the remote advanced
@@ -1285,7 +1573,7 @@ async fn git_output(
     args: &[&str],
     author: Option<(&str, &str)>,
 ) -> anyhow::Result<std::process::Output> {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     cmd.args(["-c", &format!("safe.directory={}", data_path)])
         .args(args)
         .current_dir(data_path);
@@ -1296,7 +1584,7 @@ async fn git_output(
             .env("GIT_COMMITTER_EMAIL", email);
     }
     let joined = args.first().copied().unwrap_or_default();
-    timeout(GIT_TIMEOUT, cmd.output())
+    run_bounded(&mut cmd)
         .await
         .map_err(|_| anyhow::anyhow!("git {} timed out after {:?}", joined, GIT_TIMEOUT))?
         .with_context(|| format!("Failed to spawn git {}", joined))
@@ -1411,6 +1699,28 @@ async fn unmerged_paths(data_path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Whether a rebase is stopped part-way in `data_path` (`.git/rebase-merge` or
+/// `.git/rebase-apply` present).
+fn rebase_in_progress(data_path: &str) -> bool {
+    let git_dir = Path::new(data_path).join(".git");
+    git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists()
+}
+
+/// Abort a failed or timed-out rebase so the clone is back on its branch, as it
+/// was before the rebase. The caller holds the [`GitLock`] it ran the rebase
+/// under. A rebase that is still in progress afterwards is logged at error level:
+/// [`recover_interrupted_state`] clears it at the next start.
+async fn abort_rebase(data_path: &str) {
+    let result = git_ok(data_path, &["rebase", "--abort"], None).await;
+    if rebase_in_progress(data_path) {
+        let cause = result.err().map(|e| format!("{e:#}")).unwrap_or_default();
+        error!(
+            "git rebase --abort left a rebase in progress in {data_path}; writes and \
+             pulls fail until it is cleared: {cause}"
+        );
+    }
+}
+
 /// Whether a failed `git push`'s stderr says the remote rejected it because it
 /// moved on (a non-fast-forward), as opposed to a transport failure or a hook.
 fn is_non_fast_forward_rejection(stderr: &str) -> bool {
@@ -1456,28 +1766,69 @@ pub(crate) async fn sync_to_remote(
         warn!("Pre-write fetch failed; writing on the local clone, it syncs later: {e:#}");
         return;
     }
+    match integrate_fetch_head(lock, data_path, author_name, author_email).await {
+        Integrated::FastForwarded | Integrated::Rebased | Integrated::ResetToRemote => {}
+        Integrated::RebaseFailed(rebase_err) => warn!(
+            "Pre-write sync could not rebase unpushed local commits onto the remote, and \
+             not because of a conflict; writing on the local clone, it syncs later: \
+             {rebase_err:#}"
+        ),
+        Integrated::ResetFailed(e) => {
+            error!("Pre-write sync could not reset the clone to the remote tip: {e:#}")
+        }
+    }
+}
+
+/// How [`integrate_fetch_head`] left the clone.
+#[derive(Debug)]
+pub(crate) enum Integrated {
+    /// HEAD fast-forwarded to `FETCH_HEAD` (or already contained it).
+    FastForwarded,
+    /// Local commits the remote lacks were rebased onto `FETCH_HEAD`; they are
+    /// still unpushed.
+    Rebased,
+    /// Those local commits conflicted with the remote: they were saved under a
+    /// recovery ref and the clone reset to `FETCH_HEAD` (see
+    /// [`reset_to_fetch_head`]).
+    ResetToRemote,
+    /// The rebase failed for a reason other than a conflict (a dirty or staged
+    /// tracked file, a timeout); it was aborted and the clone left as it was.
+    RebaseFailed(anyhow::Error),
+    /// The conflict reset itself failed.
+    ResetFailed(anyhow::Error),
+}
+
+/// Bring the branch onto `FETCH_HEAD`, which the caller has just fetched under
+/// the same [`GitLock`] acquisition: fast-forward when possible, otherwise rebase
+/// the local commits a push failure left unpushed onto it, and on a genuine
+/// conflict reset to it with those commits parked under a recovery ref. Shared by
+/// [`sync_to_remote`] (before every write) and `sync::pull_clone` (the webhook,
+/// `POST /admin/sync` and `git-pull`), so a diverged clone is reconciled the same
+/// way whichever reaches it first.
+pub(crate) async fn integrate_fetch_head(
+    lock: &GitLock,
+    data_path: &str,
+    author_name: &str,
+    author_email: &str,
+) -> Integrated {
     if git_ok(data_path, &["merge", "--ff-only", "FETCH_HEAD"], None)
         .await
         .is_ok()
     {
-        return;
+        return Integrated::FastForwarded;
     }
     let author = Some((author_name, author_email));
     let Err(rebase_err) = git_ok(data_path, &["rebase", "FETCH_HEAD"], author).await else {
-        return;
+        return Integrated::Rebased;
     };
     let conflicted = unmerged_paths(data_path).await;
-    let _ = git_output(data_path, &["rebase", "--abort"], None).await;
+    abort_rebase(data_path).await;
     if conflicted.is_empty() {
-        warn!(
-            "Pre-write sync could not rebase unpushed local commits onto the remote, and \
-             not because of a conflict; writing on the local clone, it syncs later: \
-             {rebase_err:#}"
-        );
-        return;
+        return Integrated::RebaseFailed(rebase_err);
     }
-    if let Err(e) = reset_to_fetch_head(lock, data_path).await {
-        error!("Pre-write sync could not reset the clone to the remote tip: {e:#}");
+    match reset_to_fetch_head(lock, data_path).await {
+        Ok(()) => Integrated::ResetToRemote,
+        Err(e) => Integrated::ResetFailed(e),
     }
 }
 
@@ -1583,7 +1934,7 @@ pub async fn commit_and_sync(
     // Helper: build a base git command with safe.directory set and cwd pointing at data_path.
     // Returns (Command,) ready to have more args appended.
     let git_cmd = |args: &[&str]| {
-        let mut cmd = Command::new("git");
+        let mut cmd = git_command();
         cmd.args(["-c", &format!("safe.directory={}", data_path)])
             .args(args)
             .current_dir(data_path);
@@ -1615,7 +1966,7 @@ pub async fn commit_and_sync(
     // exactly where it started.
     let mut add_args: Vec<&str> = vec!["add", "--"];
     add_args.extend(paths.iter().copied());
-    let add_out = timeout(GIT_TIMEOUT, git_cmd(&add_args).output())
+    let add_out = run_bounded(git_cmd(&add_args))
         .await
         .map_err(|_| {
             CommitSyncError::PreCommit(anyhow::anyhow!("git add timed out after {:?}", GIT_TIMEOUT))
@@ -1655,7 +2006,7 @@ pub async fn commit_and_sync(
     // add-new — as a single atomic commit instead of two.
     let mut commit_args: Vec<&str> = vec!["commit", "-m", message, "--"];
     commit_args.extend(paths.iter().copied());
-    let commit_out = timeout(GIT_TIMEOUT, git_cmd_authored(&commit_args).output())
+    let commit_out = run_bounded(git_cmd_authored(&commit_args))
         .await
         .map_err(|_| {
             CommitSyncError::PreCommit(anyhow::anyhow!(
@@ -1683,6 +2034,7 @@ pub async fn commit_and_sync(
         // commit above DID succeed, so this is still unambiguously post-commit. There
         // is just no sha to attach to it.
         CommitSyncError::PostCommit {
+            rebased_paths: Vec::new(),
             sha: "<unknown: rev-parse HEAD failed immediately after a successful commit>"
                 .to_string(),
             source: e,
@@ -1708,38 +2060,47 @@ pub async fn commit_and_sync(
             redact_url(&auth_url),
             branch
         );
-        let fetch_out = timeout(
-            GIT_TIMEOUT,
-            git_cmd(&["fetch", "--no-tags", &auth_url, branch]).output(),
-        )
-        .await
-        .map_err(|_| CommitSyncError::PostCommit {
-            sha: local_sha.clone(),
-            source: anyhow::anyhow!("git fetch timed out after {:?}", GIT_TIMEOUT),
-        })?
-        .map_err(|e| CommitSyncError::PostCommit {
-            sha: local_sha.clone(),
-            source: anyhow::Error::new(e).context("Failed to spawn git fetch"),
-        })?;
+        let fetch_out = run_bounded(git_cmd(&["fetch", "--no-tags", &auth_url, branch]))
+            .await
+            .map_err(|_| CommitSyncError::PostCommit {
+                rebased_paths: Vec::new(),
+                sha: local_sha.clone(),
+                source: anyhow::anyhow!("git fetch timed out after {:?}", GIT_TIMEOUT),
+            })?
+            .map_err(|e| CommitSyncError::PostCommit {
+                rebased_paths: Vec::new(),
+                sha: local_sha.clone(),
+                source: anyhow::Error::new(e).context("Failed to spawn git fetch"),
+            })?;
         if !fetch_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&fetch_out.stderr));
             return Err(CommitSyncError::PostCommit {
+                rebased_paths: Vec::new(),
                 sha: local_sha.clone(),
                 source: anyhow::anyhow!("git fetch failed: {}", stderr),
             });
         }
 
         // --- git rebase FETCH_HEAD ---
-        let rebase_out = timeout(
-            GIT_TIMEOUT,
-            git_cmd_authored(&["rebase", "FETCH_HEAD"]).output(),
-        )
-        .await
-        .map_err(|_| CommitSyncError::PostCommit {
-            sha: local_sha.clone(),
-            source: anyhow::anyhow!("git rebase timed out after {:?}", GIT_TIMEOUT),
-        })?
+        let rebase_out = match run_bounded(git_cmd_authored(&["rebase", "FETCH_HEAD"])).await {
+            Ok(out) => out,
+            Err(TimedOut) => {
+                // The killed rebase can stop mid-way, HEAD detached and
+                // `.git/rebase-merge` in place, which fails every later write and
+                // pull until a restart. Abort it under this same acquisition.
+                abort_rebase(data_path).await;
+                return Err(CommitSyncError::PostCommit {
+                    sha: local_sha.clone(),
+                    source: anyhow::anyhow!(
+                        "git rebase timed out after {:?}; rebase aborted",
+                        GIT_TIMEOUT
+                    ),
+                    rebased_paths: Vec::new(),
+                });
+            }
+        }
         .map_err(|e| CommitSyncError::PostCommit {
+            rebased_paths: Vec::new(),
             sha: local_sha.clone(),
             source: anyhow::Error::new(e).context("Failed to spawn git rebase"),
         })?;
@@ -1760,13 +2121,14 @@ pub async fn commit_and_sync(
             let conflicted = unmerged_paths(data_path).await;
 
             // Abort the rebase so the working tree is left clean at the local commit.
-            let _ = git_cmd(&["rebase", "--abort"]).output().await;
+            abort_rebase(data_path).await;
 
             // A non-conflict failure leaves our own commit (`local_sha`) in place —
             // the rebase touched nothing durable, it just couldn't finish. Still
             // PostCommit.
             if conflicted.is_empty() {
                 return Err(CommitSyncError::PostCommit {
+                    rebased_paths: Vec::new(),
                     sha: local_sha.clone(),
                     source: anyhow::anyhow!(
                         "git rebase onto FETCH_HEAD failed with no conflicting files — \
@@ -1788,6 +2150,7 @@ pub async fn commit_and_sync(
             );
             if let Err(e) = drop_own_commit(lock, data_path, pre_commit_head.as_deref()).await {
                 return Err(CommitSyncError::PostCommit {
+                    rebased_paths: Vec::new(),
                     sha: local_sha.clone(),
                     source: source.context(format!("dropping the commit failed: {e:#}")),
                 });
@@ -1811,6 +2174,7 @@ pub async fn commit_and_sync(
             rev_parse_head(lock, data_path)
                 .await
                 .map_err(|e| CommitSyncError::PostCommit {
+                    rebased_paths: Vec::new(),
                     sha: "<unknown: rev-parse HEAD failed immediately after a successful rebase>"
                         .to_string(),
                     source: e,
@@ -1823,6 +2187,7 @@ pub async fn commit_and_sync(
         rebased_paths = git_diff_name_status(lock, data_path, &old_head, &post_rebase_sha)
             .await
             .map_err(|e| CommitSyncError::PostCommit {
+                rebased_paths: Vec::new(),
                 sha: post_rebase_sha.clone(),
                 source: e.context("Failed to diff the rebase range"),
             })?;
@@ -1832,19 +2197,18 @@ pub async fn commit_and_sync(
         // --- git push <auth_url> HEAD:<branch> ---
         info!("Pushing to {} branch {}", redact_url(&auth_url), branch);
         let push_refspec = format!("HEAD:{}", branch);
-        let push_out = timeout(
-            GIT_TIMEOUT,
-            git_cmd(&["push", &auth_url, &push_refspec]).output(),
-        )
-        .await
-        .map_err(|_| CommitSyncError::PostCommit {
-            sha: post_rebase_sha.clone(),
-            source: anyhow::anyhow!("git push timed out after {:?}", GIT_TIMEOUT),
-        })?
-        .map_err(|e| CommitSyncError::PostCommit {
-            sha: post_rebase_sha.clone(),
-            source: anyhow::Error::new(e).context("Failed to spawn git push"),
-        })?;
+        let push_out = run_bounded(git_cmd(&["push", &auth_url, &push_refspec]))
+            .await
+            .map_err(|_| CommitSyncError::PostCommit {
+                rebased_paths: rebased_paths.clone(),
+                sha: post_rebase_sha.clone(),
+                source: anyhow::anyhow!("git push timed out after {:?}", GIT_TIMEOUT),
+            })?
+            .map_err(|e| CommitSyncError::PostCommit {
+                rebased_paths: rebased_paths.clone(),
+                sha: post_rebase_sha.clone(),
+                source: anyhow::Error::new(e).context("Failed to spawn git push"),
+            })?;
         if !push_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&push_out.stderr));
             // The remote advanced again between the fetch and the push. Same
@@ -1856,6 +2220,7 @@ pub async fn commit_and_sync(
                 let source = anyhow::anyhow!("git push rejected: {}", stderr);
                 if let Err(e) = drop_own_commit(lock, data_path, pre_commit_head.as_deref()).await {
                     return Err(CommitSyncError::PostCommit {
+                        rebased_paths: rebased_paths.clone(),
                         sha: post_rebase_sha.clone(),
                         source: source.context(format!("dropping the commit failed: {e:#}")),
                     });
@@ -1863,6 +2228,7 @@ pub async fn commit_and_sync(
                 return Err(CommitSyncError::Conflict { source });
             }
             return Err(CommitSyncError::PostCommit {
+                rebased_paths: rebased_paths.clone(),
                 sha: post_rebase_sha.clone(),
                 source: anyhow::anyhow!("git push failed: {}", stderr),
             });
@@ -1903,9 +2269,8 @@ pub async fn restore_from_head(
     data_path: &str,
     rel_path: &str,
 ) -> anyhow::Result<()> {
-    let out = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
+    let out = run_bounded(
+        git_command()
             .args([
                 "-c",
                 &format!("safe.directory={}", data_path),
@@ -1916,8 +2281,7 @@ pub async fn restore_from_head(
                 "--",
                 rel_path,
             ])
-            .current_dir(data_path)
-            .output(),
+            .current_dir(data_path),
     )
     .await
     .map_err(|_| anyhow::anyhow!("git restore timed out after {:?}", GIT_TIMEOUT))?
@@ -1944,9 +2308,8 @@ pub async fn restore_from_head(
 /// doc), so the caller removes the file itself and calls this to make sure `git add`
 /// staging it doesn't silently ride along on some later, unrelated commit.
 pub async fn unstage(_lock: &GitLock, data_path: &str, rel_path: &str) -> anyhow::Result<()> {
-    let out = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
+    let out = run_bounded(
+        git_command()
             .args([
                 "-c",
                 &format!("safe.directory={}", data_path),
@@ -1954,8 +2317,7 @@ pub async fn unstage(_lock: &GitLock, data_path: &str, rel_path: &str) -> anyhow
                 "--",
                 rel_path,
             ])
-            .current_dir(data_path)
-            .output(),
+            .current_dir(data_path),
     )
     .await
     .map_err(|_| anyhow::anyhow!("git reset timed out after {:?}", GIT_TIMEOUT))?
@@ -2061,13 +2423,11 @@ pub async fn recover_interrupted_state(lock: &GitLock, repo: &Path) {
 async fn run_abort(_lock: &GitLock, repo: &Path, args: &[&str]) -> anyhow::Result<()> {
     let data_path = repo.to_string_lossy();
     let joined = args.join(" ");
-    let out = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
+    let out = run_bounded(
+        git_command()
             .args(["-c", &format!("safe.directory={}", data_path)])
             .args(args)
-            .current_dir(repo)
-            .output(),
+            .current_dir(repo),
     )
     .await
     .map_err(|_| anyhow::anyhow!("git {} timed out after {:?}", joined, GIT_TIMEOUT))?
@@ -2278,16 +2638,20 @@ pub(crate) mod tests {
 
     // --- ensure_repo tests ---
 
+    /// An existing repository with no commit (a freshly initialized knowledge base)
+    /// is accepted as is, even when its remote cannot be reached to ask about it.
     #[tokio::test]
     async fn ensure_repo_short_circuits_when_git_exists() {
         let dir = tempfile::TempDir::new().unwrap();
-        // Create a fake .git directory
-        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        git_test_cmd(dir.path())
+            .args(["init", "-q", "--initial-branch", "main"])
+            .output()
+            .unwrap();
 
         let lock = lock_git().await;
         let result = ensure_repo(
             &lock,
-            "https://example.com/repo.git",
+            "/nonexistent/remote/repo.git",
             "main",
             dir.path().to_str().unwrap(),
             None,
@@ -2296,6 +2660,338 @@ pub(crate) mod tests {
         .unwrap();
 
         assert!(!result, "Should return false when .git already exists");
+    }
+
+    /// An unborn repository whose remote branch is empty too is not an
+    /// interrupted clone.
+    #[tokio::test]
+    async fn ensure_repo_accepts_an_unborn_repo_whose_remote_is_empty() {
+        let bare = tempfile::TempDir::new().unwrap();
+        git_test_cmd(bare.path())
+            .args(["init", "-q", "--bare", "--initial-branch", "main"])
+            .output()
+            .unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        git_test_cmd(dir.path())
+            .args(["init", "-q", "--initial-branch", "main"])
+            .output()
+            .unwrap();
+
+        let lock = lock_git().await;
+        let result = ensure_repo(
+            &lock,
+            bare.path().to_str().unwrap(),
+            "main",
+            dir.path().to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!result);
+    }
+
+    /// A `.git` git cannot open (here: an empty directory, as a clone killed before
+    /// writing `HEAD` leaves) is refused with an error naming the directory, and
+    /// nothing in it is deleted.
+    #[tokio::test]
+    async fn ensure_repo_refuses_a_git_dir_without_head() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("keep.md"), "# Keep\n").unwrap();
+
+        let lock = lock_git().await;
+        let err = ensure_repo(
+            &lock,
+            "/nonexistent/remote/repo.git",
+            "main",
+            dir.path().to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains(dir.path().to_str().unwrap()), "{msg}");
+        assert!(msg.contains("interrupted clone"), "{msg}");
+        assert!(dir.path().join(".git").is_dir());
+        assert!(dir.path().join("keep.md").is_file());
+    }
+
+    /// A repository with no commit whose remote branch has commits is a clone
+    /// stopped before its checkout, and is refused.
+    #[tokio::test]
+    async fn ensure_repo_refuses_an_unborn_repo_whose_remote_has_commits() {
+        let bare = create_bare_repo("main");
+        let dir = tempfile::TempDir::new().unwrap();
+        git_test_cmd(dir.path())
+            .args(["init", "-q", "--initial-branch", "main"])
+            .output()
+            .unwrap();
+
+        let lock = lock_git().await;
+        let err = ensure_repo(
+            &lock,
+            bare.path().to_str().unwrap(),
+            "main",
+            dir.path().to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("interrupted clone"), "{msg}");
+        assert!(msg.contains("remote branch main does"), "{msg}");
+    }
+
+    /// A timed-out command is killed and reaped before `run_bounded` returns, so
+    /// nothing is left running against the clone once the lock is released.
+    #[tokio::test]
+    async fn run_bounded_kills_and_reaps_a_timed_out_process() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_file = dir.path().join("pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("echo $$ > '{}'; exec sleep 30", pid_file.display()));
+
+        // A limit long enough for `sh` to write its pid file on a loaded runner,
+        // still far short of the sleep.
+        let started = std::time::Instant::now();
+        let result = TEST_GIT_TIMEOUT
+            .scope(Duration::from_secs(3), run_bounded(&mut cmd))
+            .await;
+        assert_eq!(result.unwrap_err(), TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        let mut pid = String::new();
+        for _ in 0..50 {
+            pid = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            if !pid.trim().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = pid.trim();
+        assert!(!pid.is_empty(), "the child never wrote its pid file");
+        // Reaped, not merely signalled: no /proc entry, not even a zombie.
+        assert!(
+            !Path::new("/proc").join(pid).exists(),
+            "process {pid} still exists after the timeout"
+        );
+    }
+
+    /// The happy path still returns the command's output and exit status.
+    #[tokio::test]
+    async fn run_bounded_collects_output() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("echo out; echo err >&2; exit 3");
+        let out = run_bounded(&mut cmd).await.unwrap().unwrap();
+        assert_eq!(out.stdout, b"out\n");
+        assert_eq!(out.stderr, b"err\n");
+        assert_eq!(out.status.code(), Some(3));
+    }
+
+    /// Once an existing repository has passed the check, `ensure_repo` does not run
+    /// it again for that directory in this process: a `.git` broken afterwards is
+    /// not noticed (the check guards startup, not every indexing run).
+    #[tokio::test]
+    async fn ensure_repo_checks_an_existing_repo_once_per_process() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_test_cmd(dir.path())
+            .args(["init", "-q", "--initial-branch", "main"])
+            .output()
+            .unwrap();
+        // A commit makes the first check conclusive (an unborn HEAD with an
+        // unreachable remote is not, and is not remembered).
+        git_test_cmd(dir.path())
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ])
+            .output()
+            .unwrap();
+        let data_path = dir.path().to_str().unwrap();
+
+        let lock = lock_git().await;
+        assert!(
+            !ensure_repo(&lock, "/nonexistent/remote.git", "main", data_path, None)
+                .await
+                .unwrap()
+        );
+        // Break the repository: the check would now refuse it.
+        std::fs::remove_file(dir.path().join(".git/HEAD")).unwrap();
+        assert!(
+            check_existing_repo("/nonexistent/remote.git", "main", data_path, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            !ensure_repo(&lock, "/nonexistent/remote.git", "main", data_path, None)
+                .await
+                .unwrap(),
+            "the second call must not re-run the check"
+        );
+    }
+
+    /// A check that could not reach a verdict (no commit, remote unreachable) is not
+    /// remembered either: the next call asks again.
+    #[tokio::test]
+    async fn ensure_repo_does_not_cache_an_inconclusive_check() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_test_cmd(dir.path())
+            .args(["init", "-q", "--initial-branch", "main"])
+            .output()
+            .unwrap();
+        let data_path = dir.path().to_str().unwrap();
+
+        let lock = lock_git().await;
+        assert!(
+            !ensure_repo(&lock, "/nonexistent/remote.git", "main", data_path, None)
+                .await
+                .unwrap()
+        );
+        std::fs::remove_file(dir.path().join(".git/HEAD")).unwrap();
+        assert!(
+            ensure_repo(&lock, "/nonexistent/remote.git", "main", data_path, None)
+                .await
+                .is_err(),
+            "the second call must run the check again"
+        );
+    }
+
+    /// A failed check is not cached: the next call checks again.
+    #[tokio::test]
+    async fn ensure_repo_does_not_cache_a_failed_check() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let data_path = dir.path().to_str().unwrap();
+
+        let lock = lock_git().await;
+        for _ in 0..2 {
+            assert!(
+                ensure_repo(&lock, "/nonexistent/remote.git", "main", data_path, None)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    /// A clone that fails into a directory that was empty on entry leaves the
+    /// directory empty (but present): a partial `.git` and a half checked-out file
+    /// are both removed.
+    #[tokio::test]
+    async fn ensure_repo_clears_a_failed_clone_from_an_empty_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = "mkdir -p .git/objects && echo 'ref: refs/heads/main' > .git/HEAD \
+                      && echo half > half.md && exit 128";
+
+        let lock = lock_git().await;
+        let err = TEST_CLONE_SCRIPT
+            .scope(
+                script.to_string(),
+                ensure_repo(
+                    &lock,
+                    "/nonexistent/remote.git",
+                    "main",
+                    dir.path().to_str().unwrap(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("git clone failed"), "{err:#}");
+        assert!(dir.path().is_dir());
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A directory that was not empty on entry is never cleaned, whatever the
+    /// failed clone left in it.
+    #[tokio::test]
+    async fn ensure_repo_leaves_a_nonempty_dir_alone_after_a_failed_clone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keep.md"), "# Keep\n").unwrap();
+        let script = "mkdir -p .git && echo partial > .git/HEAD && exit 128";
+
+        let lock = lock_git().await;
+        let result = TEST_CLONE_SCRIPT
+            .scope(
+                script.to_string(),
+                ensure_repo(
+                    &lock,
+                    "/nonexistent/remote.git",
+                    "main",
+                    dir.path().to_str().unwrap(),
+                    None,
+                ),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(dir.path().join("keep.md").is_file());
+        assert!(dir.path().join(".git/HEAD").is_file());
+    }
+
+    /// Only an exact `refs/heads/<branch>` line counts; `ls-remote`'s tail match
+    /// also lists `refs/heads/feature/main` for `main`.
+    #[test]
+    fn ls_remote_lists_branch_matches_the_exact_ref_only() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert!(ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/main\n"),
+            "main"
+        ));
+        assert!(ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/feature/main\n{sha}\trefs/heads/main\n"),
+            "main"
+        ));
+        assert!(!ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/feature/main\n"),
+            "main"
+        ));
+        assert!(!ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/mainline\n"),
+            "main"
+        ));
+        assert!(!ls_remote_lists_branch("", "main"));
+        // A branch configured as a qualified ref still matches its own listing.
+        assert!(ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/main\n"),
+            "refs/heads/main"
+        ));
+        assert!(ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/feature/x\n"),
+            "feature/x"
+        ));
+    }
+
+    /// An unborn repository whose remote has only a branch that merely ends in the
+    /// configured name (`feature/main`) is not an interrupted clone of `main`.
+    #[tokio::test]
+    async fn ensure_repo_accepts_an_unborn_repo_when_only_a_suffix_branch_exists() {
+        let bare = create_bare_repo("feature/main");
+        let dir = tempfile::TempDir::new().unwrap();
+        git_test_cmd(dir.path())
+            .args(["init", "-q", "--initial-branch", "main"])
+            .output()
+            .unwrap();
+
+        let lock = lock_git().await;
+        let result = ensure_repo(
+            &lock,
+            bare.path().to_str().unwrap(),
+            "main",
+            dir.path().to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!result);
     }
 
     /// Helper: create a local bare git repo with one commit on the given branch.
@@ -4207,6 +4903,7 @@ pub(crate) mod tests {
         // The enum's own Display must not leak it either — that's what a caller
         // actually logs/returns.
         let full = CommitSyncError::PostCommit {
+            rebased_paths: Vec::new(),
             sha: "deadbeef".to_string(),
             source,
         }
@@ -4292,12 +4989,23 @@ pub(crate) mod tests {
         .await;
 
         let sha = match result {
-            Err(CommitSyncError::PostCommit { sha, source }) => {
+            Err(CommitSyncError::PostCommit {
+                sha,
+                source,
+                rebased_paths,
+            }) => {
                 let msg = format!("{:#}", source);
                 assert!(
                     msg.contains("git push failed"),
                     "expected a push failure, got: {}",
                     msg
+                );
+                // The rebase pulled A's `other.md` into B's working tree; the push
+                // failing must not lose that, or it is never marked dirty.
+                assert_eq!(
+                    rebased_paths,
+                    vec![std::path::PathBuf::from("other.md")],
+                    "a push failure after a rebase must still report the paths it pulled in"
                 );
                 sha
             }

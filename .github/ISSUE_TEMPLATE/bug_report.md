@@ -9,8 +9,8 @@ assignees: ""
 ## Problem
 
 What's wrong? Include the exact error message, log line, or unexpected behavior. A
-pointer to the relevant file/line if you've found one (`src/foo.rs:123`) is
-appreciated but not required.
+pointer to the relevant file path and symbol name if you've found one (`src/foo.rs`,
+`fn bar`) is appreciated but not required.
 
 ## Failure scenario
 

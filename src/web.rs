@@ -9,6 +9,11 @@
 //! `/api/*` routes — never the static shell or assets — into the same bearer-auth
 //! layer as `/mcp`, for deployments whose API consumer is a backend service.
 //!
+//! Whatever `ui.api_auth` says, the `/api/*` routes check where a request came
+//! from ([`api_request_guard`]: `Host` against `mcp.allowed_hosts`, `Origin` on
+//! writes), and every UI response carries a CSP and anti-framing headers
+//! ([`ui_security_headers`]).
+//!
 //! [`UiState`] mirrors `server::StatusState` and `mcp::KbSearchServer`'s own
 //! fields/`deps()` helper — same retrieval plumbing (`retrieval::search`,
 //! `retrieval::get_document`), reused rather than duplicated, just wired to axum
@@ -2034,14 +2039,183 @@ async fn delete_doc_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Request-origin guard and response headers
+// ---------------------------------------------------------------------------
+
+/// Content-Security-Policy for every UI response.
+///
+/// Scripts load only from this server: `assets/ui/index.html` has no inline
+/// `<script>` or `on*=` handler attribute, and neither `viz.js`/`edit.js` nor the
+/// vendored libraries call `eval` or `new Function` (cytoscape's bundled lodash
+/// keeps a `Function("return this")` global-object fallback that is never reached
+/// in a browser, where `self` is defined). `style-src` allows inline styles because
+/// cytoscape injects a `<style>` element and rendered markdown may carry `style`
+/// attributes DOMPurify keeps. `img-src`/`media-src` allow remote `http:`/`https:`
+/// sources because document markdown can embed external images. Every `fetch` the
+/// UI makes is a relative `api/...` URL, so `connect-src` is `'self'`.
+pub(crate) const UI_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data: http: https:; \
+     media-src 'self' http: https:; connect-src 'self'; font-src 'self'; object-src 'none'; \
+     frame-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'none'; \
+     form-action 'self'";
+
+/// Add the browser hardening headers to a UI response: CSP, `nosniff`, no referrer,
+/// and no framing (`X-Frame-Options` for browsers that predate `frame-ancestors`).
+/// A header a handler already set is left as it is.
+async fn ui_security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::CONTENT_SECURITY_POLICY, UI_CONTENT_SECURITY_POLICY),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "no-referrer"),
+        (header::X_FRAME_OPTIONS, "DENY"),
+    ] {
+        headers
+            .entry(name)
+            .or_insert(header::HeaderValue::from_static(value));
+    }
+    response
+}
+
+/// State for [`api_request_guard`]: the `mcp.allowed_hosts` list, shared with the
+/// `/mcp` transport's own Host check.
+#[derive(Clone)]
+struct ApiRequestGuard {
+    allowed_hosts: Arc<[String]>,
+}
+
+/// A host and optional port, normalized the way rmcp normalizes the `/mcp` Host
+/// check: IPv6 brackets trimmed, ASCII-lowercased.
+#[derive(Debug, PartialEq, Eq)]
+struct HostPort {
+    host: String,
+    port: Option<u16>,
+}
+
+impl HostPort {
+    fn new(host: &str, port: Option<u16>) -> Self {
+        HostPort {
+            host: host
+                .trim_matches('[')
+                .trim_matches(']')
+                .to_ascii_lowercase(),
+            port,
+        }
+    }
+
+    fn from_authority(raw: &str) -> Option<Self> {
+        let authority = axum::http::uri::Authority::try_from(raw.trim()).ok()?;
+        Some(HostPort::new(authority.host(), authority.port_u16()))
+    }
+
+    /// The `Origin` header's host and port. `null` (a sandboxed or opaque origin)
+    /// and anything without a scheme and host are `None`.
+    fn from_origin(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("null") {
+            return None;
+        }
+        let uri = axum::http::Uri::try_from(raw).ok()?;
+        uri.scheme_str()?;
+        let authority = uri.authority()?;
+        Some(HostPort::new(authority.host(), authority.port_u16()))
+    }
+
+    /// The same rule rmcp applies to `/mcp`: an entry without a port matches the
+    /// host on any port, an entry with one matches only that port.
+    fn is_allowed(&self, allowed_hosts: &[String]) -> bool {
+        allowed_hosts.iter().any(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return false;
+            }
+            let allowed =
+                HostPort::from_authority(entry).unwrap_or_else(|| HostPort::new(entry, None));
+            allowed.host == self.host && allowed.port.is_none_or(|port| self.port == Some(port))
+        })
+    }
+}
+
+/// The request's target host: the `Host` header, else the URI authority (HTTP/2).
+fn request_host(req: &axum::extract::Request) -> Option<HostPort> {
+    match req.headers().get(header::HOST) {
+        Some(value) => HostPort::from_authority(value.to_str().ok()?),
+        None => req
+            .uri()
+            .authority()
+            .map(|a| HostPort::new(a.host(), a.port_u16())),
+    }
+}
+
+fn guard_refusal(message: &'static str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
+}
+
+/// DNS-rebinding and cross-site-write guard for the `/api/*` routes.
+///
+/// - With `mcp.allowed_hosts` set, a request whose `Host` is not in it is refused,
+///   matched as the `/mcp` transport matches it.
+/// - A state-changing request (`POST`/`PUT`/`PATCH`/`DELETE`) that carries an
+///   `Origin` must come from the request's own host (compared host-only: behind a
+///   TLS-terminating proxy the scheme and port the browser saw are not reliably
+///   the ones this server sees) or from a host in `mcp.allowed_hosts`. A request
+///   with no `Origin` is a non-browser client and passes.
+async fn api_request_guard(
+    State(guard): State<ApiRequestGuard>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let host = request_host(&req);
+    if !guard.allowed_hosts.is_empty()
+        && !host
+            .as_ref()
+            .is_some_and(|h| h.is_allowed(&guard.allowed_hosts))
+    {
+        warn!(host = ?req.headers().get(header::HOST), path = %req.uri().path(),
+            "web UI API request refused: Host is not in mcp.allowed_hosts");
+        return guard_refusal("host not allowed");
+    }
+
+    let state_changing = matches!(
+        *req.method(),
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    );
+    if state_changing && let Some(origin) = req.headers().get(header::ORIGIN) {
+        let same_or_allowed = origin
+            .to_str()
+            .ok()
+            .and_then(HostPort::from_origin)
+            .is_some_and(|o| {
+                host.as_ref().is_some_and(|h| h.host == o.host)
+                    || o.is_allowed(&guard.allowed_hosts)
+            });
+        if !same_or_allowed {
+            warn!(origin = ?origin, path = %req.uri().path(),
+                "web UI API write refused: cross-origin request");
+            return guard_refusal("cross-origin request refused");
+        }
+    }
+
+    next.run(req).await
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
-/// Assemble every UI route with no auth layer (the browser-only posture the module
-/// doc describes). Production goes through [`ui_router_with_api_auth`].
+/// Assemble every UI route with no auth layer and no `allowed_hosts` list (the
+/// browser-only posture the module doc describes). Production goes through
+/// [`ui_router_with_api_auth`].
 #[cfg(test)]
 pub fn ui_router(state: UiState) -> Router {
-    ui_router_with_api_auth(state, None, None)
+    ui_router_with_api_auth(state, None, None, Vec::new())
 }
 
 /// Assemble every UI route. Merged into the main app in `server::run_server`
@@ -2057,10 +2231,16 @@ pub fn ui_router(state: UiState) -> Router {
 /// (`server::api_write_auth_layer`), `Some` only with OAuth on: it wraps `POST` and
 /// `DELETE /api/doc/{*path}`, so a read-only token reads but cannot write. A static
 /// token passes it.
+///
+/// `allowed_hosts` is `mcp.allowed_hosts`: every `/api/*` route sits behind
+/// [`api_request_guard`] (outside the auth layer, so a rebinding request is refused
+/// before any credential is looked at). Every UI response, the shell and assets
+/// included, gets [`ui_security_headers`].
 pub fn ui_router_with_api_auth(
     state: UiState,
     api_auth: Option<AuthLayer>,
     api_write_auth: Option<AuthLayer>,
+    allowed_hosts: Vec<String>,
 ) -> Router {
     // `/api/doc/{*path}` carries all three methods (read, write, delete) on one
     // route so a single `DefaultBodyLimit` layer — matching `mcp_router`'s 10 MB
@@ -2094,6 +2274,12 @@ pub fn ui_router_with_api_auth(
         api_router =
             api_router.route_layer(axum::middleware::from_fn_with_state(auth, require_auth));
     }
+    let api_router = api_router.route_layer(axum::middleware::from_fn_with_state(
+        ApiRequestGuard {
+            allowed_hosts: allowed_hosts.into(),
+        },
+        api_request_guard,
+    ));
 
     Router::new()
         .route("/", get(index_handler))
@@ -2108,6 +2294,7 @@ pub fn ui_router_with_api_auth(
         .route("/assets/edit.js", get(edit_js_handler))
         .with_state(state)
         .merge(api_router)
+        .route_layer(axum::middleware::map_response(ui_security_headers))
 }
 
 #[cfg(test)]
@@ -4844,19 +5031,21 @@ mod tests {
 
     #[tokio::test]
     async fn post_doc_resolve_error_hides_absolute_path_in_response_body() {
-        // Concrete trigger: `existing.md/x` treats an existing *file* as a path
-        // component, so `canonicalize()` fails with `NotADirectory` — not
-        // `NotFound` or `PermissionDenied`, so `resolve_within_data` returns
-        // `ResolveErr::Other`, whose message embeds the canonicalized absolute
-        // path (e.g. `/tmp/.../existing.md/x`). The response body must not leak
-        // that path or the data-directory prefix (F4).
+        // Concrete trigger: `locked/` has no permissions, so stat'ing
+        // `locked/x.md` fails with `PermissionDenied` and `resolve_within_data`
+        // returns `ResolveErr::Other`, whose message embeds the absolute path
+        // (e.g. `/tmp/.../locked/x.md`). The response body must not leak that
+        // path or the data-directory prefix (F4).
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
-        std::fs::write(canonical.join("existing.md"), "hello").unwrap();
+        let Some(_locked) = LockedDir::new(&canonical.join("locked")) else {
+            eprintln!("SKIP: mode 000 is not enforced here (running as root?)");
+            return;
+        };
 
         let app = ui_router(test_state(&canonical));
         let req = post_doc_request(
-            "existing.md/x",
+            "locked/x.md",
             serde_json::json!({
                 "content": "new content",
                 "create": false,
@@ -4871,22 +5060,48 @@ mod tests {
             "response body leaked the data directory path: {body_str}"
         );
         assert!(
-            !body_str.contains("existing.md/x"),
+            !body_str.contains("locked/x.md"),
             "response body should not embed the resolved absolute path: {body_str}"
         );
         assert_eq!(body["error"], "internal error resolving path");
+    }
+
+    /// A directory with mode 000, restored on drop so the tempdir can be removed.
+    struct LockedDir(PathBuf);
+
+    impl LockedDir {
+        /// `None` when mode 000 is not enforced (running as root, or with
+        /// `CAP_DAC_OVERRIDE`): the directory is still readable, so the error these
+        /// tests need cannot be produced and the caller skips.
+        fn new(path: &Path) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let locked = LockedDir(path.to_path_buf());
+            std::fs::read_dir(path).is_err().then_some(locked)
+        }
+    }
+
+    impl Drop for LockedDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
     }
 
     #[tokio::test]
     async fn delete_doc_resolve_error_hides_absolute_path_in_response_body() {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
-        std::fs::write(canonical.join("existing.md"), "hello").unwrap();
+        let Some(_locked) = LockedDir::new(&canonical.join("locked")) else {
+            eprintln!("SKIP: mode 000 is not enforced here (running as root?)");
+            return;
+        };
 
         let app = ui_router(test_state(&canonical));
         let req = Request::builder()
             .method("DELETE")
-            .uri("/api/doc/existing.md/x")
+            .uri("/api/doc/locked/x.md")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::json!({}).to_string()))
             .unwrap();
@@ -5090,5 +5305,216 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ------------------------------------------------------------------
+    // `/api/*` Host/Origin guard and UI response headers
+    // ------------------------------------------------------------------
+
+    /// True when `resp` is `api_request_guard`'s own refusal (not a handler's 403).
+    async fn refused_by_guard(resp: Response) -> bool {
+        if resp.status() != StatusCode::FORBIDDEN {
+            return false;
+        }
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        matches!(
+            body["error"].as_str(),
+            Some("host not allowed" | "cross-origin request refused")
+        )
+    }
+
+    fn guarded_app(canonical: &Path, allowed_hosts: &[&str]) -> Router {
+        ui_router_with_api_auth(
+            test_state(canonical),
+            None,
+            None,
+            allowed_hosts.iter().map(|h| h.to_string()).collect(),
+        )
+    }
+
+    fn api_request(
+        method: &str,
+        uri: &str,
+        host: Option<&str>,
+        origin: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(host) = host {
+            builder = builder.header(header::HOST, host);
+        }
+        if let Some(origin) = origin {
+            builder = builder.header(header::ORIGIN, origin);
+        }
+        let body = if method == "GET" {
+            Body::empty()
+        } else {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from("{}")
+        };
+        builder.body(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_guard_refuses_a_host_outside_allowed_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        for (method, uri) in [
+            ("GET", "/api/history"),
+            ("POST", "/api/doc/x.md"),
+            ("DELETE", "/api/doc/x.md"),
+        ] {
+            let app = guarded_app(&canonical, &["kb.example.com"]);
+            let resp = app
+                .oneshot(api_request(method, uri, Some("attacker.example"), None))
+                .await
+                .unwrap();
+            assert!(refused_by_guard(resp).await, "{method} {uri}");
+        }
+        // No Host at all is refused too once the list is set.
+        let app = guarded_app(&canonical, &["kb.example.com"]);
+        let resp = app
+            .oneshot(api_request("GET", "/api/history", None, None))
+            .await
+            .unwrap();
+        assert!(refused_by_guard(resp).await);
+    }
+
+    #[tokio::test]
+    async fn api_guard_matches_allowed_hosts_like_the_mcp_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        // An entry without a port matches any port; case-insensitive.
+        for host in ["kb.example.com", "KB.Example.com:8001"] {
+            let app = guarded_app(&canonical, &["kb.example.com"]);
+            let resp = app
+                .oneshot(api_request("GET", "/api/history", Some(host), None))
+                .await
+                .unwrap();
+            assert!(!refused_by_guard(resp).await, "{host}");
+        }
+        // An entry with a port matches only that port.
+        let app = guarded_app(&canonical, &["kb.example.com:8443"]);
+        let resp = app
+            .oneshot(api_request(
+                "GET",
+                "/api/history",
+                Some("kb.example.com:8001"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert!(refused_by_guard(resp).await);
+    }
+
+    #[tokio::test]
+    async fn api_guard_without_allowed_hosts_leaves_host_unchecked() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let app = guarded_app(&canonical, &[]);
+        let resp = app
+            .oneshot(api_request(
+                "GET",
+                "/api/history",
+                Some("anything.example"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert!(!refused_by_guard(resp).await);
+    }
+
+    #[tokio::test]
+    async fn api_guard_refuses_cross_origin_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        for method in ["POST", "DELETE"] {
+            for origin in ["http://evil.example", "null", "not a url"] {
+                let app = guarded_app(&canonical, &[]);
+                let resp = app
+                    .oneshot(api_request(
+                        method,
+                        "/api/doc/x.md",
+                        Some("kb.local:8001"),
+                        Some(origin),
+                    ))
+                    .await
+                    .unwrap();
+                assert!(refused_by_guard(resp).await, "{method} from {origin}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_guard_allows_same_origin_allowed_origin_and_no_origin_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        for method in ["POST", "DELETE"] {
+            for (allowed, host, origin) in [
+                // Same host; the scheme and port are not compared (a TLS-terminating
+                // proxy in front changes both).
+                (&[][..], "kb.local:8001", Some("http://kb.local:8001")),
+                (&[][..], "kb.local:8001", Some("https://KB.local")),
+                // An origin host in `allowed_hosts`.
+                (
+                    &["kb.example.com"][..],
+                    "kb.example.com",
+                    Some("https://kb.example.com"),
+                ),
+                // No Origin: a non-browser client.
+                (&[][..], "kb.local:8001", None),
+            ] {
+                let app = guarded_app(&canonical, allowed);
+                let resp = app
+                    .oneshot(api_request(method, "/api/doc/x.md", Some(host), origin))
+                    .await
+                    .unwrap();
+                assert!(
+                    !refused_by_guard(resp).await,
+                    "{method} host {host} origin {origin:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_guard_origin_rule_does_not_apply_to_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let app = guarded_app(&canonical, &[]);
+        let resp = app
+            .oneshot(api_request(
+                "GET",
+                "/api/history",
+                Some("kb.local:8001"),
+                Some("http://evil.example"),
+            ))
+            .await
+            .unwrap();
+        assert!(!refused_by_guard(resp).await);
+    }
+
+    #[tokio::test]
+    async fn ui_responses_carry_the_security_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        for path in ["/", "/assets/viz.js", "/api/history"] {
+            let app = ui_router(test_state(&canonical));
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let headers = resp.headers();
+            assert_eq!(
+                headers[header::CONTENT_SECURITY_POLICY],
+                UI_CONTENT_SECURITY_POLICY,
+                "{path}"
+            );
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{path}");
+            assert_eq!(headers[header::REFERRER_POLICY], "no-referrer", "{path}");
+            assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY", "{path}");
+        }
+        assert!(UI_CONTENT_SECURITY_POLICY.contains("frame-ancestors 'none'"));
+        assert!(UI_CONTENT_SECURITY_POLICY.contains("script-src 'self';"));
     }
 }

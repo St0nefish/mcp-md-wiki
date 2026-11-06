@@ -47,7 +47,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5 # zizmor: ignore[artipacked] read-only token; the next step fetches, and nothing uploads the workspace
         with:
           fetch-depth: 0
 

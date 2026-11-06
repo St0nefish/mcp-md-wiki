@@ -97,7 +97,7 @@ jobs:
 
       # Credentials persisted (read-only token): the guards below fetch and `git ls-remote`.
       - name: Checkout the tagged commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v5 # zizmor: ignore[artipacked] credentials kept on purpose (see above)
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -224,7 +224,7 @@ jobs:
     steps:
       # Credentials persisted (read-only token): the highest-tag guard runs `git ls-remote`.
       # The smoke test script and the Qdrant pin it reads, as of the released commit.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5 # zizmor: ignore[artipacked] credentials kept on purpose (see above)
         with:
           ref: ${{ github.sha }}
 
@@ -440,7 +440,7 @@ jobs:
           permission-pull-requests: write
 
       # The App token is kept in the checkout's config so the push below is the App's.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5 # zizmor: ignore[artipacked] the App token is kept for the push
         with:
           ref: master
           fetch-depth: 0

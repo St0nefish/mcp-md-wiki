@@ -55,7 +55,8 @@ fn shift_chunks_to_file_lines(chunks: &mut [chunk::Chunk], content: &str) {
 /// gets a state row, every later reconcile hits it again. So a bug triggered by one
 /// document's shape is contained to that document here instead. The caller reports
 /// it as [`FileOutcome::Invalid`], the same per-file "could not index this" outcome a
-/// validation failure gets: counted, skipped, and retried by the next reconcile.
+/// validation failure gets: counted, purged from the index, and retried by the next
+/// reconcile.
 ///
 /// `AssertUnwindSafe` is sound: the closure only borrows immutable inputs and builds
 /// a fresh `Vec`, so nothing observable is left half-updated by an unwind.
@@ -346,6 +347,14 @@ fn walk_dir(
             .file_type()
             .with_context(|| format!("Failed to stat: {}", path.display()))?;
 
+        // Never list or descend into a `.git` (any case; a directory, or the gitfile of
+        // a worktree or submodule): nothing under it is a document (`inspect_kb_path`
+        // refuses such paths), and with a broad `include` and no `.git/**` exclude every
+        // object file would be stat'ed on every sweep.
+        if is_git_component(&entry.file_name()) {
+            continue;
+        }
+
         if file_type.is_symlink() {
             warn!("Skipping symlink: {}", path.display());
             continue;
@@ -378,6 +387,109 @@ fn walk_dir(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// KB path safety: the one definition of "a real entry under the KB root"
+// ---------------------------------------------------------------------------
+
+/// What [`inspect_kb_path`] found at a KB-relative path, none of whose existing
+/// components is a symlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KbEntry {
+    /// Nothing there (or an ancestor is missing or not a directory).
+    Missing,
+    /// A regular file.
+    File,
+    /// A directory (the KB root itself, for an empty path).
+    Dir,
+    /// Something else: a FIFO, socket or device node.
+    Other,
+}
+
+/// Why [`inspect_kb_path`] refused a KB-relative path outright.
+#[derive(Debug)]
+pub(crate) enum KbPathError {
+    /// A component other than a plain name or `.`: `..`, a root or a prefix.
+    NotRelative,
+    /// A `.git` component, compared case-insensitively. A `.git` directory is
+    /// never knowledge-base content, whatever `indexing.include` says.
+    GitDir,
+    /// An existing component — the leaf included, a dangling link included — is
+    /// a symbolic link. Git materializes tracked symlinks on checkout, so a
+    /// pushed `leak.md -> /proc/self/environ` (or a directory `d -> /etc`, or a
+    /// link to `.git/config` inside the root) is refused rather than followed.
+    Symlink,
+    /// A component could not be stat'ed (permission denied, say).
+    Io(std::io::Error),
+}
+
+/// True when `name` is a `.git` path component, ignoring ASCII case (a
+/// case-insensitive filesystem resolves `.GIT` to the same directory).
+pub(crate) fn is_git_component(name: &std::ffi::OsStr) -> bool {
+    name.eq_ignore_ascii_case(".git")
+}
+
+/// Inspect `rel` under `root` without following any symlink: every component
+/// must be a plain name (no `..`, no root), none may be `.git`, and every one
+/// that exists on disk is checked with `symlink_metadata` — a symlink anywhere
+/// is refused. With no symlink below `root`, the path cannot resolve outside
+/// it, so no separate canonical-prefix check is needed. `root` itself is not
+/// inspected (callers pass the configured or canonicalized data path).
+///
+/// The one definition shared by the indexer (`index_paths_generic`,
+/// `scan_for_dirty`), the write pipeline (`write::resolve_safe_write_path`) and
+/// the read path (`retrieval::resolve_within_data`).
+pub(crate) fn inspect_kb_path(root: &Path, rel: &Path) -> Result<KbEntry, KbPathError> {
+    let mut names: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => {
+                if is_git_component(name) {
+                    return Err(KbPathError::GitDir);
+                }
+                names.push(name);
+            }
+            _ => return Err(KbPathError::NotRelative),
+        }
+    }
+
+    let mut current = root.to_path_buf();
+    for (i, name) in names.iter().enumerate() {
+        current.push(name);
+        let meta = match std::fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(KbEntry::Missing);
+            }
+            Err(e) => return Err(KbPathError::Io(e)),
+        };
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            return Err(KbPathError::Symlink);
+        }
+        let is_leaf = i + 1 == names.len();
+        if !is_leaf {
+            if !file_type.is_dir() {
+                return Ok(KbEntry::Missing);
+            }
+            continue;
+        }
+        return Ok(if file_type.is_file() {
+            KbEntry::File
+        } else if file_type.is_dir() {
+            KbEntry::Dir
+        } else {
+            KbEntry::Other
+        });
+    }
+    Ok(KbEntry::Dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -804,6 +916,16 @@ struct PendingFile {
     chunking_fingerprint: String,
 }
 
+/// An empty document's state-row baseline, held until its old index entries are
+/// purged (see `FileOutcome::Empty`).
+struct EmptiedFile {
+    file_path: String,
+    hash: String,
+    mtime: i64,
+    size: i64,
+    schema_hash: String,
+}
+
 /// Result of processing a single discovered file.
 enum FileOutcome {
     /// Unchanged since the last run. Carries the content hash so `index_paths` can tell
@@ -818,8 +940,31 @@ enum FileOutcome {
         mtime: i64,
         size: i64,
     },
+    /// The document itself failed validation (non-strict mode) or chunking.
+    /// `validation.strict: false` documents an invalid file as skipped, which is what
+    /// a `--full` run does with it, so `index_paths_generic` purges whatever an
+    /// earlier version of it left in the index (points, metadata, links, state row)
+    /// rather than keep serving that version. No state row is written, so the next
+    /// reconcile re-validates it.
     Invalid,
-    Empty,
+    /// The validation tooling failed (the engine errored, or a `lint_command` failed,
+    /// timed out or could not run and that is the document's only validation error)
+    /// in non-strict mode. A document that also has a schema or frontmatter error is
+    /// `Invalid` instead, whatever lint said. A lint failure alone says nothing about
+    /// the document's own content, so the
+    /// index is left exactly as it is, as before the purge-on-invalid fix: a transient
+    /// tooling failure must not take an indexed document out of search. No state row
+    /// is written, so the next reconcile retries.
+    ValidatorError,
+    /// Valid, but chunking produced nothing (frontmatter only, say). Treated like a
+    /// delete — its old points, metadata and links are purged — but recorded in
+    /// `indexed_files` with `chunk_count` 0 and the stat/hash baseline below, so the
+    /// reconcile does not re-read it on every sweep. Carries what that row needs.
+    Empty {
+        hash: String,
+        mtime: i64,
+        size: i64,
+    },
     Ready(PendingFile),
     /// A `validation.strict` rejection: the content-level validation errors branch
     /// (`Ok((result, None))`) or the validation-engine error branch (`Err(e)`), when
@@ -951,7 +1096,7 @@ async fn process_file(
 
                 if chunks.is_empty() {
                     warn!("No chunks produced for: {}", file_path);
-                    return Ok(FileOutcome::Empty);
+                    return Ok(FileOutcome::Empty { hash, mtime, size });
                 }
 
                 debug!("  {} chunks from: {}", chunks.len(), file_path);
@@ -988,6 +1133,17 @@ async fn process_file(
                     return Ok(FileOutcome::Rejected { reason });
                 }
 
+                // A failing, timed-out or unrunnable `lint_command` is reported as a
+                // validation error too, but it describes the tooling, not the
+                // document: an outage must not purge every indexed file it touches.
+                // Only when lint is the sole complaint, though — a document with a
+                // schema or frontmatter error is invalid whatever lint said.
+                if !result.field_errors.is_empty()
+                    && result.field_errors.iter().all(|fe| fe.rule == "lint")
+                {
+                    return Ok(FileOutcome::ValidatorError);
+                }
+
                 Ok(FileOutcome::Invalid)
             }
             Err(e) => {
@@ -1005,7 +1161,7 @@ async fn process_file(
                     return Ok(FileOutcome::Rejected { reason });
                 }
 
-                Ok(FileOutcome::Invalid)
+                Ok(FileOutcome::ValidatorError)
             }
         }
     } else {
@@ -1029,7 +1185,7 @@ async fn process_file(
         };
         if chunks.is_empty() {
             warn!("No chunks produced for: {}", file_path);
-            return Ok(FileOutcome::Empty);
+            return Ok(FileOutcome::Empty { hash, mtime, size });
         }
 
         Ok(FileOutcome::Ready(PendingFile {
@@ -1672,12 +1828,16 @@ async fn flush_pending_batch<E: EmbedStore, Q: VectorStore + NeighborStore>(
 
 /// Remove orphaned files (deleted from disk, or now excluded by the indexing path
 /// filter — #266 — but still in the index).
+///
+/// Returns the paths whose metadata and state rows were both removed; a path whose
+/// bookkeeping failed is left out (it stays detectable and is retried next run).
 async fn remove_orphans<Q: VectorStore>(
     orphaned: &[String],
     store: &Q,
     state: &StateDb,
     collection: &str,
-) -> Result<()> {
+) -> Result<HashSet<String>> {
+    let mut removed = HashSet::with_capacity(orphaned.len());
     let orphan_refs: Vec<&str> = orphaned.iter().map(|s| s.as_str()).collect();
     store
         .delete_by_files(collection, &orphan_refs)
@@ -1716,8 +1876,9 @@ async fn remove_orphans<Q: VectorStore>(
         // no future sweep able to clear it. `record_strict_rejection` is a no-op if
         // this path was never rejected.
         crate::status::INDEX_STATUS.record_strict_rejection(file_path, None);
+        removed.insert(file_path.clone());
     }
-    Ok(())
+    Ok(removed)
 }
 
 /// The frontmatter key [`with_derived_domain`] sets from a document's
@@ -2051,6 +2212,12 @@ pub(crate) struct LinkOccurrence {
     /// document shifts a byte offset without shifting a char offset by the same
     /// amount.
     pub span: std::ops::Range<usize>,
+    /// Byte range in the original document, inside `span`, covering only the PATH
+    /// portion of the target — what [`resolve_link_target`] resolved, per
+    /// [`link_target_path_range`]: no `#fragment`, no `"title"` suffix, no
+    /// surrounding whitespace. A link rewrite replaces this range, so a fragment or
+    /// title after the path is kept as written.
+    pub path_span: std::ops::Range<usize>,
     /// The target exactly as written (between `(`/`)` for inline, between the
     /// double brackets for wiki-style, between `<`/`>` for an autolink, or after
     /// `[ref]:` for a reference definition) — before the title-suffix and
@@ -2092,10 +2259,14 @@ pub(crate) fn find_markdown_link_occurrences(
     scan_link_occurrences(body)
         .into_iter()
         .filter_map(|(span, raw, kind)| {
-            resolve_link_target(&raw, source_rel_path, kind).map(|resolved| LinkOccurrence {
-                span,
-                raw,
-                resolved,
+            resolve_link_target(&raw, source_rel_path, kind).map(|resolved| {
+                let path = link_target_path_range(&raw);
+                LinkOccurrence {
+                    path_span: span.start + path.start..span.start + path.end,
+                    span,
+                    raw,
+                    resolved,
+                }
             })
         })
         .collect()
@@ -2567,20 +2738,7 @@ fn resolve_link_target(
     source_rel_path: &str,
     kind: RawLinkKind,
 ) -> Option<String> {
-    let target = raw_target.trim();
-
-    // Strip an optional ` "title"` / ` 'title'` suffix (CommonMark link title) — take
-    // everything before the first whitespace as the actual target.
-    let target = match target.find(char::is_whitespace) {
-        Some(idx) => &target[..idx],
-        None => target,
-    };
-
-    // Strip a trailing #fragment.
-    let target = match target.find('#') {
-        Some(idx) => &target[..idx],
-        None => target,
-    };
+    let target = &raw_target[link_target_path_range(raw_target)];
 
     if target.is_empty() {
         return None;
@@ -2607,6 +2765,22 @@ fn resolve_link_target(
     };
 
     resolve_relative_md_path(target, source_rel_path)
+}
+
+/// The byte range, within `raw_target`, of the path portion of a raw link target:
+/// leading/trailing whitespace trimmed, an optional ` "title"` / ` 'title'` suffix
+/// (CommonMark link title — everything from the first whitespace on) dropped, then a
+/// trailing `#fragment` dropped. This is the one definition of "which bytes are the
+/// path" — [`resolve_link_target`] resolves exactly this slice, and a link rewrite
+/// replaces exactly this slice, leaving the fragment and title around it as written.
+fn link_target_path_range(raw_target: &str) -> std::ops::Range<usize> {
+    let lead = raw_target.len() - raw_target.trim_start().len();
+    let target = raw_target.trim();
+    let mut len = target.find(char::is_whitespace).unwrap_or(target.len());
+    if let Some(hash) = target[..len].find('#') {
+        len = hash;
+    }
+    lead..lead + len
 }
 
 /// Join `target` (a `.md`-relative path, possibly containing `./`/`../`) onto
@@ -2876,7 +3050,7 @@ const SCAN_PAGE_SIZE: i64 = 1000;
 /// makes `INDEX_STATUS.is_bulk_indexing()` true from that moment — and keeps
 /// it true past this function returning, through however long the indexing
 /// run that follows (and any retry of it) takes, until [`scan_and_index`]
-/// confirms nothing stale remains (#286; round-6 review L1).
+/// confirms nothing stale remains (#286).
 ///
 /// An invalid schema file anywhere in the tree fails the scan before any
 /// row is read (see [`build_run_schemas`]).
@@ -2938,12 +3112,16 @@ pub async fn scan_for_dirty(
                 // deleted, or it is now excluded (#266).
                 // A file that is really gone is reported at once; one still on disk is
                 // an exclusion purge, decided after the scan. An unknown stat result
-                // counts as present.
-                let abs = data_path.join(&row.file_path);
-                if tokio::fs::try_exists(&abs).await.unwrap_or(true) {
-                    excluded_present.push(row.file_path.clone());
-                } else {
-                    dirty.insert(PathBuf::from(&row.file_path));
+                // counts as present. A path that became a symlink (or now sits under
+                // one) is not a document any more: it is reported as gone, and
+                // `index_paths` purges it the way it purges a deleted file.
+                match inspect_kb_path(&data_path, Path::new(&row.file_path)) {
+                    Ok(KbEntry::File) | Err(KbPathError::Io(_)) => {
+                        excluded_present.push(row.file_path.clone());
+                    }
+                    _ => {
+                        dirty.insert(PathBuf::from(&row.file_path));
+                    }
                 }
                 continue;
             }
@@ -3008,8 +3186,10 @@ pub async fn scan_for_dirty(
             }
 
             // Reason 3: metadata staleness. Unchanged content, but the metadata index
-            // disagrees with (or lacks) it.
-            if row.doc_hash.as_deref() != Some(row.content_hash.as_str()) {
+            // disagrees with (or lacks) it. A zero-chunk row is a document that
+            // produced no chunks (`FileOutcome::Empty`): it has no metadata row on
+            // purpose, so a missing one is not staleness.
+            if row.chunk_count > 0 && row.doc_hash.as_deref() != Some(row.content_hash.as_str()) {
                 dirty.insert(PathBuf::from(&row.file_path));
             }
         }
@@ -3078,8 +3258,11 @@ pub async fn scan_for_dirty(
 /// does not exist on disk, or exists but is now excluded by `indexing.include`/
 /// `exclude`/`exclude_files` (#266; scoped runs only, and never when the path filter
 /// cannot be trusted — see [`PathFilter::for_exclusion_purge`]), its points and rows
-/// are purged. This exactly mirrors
-/// [`FileOutcome`] — see [`process_file`].
+/// are purged. A file still on disk that no longer produces an indexable document —
+/// invalid under non-strict validation, or empty of chunks — is purged the same way
+/// (an empty one keeps a zero-chunk state row); a strict-mode rejection is not, and
+/// keeps its last good version. This exactly mirrors [`FileOutcome`] — see
+/// [`process_file`].
 ///
 /// `force = true` bypasses the skip-if-unchanged check and, before touching any path,
 /// drops and recreates the Qdrant collection and clears the state DB — this is
@@ -3420,6 +3603,10 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     let mut pending: Vec<PendingFile> = Vec::new();
     let mut backfill_queue: Vec<(String, PathBuf)> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
+    // Present on disk but no longer producing an indexable document: purged like
+    // `missing`, but not counted as orphans (see `FileOutcome::Invalid`/`Empty`).
+    let mut unindexable: Vec<String> = Vec::new();
+    let mut emptied: Vec<EmptiedFile> = Vec::new();
     let mut skipped = 0usize;
     let mut invalid = 0usize;
     let mut empty = 0usize;
@@ -3450,9 +3637,34 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         // `exclude`/`exclude_files` (#266): treat as a delete, purged in a single
         // batch below rather than one Qdrant round trip per path. Only the paths
         // this run was given are ever considered.
-        if !abs_path.exists() {
-            missing.push(rel_key.clone());
-            continue;
+        //
+        // A path that is not a regular file reached without a symlink (a symlink
+        // leaf or ancestor, a `.git` component, a directory) is treated exactly as
+        // missing: the full walk (`walk_dir`) never yields one, and the paths a
+        // webhook, `/admin/sync` or a write's rebase hands in are only
+        // glob-filtered, so reading through it here would embed whatever it points
+        // at (`/proc/self/environ`, `.git/config`) and serve it from `search`.
+        match inspect_kb_path(&data_path, Path::new(rel_key.as_str())) {
+            Ok(KbEntry::File) => {}
+            Ok(KbEntry::Missing) => {
+                missing.push(rel_key.clone());
+                continue;
+            }
+            Ok(KbEntry::Dir | KbEntry::Other)
+            | Err(KbPathError::Symlink | KbPathError::GitDir | KbPathError::NotRelative) => {
+                warn!(
+                    "Not a regular file inside the knowledge base (symlink, .git path or \
+                     non-file), treating as deleted: {}",
+                    rel_key
+                );
+                missing.push(rel_key.clone());
+                continue;
+            }
+            Err(KbPathError::Io(e)) => {
+                error!("Failed to stat {}: {:#}", rel_key, e);
+                read_errors += 1;
+                continue;
+            }
         }
         if let Some(filter) = &exclusion_filter
             && !filter.is_indexable(rel_key)
@@ -3495,8 +3707,11 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
             FileOutcome::Skipped { hash, mtime, size } => {
                 skipped += 1;
                 // Unchanged content, but the metadata index may still be missing or
-                // stale for this file — queue it for a cheap parse-only backfill.
-                if document_hashes.get(rel_key) != Some(&hash) {
+                // stale for this file — queue it for a cheap parse-only backfill. Not
+                // for a zero-chunk row (an empty document, see `FileOutcome::Empty`):
+                // it has no metadata row on purpose.
+                let recorded_empty = state_map.get(rel_key).is_some_and(|e| e.chunk_count == 0);
+                if !recorded_empty && document_hashes.get(rel_key) != Some(&hash) {
                     backfill_queue.push((rel_key.clone(), abs_path.clone()));
                 }
 
@@ -3520,8 +3735,33 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
                     );
                 }
             }
-            FileOutcome::Invalid => invalid += 1,
-            FileOutcome::Empty => empty += 1,
+            FileOutcome::Invalid => {
+                invalid += 1;
+                // Not indexable any more: drop what an earlier version left behind,
+                // the way a `--full` run (which never indexes it) would. Only when
+                // there is something to drop, so an invalid file that was never
+                // indexed costs no purge on every sweep. See `FileOutcome::Invalid`.
+                if state_map.contains_key(rel_key) || document_hashes.contains_key(rel_key) {
+                    unindexable.push(rel_key.clone());
+                }
+            }
+            FileOutcome::ValidatorError => {
+                // Counted with the invalid files for the run summary, but the index is
+                // left alone: see `FileOutcome::ValidatorError`.
+                invalid += 1;
+            }
+            FileOutcome::Empty { hash, mtime, size } => {
+                empty += 1;
+                // A valid document, whatever an earlier strict-mode rejection said.
+                INDEX_STATUS.record_strict_rejection(rel_key, None);
+                emptied.push(EmptiedFile {
+                    file_path: rel_key.clone(),
+                    hash,
+                    mtime,
+                    size,
+                    schema_hash: schema_hash.clone(),
+                });
+            }
             FileOutcome::Rejected { reason } => {
                 rejected += 1;
                 // Persistent, per-path — see `FileOutcome::Rejected`'s doc comment and
@@ -3597,6 +3837,44 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         INDEX_STATUS.set_phase(Phase::RemovingOrphans);
         info!("Removing {} missing file(s) from index", missing.len());
         remove_orphans(&missing, store, &state, collection).await?;
+    }
+
+    // ── Purge files that no longer produce an indexable document ─────────────
+    //
+    // An invalid (non-strict) or empty document is what a `--full` run leaves out of
+    // the index entirely, so an incremental run must not keep serving its previous
+    // version either: its points, metadata row, field projection and outgoing links
+    // go, exactly as for a deleted file. An empty one then gets a zero-chunk state row
+    // so the reconcile's stat pre-filter can skip it until it changes.
+    unindexable.extend(emptied.iter().map(|e| e.file_path.clone()));
+    if !unindexable.is_empty() {
+        INDEX_STATUS.set_phase(Phase::RemovingOrphans);
+        info!(
+            "Purging {} file(s) that no longer produce an indexable document",
+            unindexable.len()
+        );
+        let purged = remove_orphans(&unindexable, store, &state, collection).await?;
+        for e in emptied.iter().filter(|e| purged.contains(&e.file_path)) {
+            if let Err(err) = state
+                .upsert(
+                    &e.file_path,
+                    &e.hash,
+                    0,
+                    &e.schema_hash,
+                    &chunking_fp,
+                    e.mtime,
+                    e.size,
+                )
+                .await
+            {
+                // No row means the next reconcile re-reads it and tries again.
+                warn!(
+                    file = %e.file_path,
+                    "Failed to record empty document in state DB (non-fatal, retried next scan): {:#}",
+                    err
+                );
+            }
+        }
     }
 
     // ── Summary ──────────────────────────────────────────────────────────────
@@ -3747,7 +4025,7 @@ pub async fn scan_and_index(config: &ResolvedConfig, force: bool, trigger: Trigg
         let (_data_path, all_paths) = discover_relative(config).await?;
         let result = index_paths(config, &all_paths, true, trigger).await;
         // A full reindex re-chunks every file under the current settings, so no
-        // file can be stale afterward (#286 round-6 L1): see
+        // file can be stale afterward (#286): see
         // `status::IndexStatus::clear_stale_chunking`.
         if result.is_ok() {
             INDEX_STATUS.clear_stale_chunking();
@@ -3789,7 +4067,7 @@ pub async fn scan_and_index(config: &ResolvedConfig, force: bool, trigger: Trigg
     // The scan's guard is what `mark_rechunk` (inside `scan_for_dirty`) uses to
     // set `IndexStatus`'s sticky "stale chunking remains" latch — see that
     // method's doc comment for why it deliberately outlives this guard rather
-    // than clearing when it drops (#286 round-6 L1: that used to leave the note
+    // than clearing when it drops (#286: that used to leave the note
     // dark during retry backoff, a permanent give-up, and the wait for the next
     // reconcile). Two independent confirmations clear it below: this scan
     // itself finding nothing to re-chunk, and — separately — the run that
@@ -4137,6 +4415,100 @@ mod tests {
         );
     }
 
+    /// A path handed to an incremental run (webhook, `/admin/sync`, a write's
+    /// rebase) that is a symlink, sits under a symlinked directory, or names
+    /// `.git` is never read or embedded: it is treated as deleted, so a row
+    /// indexed before it became a symlink is purged.
+    #[tokio::test]
+    async fn index_paths_generic_never_reads_through_a_symlink_and_purges_its_row() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+
+        std::fs::write(outside.path().join("secret.md"), "# Secret\n\nToken.").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.md"), dir.path().join("leak.md"))
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "[core]").unwrap();
+        std::os::unix::fs::symlink(".git/config", dir.path().join("inside.md")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("d")).unwrap();
+
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+        let state = open_scan_test_db(&config).await;
+        state
+            .upsert(
+                "leak.md",
+                "old-hash",
+                1,
+                &schema_hash,
+                &chunking_fingerprint(&config.chunking),
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let paths = vec![
+            PathBuf::from("leak.md"),
+            PathBuf::from("inside.md"),
+            PathBuf::from("d/secret.md"),
+            PathBuf::from(".git/config"),
+        ];
+        // No embedding is expected at all: an attempted one fails the run on the
+        // embedding-count mismatch.
+        let embedder = MockEmbedClient::ok(vec![]);
+        let store = TrackingMockVectorStore::all_ok();
+
+        let result = index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        assert!(
+            store.upserted_points.lock().unwrap().is_empty(),
+            "nothing behind a symlink or under .git may be embedded"
+        );
+        let deletes = store.delete_by_files_calls.lock().unwrap().clone();
+        assert_eq!(deletes.len(), 1, "one purge batch: {deletes:?}");
+        assert!(deletes[0].contains(&"leak.md".to_string()), "{deletes:?}");
+        assert!(
+            state.get("leak.md").await.unwrap().is_none(),
+            "the row indexed before the path became a symlink is purged"
+        );
+    }
+
+    #[test]
+    fn inspect_kb_path_classifies_without_following_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/a.md"), "a").unwrap();
+        std::os::unix::fs::symlink("docs", root.join("alias")).unwrap();
+        std::os::unix::fs::symlink("docs/a.md", root.join("link.md")).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("dangling.md")).unwrap();
+
+        let check = |rel: &str| inspect_kb_path(root, Path::new(rel));
+        assert!(matches!(check("docs/a.md"), Ok(KbEntry::File)));
+        assert!(matches!(check("./docs/a.md"), Ok(KbEntry::File)));
+        assert!(matches!(check("docs"), Ok(KbEntry::Dir)));
+        assert!(matches!(check("docs/none.md"), Ok(KbEntry::Missing)));
+        assert!(matches!(check("docs/a.md/x.md"), Ok(KbEntry::Missing)));
+        assert!(matches!(check("link.md"), Err(KbPathError::Symlink)));
+        assert!(matches!(check("dangling.md"), Err(KbPathError::Symlink)));
+        assert!(matches!(check("alias/a.md"), Err(KbPathError::Symlink)));
+        assert!(matches!(check(".git/config"), Err(KbPathError::GitDir)));
+        assert!(matches!(check("x/.GIT"), Err(KbPathError::GitDir)));
+        assert!(matches!(check("../x.md"), Err(KbPathError::NotRelative)));
+        assert!(matches!(check("/x.md"), Err(KbPathError::NotRelative)));
+    }
+
     /// #156: before the fix, `process_file` returned `Err` for a `validation.strict`
     /// rejection, and this function's per-path loop let that `Err` propagate straight
     /// out of the whole call via `?` — aborting the entire batch. A valid file
@@ -4350,6 +4722,174 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    async fn run_generic(config: &ResolvedConfig, paths: &[PathBuf], embeddings: usize) {
+        let embedder = MockEmbedClient::ok(vec![vec![1.0, 2.0, 3.0]; embeddings]);
+        let store = TrackingMockVectorStore::all_ok();
+        let result = index_paths_generic(
+            config,
+            paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+    }
+
+    /// A document that loses its body (frontmatter only) yields no chunks. It must be
+    /// purged like a deleted file — points, metadata and outgoing links — instead of
+    /// serving the old body forever, and recorded with a zero-chunk state row so the
+    /// reconcile stops re-reading it.
+    #[tokio::test]
+    async fn index_paths_generic_purges_a_document_that_became_empty_and_records_it() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+        let path = dir.path().join("a.md");
+        let paths = vec![PathBuf::from("a.md")];
+
+        std::fs::write(&path, "---\ntitle: A\n---\n# A\n\nSee [B](b.md).\n").unwrap();
+        run_generic(&config, &paths, 1).await;
+        let state = open_scan_test_db(&config).await;
+        assert_eq!(state.document_count().await.unwrap(), 1);
+        assert_eq!(state.all_links().await.unwrap().len(), 1);
+
+        std::fs::write(&path, "---\ntitle: A\n---\n").unwrap();
+        let embedder = MockEmbedClient::ok(vec![]);
+        let store = TrackingMockVectorStore::all_ok();
+        index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *store.delete_by_files_calls.lock().unwrap(),
+            vec![vec!["a.md".to_string()]],
+            "the emptied document's old points must be deleted"
+        );
+        assert_eq!(state.document_count().await.unwrap(), 0);
+        assert!(state.all_links().await.unwrap().is_empty());
+        let row = state.get("a.md").await.unwrap().expect("a zero-chunk row");
+        assert_eq!(row.chunk_count, 0);
+
+        // The reconcile's stat pre-filter now skips it, and a run over it again (a
+        // webhook marking it, say) neither purges again nor backfills metadata.
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
+        assert!(
+            dirty.is_empty(),
+            "an unchanged empty document is not dirty: {dirty:?}"
+        );
+        let store = TrackingMockVectorStore::all_ok();
+        index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &MockEmbedClient::ok(vec![]),
+            &store,
+        )
+        .await
+        .unwrap();
+        assert!(store.delete_by_files_calls.lock().unwrap().is_empty());
+        assert_eq!(state.document_count().await.unwrap(), 0);
+
+        // Filling the body back in indexes it again.
+        std::fs::write(&path, "---\ntitle: A\n---\n# A\n\nBack.\n").unwrap();
+        run_generic(&config, &paths, 1).await;
+        assert_eq!(state.document_count().await.unwrap(), 1);
+        assert_eq!(state.get("a.md").await.unwrap().unwrap().chunk_count, 1);
+    }
+
+    /// With `validation.strict: false` an invalid file is skipped, so an indexed
+    /// document that turns invalid must lose its old index entries (what a `--full`
+    /// run would leave), and keep no state row, so the next reconcile re-validates it.
+    #[tokio::test]
+    async fn index_paths_generic_purges_a_document_that_became_invalid_in_non_strict_mode() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+        config.validation = crate::config::ValidationConfig {
+            enabled: true,
+            strict: false,
+            ..Default::default()
+        };
+        config.frontmatter = crate::config::FrontmatterConfig {
+            required: vec!["title".into()],
+            ..Default::default()
+        };
+        let path = dir.path().join("a.md");
+        let paths = vec![PathBuf::from("a.md")];
+
+        std::fs::write(&path, "---\ntitle: A\n---\n# A\n\nSee [B](b.md).\n").unwrap();
+        run_generic(&config, &paths, 1).await;
+        let state = open_scan_test_db(&config).await;
+        assert_eq!(state.document_count().await.unwrap(), 1);
+
+        std::fs::write(&path, "---\n---\n# A\n\nSee [B](b.md).\n").unwrap();
+        let store = TrackingMockVectorStore::all_ok();
+        index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &MockEmbedClient::ok(vec![]),
+            &store,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *store.delete_by_files_calls.lock().unwrap(),
+            vec![vec!["a.md".to_string()]]
+        );
+        assert_eq!(state.document_count().await.unwrap(), 0);
+        assert!(state.all_links().await.unwrap().is_empty());
+        assert!(
+            state.get("a.md").await.unwrap().is_none(),
+            "no state row, so the next reconcile re-validates it"
+        );
+    }
+
+    /// An invalid file that was never indexed has nothing to purge, so it costs no
+    /// Qdrant delete on every sweep.
+    #[tokio::test]
+    async fn index_paths_generic_never_indexed_invalid_file_triggers_no_purge() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+        config.validation = crate::config::ValidationConfig {
+            enabled: true,
+            strict: false,
+            ..Default::default()
+        };
+        config.frontmatter = crate::config::FrontmatterConfig {
+            required: vec!["title".into()],
+            ..Default::default()
+        };
+        std::fs::write(dir.path().join("a.md"), "---\n---\n# A\n").unwrap();
+        let store = TrackingMockVectorStore::all_ok();
+        index_paths_generic(
+            &config,
+            &[PathBuf::from("a.md")],
+            false,
+            std::time::Instant::now(),
+            &MockEmbedClient::ok(vec![]),
+            &store,
+        )
+        .await
+        .unwrap();
+        assert!(store.delete_by_files_calls.lock().unwrap().is_empty());
     }
 
     /// Re-indexing a file whose links changed must REPLACE the prior edge set, not
@@ -4810,6 +5350,43 @@ mod tests {
         assert_eq!(occurrence.span.start, expected_start);
         assert_eq!(occurrence.span.end, expected_start + "guide".len());
         assert_eq!(&body[occurrence.span.clone()], "guide");
+    }
+
+    /// `path_span` covers only the path a link resolves through — never its
+    /// `#fragment`, `"title"` suffix or surrounding whitespace — so a rewrite
+    /// replacing it keeps those as written, for every syntax.
+    #[test]
+    fn find_markdown_link_occurrences_path_span_excludes_fragment_and_title() {
+        let body = "Café: [a](guide.md#install \"Title\") and [b]( other.md ) and \
+                    [[wiki#Set up|Alias]] and [[plain#h]] and <auto.md#x> and [r][ref].\n\
+                    \n[ref]: refd.md#y \"T\"\n";
+        let occurrences = find_markdown_link_occurrences(body, "docs/page.md");
+        let pairs: Vec<(&str, &str, &str)> = occurrences
+            .iter()
+            .map(|o| {
+                assert_eq!(&body[o.span.clone()], o.raw);
+                assert!(o.span.start <= o.path_span.start && o.path_span.end <= o.span.end);
+                (
+                    &body[o.span.clone()],
+                    &body[o.path_span.clone()],
+                    o.resolved.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("guide.md#install \"Title\"", "guide.md", "docs/guide.md"),
+                (" other.md ", "other.md", "docs/other.md"),
+                ("wiki#Set up", "wiki", "docs/wiki.md"),
+                ("plain#h", "plain", "docs/plain.md"),
+                ("auto.md#x", "auto.md", "docs/auto.md"),
+                ("refd.md#y", "refd.md", "docs/refd.md"),
+            ]
+        );
+        // Without a fragment or title, the path span is the whole span.
+        let plain = find_markdown_link_occurrences("[a](guide.md)", "page.md");
+        assert_eq!(plain[0].path_span, plain[0].span);
     }
 
     #[test]
@@ -5862,7 +6439,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_for_dirty_under_an_invalid_schema_never_marks_rechunk() {
-        // #286 round-6 L1: the scan aborts on the schema build, before any row's
+        // #286: the scan aborts on the schema build, before any row's
         // chunking fingerprint is compared, so a stale file cannot raise the
         // "results may be incomplete" note while nothing can be re-chunked.
         let dir = TempDir::new().unwrap();
@@ -7023,7 +7600,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(outcome, FileOutcome::Empty));
+        assert!(matches!(outcome, FileOutcome::Empty { .. }));
     }
 
     #[tokio::test]
@@ -7097,6 +7674,83 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(outcome, FileOutcome::Invalid));
+    }
+
+    /// A failing `lint_command` is reported as a validation error, but it describes
+    /// the tooling (a missing binary after a deploy, a timeout), not the document, so
+    /// non-strict mode must not treat it as an invalid document to purge.
+    #[tokio::test]
+    async fn process_file_lint_failure_in_non_strict_mode_is_validator_error_not_invalid() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\n---\n# Hello\nBody.";
+        std::fs::write(&path, content).unwrap();
+
+        let config = {
+            let mut c = config_no_validation();
+            c.validation.enabled = true;
+            c.validation.strict = false;
+            c.validation.lint_command = Some(vec!["false".into()]);
+            c
+        };
+
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config,
+            &ResolvedSchema::from_config(&config.frontmatter),
+            "",
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, FileOutcome::ValidatorError));
+    }
+
+    /// A document with a schema error is invalid even when lint also fails: the
+    /// lint failure must not shield a genuinely invalid document from the purge.
+    #[tokio::test]
+    async fn process_file_schema_error_plus_lint_failure_in_non_strict_mode_is_invalid() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\n---\n# Hello\nBody.";
+        std::fs::write(&path, content).unwrap();
+
+        let config = {
+            let mut c = config_no_validation();
+            c.validation.enabled = true;
+            c.validation.strict = false;
+            c.validation.lint_command = Some(vec!["false".into()]);
+            c.frontmatter = crate::config::FrontmatterConfig {
+                required: vec!["description".into()],
+                ..Default::default()
+            };
+            c
+        };
+
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config,
+            &ResolvedSchema::from_config(&config.frontmatter),
+            "",
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, FileOutcome::Invalid),
+            "got {}",
+            outcome_name(&outcome)
+        );
     }
 
     /// #156: a strict-mode validation failure used to propagate as `Err`, which
@@ -7363,7 +8017,8 @@ mod tests {
         match outcome {
             FileOutcome::Skipped { .. } => "Skipped",
             FileOutcome::Invalid => "Invalid",
-            FileOutcome::Empty => "Empty",
+            FileOutcome::ValidatorError => "ValidatorError",
+            FileOutcome::Empty { .. } => "Empty",
             FileOutcome::Ready(_) => "Ready",
             FileOutcome::Rejected { .. } => "Rejected",
         }
@@ -7406,6 +8061,36 @@ mod tests {
         let files = discover_files(dir.path(), &indexing).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("keep.md"));
+    }
+
+    /// The walk never enters a `.git` directory (any case, at any depth), even when
+    /// `include` is broad and `exclude` does not list `.git/**`.
+    #[test]
+    fn discover_files_never_walks_into_git_dirs() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keep.md"), "keep").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "[core]").unwrap();
+        std::fs::write(dir.path().join(".git/objects/notes.md"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/.GIT")).unwrap();
+        std::fs::write(dir.path().join("sub/.GIT/inner.md"), "x").unwrap();
+        // A worktree or submodule keeps a `.git` gitfile instead of a directory.
+        std::fs::create_dir_all(dir.path().join("wt")).unwrap();
+        std::fs::write(dir.path().join("wt/.git"), "gitdir: ../elsewhere").unwrap();
+        std::fs::write(dir.path().join("wt/kept.md"), "x").unwrap();
+
+        let indexing = IndexingConfig {
+            include: vec!["**/*".into()],
+            exclude: vec![],
+            exclude_files: vec![],
+            reconcile_interval_secs: 60,
+        };
+        let files = discover_files(dir.path(), &indexing).unwrap();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files.iter().any(|f| f.ends_with("keep.md")));
+        assert!(files.iter().any(|f| f.ends_with("wt/kept.md")));
+        let unfiltered = walk_dir_unfiltered(dir.path(), dir.path()).unwrap();
+        assert_eq!(unfiltered.len(), 2, "{unfiltered:?}");
     }
 
     #[test]

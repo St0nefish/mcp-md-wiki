@@ -9,7 +9,7 @@ land on master as they are, so a keyword there closes the issue too.
 How you verified this. For a code change: which tests you added/ran
 (`cargo test`, and `cargo test -- --ignored` against a live Qdrant if you touched
 `src/qdrant.rs`). For a doc-only change: what you checked the prose against (source
-file/line, an actual command's output, an existing test) — "read it over" isn't
+file path and symbol name, an actual command's output, an existing test) — "read it over" isn't
 enough for anything making a factual claim about behavior.
 
 ## Checklist

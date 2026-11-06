@@ -4000,7 +4000,8 @@ impl KbSearchServer {
                 };
             }
 
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            // `rebased_paths` needs no handling: `mark_full` below covers every path.
+            Err(git::CommitSyncError::PostCommit { sha, source, .. }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure writing schema '{}', commit {} \
                      stands uncorrected: {:#}",
@@ -5580,21 +5581,19 @@ impl KbSearchServer {
         // `NotFound` (nothing there yet) or `NotPermitted` (something exists
         // there, but of a non-indexable type) falls through to create, which
         // re-validates the path itself via `resolve_safe_write_path` and
-        // `check_include_pattern_against` — independent, literal, KB-root-relative
-        // checks that do not share `resolve_within_data`'s "try the raw absolute
-        // path against the real filesystem first" ambiguity. That re-validation is
+        // `check_include_pattern_against` — independent, KB-root-relative checks
+        // that refuse a `.git` component and a symlink just as
+        // `resolve_within_data` does. That re-validation is
         // what makes it safe to fall through for those two cases rather than treat
         // every non-success as a hard failure, and it is also what restores the
         // pre-merge priority: a path that both exists on disk and fails the
         // include-pattern check is reported with that specific message, not a
         // generic "not found" one.
         //
-        // `Outside` and `Other` are different: `resolve_within_data` only returns
-        // `Outside` when the literal absolute path actually EXISTS outside the
-        // data root (see its doc comment) — falling through to create would strip
-        // the leading `/` and join it KB-relative, silently writing a *new* file
-        // inside the KB at a path the caller never asked for while reporting
-        // success. `Other` (a real I/O error resolving the path) has no safe
+        // `Outside` and `Other` are different: `resolve_within_data` returns
+        // `Outside` for a path that climbs above the root or passes through a
+        // symlink (see its doc comment), and a create must not proceed at such a
+        // path either. `Other` (a real I/O error resolving the path) has no safe
         // fallback interpretation either. Both are hard errors here, same as
         // `delete_document`'s handling of the same resolver just above.
         match retrieval::resolve_within_data(
@@ -13037,37 +13036,26 @@ mod tests {
         };
         let result = server.write_document(Parameters(params)).await;
 
-        // `/etc/passwd` really exists on the filesystem, so `resolve_within_data`
-        // resolves the literal absolute path first (see its doc comment) and
-        // returns `Outside` — a hard error from the dispatch above, caught before
-        // ever reaching create's include-pattern check. This differs from the
-        // "leading `/` means the KB root" convenience: that convenience only
-        // applies once the literal absolute path does NOT exist (see
-        // `write_document_on_absolute_path_to_real_file_outside_kb_is_hard_error`
-        // for that case, and for why the misrouted version of this dispatch used
-        // to make this test pass for the wrong reason — the include-pattern guard
-        // it originally meant to exercise never actually ran on this input).
+        // A leading `/` always means the KB root, so `/etc/passwd` names
+        // `<kb>/etc/passwd` — the host file is never probed — and that path is
+        // refused by create's include-pattern check (not a markdown file).
         assert!(
             result.is_err(),
-            "an absolute path resolving to a real file outside the KB must be rejected"
+            "a non-markdown absolute path must be rejected"
         );
         let err = result.unwrap_err();
         assert!(
-            err.message.contains("outside the data directory"),
-            "error should cite the outside-data-directory guard, got: {}",
+            err.message.contains("indexable include pattern"),
+            "error should cite the include-pattern guard, got: {}",
             err.message
         );
     }
 
     #[tokio::test]
-    async fn write_document_on_absolute_path_to_real_file_outside_kb_is_hard_error() {
-        // `resolve_within_data` tries an absolute path literally first (see its
-        // doc comment). When that literal path EXISTS but is outside the data
-        // root, it returns `ResolveErr::Outside` — which the dispatch above must
-        // treat as a hard failure, not fall through to `write_document_create`.
-        // Falling through would strip the leading `/` and join it KB-relative,
-        // silently creating a *new* file inside the KB at a path the caller never
-        // asked for, while reporting success.
+    async fn write_document_on_absolute_host_path_never_touches_the_host_file() {
+        // A leading `/` always means the KB root, for reads and writes alike, so an
+        // absolute path naming a real host file outside the KB addresses
+        // `<kb>/<that path>` — the host file is never read, probed or written.
         let tmp = tempfile::tempdir().unwrap();
         let config = make_test_resolved_config(tmp.path());
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
@@ -13092,34 +13080,14 @@ mod tests {
             archive: None,
             archive_links: None,
         };
-        let result = server.write_document(Parameters(params)).await;
+        // Whatever the KB-relative create does (this test KB has no git remote,
+        // so its commit fails and is rolled back), it must not reach the host.
+        let _ = server.write_document(Parameters(params)).await;
 
-        assert!(
-            result.is_err(),
-            "a real absolute path outside the KB must be a hard error, not silently \
-             redirected into a create inside the KB"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.message.contains("outside the data directory"),
-            "error should say the path is outside the data directory, got: {}",
-            err.message
-        );
-
-        // The file outside the KB must be untouched, and nothing must have been
-        // created inside the KB at the stripped-leading-slash path.
         assert_eq!(
             std::fs::read_to_string(&outside_file).unwrap(),
             "# Not part of the KB",
             "the real file outside the KB must not be overwritten"
-        );
-        let bogus_created_path = tmp.path().join(crate::retrieval::kb_root_relative(
-            outside_file.to_str().unwrap(),
-        ));
-        assert!(
-            !bogus_created_path.exists(),
-            "a bogus file must not have been created inside the KB at {}",
-            bogus_created_path.display()
         );
     }
 
