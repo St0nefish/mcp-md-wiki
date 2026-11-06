@@ -347,6 +347,14 @@ fn walk_dir(
             .file_type()
             .with_context(|| format!("Failed to stat: {}", path.display()))?;
 
+        // Never list or descend into a `.git` (any case; a directory, or the gitfile of
+        // a worktree or submodule): nothing under it is a document (`inspect_kb_path`
+        // refuses such paths), and with a broad `include` and no `.git/**` exclude every
+        // object file would be stat'ed on every sweep.
+        if is_git_component(&entry.file_name()) {
+            continue;
+        }
+
         if file_type.is_symlink() {
             warn!("Skipping symlink: {}", path.display());
             continue;
@@ -940,8 +948,10 @@ enum FileOutcome {
     /// reconcile re-validates it.
     Invalid,
     /// The validation tooling failed (the engine errored, or a `lint_command` failed,
-    /// timed out or could not run) in non-strict mode. That says nothing about the
-    /// document's own content, so the
+    /// timed out or could not run and that is the document's only validation error)
+    /// in non-strict mode. A document that also has a schema or frontmatter error is
+    /// `Invalid` instead, whatever lint said. A lint failure alone says nothing about
+    /// the document's own content, so the
     /// index is left exactly as it is, as before the purge-on-invalid fix: a transient
     /// tooling failure must not take an indexed document out of search. No state row
     /// is written, so the next reconcile retries.
@@ -1126,10 +1136,10 @@ async fn process_file(
                 // A failing, timed-out or unrunnable `lint_command` is reported as a
                 // validation error too, but it describes the tooling, not the
                 // document: an outage must not purge every indexed file it touches.
-                if result
-                    .field_errors
-                    .iter()
-                    .any(|fe| matches!(fe.rule.as_str(), "lint" | "io"))
+                // Only when lint is the sole complaint, though — a document with a
+                // schema or frontmatter error is invalid whatever lint said.
+                if !result.field_errors.is_empty()
+                    && result.field_errors.iter().all(|fe| fe.rule == "lint")
                 {
                     return Ok(FileOutcome::ValidatorError);
                 }
@@ -7701,6 +7711,48 @@ mod tests {
         assert!(matches!(outcome, FileOutcome::ValidatorError));
     }
 
+    /// A document with a schema error is invalid even when lint also fails: the
+    /// lint failure must not shield a genuinely invalid document from the purge.
+    #[tokio::test]
+    async fn process_file_schema_error_plus_lint_failure_in_non_strict_mode_is_invalid() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\n---\n# Hello\nBody.";
+        std::fs::write(&path, content).unwrap();
+
+        let config = {
+            let mut c = config_no_validation();
+            c.validation.enabled = true;
+            c.validation.strict = false;
+            c.validation.lint_command = Some(vec!["false".into()]);
+            c.frontmatter = crate::config::FrontmatterConfig {
+                required: vec!["description".into()],
+                ..Default::default()
+            };
+            c
+        };
+
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config,
+            &ResolvedSchema::from_config(&config.frontmatter),
+            "",
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, FileOutcome::Invalid),
+            "got {}",
+            outcome_name(&outcome)
+        );
+    }
+
     /// #156: a strict-mode validation failure used to propagate as `Err`, which
     /// `index_paths_generic`'s per-path loop then let `?` straight out of the whole
     /// call — aborting every other file in the same batch. It must instead come back
@@ -8009,6 +8061,36 @@ mod tests {
         let files = discover_files(dir.path(), &indexing).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("keep.md"));
+    }
+
+    /// The walk never enters a `.git` directory (any case, at any depth), even when
+    /// `include` is broad and `exclude` does not list `.git/**`.
+    #[test]
+    fn discover_files_never_walks_into_git_dirs() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keep.md"), "keep").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "[core]").unwrap();
+        std::fs::write(dir.path().join(".git/objects/notes.md"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/.GIT")).unwrap();
+        std::fs::write(dir.path().join("sub/.GIT/inner.md"), "x").unwrap();
+        // A worktree or submodule keeps a `.git` gitfile instead of a directory.
+        std::fs::create_dir_all(dir.path().join("wt")).unwrap();
+        std::fs::write(dir.path().join("wt/.git"), "gitdir: ../elsewhere").unwrap();
+        std::fs::write(dir.path().join("wt/kept.md"), "x").unwrap();
+
+        let indexing = IndexingConfig {
+            include: vec!["**/*".into()],
+            exclude: vec![],
+            exclude_files: vec![],
+            reconcile_interval_secs: 60,
+        };
+        let files = discover_files(dir.path(), &indexing).unwrap();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files.iter().any(|f| f.ends_with("keep.md")));
+        assert!(files.iter().any(|f| f.ends_with("wt/kept.md")));
+        let unfiltered = walk_dir_unfiltered(dir.path(), dir.path()).unwrap();
+        assert_eq!(unfiltered.len(), 2, "{unfiltered:?}");
     }
 
     #[test]

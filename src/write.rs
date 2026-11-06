@@ -606,7 +606,7 @@ fn resolve_safe_write_path_detailed(
         }
         Err(crate::ingest::KbPathError::GitDir) => {
             return Err(PathSafetyError::Rejected(
-                "path must not contain a '.git' component".to_string(),
+                "path names a reserved directory".to_string(),
             ));
         }
         Err(crate::ingest::KbPathError::Symlink) => {
@@ -5232,7 +5232,9 @@ mod tests {
             ".Git",
         ] {
             let msg = resolve_safe_write_path(tmp.path(), rel).unwrap_err();
-            assert!(msg.contains(".git"), "{rel}: {msg}");
+            assert!(msg.contains("reserved directory"), "{rel}: {msg}");
+            // Nothing git-related reaches an MCP caller.
+            assert!(!msg.to_ascii_lowercase().contains("git"), "{rel}: {msg}");
         }
         // Only an exact `.git` component, not a name that merely contains it.
         assert!(resolve_safe_write_path(tmp.path(), "notes/.gitignore.md").is_ok());

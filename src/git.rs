@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -199,6 +199,12 @@ pub fn redact_url(s: &str) -> String {
 /// Ensure a git repository exists at `data_path`. If the path is not already a
 /// git repo and `git_url` is provided, performs a full single-branch clone.
 ///
+/// An existing `.git` is vetted by [`check_existing_repo`] the first time this
+/// process sees the directory; once that passes it is not asked again. A clone
+/// into a directory that was empty (or absent) on entry that fails or times out
+/// has everything it left removed, the directory itself kept; a directory that
+/// was not empty is never touched.
+///
 /// Returns `Ok(true)` if a fresh clone was performed, `Ok(false)` if the repo
 /// already existed.
 pub async fn ensure_repo(
@@ -209,10 +215,26 @@ pub async fn ensure_repo(
     token: Option<&str>,
 ) -> Result<bool> {
     // Already a git repo — nothing to do, once it is confirmed to be a usable one.
+    // The check runs at most once per directory per process: `ensure_repo` is
+    // called on every indexing run under `GIT_LOCK`, and on an empty knowledge
+    // base the check asks the remote (`ls-remote`), which would hold the lock for
+    // up to `GIT_TIMEOUT` on every run while the remote hangs.
     if std::path::Path::new(data_path).join(".git").exists() {
-        check_existing_repo(git_url, branch, data_path, token).await?;
+        let key = repo_check_key(data_path);
+        if checked_repos().contains(&key) {
+            return Ok(false);
+        }
+        // Only a check that reached a verdict is remembered: one that could not ask the
+        // remote (unborn HEAD, `ls-remote` failed or timed out) is run again next time.
+        if check_existing_repo(git_url, branch, data_path, token).await? {
+            checked_repos().insert(key);
+        }
         return Ok(false);
     }
+
+    // `git clone` into `.` requires an empty (or absent) target, so only a
+    // directory that was empty here can hold nothing but what the clone wrote.
+    let empty_at_entry = dir_is_empty_or_absent(Path::new(data_path));
 
     tokio::fs::create_dir_all(data_path)
         .await
@@ -227,33 +249,128 @@ pub async fn ensure_repo(
         data_path
     );
 
-    // Full clone (no --depth): commit_and_sync needs history to fetch/rebase/push.
-    let output = run_bounded(
-        git_command()
-            .args([
-                "clone",
-                "--branch",
-                branch,
-                "--single-branch",
-                &clone_url,
-                ".",
-            ])
-            .current_dir(data_path),
-    )
-    .await
-    .map_err(|_elapsed| {
-        error!("git clone timed out after {:?}", GIT_TIMEOUT);
-        anyhow::anyhow!("git clone timed out after {:?}", GIT_TIMEOUT)
-    })?
-    .context("Failed to run git clone")?;
+    let result = run_clone(&clone_url, branch, data_path).await;
+    if result.is_err() && empty_at_entry {
+        // A clone killed on timeout never runs git's own cleanup, and the `.git`
+        // it leaves would be refused as an interrupted clone on every later start.
+        // The directory itself stays: it may be a mount point.
+        match clear_dir_contents(Path::new(data_path)) {
+            Ok(0) => {}
+            Ok(n) => warn!(
+                "git clone failed; removed the {n} entr{} it left in {data_path}",
+                if n == 1 { "y" } else { "ies" }
+            ),
+            Err(e) => {
+                error!("git clone failed, and clearing what it left in {data_path} failed: {e}")
+            }
+        }
+    }
+    result?;
+
+    info!("Clone complete");
+    Ok(true)
+}
+
+/// The full clone behind [`ensure_repo`] (no `--depth`: `commit_and_sync` needs
+/// history to fetch, rebase and push).
+async fn run_clone(clone_url: &str, branch: &str, data_path: &str) -> Result<()> {
+    let mut cmd = git_command();
+    cmd.args([
+        "clone",
+        "--branch",
+        branch,
+        "--single-branch",
+        clone_url,
+        ".",
+    ])
+    .current_dir(data_path);
+    #[cfg(test)]
+    if let Ok(script) = TEST_CLONE_SCRIPT.try_with(|s| s.clone()) {
+        cmd = Command::new("sh");
+        cmd.arg("-c").arg(script).current_dir(data_path);
+    }
+
+    let output = run_bounded(&mut cmd)
+        .await
+        .map_err(|_elapsed| {
+            error!("git clone timed out after {:?}", GIT_TIMEOUT);
+            anyhow::anyhow!("git clone timed out after {:?}", GIT_TIMEOUT)
+        })?
+        .context("Failed to run git clone")?;
 
     if !output.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&output.stderr));
         anyhow::bail!("git clone failed: {}", stderr);
     }
+    Ok(())
+}
 
-    info!("Clone complete");
-    Ok(true)
+#[cfg(test)]
+tokio::task_local! {
+    /// A test's stand-in for the `git clone` in [`run_clone`]: a `sh -c` script run
+    /// in the target directory, to leave a deterministic partial clone behind.
+    static TEST_CLONE_SCRIPT: String;
+}
+
+/// Directories whose existing `.git` [`check_existing_repo`] has accepted in this
+/// process, keyed by [`repo_check_key`]. A failed check is not recorded.
+static CHECKED_REPOS: LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+fn checked_repos() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+    CHECKED_REPOS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `data_path` canonicalized, so two spellings of one directory share an entry.
+fn repo_check_key(data_path: &str) -> PathBuf {
+    std::fs::canonicalize(data_path).unwrap_or_else(|_| PathBuf::from(data_path))
+}
+
+/// True when `dir` does not exist or has no entries. An unreadable directory
+/// counts as non-empty, so nothing in it is ever cleared.
+fn dir_is_empty_or_absent(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Remove every entry inside `dir`, keeping `dir` itself. Symlinks are removed,
+/// never followed. Returns how many top-level entries were removed.
+fn clear_dir_contents(dir: &Path) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Whether `git ls-remote --heads <url> <branch>` output names exactly
+/// `refs/heads/<branch>`. `ls-remote` matches its pattern against the tail of
+/// each ref, so `refs/heads/feature/main` is listed for `main` too and must not
+/// count.
+fn ls_remote_lists_branch(stdout: &str, branch: &str) -> bool {
+    // `source.git_branch` may be given as a qualified ref.
+    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    let wanted = format!("refs/heads/{branch}");
+    stdout.lines().any(|line| {
+        line.split_once('\t')
+            .is_some_and(|(_, refname)| refname.trim_end() == wanted)
+    })
 }
 
 /// Refuse an existing `.git` that is not a usable repository, so startup fails
@@ -278,7 +395,7 @@ async fn check_existing_repo(
     branch: &str,
     data_path: &str,
     token: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     let git_dir = Path::new(data_path).join(".git");
     let git_dir_str = git_dir.to_string_lossy().into_owned();
     // `--git-dir` pins the repository: without it git would walk up from a broken
@@ -320,7 +437,7 @@ async fn check_existing_repo(
     .map_err(|_| anyhow::anyhow!("git rev-parse timed out after {:?}", GIT_TIMEOUT))?
     .context("Failed to run git rev-parse")?;
     if head.status.success() {
-        return Ok(());
+        return Ok(true);
     }
 
     // No commit yet. Fine for an empty knowledge base; an interrupted clone if the
@@ -329,8 +446,8 @@ async fn check_existing_repo(
     let remote = run_bounded(probe(&["ls-remote", "--heads", &url, branch])).await;
     match remote {
         Ok(Ok(out)) if out.status.success() => {
-            if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
-                Ok(())
+            if !ls_remote_lists_branch(&String::from_utf8_lossy(&out.stdout), branch) {
+                Ok(true)
             } else {
                 Err(refuse(&format!(
                     "it has no commit, but the remote branch {branch} does"
@@ -343,15 +460,15 @@ async fn check_existing_repo(
                  branch {branch} has any; continuing: {}",
                 redact_url(&String::from_utf8_lossy(&out.stderr)).trim()
             );
-            Ok(())
+            Ok(false)
         }
         Ok(Err(e)) => {
             warn!("{data_path} has no commit yet; could not run git ls-remote: {e}");
-            Ok(())
+            Ok(false)
         }
         Err(TimedOut) => {
             warn!("{data_path} has no commit yet; git ls-remote timed out, continuing");
-            Ok(())
+            Ok(false)
         }
     }
 }
@@ -2636,16 +2753,25 @@ pub(crate) mod tests {
         cmd.arg("-c")
             .arg(format!("echo $$ > '{}'; exec sleep 30", pid_file.display()));
 
+        // A limit long enough for `sh` to write its pid file on a loaded runner,
+        // still far short of the sleep.
         let started = std::time::Instant::now();
         let result = TEST_GIT_TIMEOUT
-            .scope(Duration::from_millis(500), run_bounded(&mut cmd))
+            .scope(Duration::from_secs(3), run_bounded(&mut cmd))
             .await;
         assert_eq!(result.unwrap_err(), TimedOut);
         assert!(started.elapsed() < Duration::from_secs(10));
 
-        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let mut pid = String::new();
+        for _ in 0..50 {
+            pid = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            if !pid.trim().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let pid = pid.trim();
-        assert!(!pid.is_empty());
+        assert!(!pid.is_empty(), "the child never wrote its pid file");
         // Reaped, not merely signalled: no /proc entry, not even a zombie.
         assert!(
             !Path::new("/proc").join(pid).exists(),
@@ -2662,6 +2788,210 @@ pub(crate) mod tests {
         assert_eq!(out.stdout, b"out\n");
         assert_eq!(out.stderr, b"err\n");
         assert_eq!(out.status.code(), Some(3));
+    }
+
+    /// Once an existing repository has passed the check, `ensure_repo` does not run
+    /// it again for that directory in this process: a `.git` broken afterwards is
+    /// not noticed (the check guards startup, not every indexing run).
+    #[tokio::test]
+    async fn ensure_repo_checks_an_existing_repo_once_per_process() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_test_cmd(dir.path())
+            .args(["init", "-q", "--initial-branch", "main"])
+            .output()
+            .unwrap();
+        // A commit makes the first check conclusive (an unborn HEAD with an
+        // unreachable remote is not, and is not remembered).
+        git_test_cmd(dir.path())
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ])
+            .output()
+            .unwrap();
+        let data_path = dir.path().to_str().unwrap();
+
+        let lock = lock_git().await;
+        assert!(
+            !ensure_repo(&lock, "/nonexistent/remote.git", "main", data_path, None)
+                .await
+                .unwrap()
+        );
+        // Break the repository: the check would now refuse it.
+        std::fs::remove_file(dir.path().join(".git/HEAD")).unwrap();
+        assert!(
+            check_existing_repo("/nonexistent/remote.git", "main", data_path, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            !ensure_repo(&lock, "/nonexistent/remote.git", "main", data_path, None)
+                .await
+                .unwrap(),
+            "the second call must not re-run the check"
+        );
+    }
+
+    /// A check that could not reach a verdict (no commit, remote unreachable) is not
+    /// remembered either: the next call asks again.
+    #[tokio::test]
+    async fn ensure_repo_does_not_cache_an_inconclusive_check() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_test_cmd(dir.path())
+            .args(["init", "-q", "--initial-branch", "main"])
+            .output()
+            .unwrap();
+        let data_path = dir.path().to_str().unwrap();
+
+        let lock = lock_git().await;
+        assert!(
+            !ensure_repo(&lock, "/nonexistent/remote.git", "main", data_path, None)
+                .await
+                .unwrap()
+        );
+        std::fs::remove_file(dir.path().join(".git/HEAD")).unwrap();
+        assert!(
+            ensure_repo(&lock, "/nonexistent/remote.git", "main", data_path, None)
+                .await
+                .is_err(),
+            "the second call must run the check again"
+        );
+    }
+
+    /// A failed check is not cached: the next call checks again.
+    #[tokio::test]
+    async fn ensure_repo_does_not_cache_a_failed_check() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let data_path = dir.path().to_str().unwrap();
+
+        let lock = lock_git().await;
+        for _ in 0..2 {
+            assert!(
+                ensure_repo(&lock, "/nonexistent/remote.git", "main", data_path, None)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    /// A clone that fails into a directory that was empty on entry leaves the
+    /// directory empty (but present): a partial `.git` and a half checked-out file
+    /// are both removed.
+    #[tokio::test]
+    async fn ensure_repo_clears_a_failed_clone_from_an_empty_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = "mkdir -p .git/objects && echo 'ref: refs/heads/main' > .git/HEAD \
+                      && echo half > half.md && exit 128";
+
+        let lock = lock_git().await;
+        let err = TEST_CLONE_SCRIPT
+            .scope(
+                script.to_string(),
+                ensure_repo(
+                    &lock,
+                    "/nonexistent/remote.git",
+                    "main",
+                    dir.path().to_str().unwrap(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("git clone failed"), "{err:#}");
+        assert!(dir.path().is_dir());
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A directory that was not empty on entry is never cleaned, whatever the
+    /// failed clone left in it.
+    #[tokio::test]
+    async fn ensure_repo_leaves_a_nonempty_dir_alone_after_a_failed_clone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keep.md"), "# Keep\n").unwrap();
+        let script = "mkdir -p .git && echo partial > .git/HEAD && exit 128";
+
+        let lock = lock_git().await;
+        let result = TEST_CLONE_SCRIPT
+            .scope(
+                script.to_string(),
+                ensure_repo(
+                    &lock,
+                    "/nonexistent/remote.git",
+                    "main",
+                    dir.path().to_str().unwrap(),
+                    None,
+                ),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(dir.path().join("keep.md").is_file());
+        assert!(dir.path().join(".git/HEAD").is_file());
+    }
+
+    /// Only an exact `refs/heads/<branch>` line counts; `ls-remote`'s tail match
+    /// also lists `refs/heads/feature/main` for `main`.
+    #[test]
+    fn ls_remote_lists_branch_matches_the_exact_ref_only() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert!(ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/main\n"),
+            "main"
+        ));
+        assert!(ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/feature/main\n{sha}\trefs/heads/main\n"),
+            "main"
+        ));
+        assert!(!ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/feature/main\n"),
+            "main"
+        ));
+        assert!(!ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/mainline\n"),
+            "main"
+        ));
+        assert!(!ls_remote_lists_branch("", "main"));
+        // A branch configured as a qualified ref still matches its own listing.
+        assert!(ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/main\n"),
+            "refs/heads/main"
+        ));
+        assert!(ls_remote_lists_branch(
+            &format!("{sha}\trefs/heads/feature/x\n"),
+            "feature/x"
+        ));
+    }
+
+    /// An unborn repository whose remote has only a branch that merely ends in the
+    /// configured name (`feature/main`) is not an interrupted clone of `main`.
+    #[tokio::test]
+    async fn ensure_repo_accepts_an_unborn_repo_when_only_a_suffix_branch_exists() {
+        let bare = create_bare_repo("feature/main");
+        let dir = tempfile::TempDir::new().unwrap();
+        git_test_cmd(dir.path())
+            .args(["init", "-q", "--initial-branch", "main"])
+            .output()
+            .unwrap();
+
+        let lock = lock_git().await;
+        let result = ensure_repo(
+            &lock,
+            bare.path().to_str().unwrap(),
+            "main",
+            dir.path().to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!result);
     }
 
     /// Helper: create a local bare git repo with one commit on the given branch.

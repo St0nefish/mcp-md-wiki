@@ -52,8 +52,11 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`. `/mcp`, `/health` and
   `/metrics` are unchanged.
 - **Startup warning when the UI write API is unauthenticated.** With `ui.api_auth`
-  off, `serve` logs that `POST`/`DELETE /api/doc` are unauthenticated and the
-  deployment must sit behind an authenticating proxy or set `ui.api_auth: true`.
+  off and `mcp.allowed_hosts` unset, `serve` warns that `/api/*`, writes included, is
+  unauthenticated and has no `Host` check, so a DNS-rebinding page can reach it from a
+  browser that can reach the port; the remedies are an authenticating proxy or
+  `ui.api_auth: true`, and setting `mcp.allowed_hosts`. With `mcp.allowed_hosts` set,
+  the same fact is logged at `info`.
 - **Compose files publish port 8001 on loopback by default.** `docker-compose.yml`
   and `deploy/templates/compose-*.yml` now map
   `"${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8001}:8001"` (`MCP_BIND` and `MCP_PORT` are
@@ -101,17 +104,30 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   rebase failed. Startup now refuses a `.git` that git cannot open, or one with no
   commit while the remote branch has commits, with an error naming the data
   directory. Nothing is deleted: move the directory aside and restart to clone
-  again. An empty repository whose remote is empty (or unreachable) still starts.
+  again. An empty repository whose remote is empty (or unreachable) still starts,
+  as does one whose remote has only a branch ending in the configured name
+  (`feature/main` for `main`). Once the check has reached a verdict the
+  repository is not checked again in that process (one that could not ask the
+  remote is retried), so a hanging remote no longer holds the git lock on each
+  indexing run. A
+  clone that fails or times out into a data directory that was empty beforehand now
+  removes what it left there (the directory itself stays), so the next start clones
+  again instead of refusing a partial `.git`; a non-empty directory is never touched.
 - **A document that becomes empty or invalid stops being served.** An indexed
   document edited down to frontmatter only (no chunks), or one that fails
   validation with `validation.strict: false`, kept its old chunks, metadata row and
   links in the index indefinitely, and the reconcile re-read it on every sweep;
   only `index --full` dropped it. Both are now purged like a deleted file. An empty
   document keeps a zero-chunk state row, so the reconcile skips it until it
-  changes; an invalid one keeps none, so the next sweep re-validates it. A
-  failing, timed-out or unrunnable `validation.lint_command` (or a validator
-  error) describes the tooling rather than the document, so it purges nothing: a
-  lint outage cannot empty the index. A strict-mode rejection is unchanged: the
+  changes; an invalid one keeps none, so the next sweep re-validates it. This
+  includes a schema or `frontmatter` config change (with `validation.strict: false`,
+  the default): documents it makes invalid — a newly required field, say — drop out
+  of search on the next reconcile until the schema or the documents are fixed, and
+  fixing them re-indexes them on the next sweep. A failing, timed-out or unrunnable
+  `validation.lint_command` describes the tooling rather than the document, so when
+  the lint failure is the only error it purges nothing: a lint outage cannot empty
+  the index. A document with schema or frontmatter errors is invalid, and purged,
+  whether or not lint also failed. A strict-mode rejection is unchanged: the
   last good version stays served and
   `/status` lists the rejection. No reindex needed: an affected document's state
   row never matched its content, so the first reconcile after upgrading cleans it

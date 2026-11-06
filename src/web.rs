@@ -5038,7 +5038,10 @@ mod tests {
         // path or the data-directory prefix (F4).
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
-        let _locked = LockedDir::new(&canonical.join("locked"));
+        let Some(_locked) = LockedDir::new(&canonical.join("locked")) else {
+            eprintln!("SKIP: mode 000 is not enforced here (running as root?)");
+            return;
+        };
 
         let app = ui_router(test_state(&canonical));
         let req = post_doc_request(
@@ -5067,11 +5070,15 @@ mod tests {
     struct LockedDir(PathBuf);
 
     impl LockedDir {
-        fn new(path: &Path) -> Self {
+        /// `None` when mode 000 is not enforced (running as root, or with
+        /// `CAP_DAC_OVERRIDE`): the directory is still readable, so the error these
+        /// tests need cannot be produced and the caller skips.
+        fn new(path: &Path) -> Option<Self> {
             use std::os::unix::fs::PermissionsExt;
             std::fs::create_dir_all(path).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            LockedDir(path.to_path_buf())
+            let locked = LockedDir(path.to_path_buf());
+            std::fs::read_dir(path).is_err().then_some(locked)
         }
     }
 
@@ -5086,7 +5093,10 @@ mod tests {
     async fn delete_doc_resolve_error_hides_absolute_path_in_response_body() {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
-        let _locked = LockedDir::new(&canonical.join("locked"));
+        let Some(_locked) = LockedDir::new(&canonical.join("locked")) else {
+            eprintln!("SKIP: mode 000 is not enforced here (running as root?)");
+            return;
+        };
 
         let app = ui_router(test_state(&canonical));
         let req = Request::builder()

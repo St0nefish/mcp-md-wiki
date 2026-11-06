@@ -2585,10 +2585,21 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     info!("  Admin endpoint: POST /admin/reload (re-reads config.yaml without a restart)");
     if config.ui.api_auth {
         info!("  Web UI: / (shell open; /api/* behind the /mcp authentication — ui.api_auth)");
-    } else {
+    } else if config.mcp.allowed_hosts.is_empty() {
+        // The server cannot see an authenticating proxy in front of it, so this
+        // fires for a proxied deployment too; setting `mcp.allowed_hosts` (which
+        // such a deployment should anyway) drops it to `info`.
         warn!(
-            "Web UI write routes (POST/DELETE /api/doc) are unauthenticated — run behind an \
-             authenticating reverse proxy or set ui.api_auth: true"
+            "Web UI /api/* routes, including the write routes (POST/DELETE /api/doc), are \
+             unauthenticated, and with mcp.allowed_hosts unset the Host header is not \
+             checked, so a DNS-rebinding page can reach them if this port is reachable from \
+             the browser. Run behind an authenticating reverse proxy or set \
+             ui.api_auth: true, and set mcp.allowed_hosts to the hostname(s) clients use"
+        );
+    } else {
+        info!(
+            "  Web UI: / and /api/* unauthenticated, including writes (Host checked against \
+             mcp.allowed_hosts; set ui.api_auth: true to require authentication)"
         );
     }
     if let Some(oauth) = auth.oauth() {
