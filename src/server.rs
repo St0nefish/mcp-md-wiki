@@ -2090,10 +2090,15 @@ async fn build_startup_schema_cache(
     frontmatter: crate::config::FrontmatterConfig,
     indexing: crate::config::IndexingConfig,
 ) -> Result<SchemaCache> {
-    tokio::task::spawn_blocking(move || SchemaCache::build(&data_path, &frontmatter, &indexing))
-        .await
-        .context("Schema walk panicked during startup")?
-        .context("Refusing to start: every schema file in the indexed tree must be valid")
+    let schemas = tokio::task::spawn_blocking(move || {
+        SchemaCache::build(&data_path, &frontmatter, &indexing)
+    })
+    .await
+    .context("Schema walk panicked during startup")?
+    .context("Refusing to start: every schema file in the indexed tree must be valid")?;
+    // Every lint finding once at startup; later rebuilds log only new ones (#347).
+    crate::schema::log_lint_findings(&schemas.lint_findings());
+    Ok(schemas)
 }
 
 pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf) -> Result<()> {

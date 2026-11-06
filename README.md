@@ -406,7 +406,7 @@ Both write tools share the same pipeline: **path-safety guard** (no `..`, no `.g
 | `write_document` (batch, `documents`) | `documents[]` (`path`, `action` (`created`/`updated`), `version`, `diff`? (update), `diff_truncated`?, `diff_total_bytes`?, `merged_with_other_changes`?) |
 | `write_document` (directory move) | `path`, `action: "moved"`, `from`, `moved[]` (`from`, `to`), `moved_schema_dirs[]`?, `rewritten_paths`?, `merged_with_other_changes`? |
 | `delete_document` | `path`, `action: "deleted"`, `referencing_paths`?, `rewritten_paths`? (with `unlink_inbound`, in which case `referencing_paths` is empty), `merged_with_other_changes`? |
-| `update_schema` | `path`, `summary`, `invalidated`?, `casualties_total`?/`casualties_truncated`? (only when the list was capped), `warning`? (saved but not in effect yet: another directory's schema is invalid). A `dry_run` preview instead returns `dry_run: true`, `path`, `summary`, `field`, `definition` (the edited field as the scope would resolve it, in `get_schema`'s shape) and `would_invalidate`? |
+| `update_schema` | `path`, `summary`, `invalidated`?, `casualties_total`?/`casualties_truncated`? (only when the list was capped), `warning`? (saved but not in effect yet: another directory's schema is invalid), `warnings`? (lint findings for the schema file as written — see [Lint warnings](#syntax); capped at 20, never a refusal). A `dry_run` preview instead returns `dry_run: true`, `path`, `summary`, `field`, `definition` (the edited field as the scope would resolve it, in `get_schema`'s shape), `would_invalidate`? and `warnings`? |
 
 `?` marks a field present only when it applies.
 
@@ -470,7 +470,7 @@ Exactly one edit mode is required unless the call is a pure move (`new_path` alo
 | `force` | boolean | no | Apply even if existing documents would fail the new rules (default: `false`) |
 | `acknowledge_root_change` | boolean | no | Must be `true` to change the root schema with `add_values`, `set_field` or `remove_field`; `remove_values` and `dry_run` are exempt (default: `false`) |
 
-When validation fails, write tools return a structured error whose `data.field_errors` array names each offending `field`, the `rule` it broke (`required` / `allowed_value` / `lint` / `type_mismatch` / `closed_object` / `derived`), and — for closed-set fields — the value it `got` and the values it `expected`, so an agent can self-correct.
+When validation fails, write tools return a structured error whose `data.field_errors` array names each offending `field` (a dot-path, with list elements indexed: `npcs[2].name`), the `rule` it broke (`required` / `allowed_value` / `lint` / `type_mismatch` / `closed_object` / `derived`; past 100 errors, one final `too_many_errors` entry counts the rest), and — for closed-set fields — the value it `got` and the values it `expected`, so an agent can self-correct.
 
 Server and tool descriptions are assembled from three layers, in order: mechanics true of every deployment (compiled into the binary), short sentences that depend on this deployment's config or corpus (e.g. the quoted-phrase sentence on `search` when `search.phrase` is on, the enabled granularities, and — in the server instructions — the top-level areas plus one pointer to `get_schema` for field values and per-folder rules; no field vocabularies, scoped folders or authoring rules are enumerated up front), and this knowledge base's own policy — what belongs here, tagging conventions, writing style — loaded at runtime from `<mcp.extensions_path>/` in the served repo (default `meta/mcp`) and refreshed on `mcp.metadata_refresh_secs`. The per-KB layer is append-only: editing it is a normal `write_document` call, no restart required. `mcp.instructions` is a deprecated narrative override that still works but is superseded by `<extensions_path>/server.md` when both are set.
 
@@ -527,9 +527,17 @@ fields:
         role: { type: enum, values: [ally, foe] }
 ```
 
-**Paths.** Everywhere a schema names a field — a key under `fields:`, `update_schema`'s `field` — it uses one grammar: `a.b` is a child field, `a[]` the elements of list `a`, and `a[].b` a field of each element (`npcs[].role:` as a key is the same field as the nested form above). `items` definitions are merged down the cascade like any other field, shown by `get_schema` under the list field's `items`, and part of the schema fingerprint; they are **not yet enforced** on documents, indexed, or usable in `search` filters.
+**Paths.** Everywhere a schema names a field — a key under `fields:`, `update_schema`'s `field` — it uses one grammar: `a.b` is a child field, `a[]` the elements of list `a`, and `a[].b` a field of each element (`npcs[].role:` as a key is the same field as the nested form above). `items` definitions are merged down the cascade like any other field, shown by `get_schema` under the list field's `items`, part of the schema fingerprint, and enforced on every element (see below); they are **not yet** indexed or usable in `search` filters.
 
-**Types:** `text`, `integer`, `number`, `boolean`, `enum`, `list`, `date` (`YYYY-MM-DD`), `timestamp` (RFC 3339), `object`. Declared types are strictly enforced with no coercion — `prep_minutes: "45"` fails against `type: integer`. Undeclared fields are not type-checked and remain legal.
+**Types:** `text`, `integer`, `number`, `boolean`, `enum`, `list`, `date` (`YYYY-MM-DD`), `timestamp` (RFC 3339), `object`. Declared types are strictly enforced with no coercion — `prep_minutes: "45"` fails against `type: integer` — except that an `integer` accepts a whole number written as a decimal (`3.0`, never `3.5`). Undeclared fields are not type-checked and remain legal.
+
+**How nested rules apply.** Validation walks the schema tree:
+
+- `required` on a nested field applies only when its parent is present: with `planning.effort` required, a document without `planning` (or with `planning: null`) passes, and one with `planning: {}` does not. A top-level required field is always checked. A nested `default` creates its parent object, so once a scope defaults one child of `planning`, the other required children of `planning` apply to every document.
+- `open: false` is enforced on every object it is set on, at any depth, inside list elements included.
+- A list's elements are checked against its `items` — type, `values`, and for object elements their own `required`/`open`/child rules — and an error names the element by index: `npcs[2].name`. Defaults are never applied inside list elements.
+
+**Lint warnings.** Some definitions load fine but are probably mistakes: a `default` that fails the field's own `type` or `values`, `values` on an `object` or `boolean` field, a `default` under a list's `items` (never applied to elements), and a top-level field named like a key the search index writes itself (`file_path`, `mtime`, `chunk_index`, `text`, `text_body_offset`, `line_start`, `line_end`, `path_ancestors`, the `heading_*`/`section_*` keys, and `fm`). These are warnings, never errors: the server logs them (naming the scope) once at startup and in `mcp-md-wiki validate`, and afterwards only those a schema rebuild newly introduces; `update_schema` returns them in `warnings`.
 
 A field can't declare both a scalar `type` and nested `fields:` — it's either a value or a container, not both (`type: object` is the exception, since `object` means "has nested fields"). `update_schema` enforces this the same way a hand-edited `.schema.yaml` does.
 

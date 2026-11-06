@@ -17,8 +17,13 @@
 //! Most consumers read the schema's **flat dot-path view** ([`ResolvedFields`]):
 //! every declared field outside a list's `items`, keyed by dot-path
 //! (`planning.prep_minutes`), containers included. Fields under `items` (`a[]…`) live
-//! only in the tree for now — reachable through [`ResolvedFields::lookup`] — and are
-//! not validated, indexed or offered as filter vocabulary.
+//! only in the tree for now — reachable through [`ResolvedFields::lookup`]. Validation
+//! walks the tree, so list elements are checked against them (#347); they are not
+//! indexed or offered as filter vocabulary.
+//!
+//! [`lint_raw`] reports definitions that load but are probably mistakes (a default
+//! that fails its own type, say). Those are warnings, never load errors: schema load
+//! is fail-fast, so any new strictness check ships as a lint warning first.
 //!
 //! Deployments with no schema files keep working: the global `frontmatter` block in
 //! `config.yaml` becomes the implicit root schema via [`ResolvedSchema::from_config`].
@@ -294,8 +299,14 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
     },
 ];
 
+/// An integer, including one that arrives as an integral float (`3.0`, which YAML
+/// parses as a float), but not a fractional one (`3.5`) (#347).
 fn accepts_integer(value: &Value) -> bool {
-    value.as_i64().is_some() || value.as_u64().is_some()
+    value.as_i64().is_some()
+        || value.as_u64().is_some()
+        || value
+            .as_f64()
+            .is_some_and(|f| f.is_finite() && f.fract() == 0.0)
 }
 
 /// Enum accepts a scalar, or an array of scalars — the latter preserves how the
@@ -962,6 +973,125 @@ fn check_unique_paths(
         check_unique_paths(&format!("{path}[]"), items, seen)?;
     }
     Ok(())
+}
+
+/// Top-level names the indexer writes into every chunk's Qdrant payload itself
+/// (`ingest::upsert_pending`), plus `fm`, reserved for the frontmatter namespace
+/// (#350). A frontmatter field of the same name is overwritten in the payload by the
+/// built-in value, so a query-mode filter on it never sees what the document says.
+pub const RESERVED_PAYLOAD_NAMES: &[&str] = &[
+    "file_path",
+    "mtime",
+    "chunk_index",
+    crate::qdrant::CHUNK_TEXT_KEY,
+    crate::qdrant::CHUNK_BODY_OFFSET_KEY,
+    "line_start",
+    "line_end",
+    crate::qdrant::PATH_ANCESTORS_KEY,
+    crate::qdrant::HEADING_PATH_KEY,
+    crate::qdrant::HEADING_LEVEL_KEY,
+    crate::qdrant::HEADING_PREFIXES_KEY,
+    crate::qdrant::SECTION_KEY,
+    crate::qdrant::SECTION_LINE_START_KEY,
+    crate::qdrant::SECTION_LINE_END_KEY,
+    "fm",
+];
+
+/// Definitions in one schema file that load but are probably mistakes (#347).
+///
+/// Pure, and **warnings only**: nothing here ever stops a schema from loading or an
+/// `update_schema` from landing. Schema load is fail-fast, so a new strictness check
+/// is introduced as a warning here first. Each warning names the field path (in
+/// [`FieldPath`]'s grammar) and the problem. Checks:
+///
+/// - a `default` that fails the field's own `type` or `values` (checked with the same
+///   functions validation uses; a `values` list carrying `$values` or `extend` is
+///   skipped, since the inherited part is not in this file, and so is a field whose
+///   type is inherited rather than written here);
+/// - `values` on an `object` field (no object value can ever match it) or a `boolean`
+///   field (where it is at best a roundabout way to forbid one of the two values);
+/// - a `default` anywhere under a list's `items` (a `[]` path), which is never
+///   applied to list elements;
+/// - a top-level field whose name is one of [`RESERVED_PAYLOAD_NAMES`].
+///
+/// `_is_root` says whether the file is the knowledge base's root schema; no check
+/// depends on it yet, but root-only blocks will (#345).
+pub fn lint_raw(file: &SchemaFile, _is_root: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (key, raw) in &file.fields {
+        if let Some(PathStep::Field(name)) = FieldPath::parse(key).steps().first()
+            && RESERVED_PAYLOAD_NAMES.contains(&name.as_str())
+        {
+            warnings.push(format!(
+                "field '{key}': '{name}' is reserved — the search index stores its own \
+                 value under that name, which hides a frontmatter field of the same \
+                 name from search filters; rename the field"
+            ));
+        }
+        lint_field(key, raw, &mut warnings);
+    }
+    warnings
+}
+
+fn lint_field(path: &str, raw: &RawFieldDef, warnings: &mut Vec<String>) {
+    // The type this declaration gives the field, as `FieldDef::merge_node` resolves
+    // it: nested `fields` mean object, `items` mean list.
+    let ty = raw.ty.or(if raw.fields.is_some() {
+        Some(FieldType::Object)
+    } else if raw.items.is_some() {
+        Some(FieldType::List)
+    } else {
+        None
+    });
+
+    if let Some(ty @ (FieldType::Object | FieldType::Boolean)) = ty
+        && raw.values.is_some()
+    {
+        warnings.push(format!(
+            "field '{path}': 'values' does not belong on {} field (it constrains enum \
+             and list fields)",
+            ty.kind().describe
+        ));
+    }
+
+    if raw.default.is_some() && FieldPath::parse(path).steps().contains(&PathStep::Items) {
+        // `validate::apply_defaults` never fills in list elements, so a default here
+        // does nothing — and next to `required`, it suggests a rule that is not there.
+        warnings.push(format!(
+            "field '{path}': a default inside a list's items is never applied to its \
+             elements; every element must set this field itself"
+        ));
+    }
+
+    if let Some(default) = &raw.default {
+        if let Some(ty) = ty
+            && let Err(reason) = check_type(ty, default)
+        {
+            warnings.push(format!(
+                "field '{path}': the default fails the field's own type ({reason})"
+            ));
+        } else if let Some(values) = &raw.values
+            && !raw.extend
+            && !values.iter().any(|v| v == VALUES_SENTINEL)
+        {
+            let check = match ty {
+                None => check_values_lenient(default, Some(values)),
+                Some(_) => check_values(default, values),
+            };
+            if let Err(reason) = check {
+                warnings.push(format!(
+                    "field '{path}': the default fails the field's own values ({reason})"
+                ));
+            }
+        }
+    }
+
+    for (name, child) in raw.fields.iter().flatten() {
+        lint_field(&format!("{path}.{name}"), child, warnings);
+    }
+    if let Some(items) = &raw.items {
+        lint_field(&format!("{path}[]"), items, warnings);
+    }
 }
 
 // Raw-tree navigation for `SchemaFile::apply_inheriting`. A path (`a.b`, `a[]`,
@@ -1958,6 +2088,29 @@ pub fn store_shared(shared: &SharedSchemaCache, new: SchemaCache) {
     *guard = Arc::new(new);
 }
 
+/// One [`lint_raw`] finding: the governing directory of the schema file, and the
+/// warning.
+pub type LintFinding = (PathBuf, String);
+
+/// The findings in `new` that `previous` does not have, in `new`'s order.
+pub fn new_lint_findings(previous: &SchemaCache, new: &SchemaCache) -> Vec<LintFinding> {
+    let seen: BTreeSet<LintFinding> = previous.lint_findings().into_iter().collect();
+    new.lint_findings()
+        .into_iter()
+        .filter(|finding| !seen.contains(finding))
+        .collect()
+}
+
+/// Log lint findings at `warn`, naming each one's scope (#347). Called for the
+/// startup cache (all findings), the `validate` CLI, and a shared-cache rebuild
+/// (only the findings that rebuild introduced, [`new_lint_findings`]); never for the
+/// throwaway caches indexing runs build, which would repeat them on every write.
+pub fn log_lint_findings(findings: &[LintFinding]) {
+    for (rel_dir, warning) in findings {
+        warn!(scope = %scope_label(rel_dir), "schema lint: {warning}");
+    }
+}
+
 /// The process-wide order of [`SchemaCache::build`] calls.
 static REBUILD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1986,6 +2139,10 @@ pub fn apply_rebuild(
 ) -> bool {
     match built {
         Ok(schemas) => {
+            // Only findings the installed cache did not already have: a rebuild
+            // before every full reconcile must not repeat the same warnings (#347).
+            let previous = load_shared(shared);
+            log_lint_findings(&new_lint_findings(&previous, &schemas));
             store_shared(shared, schemas);
             if status.schema_error().is_some() {
                 tracing::info!(
@@ -2199,6 +2356,9 @@ impl SchemaCache {
             match parsed {
                 Ok(file) => {
                     debug!(scope = %rel_dir.display(), "loaded schema");
+                    // Lint warnings (#347) are not logged here: throwaway builds
+                    // (one per indexing run) would repeat them. The shared-cache
+                    // paths log them — see `SchemaCache::log_lint_findings`.
                     raw.insert(rel_dir, file);
                 }
                 Err(reason) => invalid.push(InvalidSchemaFile {
@@ -2519,6 +2679,19 @@ impl SchemaCache {
             .into_iter()
             .filter(|dir| dir.ends_with(needle))
             .cloned()
+            .collect()
+    }
+
+    /// [`lint_raw`] over every schema file this cache was built from, by governing
+    /// directory (#347).
+    pub fn lint_findings(&self) -> Vec<LintFinding> {
+        self.raw
+            .iter()
+            .flat_map(|(rel_dir, file)| {
+                lint_raw(file, rel_dir.as_os_str().is_empty())
+                    .into_iter()
+                    .map(move |warning| (rel_dir.clone(), warning))
+            })
             .collect()
     }
 
@@ -5056,6 +5229,192 @@ mod tests {
         assert!(check_type(FieldType::List, &json!(["a"])).is_ok());
         assert!(check_type(FieldType::List, &json!("a")).is_err());
         assert!(check_type(FieldType::Object, &json!({"a": 1})).is_ok());
+    }
+
+    #[test]
+    fn an_integral_float_is_an_integer_and_a_fractional_one_is_not() {
+        // YAML reads `3.0` as a float; it is still a whole number (#347).
+        assert!(check_type(FieldType::Integer, &json!(3.0)).is_ok());
+        assert!(check_type(FieldType::Integer, &json!(-12.0)).is_ok());
+        let err = check_type(FieldType::Integer, &json!(3.5)).unwrap_err();
+        assert_eq!(err, "expected an integer, got a decimal number");
+    }
+
+    // -- lint warnings (#347) -------------------------------------------------
+
+    fn lint(yaml: &str) -> Vec<String> {
+        let file: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+        file.validate_self()
+            .expect("lint findings are never load errors");
+        lint_raw(&file, false)
+    }
+
+    #[test]
+    fn lint_is_silent_for_a_clean_schema() {
+        assert!(
+            lint(
+                "fields:
+  status:
+    type: enum
+    values: [active, archived]
+    default: active
+  servings:
+    type: integer
+    default: 4.0
+  tags:
+    type: list
+    values: [$values, x]
+    default: [anything]
+  planning:
+    fields:
+      effort:
+        values: [low, high]
+        default: low
+  npcs:
+    items:
+      fields:
+        name:
+          type: text
+          required: true
+"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn lint_flags_a_default_inside_list_items() {
+        let warnings = lint(
+            "fields:\n  npcs:\n    items:\n      fields:\n        name:\n          \
+             required: true\n          default: anon\n  tags[]:\n    default: x\n",
+        );
+        assert_eq!(
+            warnings,
+            vec![
+                "field 'npcs[].name': a default inside a list's items is never applied to \
+                 its elements; every element must set this field itself"
+                    .to_string(),
+                "field 'tags[]': a default inside a list's items is never applied to its \
+                 elements; every element must set this field itself"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn lint_flags_a_default_that_fails_its_own_type() {
+        let warnings = lint(
+            "fields:\n  servings:\n    type: integer\n    default: four\n  \
+             planning:\n    fields:\n      level:\n        type: integer\n        \
+             default: 1.5\n",
+        );
+        assert_eq!(
+            warnings,
+            vec![
+                "field 'planning.level': the default fails the field's own type (expected \
+                 an integer, got a decimal number)"
+                    .to_string(),
+                "field 'servings': the default fails the field's own type (expected an \
+                 integer, got a string)"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn lint_flags_a_default_that_fails_its_own_values() {
+        let warnings = lint(
+            "fields:\n  status:\n    type: enum\n    values: [active]\n    default: draft\n  \
+             legacy:\n    values: [a]\n    default: b\n",
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("field 'legacy': the default fails the field's own values")
+        );
+        assert!(
+            warnings[1].starts_with("field 'status': the default fails the field's own values")
+        );
+        assert!(
+            warnings[1].contains("'draft' is not permitted"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn lint_flags_values_on_object_and_boolean_fields() {
+        let warnings = lint(
+            "fields:\n  flag:\n    type: boolean\n    values: [\"true\"]\n  \
+             box:\n    values: [a]\n    fields:\n      inner:\n        type: text\n",
+        );
+        assert_eq!(
+            warnings,
+            vec![
+                "field 'box': 'values' does not belong on an object field (it constrains \
+                 enum and list fields)"
+                    .to_string(),
+                "field 'flag': 'values' does not belong on a boolean field (it constrains \
+                 enum and list fields)"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn lint_flags_top_level_names_reserved_by_the_payload() {
+        let warnings = lint(
+            "fields:\n  text:\n    type: text\n  fm:\n    type: object\n  \
+             mtime.sub:\n    type: text\n  meta:\n    fields:\n      text:\n        type: text\n",
+        );
+        let flagged: Vec<&str> = warnings
+            .iter()
+            .map(|w| w.split('\'').nth(1).unwrap())
+            .collect();
+        // Only top-level names: `meta.text` is not a payload key.
+        assert_eq!(flagged, vec!["fm", "mtime.sub", "text"]);
+        assert!(warnings[0].contains("reserved"), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_schema_with_lint_findings_still_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema(
+            tmp.path(),
+            "",
+            "fields:\n  text:\n    type: integer\n    default: x\n",
+        );
+        let cache = SchemaCache::build(tmp.path(), &empty_config(), &Default::default())
+            .expect("lint warnings never fail a build");
+        assert!(cache.root().fields.contains_key("text"));
+        assert_eq!(
+            cache.lint_findings().len(),
+            2,
+            "{:?}",
+            cache.lint_findings()
+        );
+    }
+
+    #[test]
+    fn a_rebuild_reports_only_lint_findings_it_introduced() {
+        // `apply_rebuild` logs `new_lint_findings`, so a rebuild before every full
+        // reconcile does not repeat warnings the installed cache already had.
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema(tmp.path(), "", "fields:\n  fm:\n    type: text\n");
+        let first = SchemaCache::build_for_test(tmp.path(), &empty_config());
+        assert_eq!(first.lint_findings().len(), 1);
+
+        let same = SchemaCache::build_for_test(tmp.path(), &empty_config());
+        assert!(new_lint_findings(&first, &same).is_empty());
+
+        write_schema(
+            tmp.path(),
+            "notes",
+            "fields:\n  n:\n    type: integer\n    default: x\n",
+        );
+        let grown = SchemaCache::build_for_test(tmp.path(), &empty_config());
+        let added = new_lint_findings(&first, &grown);
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0].0, PathBuf::from("notes"));
+        assert!(added[0].1.starts_with("field 'n':"), "{added:?}");
     }
 
     #[test]

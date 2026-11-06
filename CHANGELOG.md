@@ -77,8 +77,8 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   schema keys and as `update_schema`'s `field`, follow one grammar: `a.b`, `a[]` (a
   list's elements), `a[].b` (a field of each element); `[]` steps count toward the
   16-step depth cap. Item definitions cascade per attribute like any other field and
-  are shown by `get_schema` under the list field's `items`, but are **not enforced
-  on documents, indexed, or filterable yet**. Internally the resolved schema is now
+  are shown by `get_schema` under the list field's `items`, and are enforced on every
+  element (#347, under Changed), but are **not indexed or filterable yet**. Internally the resolved schema is now
   a tree with per-attribute provenance and one per-type table (`FieldKind`) shared by
   validation, Qdrant index kinds, range-filter support and type names; for every
   schema that does not use `items` the result is unchanged, including its
@@ -89,6 +89,55 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   `tags` as a `list`), and `items:` is a new key, so a schema file that
   uses it is rejected as invalid by an older binary — roll back only after removing
   it.
+- **Schema lint warnings** (#347). A schema definition that loads but is probably a
+  mistake is now reported, never refused: a `default` that fails the field's own
+  `type` or `values`, `values` on an `object` or `boolean` field, and a top-level
+  field named like a key the search index writes itself (`file_path`, `mtime`,
+  `chunk_index`, `text`, `text_body_offset`, `line_start`, `line_end`,
+  `path_ancestors`, the `heading_*`/`section_*` keys, and `fm`, reserved for the
+  frontmatter namespace), and any `default` under a list's `items` (defaults are
+  never applied to list elements, so it does nothing). The server logs each one at
+  `warn`, naming the scope: every finding once at startup and in `mcp-md-wiki
+  validate`, and afterwards only findings a schema rebuild newly introduces (indexing
+  runs never log them). `update_schema` returns them in a new `warnings` array (dry
+  run included; omitted when empty; capped at 20). Nothing that loaded before stops
+  loading.
+
+### Changed
+
+- **Frontmatter validation now walks nested and list structure** (#347). Behavior
+  changes, applying to writes, `update_schema`'s casualty check, `validate` and
+  index-time validation alike:
+  - **Stricter:** a list's elements are checked against its `items` (type, `values`,
+    and an object element's own `required`/`open`/children), with errors at indexed
+    paths such as `npcs[2].name`; `open: false` is enforced on every object at any
+    depth, inside list elements included (and on an `open: false` field with no
+    declared type whose value is an object). A `null` list element is now a
+    `type_mismatch` against a typed `items`. A document accepted before can now be
+    refused on its next write.
+  - **Looser:** a required nested field is required only when its parent is present.
+    With `planning.effort` required, a document with no `planning` (or
+    `planning: null`) used to fail and now passes; `planning: {}` still fails.
+    Required top-level fields are unaffected. A nested `default` still creates its
+    parent object, so in a scope that defaults one child of `planning`, `planning`'s
+    other required children still apply to every document. A closed object no
+    longer rejects a key that only a deeper declared path passes through (`a` closed
+    with `a.b.c` declared now accepts `a: {b: {c: …}}`).
+  - **Looser:** `type: integer` accepts a whole number written as a decimal (`3.0`);
+    `3.5` is still refused.
+  - Defaults are never applied inside list elements.
+  - A document's schema errors are capped at 100; past that, one final
+    `rule: "too_many_errors"` entry (field `<more>`) counts the rest.
+
+  **Upgrade:** the schema fingerprint is unchanged, so upgrading re-validates and
+  re-embeds nothing. Existing documents are not re-checked against the stricter
+  rules until they are next reindexed — a git push that touches them, a change to
+  their governing schema, `index --full`, or a future chunker-version bump. **With
+  the default `validation.strict: false`, a document that now fails (a bad list
+  element, say) is purged from the index at that point and stays out of search until
+  it is fixed**; with `validation.strict: true` the index keeps its last good version
+  and lists it as rejected. Run `mcp-md-wiki validate` after upgrading to find such
+  documents ahead of time.
 
 ### Fixed
 

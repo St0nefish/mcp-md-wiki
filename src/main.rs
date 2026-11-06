@@ -394,6 +394,8 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                 };
+            // Lint findings (#347) are warnings: logged, never a failed check.
+            schema::log_lint_findings(&schemas.lint_findings());
 
             let results =
                 validate::validate_all(&files, data_path, &schemas, &cfg.validation).await;

@@ -8,14 +8,17 @@ use gray_matter::{Matter, Pod};
 use serde_json::Value;
 
 use crate::config::ValidationConfig;
-use crate::schema::{self, ResolvedSchema, SchemaCache};
+use crate::schema::{self, FieldDef, ResolvedSchema, SchemaCache};
 
 /// A structured, machine-readable description of a single validation failure.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FieldError {
-    /// The frontmatter field name (or `"<lint>"` for external lint failures).
+    /// The frontmatter field name (or `"<lint>"` for external lint failures, `"<more>"`
+    /// for the `too_many_errors` entry).
     pub field: String,
-    /// Rule that was violated: `"required"` | `"allowed_value"` | `"lint"`.
+    /// Rule that was violated: `"required"` | `"allowed_value"` | `"type_mismatch"` |
+    /// `"closed_object"` | `"lint"` | `"too_many_errors"` (the list was capped at
+    /// [`MAX_FIELD_ERRORS`]; `message` counts the rest).
     pub rule: String,
     /// Human-readable message (identical text to what was previously in `errors`).
     pub message: String,
@@ -90,8 +93,12 @@ pub async fn validate_file(
 /// originate in directory names from a synced git repo and are reflected straight into
 /// an error a caller reads, so they get the same control-character/length treatment as
 /// any other knowledge-base-controlled string reaching an agent.
-fn origin_suffix(schema: &ResolvedSchema, field: &str) -> (Option<String>, String) {
-    match schema.origin().get(field) {
+///
+/// `def` is the field tree node whose rule failed; its `declared_in` is the same label
+/// the flat view's origin map holds for a flat-view path, and it also attributes an
+/// element rule (`npcs[2].name`), which has no flat-view entry.
+fn origin_suffix(def: &FieldDef) -> (Option<String>, String) {
+    match &def.declared_in {
         Some(origin) => {
             let clean = crate::server::sanitize_facet_value(origin);
             let suffix = format!(" [declared in {clean}]");
@@ -155,6 +162,14 @@ fn is_derived_field(field: &str) -> bool {
 
 /// Fill in schema-declared defaults for fields the document omitted. A default
 /// declared for a derived field is ignored.
+///
+/// Walks the flat view, so it reaches nested object fields (`planning.effort`) but
+/// never a list's element schema: a default declared under `items` is not applied
+/// inside list elements (#347) — which elements a list "should" have is not something
+/// a default can say. A nested default creates its missing parent object, so the
+/// parent is then present and its other children's `required` rules apply to the
+/// document (see [`validate_frontmatter`]); a default is a statement that the parent
+/// exists.
 pub(crate) fn apply_defaults(frontmatter: &mut HashMap<String, Value>, schema: &ResolvedSchema) {
     for (path, def) in &schema.fields {
         let Some(default) = &def.default else {
@@ -173,116 +188,189 @@ pub(crate) fn apply_defaults(frontmatter: &mut HashMap<String, Value>, schema: &
 ///
 /// Separate from [`validate_content`] so a schema change can be dry-run against the
 /// frontmatter already stored in the metadata index, without re-reading any documents.
+///
+/// Walks the schema's field tree recursively (#347), depth first in name order:
+///
+/// - `required` is checked only where the field's parent is present. A top-level
+///   field's parent is the document, so a required top-level field is always checked;
+///   a required `planning.effort` is checked only when `planning` is present (not
+///   absent or `null`). A present parent that is not an object (a string, say) still
+///   has its required children reported, as before.
+/// - `open: false` is enforced on every object the walk reaches — nested objects and
+///   objects inside list elements included, not only top-level containers. A key is
+///   declared when the tree has a node for it (including an implicit one some deeper
+///   declared path passes through).
+/// - A list's elements are checked against its `items` schema (type, `values`, and for
+///   object elements their own `required`/`open`/children, recursively), with errors
+///   reported at indexed paths: `npcs[2].name`.
 pub fn validate_frontmatter(
     frontmatter: &HashMap<String, Value>,
     schema: &ResolvedSchema,
 ) -> Vec<FieldError> {
     let mut field_errors: Vec<FieldError> = Vec::new();
+    for (name, def) in schema.fields.tree() {
+        check_field(name, def, frontmatter.get(name), &mut field_errors);
+    }
+    cap_field_errors(&mut field_errors);
+    field_errors
+}
 
-    // One pass over the resolved schema, dispatching per field definition. Field paths
-    // may be nested (`planning.prep_minutes`), so lookups go through dot-path access.
-    for (field, def) in &schema.fields {
-        let value = schema::get_by_dotpath(frontmatter, field);
+/// Most schema errors [`validate_frontmatter`] reports for one document. A long list
+/// of bad elements would otherwise make an MCP error payload as large as the
+/// document is long (#347).
+pub const MAX_FIELD_ERRORS: usize = 100;
 
-        // An empty string satisfies "present" for lookup purposes but not for the
-        // required check — matching the pre-cascade behavior exactly.
-        let empty_string = value.and_then(Value::as_str) == Some("");
-        let absent = matches!(value, None | Some(Value::Null));
+/// Keep the first [`MAX_FIELD_ERRORS`] errors and, when there were more, append one
+/// `rule: "too_many_errors"` entry (field `<more>`) saying how many were left out
+/// and the total. A list within the cap is untouched.
+fn cap_field_errors(errors: &mut Vec<FieldError>) {
+    let total = errors.len();
+    if total <= MAX_FIELD_ERRORS {
+        return;
+    }
+    errors.truncate(MAX_FIELD_ERRORS);
+    errors.push(FieldError {
+        field: "<more>".into(),
+        rule: "too_many_errors".into(),
+        message: format!(
+            "{} more frontmatter errors not shown ({total} in total)",
+            total - MAX_FIELD_ERRORS
+        ),
+        got: None,
+        expected: None,
+        schema_origin: None,
+    });
+}
 
-        if absent || empty_string {
-            if def.required && !is_derived_field(field) {
-                let (schema_origin, suffix) = origin_suffix(schema, field);
-                field_errors.push(FieldError {
-                    field: field.clone(),
-                    rule: "required".into(),
-                    message: format!("Missing required frontmatter field: '{}'{}", field, suffix),
-                    got: None,
-                    expected: None,
-                    schema_origin,
-                });
-            }
-            if absent {
-                // A genuinely absent field has nothing to type- or value-check.
-                continue;
-            }
-            // An empty string that IS present still gets checked below: the old
-            // validator ran it against the allowed set and reported a value error,
-            // and skipping that here would silently accept documents it rejected.
-        }
+/// Check one field (a node of the schema tree at rendered path `path`) whose parent is
+/// present. `value` is `None` when the parent has no such key.
+fn check_field(path: &str, def: &FieldDef, value: Option<&Value>, errors: &mut Vec<FieldError>) {
+    // An empty string satisfies "present" for lookup purposes but not for the
+    // required check — matching the pre-cascade behavior exactly.
+    let empty_string = value.and_then(Value::as_str) == Some("");
+    let absent = matches!(value, None | Some(Value::Null));
 
-        let Some(value) = value else {
-            continue;
-        };
+    if (absent || empty_string) && def.required && !is_derived_field(path) {
+        let (schema_origin, suffix) = origin_suffix(def);
+        errors.push(FieldError {
+            field: path.to_string(),
+            rule: "required".into(),
+            message: format!("Missing required frontmatter field: '{}'{}", path, suffix),
+            got: None,
+            expected: None,
+            schema_origin,
+        });
+    }
+    // A genuinely absent field has nothing to type- or value-check, and its children
+    // are not required of a document that has no parent for them. An empty string
+    // that IS present still gets checked: the old validator ran it against the allowed
+    // set and reported a value error, and skipping that would silently accept
+    // documents it rejected.
+    let Some(value) = value.filter(|_| !absent) else {
+        return;
+    };
+    check_value(path, def, value, errors);
+}
 
-        if let Some(ty) = def.ty {
-            if let Err(reason) = schema::check_type(ty, value) {
-                let (schema_origin, suffix) = origin_suffix(schema, field);
-                field_errors.push(FieldError {
-                    field: field.clone(),
-                    rule: "type_mismatch".into(),
-                    message: format!("field '{}': {}{}", field, reason, suffix),
-                    got: Some(compact_value(value)),
-                    expected: None,
-                    schema_origin,
-                });
-                // A wrong-typed value cannot be meaningfully checked against a value
-                // set or an object's key list.
-                continue;
-            }
-
-            if ty == schema::FieldType::Object
-                && !def.open
-                && let Some(map) = value.as_object()
-            {
-                // The rule lives on the parent object field (e.g. `planning`), not the
-                // undeclared child key (`planning.typo_key`) — look origin up by that.
-                let (schema_origin, suffix) = origin_suffix(schema, field);
-                for key in map.keys() {
-                    let child = format!("{}.{}", field, key);
-                    if !schema.fields.contains_key(&child) {
-                        field_errors.push(FieldError {
-                            field: child.clone(),
-                            rule: "closed_object".into(),
-                            message: format!(
-                                "field '{}' is not declared, and '{}' does not allow undeclared keys{}",
-                                child, field, suffix
-                            ),
-                            got: None,
-                            expected: None,
-                            schema_origin: schema_origin.clone(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // A field whose type was never declared keeps the pre-cascade value-checking
-        // semantics: only strings and string array elements are checked, everything
-        // else is exempt. Explicitly declared enum/list fields get the strict check.
-        let value_check = match def.ty {
-            None => schema::check_values_lenient(value, def.values.as_deref()),
-            Some(_) => def
-                .values
-                .as_ref()
-                .map_or(Ok(()), |permitted| schema::check_values(value, permitted)),
-        };
-
-        if let Some(permitted) = &def.values
-            && let Err(reason) = value_check
-        {
-            let (schema_origin, suffix) = origin_suffix(schema, field);
-            field_errors.push(FieldError {
-                field: field.clone(),
-                rule: "allowed_value".into(),
-                message: format!("field '{}': {}{}", field, reason, suffix),
+/// Check a present `value` against `def`: its type, its `open: false` key list, its
+/// `values`, its list elements against `items`, then its children.
+fn check_value(path: &str, def: &FieldDef, value: &Value, errors: &mut Vec<FieldError>) {
+    let type_ok = match def.ty.map(|ty| schema::check_type(ty, value)) {
+        Some(Err(reason)) => {
+            let (schema_origin, suffix) = origin_suffix(def);
+            errors.push(FieldError {
+                field: path.to_string(),
+                rule: "type_mismatch".into(),
+                message: format!("field '{}': {}{}", path, reason, suffix),
                 got: Some(compact_value(value)),
-                expected: Some(permitted.clone()),
+                expected: None,
                 schema_origin,
             });
+            false
+        }
+        _ => true,
+    };
+
+    // A wrong-typed value cannot be meaningfully checked against a value set, an
+    // object's key list or an element schema.
+    if type_ok {
+        check_closed_keys(path, def, value, errors);
+        check_permitted_values(path, def, value, errors);
+        if let (Some(items), Some(elements)) = (def.items.as_deref(), value.as_array()) {
+            for (i, element) in elements.iter().enumerate() {
+                check_value(&format!("{path}[{i}]"), items, element, errors);
+            }
         }
     }
 
-    field_errors
+    // Children are their own rules (each with its own origin), checked whether or not
+    // the parent's type matched — a parent that is present but not an object still
+    // gets its required children reported.
+    let object = value.as_object();
+    for (name, child) in &def.fields {
+        check_field(
+            &format!("{path}.{name}"),
+            child,
+            object.and_then(|map| map.get(name)),
+            errors,
+        );
+    }
+}
+
+/// `open: false` on an object (declared `type: object`, or untyped): every key the
+/// value carries must have a node in the schema tree.
+fn check_closed_keys(path: &str, def: &FieldDef, value: &Value, errors: &mut Vec<FieldError>) {
+    if def.open || !matches!(def.ty, None | Some(schema::FieldType::Object)) {
+        return;
+    }
+    let Some(map) = value.as_object() else {
+        return;
+    };
+    // The rule lives on the parent object field (e.g. `planning`), not the undeclared
+    // child key (`planning.typo_key`) — attribute it to that.
+    let (schema_origin, suffix) = origin_suffix(def);
+    for key in map.keys() {
+        if def.fields.contains_key(key) {
+            continue;
+        }
+        let child = format!("{}.{}", path, key);
+        errors.push(FieldError {
+            field: child.clone(),
+            rule: "closed_object".into(),
+            message: format!(
+                "field '{}' is not declared, and '{}' does not allow undeclared keys{}",
+                child, path, suffix
+            ),
+            got: None,
+            expected: None,
+            schema_origin: schema_origin.clone(),
+        });
+    }
+}
+
+/// The `values` check. A field whose type was never declared keeps the pre-cascade
+/// value-checking semantics: only strings and string array elements are checked,
+/// everything else is exempt. Explicitly declared enum/list fields get the strict
+/// check.
+fn check_permitted_values(path: &str, def: &FieldDef, value: &Value, errors: &mut Vec<FieldError>) {
+    let Some(permitted) = &def.values else {
+        return;
+    };
+    let value_check = match def.ty {
+        None => schema::check_values_lenient(value, Some(permitted)),
+        Some(_) => schema::check_values(value, permitted),
+    };
+    if let Err(reason) = value_check {
+        let (schema_origin, suffix) = origin_suffix(def);
+        errors.push(FieldError {
+            field: path.to_string(),
+            rule: "allowed_value".into(),
+            message: format!("field '{}': {}{}", path, reason, suffix),
+            got: Some(compact_value(value)),
+            expected: Some(permitted.clone()),
+            schema_origin,
+        });
+    }
 }
 
 pub async fn validate_content(
@@ -907,6 +995,267 @@ mod tests {
         .unwrap();
 
         assert!(result.valid, "containers are open by default");
+    }
+
+    // -- recursive validation (#347) ----------------------------------------
+
+    /// A schema resolved from one root file's YAML.
+    fn resolve(yaml: &str) -> ResolvedSchema {
+        let schema: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+        ResolvedSchema::default().merged_with_for_test(&schema, "s")
+    }
+
+    /// `validate_frontmatter` over a document's YAML frontmatter (no defaults applied).
+    fn errors_for(schema: &ResolvedSchema, frontmatter_yaml: &str) -> Vec<FieldError> {
+        let (fm, _) = parse_frontmatter_raw(&format!("---\n{frontmatter_yaml}---\nBody"));
+        validate_frontmatter(&fm, schema)
+    }
+
+    fn summary(errors: &[FieldError]) -> Vec<(String, String)> {
+        errors
+            .iter()
+            .map(|e| (e.field.clone(), e.rule.clone()))
+            .collect()
+    }
+
+    const NESTED_REQUIRED: &str = "fields:
+  title:
+    required: true
+  planning:
+    type: object
+    fields:
+      effort:
+        type: text
+        required: true
+      prep:
+        type: integer
+";
+
+    #[test]
+    fn a_nested_required_field_is_not_required_when_its_parent_is_absent() {
+        let schema = resolve(NESTED_REQUIRED);
+        assert!(errors_for(&schema, "title: X\n").is_empty());
+        assert!(
+            errors_for(&schema, "title: X\nplanning: null\n").is_empty(),
+            "a null parent is absent"
+        );
+        // A top-level required field is always checked: its parent is the document.
+        assert_eq!(
+            summary(&errors_for(&schema, "planning:\n  effort: low\n")),
+            vec![("title".to_string(), "required".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_nested_required_field_is_required_when_its_parent_is_present() {
+        let schema = resolve(NESTED_REQUIRED);
+        let errors = errors_for(&schema, "title: X\nplanning:\n  prep: 5\n");
+        assert_eq!(
+            summary(&errors),
+            vec![("planning.effort".to_string(), "required".to_string())]
+        );
+        assert_eq!(
+            errors[0].message,
+            "Missing required frontmatter field: 'planning.effort' [declared in s]"
+        );
+        // A parent that is present but not an object still has its required children
+        // reported, alongside its own type error.
+        assert_eq!(
+            summary(&errors_for(&schema, "title: X\nplanning: soon\n")),
+            vec![
+                ("planning".to_string(), "type_mismatch".to_string()),
+                ("planning.effort".to_string(), "required".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_nested_default_makes_its_parent_present_so_siblings_are_required() {
+        // The documented interplay: a default creates the parent object, after which
+        // its required children apply.
+        let schema = resolve(
+            "fields:\n  planning:\n    fields:\n      method:\n        default: bake\n      \
+             effort:\n        required: true\n",
+        );
+        let (fm, _) = parse_frontmatter("---\ntitle: X\n---\nBody", &schema);
+        assert_eq!(
+            summary(&validate_frontmatter(&fm, &schema)),
+            vec![("planning.effort".to_string(), "required".to_string())]
+        );
+    }
+
+    #[test]
+    fn open_false_is_enforced_at_every_depth() {
+        let schema = resolve(
+            "fields:
+  a:
+    fields:
+      b:
+        open: false
+        fields:
+          c:
+            open: false
+            fields:
+              d:
+                type: text
+",
+        );
+        assert!(errors_for(&schema, "a:\n  b:\n    c:\n      d: x\n").is_empty());
+        let errors = errors_for(
+            &schema,
+            "a:\n  extra: ok\n  b:\n    typo: 1\n    c:\n      d: x\n      deeper: 2\n",
+        );
+        assert_eq!(
+            summary(&errors),
+            vec![
+                ("a.b.typo".to_string(), "closed_object".to_string()),
+                ("a.b.c.deeper".to_string(), "closed_object".to_string()),
+            ],
+            "`a` is open; `a.b` and `a.b.c` are closed"
+        );
+        assert_eq!(
+            errors[1].message,
+            "field 'a.b.c.deeper' is not declared, and 'a.b.c' does not allow undeclared \
+             keys [declared in s]"
+        );
+    }
+
+    #[test]
+    fn a_closed_object_accepts_a_key_only_a_deeper_declaration_passes_through() {
+        // `b` is never declared itself, but `b.c` is, so `b` is a known key of `a`.
+        let schema =
+            resolve("fields:\n  a:\n    type: object\n    open: false\n  a.b.c:\n    type: text\n");
+        assert!(errors_for(&schema, "a:\n  b:\n    c: x\n").is_empty());
+    }
+
+    const NPCS: &str = "fields:
+  npcs:
+    type: list
+    items:
+      type: object
+      open: false
+      fields:
+        name:
+          type: text
+          required: true
+        role:
+          type: enum
+          values: [ally, foe]
+        level:
+          type: integer
+  tags:
+    type: list
+    items:
+      type: enum
+      values: [a, b]
+";
+
+    #[test]
+    fn list_elements_are_checked_against_items_with_indexed_paths() {
+        let schema = resolve(NPCS);
+        assert!(
+            errors_for(
+                &schema,
+                "npcs:\n  - name: Bob\n    role: ally\n    level: 3\n  - name: Eve\ntags: [a, b]\n"
+            )
+            .is_empty()
+        );
+
+        let errors = errors_for(
+            &schema,
+            "npcs:
+  - name: Bob
+  - name: Ann
+    role: neutral
+  - role: foe
+    hat: red
+  - name: Cy
+    level: high
+  - just a string
+tags: [a, z]
+",
+        );
+        assert_eq!(
+            summary(&errors),
+            vec![
+                ("npcs[1].role".to_string(), "allowed_value".to_string()),
+                ("npcs[2].hat".to_string(), "closed_object".to_string()),
+                ("npcs[2].name".to_string(), "required".to_string()),
+                ("npcs[3].level".to_string(), "type_mismatch".to_string()),
+                ("npcs[4]".to_string(), "type_mismatch".to_string()),
+                ("npcs[4].name".to_string(), "required".to_string()),
+                ("tags[1]".to_string(), "allowed_value".to_string()),
+            ]
+        );
+        let by_field = |f: &str| errors.iter().find(|e| e.field == f).unwrap();
+        assert_eq!(
+            by_field("npcs[2].name").message,
+            "Missing required frontmatter field: 'npcs[2].name' [declared in s]"
+        );
+        assert_eq!(
+            by_field("npcs[2].hat").message,
+            "field 'npcs[2].hat' is not declared, and 'npcs[2]' does not allow undeclared \
+             keys [declared in s]"
+        );
+        assert_eq!(by_field("npcs[3].level").got.as_deref(), Some("high"));
+        let tag = by_field("tags[1]");
+        assert_eq!(tag.got.as_deref(), Some("z"));
+        assert_eq!(tag.expected, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(tag.schema_origin.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn list_elements_recurse_into_nested_lists() {
+        let schema = resolve("fields:\n  grid:\n    items:\n      items:\n        type: integer\n");
+        assert!(errors_for(&schema, "grid: [[1, 2], [3]]\n").is_empty());
+        assert_eq!(
+            summary(&errors_for(&schema, "grid: [[1, 2], [3, x]]\n")),
+            vec![("grid[1][1]".to_string(), "type_mismatch".to_string())]
+        );
+    }
+
+    #[test]
+    fn schema_errors_are_capped_with_a_count_of_the_rest() {
+        let schema = resolve(NPCS);
+        let bad: String = (0..150).map(|_| "  - role: foe\n").collect();
+        let errors = errors_for(&schema, &format!("npcs:\n{bad}"));
+        assert_eq!(errors.len(), MAX_FIELD_ERRORS + 1);
+        assert_eq!(errors[99].field, "npcs[99].name");
+        let last = errors.last().unwrap();
+        assert_eq!(last.rule, "too_many_errors");
+        assert_eq!(
+            last.message,
+            "50 more frontmatter errors not shown (150 in total)"
+        );
+
+        // At the cap exactly, nothing is added.
+        let bad: String = (0..100).map(|_| "  - role: foe\n").collect();
+        let errors = errors_for(&schema, &format!("npcs:\n{bad}"));
+        assert_eq!(errors.len(), MAX_FIELD_ERRORS);
+        assert!(errors.iter().all(|e| e.rule == "required"));
+    }
+
+    #[test]
+    fn a_null_list_element_is_a_type_mismatch_against_items() {
+        let schema = resolve(NPCS);
+        assert_eq!(
+            summary(&errors_for(&schema, "npcs:\n  - name: Bob\n  - null\n")),
+            vec![
+                ("npcs[1]".to_string(), "type_mismatch".to_string()),
+                ("npcs[1].name".to_string(), "required".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_integral_float_satisfies_integer_and_a_fractional_one_does_not() {
+        let schema = resolve("fields:\n  servings:\n    type: integer\n");
+        assert!(errors_for(&schema, "servings: 3.0\n").is_empty());
+        let errors = errors_for(&schema, "servings: 3.5\n");
+        assert_eq!(
+            errors[0].message,
+            "field 'servings': expected an integer, got a decimal number [declared in s]"
+        );
     }
 
     #[tokio::test]

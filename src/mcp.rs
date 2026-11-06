@@ -697,6 +697,20 @@ fn capped_casualties(casualties: &[serde_json::Value]) -> (Vec<serde_json::Value
     (capped, total, total > MAX_REPORTED_CASUALTIES)
 }
 
+/// `update_schema`'s `warnings`: `schema::lint_raw` over the schema file as it will be
+/// written (#347), capped at [`MAX_REPORTED_CASUALTIES`] with a closing line counting
+/// the rest, so a file full of findings cannot balloon the result. Empty when the file
+/// is clean (the key is then omitted).
+fn schema_lint_warnings(file: &crate::schema::SchemaFile, is_root: bool) -> Vec<String> {
+    let mut warnings = crate::schema::lint_raw(file, is_root);
+    if warnings.len() > MAX_REPORTED_CASUALTIES {
+        let rest = warnings.len() - MAX_REPORTED_CASUALTIES;
+        warnings.truncate(MAX_REPORTED_CASUALTIES);
+        warnings.push(format!("…and {rest} more"));
+    }
+    warnings
+}
+
 /// Cap `diff` (a `WriteSuccess`/`DirectoryMoveSuccess` unified diff) for
 /// `structured_content` — see [`MAX_STRUCTURED_DIFF_BYTES`]'s doc comment.
 /// Returns `(capped_diff, diff_truncated, diff_total_bytes)`, the same
@@ -4572,7 +4586,7 @@ impl KbSearchServer {
         // is now — two concurrent edits both land, neither overwriting the other.
         let (git_lock, mut head) = write::lock_and_sync(&deps).await;
         let mut attempt = 0;
-        let (summary, casualties) = loop {
+        let (summary, casualties, warnings) = loop {
             attempt += 1;
 
             // Read from disk, not the shared cache: the edit must apply to the file as
@@ -4605,6 +4619,9 @@ impl KbSearchServer {
             // next schema rebuild (and stop the server from starting) — after this call
             // has already reported success. Catch it here, where the caller can act.
             file.validate_self().map_err(invalid)?;
+            // Lint warnings (#347) for the file as it will be written: reported, never
+            // a refusal.
+            let warnings = schema_lint_warnings(&file, is_root);
 
             let yaml = file.to_yaml().map_err(invalid)?;
 
@@ -4678,6 +4695,9 @@ impl KbSearchServer {
                     casualties_total,
                     casualties_truncated,
                 );
+                if !warnings.is_empty() {
+                    response["warnings"] = serde_json::json!(warnings);
+                }
                 return Ok(CallToolResult::structured(response));
             }
 
@@ -4706,7 +4726,7 @@ impl KbSearchServer {
                 )
                 .await?
             {
-                RawWrite::Committed => break (summary, casualties),
+                RawWrite::Committed => break (summary, casualties, warnings),
                 // Every conflict syncs, the last one included: the reset that dropped
                 // this commit went back to `head`, so this sync is what brings the
                 // clone onto whatever reached the remote since and marks those paths
@@ -4797,6 +4817,9 @@ impl KbSearchServer {
                  the previous rules stay enforced until it is fixed. {}",
                 refusal.model_facing()
             ));
+        }
+        if !warnings.is_empty() {
+            response["warnings"] = serde_json::json!(warnings);
         }
         Ok(CallToolResult::structured(response))
     }
@@ -9120,6 +9143,134 @@ mod tests {
         assert_eq!(
             reparsed.fields["status"].values,
             Some(vec!["active".to_string(), "draft".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_reports_lint_warnings_without_refusing() {
+        // A default that fails its own type and a reserved payload name are lint
+        // warnings (#347): reported in `warnings`, dry run and real write alike, and
+        // the write still lands.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+        let set = |field: &str, def: serde_json::Value, dry_run: bool| UpdateSchemaParams {
+            path: Some("notes".into()),
+            definition: Some(definition(def)),
+            dry_run: Some(dry_run),
+            ..update_params("set_field", field)
+        };
+
+        let dry = server
+            .update_schema(Parameters(set(
+                "servings",
+                serde_json::json!({ "type": "integer", "default": "four" }),
+                true,
+            )))
+            .await
+            .unwrap();
+        let dry = single_representation(&dry);
+        assert_eq!(
+            dry["warnings"],
+            serde_json::json!([
+                "field 'servings': the default fails the field's own type (expected an \
+                 integer, got a string)"
+            ])
+        );
+
+        let real = server
+            .update_schema(Parameters(set(
+                "servings",
+                serde_json::json!({ "type": "integer", "default": "four" }),
+                false,
+            )))
+            .await
+            .expect("a lint warning never refuses a write");
+        let real = single_representation(&real);
+        assert_eq!(real["warnings"], dry["warnings"]);
+        assert!(
+            work.path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists()
+        );
+
+        // Warnings cover the whole file as written, not just the edited field.
+        let next = server
+            .update_schema(Parameters(set(
+                "text",
+                serde_json::json!({ "type": "text" }),
+                false,
+            )))
+            .await
+            .expect("a reserved name is a warning, not a refusal");
+        let next = single_representation(&next);
+        let warnings = next["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .as_str()
+                .unwrap()
+                .starts_with("field 'servings'")
+        );
+        assert!(warnings[1].as_str().unwrap().contains("reserved"));
+    }
+
+    #[tokio::test]
+    async fn update_schema_omits_warnings_for_a_clean_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                definition: Some(definition(
+                    serde_json::json!({ "type": "integer", "default": 4 }),
+                )),
+                dry_run: Some(true),
+                ..update_params("set_field", "servings")
+            }))
+            .await
+            .unwrap();
+        assert!(single_representation(&result).get("warnings").is_none());
+    }
+
+    #[tokio::test]
+    async fn update_schema_casualty_check_validates_list_elements() {
+        // The dry run's casualty pass shares the recursive validator (#347), so an
+        // element rule names the element that would break.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "notes/a.md",
+            serde_json::json!({ "title": "A", "npcs": [{ "name": "Bob" }, { "role": "foe" }] }),
+        )
+        .await;
+        seed_document(
+            &server,
+            "notes/b.md",
+            serde_json::json!({ "title": "B", "npcs": [{ "name": "Eve" }] }),
+        )
+        .await;
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                definition: Some(definition(serde_json::json!({
+                    "type": "list",
+                    "items": { "fields": { "name": { "type": "text", "required": true } } },
+                }))),
+                dry_run: Some(true),
+                ..update_params("set_field", "npcs")
+            }))
+            .await
+            .unwrap();
+        let structured = single_representation(&result);
+        let casualties = structured["would_invalidate"].as_array().unwrap();
+        assert_eq!(casualties.len(), 1, "{casualties:?}");
+        assert!(
+            casualties[0].to_string().contains("npcs[1].name"),
+            "{casualties:?}"
         );
     }
 
