@@ -4066,6 +4066,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fingerprint_matches_the_pinned_golden() {
+        // Pins the exact fingerprint bytes of a fixture covering every input the hash
+        // reads. It guards the schema model refactor (#346) against fingerprint drift:
+        // a changed fingerprint makes every governed document re-validate (and the
+        // corpus re-embed), so a deliberate change must update this golden consciously.
+        //
+        // Coverage: a flat scalar; a container with children (hashed as its own entry
+        // with type `Some(Object)`) and `open: false`; `values: []` vs absent values;
+        // a `default`; a typeless values-only field; a `$values` splice inherited from
+        // a parent scope; and the siblings `a`, `a-b`, `a.b`, which sort differently
+        // under a depth-first walk than in flat dot-path order ('-' < '.').
+        let parent: SchemaFile = serde_yaml_ng::from_str(
+            "fields:\n  \
+               title:\n    type: text\n    required: true\n    indexed: true\n  \
+               tags:\n    values: [b, a]\n  \
+               a:\n    type: object\n    fields:\n      b:\n        type: text\n  \
+               a-b:\n    type: text\n",
+        )
+        .unwrap();
+        let child: SchemaFile = serde_yaml_ng::from_str(
+            "fields:\n  \
+               tags:\n    values: [$values, c]\n  \
+               planning:\n    type: object\n    open: false\n    fields:\n      \
+                 method:\n        type: enum\n        values: [braise, oven]\n      \
+                 minutes:\n        type: integer\n        default: 45\n  \
+               closed:\n    type: text\n    values: []\n  \
+               open_text:\n    type: text\n  \
+               status:\n    values: [draft, done]\n    default: draft\n",
+        )
+        .unwrap();
+
+        let resolved = ResolvedSchema::default()
+            .merged_with(&parent, "parent")
+            .merged_with(&child, "child");
+        assert_eq!(
+            resolved.fields["tags"].values,
+            Some(vec!["b".into(), "a".into(), "c".into()]),
+            "the sentinel must have spliced the inherited values"
+        );
+
+        assert_eq!(
+            resolved.fingerprint(),
+            "40db66e6f16490c85dd9efaca0aa87bf821f7ad19a0d60bde3671c6c367e8f4e"
+        );
+    }
+
     // -- dot-path access ----------------------------------------------------
 
     #[test]
