@@ -68,9 +68,10 @@ nothing; add a root schema file to keep deriving.
 - **Reindex:** `derived` is part of the schema fingerprint (only when non-empty, so
   every existing schema hashes exactly as before and the upgrade alone reindexes
   nothing). Adding the `derived:` block above therefore changes every document's
-  fingerprint, and the next reconcile reprocesses — today fully re-chunks and
-  re-embeds — the whole corpus, as does any later change to the block. Adding,
-  changing or removing `root_edit:` reindexes nothing.
+  fingerprint, and the next reconcile reprocesses the whole corpus, as does any
+  later change to the block — since #351 (below) by refreshing each document's
+  metadata and Qdrant payload in place, not by re-chunking or re-embedding it.
+  Adding, changing or removing `root_edit:` reindexes nothing.
 - The server instructions still say nothing about derived fields; the write-time
   refusal is what tells a model.
 
@@ -132,6 +133,36 @@ schema rebuild and fails to start.
 - **Reindex:** none on upgrade. The new keys change the schema fingerprint only
   through what they remove or exclude, and only for the directories that use them,
   so a knowledge base that does not use them hashes exactly as before.
+
+### Schema edits no longer re-embed (#351)
+
+- A schema edit used to re-chunk and re-embed every document it governs, although
+  chunk text does not depend on the schema. Now a document whose bytes and chunking
+  settings are unchanged is **revalidated** (an invalid one is still dropped from the
+  index in non-strict mode, and a strict-mode rejection still keeps its last good
+  version), its metadata index row and links are rewritten, and — only when the
+  edit changed what goes into its Qdrant payload, i.e. a field `default` or the root
+  `derived:` block — its payload is updated **in place** (merging the new
+  frontmatter keys and deleting the ones the edit removed; chunk text, line ranges
+  and heading keys are untouched). No embedding call, no point upsert.
+- **Exception:** with `chunking.prepend_description` on (the default), a document's
+  `description` is prepended to every chunk's embedded text, and a schema `default`
+  for `description` can change it. A document whose prepended description a schema
+  edit changes (the default added, changed or removed while the document has no
+  `description` of its own) is still re-chunked and re-embedded; one with its own
+  `description` is not. A document with no stored metadata row is re-embedded too.
+- New `indexed_files.payload_hash` column (added automatically) tracks the
+  payload-shaping part of the schema next to `schema_hash`, which keeps its meaning.
+  `/status`, `/metrics` and the run summary gain a `refreshed` count.
+- A schema edit no longer lights the "results may be incomplete" note on `section`
+  and `heading_prefix` results: the chunks those come from are unchanged.
+- **Reindex:** none. The upgrade is a **no-op reindex** — existing rows get an
+  empty `payload_hash`, read as "current" while `schema_hash` matches, so nothing is
+  re-embedded and nothing is written to Qdrant. The first schema edit after the
+  upgrade refreshes the payload of the documents it governs once (their payload hash
+  was unknown), still without re-embedding.
+- A frontmatter key named like a heading/section payload key (`section_key`, …)
+  still reaches the payload while `chunking.heading_metadata` is off, as before.
 
 ### Security
 

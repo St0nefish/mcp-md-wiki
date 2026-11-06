@@ -2659,7 +2659,10 @@ impl ResolvedSchema {
     /// Hashes the flat view in dot-path order. A field's `items` element schema is
     /// hashed only when present, so a schema that uses none hashes exactly as it did
     /// before `items` existed (#346) — changing the bytes of a field without `items`
-    /// would re-validate (and re-embed) the whole corpus.
+    /// would re-validate (and reproject) the whole corpus. Since #351 a moved
+    /// fingerprint alone never re-embeds a document (see [`Self::payload_fingerprint`]
+    /// for what reaches Qdrant; a `description` default that changes a document's
+    /// prepended description is the exception ingest checks per document).
     ///
     /// `removed` and `exclude_values` (#348) are not hashed as attributes: they act
     /// on the resolved model (a removed field is absent from it, an excluded value
@@ -2696,6 +2699,48 @@ impl ResolvedSchema {
                 hasher.update((rule.index as u64).to_le_bytes());
                 hasher.update([0xffu8]);
             }
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    /// A stable fingerprint of exactly the schema inputs that shape the frontmatter
+    /// ingest writes into every chunk's Qdrant payload (#351): the defaults
+    /// `validate::apply_defaults` fills in (flat-view path and value; a default on a
+    /// derived field is never applied, so it is left out) and the `derived:` rules
+    /// `ingest::with_derived_fields` applies.
+    ///
+    /// Stored per file as `indexed_files.payload_hash`, next to [`Self::fingerprint`]
+    /// (`schema_hash`), which stays the validation and metadata-projection hash. A
+    /// schema edit that moves `fingerprint` but not this — tightening `required`,
+    /// narrowing `values`, marking a field `indexed` — revalidates and reprojects the
+    /// document without touching Qdrant; one that moves this too also refreshes the
+    /// payload in place. Neither re-embeds. Every input here is also an input of
+    /// `fingerprint`, so a change here always moves both.
+    pub fn payload_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for (path, def) in &self.fields {
+            let Some(default) = &def.default else {
+                continue;
+            };
+            if self.is_derived(path) {
+                continue;
+            }
+            hasher.update(path.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(default.to_string().as_bytes());
+            hasher.update([0xffu8]);
+        }
+        hasher.update([0xfcu8]);
+        for (name, rule) in &self.derived {
+            hasher.update(name.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(match rule.from {
+                DerivedFrom::PathSegment => b"path_segment".as_slice(),
+            });
+            hasher.update([0u8]);
+            hasher.update((rule.index as u64).to_le_bytes());
+            hasher.update([0xffu8]);
         }
         hex::encode(hasher.finalize())
     }
@@ -6221,6 +6266,85 @@ mod tests {
             unconstrained_resolved.fingerprint(),
             closed_resolved.fingerprint(),
             "None and Some(vec![]) values must produce different fingerprints"
+        );
+    }
+
+    /// #351: the payload fingerprint moves with exactly what reaches the Qdrant payload
+    /// frontmatter — defaults and derived rules — and not with validation-only edits,
+    /// all of which still move `fingerprint`.
+    #[test]
+    fn payload_fingerprint_tracks_defaults_and_derived_only() {
+        let resolve = |yaml: &str| {
+            let file: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+            ResolvedSchema::default().merged_with(&file, &scope_label(Path::new("")))
+        };
+        let base = resolve("fields:\n  status:\n    values: [draft, done]\n    default: draft\n");
+
+        for (what, yaml) in [
+            (
+                "required",
+                "fields:\n  status:\n    values: [draft, done]\n    default: draft\n    required: true\n",
+            ),
+            (
+                "values",
+                "fields:\n  status:\n    values: [draft]\n    default: draft\n",
+            ),
+            (
+                "indexed",
+                "fields:\n  status:\n    values: [draft, done]\n    default: draft\n    indexed: true\n",
+            ),
+            (
+                "a field with no default",
+                "fields:\n  status:\n    values: [draft, done]\n    default: draft\n  owner:\n    type: text\n",
+            ),
+        ] {
+            let edited = resolve(yaml);
+            assert_ne!(edited.fingerprint(), base.fingerprint(), "{what}");
+            assert_eq!(
+                edited.payload_fingerprint(),
+                base.payload_fingerprint(),
+                "{what} must not move the payload fingerprint"
+            );
+        }
+
+        for (what, yaml) in [
+            (
+                "a changed default",
+                "fields:\n  status:\n    values: [draft, done]\n    default: done\n",
+            ),
+            (
+                "a removed default",
+                "fields:\n  status:\n    values: [draft, done]\n",
+            ),
+            (
+                "a nested default",
+                "fields:\n  status:\n    values: [draft, done]\n    default: draft\n  \
+                 planning:\n    fields:\n      effort:\n        default: low\n",
+            ),
+            (
+                "a derived rule",
+                "fields:\n  status:\n    values: [draft, done]\n    default: draft\n\
+                 derived:\n  domain: {from: path_segment, index: 0}\n",
+            ),
+        ] {
+            let edited = resolve(yaml);
+            assert_ne!(edited.fingerprint(), base.fingerprint(), "{what}");
+            assert_ne!(
+                edited.payload_fingerprint(),
+                base.payload_fingerprint(),
+                "{what} must move the payload fingerprint"
+            );
+        }
+
+        // A default on a derived field is never applied, so it is not payload input.
+        let derived = resolve("derived:\n  domain: {from: path_segment, index: 0}\n");
+        let derived_with_default = resolve(
+            "fields:\n  domain:\n    default: misc\n\
+             derived:\n  domain: {from: path_segment, index: 0}\n",
+        );
+        assert_eq!(
+            derived.payload_fingerprint(),
+            derived_with_default.payload_fingerprint()
         );
     }
 

@@ -912,6 +912,8 @@ struct PendingFile {
     display_mtime: i64,
     /// Fingerprint of the schema this file was validated against.
     schema_hash: String,
+    /// [`payload_hash_for`] of that schema (#351).
+    payload_hash: String,
     /// [`chunking_fingerprint`] of the config this file's chunks were produced under.
     chunking_fingerprint: String,
     /// The `derived:` rules (#345) of the schema this file was validated against —
@@ -928,6 +930,135 @@ struct EmptiedFile {
     mtime: i64,
     size: i64,
     schema_hash: String,
+    payload_hash: String,
+}
+
+/// A validated document before chunking. As [`FileOutcome::Refresh`] it is an indexed
+/// document whose bytes and chunking are unchanged but whose governing schema moved
+/// (#351), carrying what its metadata row, links and (when `payload_changed`) Qdrant
+/// payload need, without chunks or embeddings; [`chunk_validated`] turns one into the
+/// full path's outcome when a refresh cannot be used.
+struct RefreshFile {
+    file_path: String,
+    /// Frontmatter after schema defaults, before derived fields — like
+    /// [`PendingFile::frontmatter`].
+    frontmatter: HashMap<String, serde_json::Value>,
+    body: String,
+    hash: String,
+    /// Stat baseline, as [`PendingFile::mtime`]/[`PendingFile::size`].
+    mtime: i64,
+    size: i64,
+    /// As [`PendingFile::display_mtime`].
+    display_mtime: i64,
+    /// The row's chunk count, unchanged: the chunks in Qdrant stay as they are.
+    chunk_count: i64,
+    schema_hash: String,
+    payload_hash: String,
+    derived: std::collections::BTreeMap<String, crate::schema::DerivedField>,
+    /// Whether the payload-shaping part of the schema moved (or is unknown — a row
+    /// written before `payload_hash` existed), so Qdrant must be refreshed too.
+    payload_changed: bool,
+}
+
+/// The `indexed_files.payload_hash` value for a document governed by `schema` (#351):
+/// [`ResolvedSchema::payload_fingerprint`].
+pub(crate) fn payload_hash_for(schema: &ResolvedSchema) -> String {
+    schema.payload_fingerprint()
+}
+
+/// Whether a stored row's schema hashes say the document is current under the
+/// schema whose hashes are `schema_hash`/`payload_hash` (#351). An empty stored
+/// payload hash (a row from before that column existed) is unknown and counts as
+/// current; `schema_hash` alone then decides, as it always did.
+fn schema_hashes_current(
+    stored_schema_hash: &str,
+    stored_payload_hash: &str,
+    schema_hash: &str,
+    payload_hash: &str,
+) -> bool {
+    stored_schema_hash == schema_hash
+        && (stored_payload_hash.is_empty() || stored_payload_hash == payload_hash)
+}
+
+/// Whether a [`FileOutcome::Refresh`] candidate can really be refreshed, given its
+/// stored `documents.frontmatter` (`None`: no metadata row, or one that could not be
+/// read). Returns the stored top-level keys — what the old payload carries, which a
+/// refresh must know to delete the ones the schema dropped — or `None` for the full
+/// re-chunk/re-embed path:
+///
+/// - without a stored row there is no record of the old payload keys, so a key the
+///   schema removed could never be deleted from Qdrant;
+/// - a schema reaches chunk text only through a `description` default, which
+///   chunking prepends to every chunk under `chunking.prepend_description`. The
+///   stored `description` is exactly what was prepended (it is never a derived
+///   field), so the full path is taken exactly when the description about to be
+///   prepended differs from it — a default added, changed or removed under a document
+///   that relies on it — and a document with its own description is refreshed.
+fn refresh_plan(
+    rf: &RefreshFile,
+    stored: Option<&serde_json::Map<String, serde_json::Value>>,
+    chunking: &crate::config::ChunkingConfig,
+) -> Option<Vec<String>> {
+    let stored = stored?;
+    if chunking.prepend_description {
+        let prepended = rf.frontmatter.get("description").and_then(|v| v.as_str());
+        let was_prepended = stored.get("description").and_then(|v| v.as_str());
+        if prepended != was_prepended {
+            return None;
+        }
+    }
+    Some(stored.keys().cloned().collect())
+}
+
+/// Chunk a validated document: the full path's outcome (`Ready`, or `Empty`/`Invalid`
+/// when chunking yields nothing or panics). Shared by [`process_file`] and the
+/// fallback from a refresh that [`refresh_plan`] refused.
+fn chunk_validated(
+    rf: RefreshFile,
+    content: &str,
+    chunking_fp: &str,
+    chunking: &crate::config::ChunkingConfig,
+) -> FileOutcome {
+    let description = rf
+        .frontmatter
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let Some(chunks) = chunk_file(
+        &rf.file_path,
+        content,
+        &rf.body,
+        description.as_deref(),
+        chunking,
+    ) else {
+        return FileOutcome::Invalid;
+    };
+    if chunks.is_empty() {
+        warn!("No chunks produced for: {}", rf.file_path);
+        return FileOutcome::Empty {
+            hash: rf.hash,
+            mtime: rf.mtime,
+            size: rf.size,
+        };
+    }
+
+    debug!("  {} chunks from: {}", chunks.len(), rf.file_path);
+
+    FileOutcome::Ready(Box::new(PendingFile {
+        file_path: rf.file_path,
+        frontmatter: rf.frontmatter,
+        chunks,
+        body: rf.body,
+        hash: rf.hash,
+        old_chunk_count: rf.chunk_count.max(0) as usize,
+        mtime: rf.mtime,
+        size: rf.size,
+        display_mtime: rf.display_mtime,
+        schema_hash: rf.schema_hash,
+        payload_hash: rf.payload_hash,
+        chunking_fingerprint: chunking_fp.to_string(),
+        derived: rf.derived,
+    }))
 }
 
 /// Result of processing a single discovered file.
@@ -963,6 +1094,13 @@ enum FileOutcome {
     Empty { hash: String, mtime: i64, size: i64 },
     /// Boxed: a `PendingFile` is far larger than every other variant.
     Ready(Box<PendingFile>),
+    /// Valid, with unchanged bytes and chunking, under a schema whose hashes moved
+    /// (#351): `index_paths_generic` refreshes the metadata index, links and — only
+    /// when the payload-shaping part of the schema moved — the Qdrant payload in
+    /// place, without chunking or embedding. Validation ran exactly as for `Ready`, so
+    /// a document the new schema rejects is `Invalid`/`Rejected`/`ValidatorError`
+    /// instead, with the same consequences.
+    Refresh(Box<RefreshFile>),
     /// A `validation.strict` rejection: the content-level validation errors branch
     /// (`Ok((result, None))`) or the validation-engine error branch (`Err(e)`), when
     /// `config.validation.strict` is set, both land here instead of propagating an
@@ -1017,6 +1155,16 @@ enum FileOutcome {
 /// `force` bypasses the skip-if-unchanged check below — set only by `index_paths`'
 /// destructive `mcp-md-wiki index --full` path, where the state DB has just been
 /// cleared, so there is nothing meaningful to compare against anyway.
+///
+/// `schema_hash` is `schema.fingerprint()` and `payload_hash` is
+/// [`payload_hash_for`]`(schema)`, computed by the caller. When the bytes and chunking
+/// fingerprint match the stored row but those hashes do not (#351), the document is
+/// validated exactly as a changed one is and, if valid, returned as
+/// [`FileOutcome::Refresh`] rather than chunked: a schema edit does not change chunk
+/// text, so nothing is re-embedded. A row with no chunking fingerprint or no chunks
+/// takes the full path as before. The caller still checks a `Refresh` against the
+/// stored metadata row ([`refresh_plan`]: a missing row, or a prepended `description`
+/// the schema changed, falls back to [`chunk_validated`]).
 #[allow(clippy::too_many_arguments)]
 async fn process_file(
     path: &Path,
@@ -1027,6 +1175,7 @@ async fn process_file(
     config: &ResolvedConfig,
     schema: &ResolvedSchema,
     schema_hash: &str,
+    payload_hash: &str,
     chunking_fp: &str,
     git_mtimes: &HashMap<String, i64>,
 ) -> Result<FileOutcome> {
@@ -1060,57 +1209,39 @@ async fn process_file(
     // fingerprint is part of it for the same reason: a changed `chunking.*` setting (or
     // a `CHUNKER_VERSION` bump) changes no bytes either, and skipping here would leave
     // this file's old chunks in a now-mixed index.
+    //
+    // #351: when only the schema hashes moved, the chunks in Qdrant are still the
+    // right chunks (a schema reaches chunk text only through a `description` default,
+    // which `refresh_plan` checks) — so the document is revalidated and refreshed
+    // instead of re-chunked. `refresh` carries the payload-changed flag for that case;
+    // `None` means the full path.
+    let mut refresh: Option<bool> = None;
     if !force
         && let Some(ref entry) = state_entry
         && entry.content_hash == hash
-        && entry.schema_hash == schema_hash
         && entry.chunking_fingerprint == chunking_fp
     {
-        debug!("Unchanged, skipping: {}", file_path);
-        return Ok(FileOutcome::Skipped { hash, mtime, size });
+        if schema_hashes_current(
+            &entry.schema_hash,
+            &entry.payload_hash,
+            schema_hash,
+            payload_hash,
+        ) {
+            debug!("Unchanged, skipping: {}", file_path);
+            return Ok(FileOutcome::Skipped { hash, mtime, size });
+        }
+        // An empty chunking fingerprint (a row from before it existed) never equals
+        // a real one, so it cannot get here in production; a zero-chunk row is an
+        // empty document with no metadata or points to refresh. Both keep the full
+        // path.
+        if !entry.chunking_fingerprint.is_empty() && entry.chunk_count > 0 {
+            refresh = Some(entry.payload_hash.is_empty() || entry.payload_hash != payload_hash);
+        }
     }
 
-    if config.validation.enabled {
+    let (frontmatter, body) = if config.validation.enabled {
         match validate::validate_content(path, content, schema, &config.validation).await {
-            Ok((_result, Some(validated))) => {
-                let description = validated
-                    .frontmatter
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned);
-
-                let Some(chunks) = chunk_file(
-                    &file_path,
-                    content,
-                    &validated.body,
-                    description.as_deref(),
-                    &config.chunking,
-                ) else {
-                    return Ok(FileOutcome::Invalid);
-                };
-
-                if chunks.is_empty() {
-                    warn!("No chunks produced for: {}", file_path);
-                    return Ok(FileOutcome::Empty { hash, mtime, size });
-                }
-
-                debug!("  {} chunks from: {}", chunks.len(), file_path);
-
-                Ok(FileOutcome::Ready(Box::new(PendingFile {
-                    file_path,
-                    frontmatter: validated.frontmatter,
-                    chunks,
-                    body: validated.body,
-                    hash,
-                    old_chunk_count,
-                    mtime,
-                    size,
-                    display_mtime,
-                    schema_hash: schema_hash.to_string(),
-                    chunking_fingerprint: chunking_fp.to_string(),
-                    derived: schema.derived.clone(),
-                })))
-            }
+            Ok((_result, Some(validated))) => (validated.frontmatter, validated.body),
             Ok((result, None)) => {
                 for err in &result.errors {
                     warn!("Validation error [{}]: {}", file_path, err);
@@ -1140,7 +1271,7 @@ async fn process_file(
                     return Ok(FileOutcome::ValidatorError);
                 }
 
-                Ok(FileOutcome::Invalid)
+                return Ok(FileOutcome::Invalid);
             }
             Err(e) => {
                 error!("Failed to validate {}: {:#}", file_path, e);
@@ -1157,7 +1288,7 @@ async fn process_file(
                     return Ok(FileOutcome::Rejected { reason });
                 }
 
-                Ok(FileOutcome::ValidatorError)
+                return Ok(FileOutcome::ValidatorError);
             }
         }
     } else {
@@ -1165,40 +1296,39 @@ async fn process_file(
         // The metadata backfill path parses unconditionally, so returning an empty map
         // here would let Qdrant and SQLite hold different frontmatter for the same
         // document, and search filters would silently never match it.
-        let (frontmatter, body) = validate::parse_frontmatter(content, schema);
-        let description = frontmatter
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
-        let Some(chunks) = chunk_file(
-            &file_path,
-            content,
-            &body,
-            description.as_deref(),
-            &config.chunking,
-        ) else {
-            return Ok(FileOutcome::Invalid);
-        };
-        if chunks.is_empty() {
-            warn!("No chunks produced for: {}", file_path);
-            return Ok(FileOutcome::Empty { hash, mtime, size });
-        }
+        validate::parse_frontmatter(content, schema)
+    };
 
-        Ok(FileOutcome::Ready(Box::new(PendingFile {
-            file_path,
-            frontmatter,
-            chunks,
-            body,
-            hash,
-            old_chunk_count,
-            mtime,
-            size,
-            display_mtime,
-            schema_hash: schema_hash.to_string(),
-            chunking_fingerprint: chunking_fp.to_string(),
-            derived: schema.derived.clone(),
-        })))
+    let validated = RefreshFile {
+        file_path,
+        frontmatter,
+        body,
+        hash,
+        mtime,
+        size,
+        display_mtime,
+        chunk_count: old_chunk_count as i64,
+        schema_hash: schema_hash.to_string(),
+        payload_hash: payload_hash.to_string(),
+        derived: schema.derived.clone(),
+        payload_changed: refresh.unwrap_or(false),
+    };
+
+    if refresh.is_some() {
+        debug!(
+            file = %validated.file_path,
+            payload_changed = validated.payload_changed,
+            "Schema changed, content and chunking unchanged: refreshing without re-embedding"
+        );
+        return Ok(FileOutcome::Refresh(Box::new(validated)));
     }
+
+    Ok(chunk_validated(
+        validated,
+        content,
+        chunking_fp,
+        &config.chunking,
+    ))
 }
 
 /// Embed all pending files and upsert their points into Qdrant.
@@ -1253,7 +1383,12 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     for (pf, (start, count)) in pending.iter().zip(file_boundaries.iter()) {
         let embeddings = &all_embeddings[*start..*start + *count];
 
-        let mut base_payload = with_derived_fields(&pf.frontmatter, &pf.file_path, &pf.derived);
+        let mut base_payload = frontmatter_payload(
+            &pf.frontmatter,
+            &pf.file_path,
+            &pf.derived,
+            heading_metadata,
+        );
         // #130: every point for this file carries the same ancestor-path array —
         // computed once per file, not per chunk, same as `base_payload` itself.
         base_payload.insert(
@@ -1402,15 +1537,16 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     let mut bookkeeping_failures = 0usize;
     for (pf, (_start, count)) in pending.iter().zip(file_boundaries.iter()) {
         if let Err(e) = state
-            .upsert(
-                &pf.file_path,
-                &pf.hash,
-                *count as i64,
-                &pf.schema_hash,
-                &pf.chunking_fingerprint,
-                pf.mtime,
-                pf.size,
-            )
+            .upsert_record(&crate::state::IndexedFileRecord {
+                file_path: &pf.file_path,
+                content_hash: &pf.hash,
+                chunk_count: *count as i64,
+                schema_hash: &pf.schema_hash,
+                payload_hash: &pf.payload_hash,
+                chunking_fingerprint: &pf.chunking_fingerprint,
+                mtime: pf.mtime,
+                size: pf.size,
+            })
             .await
         {
             error!("Failed to update state DB for '{}': {:#}", pf.file_path, e);
@@ -1949,6 +2085,133 @@ fn with_derived_fields(
         }
     }
     out
+}
+
+/// The frontmatter part of every chunk payload for one document: its frontmatter
+/// (schema defaults applied) with the derived fields set ([`with_derived_fields`]),
+/// minus the keys the chunk's own data owns under `heading_metadata`
+/// ([`crate::qdrant::is_chunk_owned_payload_key`]), which the full path writes on top
+/// and so would overwrite anyway.
+///
+/// The one builder both writers use — `upsert_pending` for a full index, which adds
+/// the chunk keys on top, and [`refresh_document`] for a schema-only change (#351),
+/// which sends exactly this to [`VectorStore::refresh_file_payload`] — so a refreshed
+/// payload and a re-embedded one cannot disagree.
+fn frontmatter_payload(
+    frontmatter: &HashMap<String, serde_json::Value>,
+    rel_path: &str,
+    derived: &std::collections::BTreeMap<String, crate::schema::DerivedField>,
+    heading_metadata: bool,
+) -> HashMap<String, serde_json::Value> {
+    let mut payload = with_derived_fields(frontmatter, rel_path, derived);
+    payload.retain(|key, _| !crate::qdrant::is_chunk_owned_payload_key(key, heading_metadata));
+    payload
+}
+
+/// The payload keys a refresh must delete (#351): `old_keys` (the document's stored
+/// frontmatter keys from before the refresh) that `new_payload` no longer carries,
+/// never a key the chunk owns under `heading_metadata`. Sorted, so the call is
+/// deterministic.
+fn removed_payload_keys(
+    old_keys: &[String],
+    new_payload: &HashMap<String, serde_json::Value>,
+    heading_metadata: bool,
+) -> Vec<String> {
+    let mut removed: Vec<String> = old_keys
+        .iter()
+        .filter(|key| {
+            !new_payload.contains_key(key.as_str())
+                && !crate::qdrant::is_chunk_owned_payload_key(key, heading_metadata)
+        })
+        .cloned()
+        .collect();
+    removed.sort();
+    removed.dedup();
+    removed
+}
+
+/// Apply a [`FileOutcome::Refresh`] (#351): no chunking, no embedding. `old_keys` are
+/// the document's stored frontmatter keys from before the refresh ([`refresh_plan`]).
+///
+/// Order matters for recovery: the Qdrant payload is refreshed first (only when the
+/// payload hash moved); then the metadata row and links; and the state row's hashes
+/// last. A failure anywhere before that last step leaves the row's old hashes in
+/// place, so the next run refreshes the file again — every step is idempotent. A
+/// Qdrant failure is returned (the run fails and is retried, like a failed upsert); a
+/// bookkeeping failure is logged and left for the next run. Returns whether the
+/// refresh was completely recorded.
+async fn refresh_document<Q: VectorStore>(
+    rf: &RefreshFile,
+    old_keys: &[String],
+    store: &Q,
+    state: &StateDb,
+    collection: &str,
+    heading_metadata: bool,
+) -> Result<bool> {
+    if rf.payload_changed {
+        let set = frontmatter_payload(
+            &rf.frontmatter,
+            &rf.file_path,
+            &rf.derived,
+            heading_metadata,
+        );
+        let delete_keys = removed_payload_keys(old_keys, &set, heading_metadata);
+        store
+            .refresh_file_payload(collection, &rf.file_path, set, delete_keys)
+            .await
+            .with_context(|| format!("Failed to refresh the payload of '{}'", rf.file_path))?;
+    }
+
+    if let Err(e) = state
+        .upsert_document_metadata(
+            &rf.file_path,
+            &with_derived_fields(&rf.frontmatter, &rf.file_path, &rf.derived),
+            rf.display_mtime,
+            &rf.hash,
+            rf.chunk_count,
+        )
+        .await
+    {
+        error!(
+            "Failed to refresh document metadata for '{}' (retried next run): {:#}",
+            rf.file_path, e
+        );
+        return Ok(false);
+    }
+
+    let link_targets: Vec<(String, Option<f64>)> = extract_markdown_links(&rf.body, &rf.file_path)
+        .into_iter()
+        .map(|target| (target, None))
+        .collect();
+    if let Err(e) = state
+        .replace_links(&rf.file_path, "markdown", &link_targets)
+        .await
+    {
+        warn!(
+            file = %rf.file_path,
+            "Failed to update markdown links (non-fatal, will self-heal next run): {:#}",
+            e
+        );
+    }
+
+    if let Err(e) = state
+        .update_schema_hashes(
+            &rf.file_path,
+            &rf.schema_hash,
+            &rf.payload_hash,
+            rf.mtime,
+            rf.size,
+        )
+        .await
+    {
+        error!(
+            "Failed to record the refreshed schema hashes for '{}' (refreshed again next \
+             run): {:#}",
+            rf.file_path, e
+        );
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Derive the ancestor-path keyword array (#130) stored under
@@ -2998,7 +3261,8 @@ const SCAN_PAGE_SIZE: i64 = 1000;
 /// 1. **Changed or new.** It exists on disk with no `indexed_files` row, or with an
 ///    `mtime`/`size` that no longer matches the row. A changed schema or chunking
 ///    fingerprint also counts, checked before the stat pre-filter since neither moves
-///    a file's stat. This is a pre-filter only — the
+///    a file's stat; only the chunking one marks a re-chunk (a schema change is a
+///    refresh, #351). This is a pre-filter only — the
 ///    content hash remains the sole authority on whether a file actually changed, and
 ///    that authoritative check happens when `index_paths` re-reads the file. A false
 ///    positive here (mtime touched, bytes unchanged) costs one wasted hash comparison
@@ -3104,21 +3368,31 @@ pub async fn scan_for_dirty(
 
             let rel = Path::new(&row.file_path);
 
-            // Reason 1a: the schema fingerprint moved. Cheap — no disk I/O, just a
-            // lookup against the already-built schema tree — and it can flip a file
-            // dirty even when its bytes and stat metadata are untouched.
-            if schemas.resolve_for(rel).fingerprint() != row.schema_hash {
+            // Reason 1c: the chunking fingerprint moved (a `chunking.*` change applied
+            // by restart or `/admin/reload`, a `CHUNKER_VERSION` bump, or a pre-upgrade
+            // row with an empty fingerprint). It must sit ahead of the stat pre-filter:
+            // the file's bytes and stat are untouched, so 1b would otherwise
+            // short-circuit past it forever. Checked before 1a so a row stale on both
+            // still raises the incomplete-results note.
+            if row.chunking_fingerprint != chunking_fp {
+                scan.mark_rechunk();
                 dirty.insert(PathBuf::from(&row.file_path));
                 continue;
             }
 
-            // Reason 1c: the chunking fingerprint moved (a `chunking.*` change applied
-            // by restart or `/admin/reload`, a `CHUNKER_VERSION` bump, or a pre-upgrade
-            // row with an empty fingerprint). Same shape as 1a, and it must sit ahead
-            // of the stat pre-filter for the same reason: the file's bytes and stat are
-            // untouched, so 1b would otherwise short-circuit past it forever.
-            if row.chunking_fingerprint != chunking_fp {
-                scan.mark_rechunk();
+            // Reason 1a: the schema hashes moved. Cheap — no disk I/O, just a lookup
+            // against the already-built schema tree — and it can flip a file dirty
+            // even when its bytes and stat metadata are untouched. Unlike 1c this
+            // does NOT mark a re-chunk (#351): `index_paths` revalidates the file and
+            // refreshes its metadata and payload in place, so its chunks — and the
+            // `section`/`heading_prefix` results built from them — stay complete.
+            let schema = schemas.resolve_for(rel);
+            if !schema_hashes_current(
+                &row.schema_hash,
+                &row.payload_hash,
+                &schema.fingerprint(),
+                &payload_hash_for(schema),
+            ) {
                 dirty.insert(PathBuf::from(&row.file_path));
                 continue;
             }
@@ -3228,8 +3502,11 @@ pub async fn scan_for_dirty(
 /// look when the index and the filesystem disagree.
 ///
 /// For each path: if the file exists on disk it is (re)read and hashed; if its content
-/// or governing schema fingerprint actually changed (or `force` is set), it is
-/// chunked, embedded, and upserted. If unchanged but the metadata index is stale, only
+/// or chunking fingerprint actually changed (or `force` is set), it is chunked,
+/// embedded, and upserted. If only its governing schema's hashes moved, it is
+/// revalidated and its metadata (and, when the payload-shaping part moved, its Qdrant
+/// payload) refreshed in place — **no re-embedding** (#351; a schema `description`
+/// default is the exception, see [`process_file`]). If unchanged but the metadata index is stale, only
 /// that (cheap, parse-only) metadata is refreshed — **no re-embedding**. If the file
 /// does not exist on disk, or exists but is now excluded by `indexing.include`/
 /// `exclude`/`exclude_files` (#266; scoped runs only, and never when the path filter
@@ -3588,6 +3865,8 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     let mut empty = 0usize;
     let mut read_errors = 0usize;
     let mut rejected = 0usize;
+    // #351: revalidated under a changed schema and refreshed without re-embedding.
+    let mut refreshed = 0usize;
     // #160: running total across every `flush_pending_batch` call (mid-loop and the
     // trailing one), since `pending.len()` after the loop is no longer a meaningful
     // count of files indexed this run — every mid-loop flush resets it to 0.
@@ -3664,9 +3943,10 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
 
         let schema = schemas.resolve_for(rel);
         let schema_hash = schema.fingerprint();
+        let payload_hash = payload_hash_for(schema);
         let state_entry = state_map.get(rel_key).cloned();
 
-        match process_file(
+        let outcome = process_file(
             &abs_path,
             rel_key,
             &content,
@@ -3675,11 +3955,45 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
             config,
             schema,
             &schema_hash,
+            &payload_hash,
             &chunking_fp,
             &git_mtimes,
         )
-        .await?
-        {
+        .await?;
+
+        // #351: a refresh is confirmed against the stored metadata row; without one,
+        // or when the description chunking prepends changed, the document takes the
+        // full path after all (`refresh_plan`).
+        let mut refresh_old_keys: Vec<String> = Vec::new();
+        let outcome = match outcome {
+            FileOutcome::Refresh(rf) => {
+                let stored = match state.document_frontmatter(rel_key).await {
+                    Ok(stored) => stored,
+                    Err(e) => {
+                        warn!(
+                            file = %rel_key,
+                            "Failed to read the stored metadata; re-embedding instead of \
+                             refreshing: {:#}",
+                            e
+                        );
+                        None
+                    }
+                };
+                match refresh_plan(&rf, stored.as_ref(), &config.chunking) {
+                    Some(keys) => {
+                        refresh_old_keys = keys;
+                        FileOutcome::Refresh(rf)
+                    }
+                    None => {
+                        debug!(file = %rel_key, "Refresh not possible; taking the full path");
+                        chunk_validated(*rf, &content, &chunking_fp, &config.chunking)
+                    }
+                }
+            }
+            other => other,
+        };
+
+        match outcome {
             FileOutcome::Skipped { hash, mtime, size } => {
                 skipped += 1;
                 // Unchanged content, but the metadata index may still be missing or
@@ -3736,7 +4050,24 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
                     mtime,
                     size,
                     schema_hash: schema_hash.clone(),
+                    payload_hash: payload_hash.clone(),
                 });
+            }
+            FileOutcome::Refresh(rf) => {
+                // Valid under the new rules, like `Ready` below.
+                INDEX_STATUS.record_strict_rejection(rel_key, None);
+                if refresh_document(
+                    &rf,
+                    &refresh_old_keys,
+                    store,
+                    &state,
+                    collection,
+                    config.chunking.heading_metadata,
+                )
+                .await?
+                {
+                    refreshed += 1;
+                }
             }
             FileOutcome::Rejected { reason } => {
                 rejected += 1;
@@ -3832,15 +4163,16 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         let purged = remove_orphans(&unindexable, store, &state, collection).await?;
         for e in emptied.iter().filter(|e| purged.contains(&e.file_path)) {
             if let Err(err) = state
-                .upsert(
-                    &e.file_path,
-                    &e.hash,
-                    0,
-                    &e.schema_hash,
-                    &chunking_fp,
-                    e.mtime,
-                    e.size,
-                )
+                .upsert_record(&crate::state::IndexedFileRecord {
+                    file_path: &e.file_path,
+                    content_hash: &e.hash,
+                    chunk_count: 0,
+                    schema_hash: &e.schema_hash,
+                    payload_hash: &e.payload_hash,
+                    chunking_fingerprint: &chunking_fp,
+                    mtime: e.mtime,
+                    size: e.size,
+                })
                 .await
             {
                 // No row means the next reconcile re-reads it and tries again.
@@ -3867,6 +4199,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         metadata_backfilled: backfilled as u64,
         orphans_removed: missing.len() as u64,
         strict_rejected: rejected as u64,
+        refreshed: refreshed as u64,
     };
     INDEX_STATUS.set_counters(counters.clone());
 
@@ -3880,6 +4213,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         metadata_backfilled = counters.metadata_backfilled,
         orphans_removed = counters.orphans_removed,
         strict_rejected = counters.strict_rejected,
+        refreshed = counters.refreshed,
         elapsed_secs = run_start.elapsed().as_secs_f64(),
         "Indexing run complete"
     );
@@ -6017,13 +6351,14 @@ mod tests {
 
         let db = open_scan_test_db(&config).await;
         // A fingerprint that will never match the real one built from `dir` — stands
-        // in for "the schema changed since this was last indexed".
+        // in for "the schema changed since this was last indexed". The chunking
+        // fingerprint is current, so only reason 1a can flag it.
         db.upsert(
             "doc.md",
             "some-hash",
             1,
             "stale-fingerprint",
-            "",
+            &chunking_fingerprint(&config.chunking),
             mtime,
             size,
         )
@@ -6035,10 +6370,11 @@ mod tests {
             .await
             .unwrap();
 
-        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
-            .await
-            .unwrap();
+        let scan = INDEX_STATUS.begin_reconcile_scan();
+        let dirty = scan_for_dirty(&config, &scan).await.unwrap();
         assert_eq!(dirty, vec![PathBuf::from("doc.md")]);
+        // #351: a schema change is refreshed, not re-chunked.
+        assert!(!scan.rechunk_detected());
     }
 
     // -- chunking fingerprint --------------------------------------------------
@@ -6372,6 +6708,7 @@ mod tests {
                 chunk_count: 1,
                 indexed_at: String::new(),
                 schema_hash: "schema".into(),
+                payload_hash: "payload".into(),
                 chunking_fingerprint: fp.to_string(),
                 mtime: 0,
                 size: 0,
@@ -6394,6 +6731,7 @@ mod tests {
                 &config,
                 &test_schema(),
                 "schema",
+                "payload",
                 &current_fp,
                 &HashMap::new(),
             )
@@ -6446,6 +6784,587 @@ mod tests {
         let scan = INDEX_STATUS.begin_reconcile_scan();
         assert!(scan_for_dirty(&config, &scan).await.is_err());
         assert!(!scan.rechunk_detected());
+    }
+
+    // -- schema-only changes: refresh without re-embedding (#351) ---------------
+
+    /// Counts `embed_texts` calls and texts, embedding like [`EchoEmbedClient`].
+    #[derive(Default)]
+    struct CountingEmbedClient {
+        calls: std::sync::atomic::AtomicUsize,
+        texts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingEmbedClient {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl EmbedStore for CountingEmbedClient {
+        async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.texts
+                .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![1.0_f32]).collect())
+        }
+    }
+
+    /// One `index_paths_generic` run over `paths` with fresh fakes, returning them.
+    async fn index_with_fakes(
+        config: &ResolvedConfig,
+        paths: &[&str],
+        force: bool,
+    ) -> (CountingEmbedClient, TrackingMockVectorStore) {
+        let embedder = CountingEmbedClient::default();
+        let store = TrackingMockVectorStore::all_ok();
+        let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        index_paths_generic(
+            config,
+            &paths,
+            force,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await
+        .expect("indexing run failed");
+        (embedder, store)
+    }
+
+    fn schema_test_config(dir: &TempDir) -> ResolvedConfig {
+        let mut config = scan_test_config(dir);
+        config.validation.enabled = true;
+        config
+    }
+
+    fn write_root_schema(dir: &TempDir, yaml: &str) {
+        std::fs::write(dir.path().join(".schema.yaml"), yaml).unwrap();
+    }
+
+    async fn stored_frontmatter(db: &StateDb, path: &str) -> serde_json::Value {
+        let (json,): (String,) =
+            sqlx::query_as("SELECT frontmatter FROM documents WHERE file_path = ?")
+                .bind(path)
+                .fetch_one(db.pool_for_test())
+                .await
+                .unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_validation_only_schema_edit_reprojects_without_embedding_or_qdrant_writes() {
+        let dir = TempDir::new().unwrap();
+        let config = schema_test_config(&dir);
+        write_root_schema(&dir, "fields:\n  status:\n    values: [draft, active]\n");
+        std::fs::write(
+            dir.path().join("doc.md"),
+            "---\ntitle: T\nstatus: draft\n---\n# T\n\nBody.\n",
+        )
+        .unwrap();
+        let (embedder, _) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 1, "precondition: the first run embeds");
+
+        // Make the metadata row visibly stale, so the refresh can be seen rewriting it.
+        let db = open_scan_test_db(&config).await;
+        let before = db.get("doc.md").await.unwrap().unwrap();
+        let mut stale = HashMap::new();
+        stale.insert("title".to_string(), serde_json::json!("stale"));
+        db.upsert_document_metadata("doc.md", &stale, 0, &before.content_hash, 1)
+            .await
+            .unwrap();
+
+        // Tighten `required`: validation and projection change, the payload does not.
+        write_root_schema(
+            &dir,
+            "fields:\n  status:\n    values: [draft, active]\n    required: true\n",
+        );
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+
+        assert_eq!(embedder.calls(), 0, "a schema-only edit must not embed");
+        assert!(store.upserted_points.lock().unwrap().is_empty());
+        assert!(store.delete_by_files_calls.lock().unwrap().is_empty());
+        assert!(
+            store.refresh_calls().is_empty(),
+            "nothing payload-shaping changed, so Qdrant is not written at all"
+        );
+
+        let after = db.get("doc.md").await.unwrap().unwrap();
+        let schemas = SchemaCache::build_for_test(dir.path(), &config.frontmatter);
+        let schema = schemas.resolve_for(Path::new("doc.md"));
+        assert_ne!(after.schema_hash, before.schema_hash);
+        assert_eq!(after.schema_hash, schema.fingerprint());
+        assert_eq!(after.payload_hash, payload_hash_for(schema));
+        assert_eq!(after.payload_hash, before.payload_hash);
+        assert_eq!(after.chunk_count, before.chunk_count);
+        assert_eq!(
+            after.indexed_at, before.indexed_at,
+            "the chunks were not rewritten"
+        );
+        assert_eq!(
+            stored_frontmatter(&db, "doc.md").await,
+            serde_json::json!({"title": "T", "status": "draft"}),
+            "the metadata row is rewritten from the document"
+        );
+
+        // And the run after that is a plain skip.
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 0);
+        assert!(store.refresh_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_default_or_derived_edit_refreshes_the_payload_without_embedding() {
+        let dir = TempDir::new().unwrap();
+        let config = schema_test_config(&dir);
+        write_root_schema(
+            &dir,
+            "fields:\n  status:\n    default: draft\n  legacy:\n    default: x\n",
+        );
+        std::fs::create_dir_all(dir.path().join("food")).unwrap();
+        std::fs::write(
+            dir.path().join("food/doc.md"),
+            "---\ntitle: T\n---\n# T\n\nBody.\n",
+        )
+        .unwrap();
+        let (embedder, store) = index_with_fakes(&config, &["food/doc.md"], false).await;
+        assert_eq!(embedder.calls(), 1);
+        {
+            let points = store.upserted_points.lock().unwrap();
+            assert_eq!(points[0].payload["status"], "draft");
+            assert_eq!(points[0].payload["legacy"], "x");
+        }
+
+        // A changed default, a removed one, and a new derived field.
+        write_root_schema(
+            &dir,
+            "fields:\n  status:\n    default: active\n\
+             derived:\n  domain: {from: path_segment, index: 0}\n",
+        );
+        let (embedder, store) = index_with_fakes(&config, &["food/doc.md"], false).await;
+        assert_eq!(
+            embedder.calls(),
+            0,
+            "a payload-shaping edit still does not embed"
+        );
+        assert!(store.upserted_points.lock().unwrap().is_empty());
+
+        let calls = store.refresh_calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let call = &calls[0];
+        assert_eq!(call.file_path, "food/doc.md");
+        assert_eq!(call.set["status"], "active");
+        assert_eq!(call.set["domain"], "food");
+        assert_eq!(call.set["title"], "T");
+        assert_eq!(call.delete_keys, vec!["legacy".to_string()]);
+        assert!(
+            call.set
+                .keys()
+                .all(|k| !crate::qdrant::is_chunk_owned_payload_key(k, false)),
+            "a refresh never touches a chunk key"
+        );
+
+        let db = open_scan_test_db(&config).await;
+        assert_eq!(
+            stored_frontmatter(&db, "food/doc.md").await,
+            serde_json::json!({"title": "T", "status": "active", "domain": "food"})
+        );
+
+        // The refresh and a full re-embed under the same schema agree on every
+        // frontmatter key: the full path's payload minus the chunk keys is exactly
+        // what the refresh set.
+        let (_, full) = index_with_fakes(&config, &["food/doc.md"], true).await;
+        let points = full.upserted_points.lock().unwrap();
+        let mut frontmatter_part = points[0].payload.clone();
+        frontmatter_part.retain(|k, _| !crate::qdrant::is_chunk_owned_payload_key(k, false));
+        assert_eq!(frontmatter_part, call.set);
+    }
+
+    #[tokio::test]
+    async fn refresh_and_full_path_agree_on_heading_named_keys_in_both_modes() {
+        // A frontmatter key spelled like a heading/section key reaches the payload
+        // only while `chunking.heading_metadata` is off (with it on, the chunk's own
+        // value wins). A refresh follows the same rule, so in both modes it sets
+        // exactly the full path's frontmatter part.
+        for heading_metadata in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let mut config = schema_test_config(&dir);
+            config.chunking.heading_metadata = heading_metadata;
+            write_root_schema(&dir, "fields:\n  status:\n    default: draft\n");
+            std::fs::write(
+                dir.path().join("doc.md"),
+                "---\ntitle: T\nsection_key: authored\n---\n# T\n\nBody.\n",
+            )
+            .unwrap();
+            let (_, first) = index_with_fakes(&config, &["doc.md"], false).await;
+            {
+                let points = first.upserted_points.lock().unwrap();
+                if heading_metadata {
+                    assert_ne!(points[0].payload["section_key"], "authored");
+                } else {
+                    assert_eq!(points[0].payload["section_key"], "authored");
+                }
+            }
+
+            write_root_schema(&dir, "fields:\n  status:\n    default: active\n");
+            let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+            assert_eq!(embedder.calls(), 0);
+            let calls = store.refresh_calls();
+            assert_eq!(calls.len(), 1, "heading_metadata={heading_metadata}");
+            assert_eq!(calls[0].set.contains_key("section_key"), !heading_metadata);
+            assert!(
+                calls[0].delete_keys.is_empty(),
+                "{:?}",
+                calls[0].delete_keys
+            );
+
+            let (_, full) = index_with_fakes(&config, &["doc.md"], true).await;
+            let points = full.upserted_points.lock().unwrap();
+            let mut frontmatter_part = points[0].payload.clone();
+            frontmatter_part
+                .retain(|k, _| !crate::qdrant::is_chunk_owned_payload_key(k, heading_metadata));
+            assert_eq!(
+                frontmatter_part, calls[0].set,
+                "heading_metadata={heading_metadata}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_metadata_row_falls_back_to_the_full_path() {
+        // Without the stored frontmatter a refresh cannot know which keys to delete
+        // from Qdrant, so the document is re-embedded instead.
+        let dir = TempDir::new().unwrap();
+        let config = schema_test_config(&dir);
+        write_root_schema(&dir, "fields:\n  legacy:\n    default: x\n");
+        std::fs::write(dir.path().join("doc.md"), "# T\n\nBody.\n").unwrap();
+        index_with_fakes(&config, &["doc.md"], false).await;
+        let db = open_scan_test_db(&config).await;
+        db.delete_document("doc.md").await.unwrap();
+
+        write_root_schema(&dir, "fields:\n  status:\n    default: draft\n");
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 1, "no metadata row: the full path");
+        assert!(store.refresh_calls().is_empty());
+        let payload = store.upserted_points.lock().unwrap()[0].payload.clone();
+        assert!(!payload.contains_key("legacy"));
+        assert_eq!(payload["status"], "draft");
+        assert_eq!(
+            stored_frontmatter(&db, "doc.md").await,
+            serde_json::json!({"status": "draft"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunking_change_still_re_embeds_alongside_a_schema_change() {
+        let dir = TempDir::new().unwrap();
+        let mut config = schema_test_config(&dir);
+        write_root_schema(&dir, "fields:\n  status:\n    default: draft\n");
+        std::fs::write(dir.path().join("doc.md"), "# T\n\nBody.\n").unwrap();
+        index_with_fakes(&config, &["doc.md"], false).await;
+
+        config.chunking.max_chunk_size += 500;
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 1, "a chunking change re-embeds");
+        assert!(store.refresh_calls().is_empty());
+
+        // Both at once: the chunking change wins, so the file is re-embedded once.
+        config.chunking.max_chunk_size += 500;
+        write_root_schema(&dir, "fields:\n  status:\n    default: active\n");
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 1);
+        assert_eq!(
+            store.upserted_points.lock().unwrap()[0].payload["status"],
+            "active"
+        );
+        assert!(store.refresh_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_description_default_re_embeds_exactly_when_the_prepended_text_changes() {
+        // The default reaches chunk text through `chunking.prepend_description`, so a
+        // schema edit re-embeds a document exactly when the description it would
+        // prepend differs from the stored one: added or removed re-embeds, kept while
+        // something else changes refreshes — and with the prepend off it is always a
+        // refresh.
+        let dir = TempDir::new().unwrap();
+        let mut config = schema_test_config(&dir);
+        std::fs::write(dir.path().join("doc.md"), "# T\n\nBody.\n").unwrap();
+
+        write_root_schema(&dir, "fields:\n  status:\n    default: draft\n");
+        index_with_fakes(&config, &["doc.md"], false).await;
+
+        // Added: the new schema has the default.
+        write_root_schema(
+            &dir,
+            "fields:\n  status:\n    default: draft\n  description:\n    default: Shared summary\n",
+        );
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(
+            embedder.calls(),
+            1,
+            "adding a description default re-embeds"
+        );
+        assert!(
+            store.upserted_points.lock().unwrap()[0].payload["text"]
+                .as_str()
+                .unwrap()
+                .contains("Shared summary")
+        );
+
+        // Kept, while something else changed: the prepended text is the same, so a
+        // refresh.
+        write_root_schema(
+            &dir,
+            "fields:\n  status:\n    default: active\n  description:\n    default: Shared summary\n",
+        );
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 0);
+        assert_eq!(store.refresh_calls().len(), 1);
+
+        // Removed: the stored description says what was prepended.
+        write_root_schema(&dir, "fields:\n  status:\n    default: active\n");
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(
+            embedder.calls(),
+            1,
+            "removing a description default re-embeds"
+        );
+        assert!(
+            !store.upserted_points.lock().unwrap()[0].payload["text"]
+                .as_str()
+                .unwrap()
+                .contains("Shared summary")
+        );
+
+        // With the prepend off, a description default never reaches chunk text.
+        config.chunking.prepend_description = false;
+        index_with_fakes(&config, &["doc.md"], false).await;
+        write_root_schema(
+            &dir,
+            "fields:\n  status:\n    default: draft\n  description:\n    default: Shared summary\n",
+        );
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 0);
+        assert_eq!(store.refresh_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_document_with_its_own_description_is_refreshed_under_a_description_default() {
+        let dir = TempDir::new().unwrap();
+        let config = schema_test_config(&dir);
+        std::fs::write(
+            dir.path().join("doc.md"),
+            "---\ndescription: Mine\n---\n# T\n\nBody.\n",
+        )
+        .unwrap();
+        write_root_schema(&dir, "fields:\n  status:\n    default: draft\n");
+        index_with_fakes(&config, &["doc.md"], false).await;
+
+        // The default never applies to this document, so its chunk text is unchanged
+        // whether the default is added, changed or removed.
+        for yaml in [
+            "fields:\n  status:\n    default: draft\n  description:\n    default: Shared\n",
+            "fields:\n  status:\n    default: active\n  description:\n    default: Other\n",
+            "fields:\n  status:\n    default: draft\n",
+        ] {
+            write_root_schema(&dir, yaml);
+            let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+            assert_eq!(embedder.calls(), 0, "{yaml}");
+            assert!(store.upserted_points.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_legacy_row_whose_description_default_is_removed_is_re_embedded() {
+        // A row from before `payload_hash` existed: the stored description is still
+        // the record of what was prepended, so removing the default it came from is
+        // caught.
+        let dir = TempDir::new().unwrap();
+        let config = schema_test_config(&dir);
+        std::fs::write(dir.path().join("doc.md"), "# T\n\nBody.\n").unwrap();
+        write_root_schema(
+            &dir,
+            "fields:\n  description:\n    default: Shared summary\n",
+        );
+        index_with_fakes(&config, &["doc.md"], false).await;
+
+        let db = open_scan_test_db(&config).await;
+        let row = db.get("doc.md").await.unwrap().unwrap();
+        db.upsert(
+            "doc.md",
+            &row.content_hash,
+            row.chunk_count,
+            &row.schema_hash,
+            &row.chunking_fingerprint,
+            row.mtime,
+            row.size,
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.get("doc.md").await.unwrap().unwrap().payload_hash, "");
+
+        write_root_schema(&dir, "fields:\n  status:\n    default: draft\n");
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 1, "the prepended description changed");
+        assert!(store.refresh_calls().is_empty());
+        assert!(
+            !store.upserted_points.lock().unwrap()[0].payload["text"]
+                .as_str()
+                .unwrap()
+                .contains("Shared summary")
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrading_rows_without_a_payload_hash_reindexes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let config = schema_test_config(&dir);
+        write_root_schema(&dir, "fields:\n  status:\n    default: draft\n");
+        std::fs::write(dir.path().join("doc.md"), "# T\n\nBody.\n").unwrap();
+        index_with_fakes(&config, &["doc.md"], false).await;
+
+        // Rewrite the row as the previous release left it: every column real, the
+        // payload hash unknown.
+        let db = open_scan_test_db(&config).await;
+        let row = db.get("doc.md").await.unwrap().unwrap();
+        assert!(!row.payload_hash.is_empty());
+        db.upsert(
+            "doc.md",
+            &row.content_hash,
+            row.chunk_count,
+            &row.schema_hash,
+            &row.chunking_fingerprint,
+            row.mtime,
+            row.size,
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.get("doc.md").await.unwrap().unwrap().payload_hash, "");
+
+        // The upgrade itself: a reconcile finds nothing, and indexing the path anyway
+        // is a no-op.
+        let scan = INDEX_STATUS.begin_reconcile_scan();
+        assert!(scan_for_dirty(&config, &scan).await.unwrap().is_empty());
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 0);
+        assert!(store.upserted_points.lock().unwrap().is_empty());
+        assert!(store.refresh_calls().is_empty());
+        assert!(store.delete_by_files_calls.lock().unwrap().is_empty());
+
+        // The first schema edit after it: unknown counts as changed, so the payload is
+        // refreshed — not re-embedded — and the hash recorded from then on.
+        write_root_schema(
+            &dir,
+            "fields:\n  status:\n    default: draft\n    indexed: true\n",
+        );
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 0);
+        assert_eq!(store.refresh_calls().len(), 1);
+        let schemas = SchemaCache::build_for_test(dir.path(), &config.frontmatter);
+        assert_eq!(
+            db.get("doc.md").await.unwrap().unwrap().payload_hash,
+            payload_hash_for(schemas.resolve_for(Path::new("doc.md")))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schema_edit_that_invalidates_a_document_purges_or_rejects_it_as_before() {
+        for strict in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let mut config = schema_test_config(&dir);
+            config.validation.strict = strict;
+            write_root_schema(&dir, "fields:\n  status:\n    values: [draft]\n");
+            std::fs::write(dir.path().join("doc.md"), "# T\n\nBody.\n").unwrap();
+            index_with_fakes(&config, &["doc.md"], false).await;
+            let db = open_scan_test_db(&config).await;
+            let before = db.get("doc.md").await.unwrap().unwrap();
+
+            // The document has no `status`, which the new schema requires.
+            write_root_schema(
+                &dir,
+                "fields:\n  status:\n    values: [draft]\n    required: true\n",
+            );
+            let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+            assert_eq!(embedder.calls(), 0);
+            assert!(store.refresh_calls().is_empty(), "strict={strict}");
+            let after = db.get("doc.md").await.unwrap();
+            if strict {
+                // Rejected: the last good version stays, row untouched, so the next
+                // sweep re-validates it.
+                assert!(store.delete_by_files_calls.lock().unwrap().is_empty());
+                let after = after.expect("a strict rejection keeps the row");
+                assert_eq!(after.schema_hash, before.schema_hash);
+            } else {
+                // Invalid: purged like a deleted file.
+                assert_eq!(
+                    *store.delete_by_files_calls.lock().unwrap(),
+                    vec![vec!["doc.md".to_string()]]
+                );
+                assert!(after.is_none(), "the purged row is gone");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_marks_a_schema_only_change_dirty_without_a_rechunk() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Doc").unwrap();
+        let (mtime, size) = stat(&path);
+        let schemas = SchemaCache::build_for_test(dir.path(), &config.frontmatter);
+        let schema = schemas.resolve_for(Path::new("doc.md"));
+        let chunking_fp = indexing_fingerprint(&config.chunking, "");
+
+        let db = open_scan_test_db(&config).await;
+        let mut fm = HashMap::new();
+        fm.insert("title".into(), serde_json::json!("Doc"));
+        db.upsert_document_metadata("doc.md", &fm, mtime, "some-hash", 1)
+            .await
+            .unwrap();
+        let write_row = |schema_hash: String, payload_hash: String| {
+            let db = &db;
+            let chunking_fp = chunking_fp.clone();
+            async move {
+                db.upsert_record(&crate::state::IndexedFileRecord {
+                    file_path: "doc.md",
+                    content_hash: "some-hash",
+                    chunk_count: 1,
+                    schema_hash: &schema_hash,
+                    payload_hash: &payload_hash,
+                    chunking_fingerprint: &chunking_fp,
+                    mtime,
+                    size,
+                })
+                .await
+                .unwrap();
+            }
+        };
+
+        // (stored schema hash, stored payload hash, expect dirty)
+        for (stored_schema, stored_payload, expect_dirty) in [
+            (schema.fingerprint(), payload_hash_for(schema), false),
+            // Unknown payload hash with a matching schema hash: an upgraded row.
+            (schema.fingerprint(), String::new(), false),
+            ("stale".to_string(), payload_hash_for(schema), true),
+            ("stale".to_string(), String::new(), true),
+            // A payload hash that moved on its own still counts.
+            (schema.fingerprint(), "stale".to_string(), true),
+        ] {
+            write_row(stored_schema.clone(), stored_payload.clone()).await;
+            let scan = INDEX_STATUS.begin_reconcile_scan();
+            let dirty = scan_for_dirty(&config, &scan).await.unwrap();
+            assert_eq!(
+                !dirty.is_empty(),
+                expect_dirty,
+                "{stored_schema:?}/{stored_payload:?}"
+            );
+            assert!(
+                !scan.rechunk_detected(),
+                "a schema-only difference is a refresh, never a re-chunk"
+            );
+        }
     }
 
     // -- detect_qdrant_wipe (#155 active self-heal) ---------------------------
@@ -7337,6 +8256,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: String::new(),
             schema_hash: String::new(),
+            payload_hash: String::new(),
             chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
@@ -7351,6 +8271,7 @@ mod tests {
             state_entry,
             &config,
             &test_schema(),
+            "",
             "",
             "",
             &HashMap::new(),
@@ -7395,6 +8316,7 @@ mod tests {
                 &test_schema(),
                 "",
                 "",
+                "",
                 &HashMap::new(),
             )
             .await
@@ -7435,6 +8357,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: String::new(),
             schema_hash: String::new(),
+            payload_hash: String::new(),
             chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
@@ -7449,6 +8372,7 @@ mod tests {
             state_entry,
             &config,
             &test_schema(),
+            "",
             "",
             "",
             &HashMap::new(),
@@ -7479,6 +8403,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: String::new(),
             schema_hash: String::new(),
+            payload_hash: String::new(),
             chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
@@ -7493,6 +8418,7 @@ mod tests {
             state_entry,
             &config,
             &test_schema(),
+            "",
             "",
             "",
             &HashMap::new(),
@@ -7521,6 +8447,7 @@ mod tests {
             None,
             &config,
             &test_schema(),
+            "",
             "",
             "",
             &HashMap::new(),
@@ -7555,6 +8482,7 @@ mod tests {
             None,
             &config,
             &test_schema(),
+            "",
             "",
             "",
             &git_mtimes,
@@ -7603,6 +8531,7 @@ mod tests {
             &test_schema(),
             "",
             "",
+            "",
             &HashMap::new(),
         )
         .await
@@ -7634,6 +8563,7 @@ mod tests {
             None,
             &config,
             &test_schema(),
+            "",
             "",
             "",
             &HashMap::new(),
@@ -7668,6 +8598,7 @@ mod tests {
             None,
             &config,
             &test_schema(),
+            "",
             "",
             "",
             &HashMap::new(),
@@ -7709,6 +8640,7 @@ mod tests {
             &ResolvedSchema::from_config(&config.frontmatter),
             "",
             "",
+            "",
             &HashMap::new(),
         )
         .await
@@ -7742,6 +8674,7 @@ mod tests {
             None,
             &config,
             &ResolvedSchema::from_config(&config.frontmatter),
+            "",
             "",
             "",
             &HashMap::new(),
@@ -7780,6 +8713,7 @@ mod tests {
             None,
             &config,
             &ResolvedSchema::from_config(&config.frontmatter),
+            "",
             "",
             "",
             &HashMap::new(),
@@ -7831,6 +8765,7 @@ mod tests {
             &ResolvedSchema::from_config(&config.frontmatter),
             "",
             "",
+            "",
             &HashMap::new(),
         )
         .await
@@ -7876,6 +8811,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: "now".into(),
             schema_hash: "abc".into(),
+            payload_hash: String::new(),
             chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
@@ -7890,6 +8826,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             "abc",
+            "",
             "",
             &HashMap::new(),
         )
@@ -7908,88 +8845,176 @@ mod tests {
         let content = "---\ntitle: Test\n---\nBody.";
         std::fs::write(&path, content).unwrap();
 
-        let state_entry = Some(IndexedFile {
-            file_path: "doc.md".into(),
-            content_hash: compute_hash_from_bytes(content.as_bytes()),
-            chunk_count: 1,
-            indexed_at: "now".into(),
-            schema_hash: "old-fingerprint".into(),
-            chunking_fingerprint: String::new(),
-            mtime: 0,
-            size: 0,
-        });
+        //
+        // #351: it is reprocessed as a refresh (revalidated, metadata rewritten, no
+        // re-chunk), and the payload is refreshed exactly when its hash moved or is
+        // unknown. A row without a chunking fingerprint keeps the full path.
+        let config = config_no_validation();
+        let fp = chunking_fingerprint(&config.chunking);
+        let row = |payload_hash: &str, chunking: &str| {
+            Some(IndexedFile {
+                file_path: "doc.md".into(),
+                content_hash: compute_hash_from_bytes(content.as_bytes()),
+                chunk_count: 1,
+                indexed_at: "now".into(),
+                schema_hash: "old-fingerprint".into(),
+                payload_hash: payload_hash.into(),
+                chunking_fingerprint: chunking.into(),
+                mtime: 0,
+                size: 0,
+            })
+        };
 
+        // (stored payload hash, stored chunking fingerprint, expected payload_changed
+        // or None for the full path)
+        for (stored_payload, stored_chunking, expected) in [
+            ("payload-now", fp.as_str(), Some(false)),
+            ("payload-before", fp.as_str(), Some(true)),
+            ("", fp.as_str(), Some(true)),
+            ("payload-now", "", None),
+        ] {
+            let outcome = process_file(
+                &path,
+                "doc.md",
+                content,
+                false,
+                row(stored_payload, stored_chunking),
+                &config,
+                &test_schema(),
+                "new-fingerprint",
+                "payload-now",
+                &fp,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+            match (outcome, expected) {
+                (FileOutcome::Refresh(rf), Some(changed)) => {
+                    assert_eq!(rf.payload_changed, changed, "{stored_payload:?}");
+                    assert_eq!(rf.schema_hash, "new-fingerprint");
+                    assert_eq!(rf.payload_hash, "payload-now");
+                    assert_eq!(rf.chunk_count, 1);
+                }
+                (FileOutcome::Ready(_), None) => {}
+                (other, _) => panic!(
+                    "{stored_payload:?}/{stored_chunking:?}: unexpected {}",
+                    outcome_name(&other)
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_schema_only_change_on_an_empty_document_keeps_the_full_path() {
+        // A zero-chunk row is an empty document with no points or metadata row; it
+        // has nothing to refresh, so it is re-processed (and recorded empty again).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Empty\n---\n";
+        std::fs::write(&path, content).unwrap();
+        let config = config_no_validation();
+        let fp = chunking_fingerprint(&config.chunking);
         let outcome = process_file(
             &path,
             "doc.md",
             content,
             false,
-            state_entry,
-            &config_no_validation(),
+            Some(IndexedFile {
+                file_path: "doc.md".into(),
+                content_hash: compute_hash_from_bytes(content.as_bytes()),
+                chunk_count: 0,
+                indexed_at: "now".into(),
+                schema_hash: "old".into(),
+                payload_hash: "p".into(),
+                chunking_fingerprint: fp.clone(),
+                mtime: 0,
+                size: 0,
+            }),
+            &config,
             &test_schema(),
-            "new-fingerprint",
-            "",
+            "new",
+            "p",
+            &fp,
             &HashMap::new(),
         )
         .await
         .unwrap();
-
         assert!(
-            !matches!(outcome, FileOutcome::Skipped { .. }),
-            "a tightened schema must force revalidation of unchanged content"
+            matches!(outcome, FileOutcome::Empty { .. }),
+            "got {}",
+            outcome_name(&outcome)
         );
     }
 
     #[tokio::test]
     async fn upgrade_reprocesses_every_file_so_qdrant_and_sqlite_agree_on_domain() {
-        // Derived `domain` is written to the Qdrant payload only via the full
-        // reprocess path, while metadata backfill deliberately skips Qdrant. The two
-        // stores would diverge on upgrade if legacy rows were SKIPPED — they are not,
-        // because their empty schema_hash never equals a real fingerprint. This test
-        // pins that reasoning down rather than leaving it as an assumption.
+        // Derived `domain` reaches the Qdrant payload only through the full reprocess
+        // path or a payload refresh (#351), while metadata backfill deliberately skips
+        // Qdrant. The two stores would diverge on upgrade if legacy rows were SKIPPED
+        // — they are not, because their empty schema_hash never equals a real
+        // fingerprint. A legacy row with no chunking fingerprint is fully
+        // reprocessed; one with a chunking fingerprint is refreshed, and its unknown
+        // payload hash counts as changed, so the payload is rewritten either way.
+        // This test pins that reasoning down rather than leaving it as an assumption.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("doc.md");
         let content = "---\ntitle: Test\ndomain: stale\n---\nBody.";
         std::fs::write(&path, content).unwrap();
+        let config = config_no_validation();
+        let fp = chunking_fingerprint(&config.chunking);
 
-        let legacy_row = Some(IndexedFile {
-            file_path: "food/doc.md".into(),
-            content_hash: compute_hash_from_bytes(content.as_bytes()),
-            chunk_count: 1,
-            indexed_at: "now".into(),
-            schema_hash: String::new(),
-            chunking_fingerprint: String::new(),
-            mtime: 0,
-            size: 0,
-        });
+        for stored_chunking in ["", fp.as_str()] {
+            let legacy_row = Some(IndexedFile {
+                file_path: "food/doc.md".into(),
+                content_hash: compute_hash_from_bytes(content.as_bytes()),
+                chunk_count: 1,
+                indexed_at: "now".into(),
+                schema_hash: String::new(),
+                payload_hash: String::new(),
+                chunking_fingerprint: stored_chunking.into(),
+                mtime: 0,
+                size: 0,
+            });
 
-        let outcome = process_file(
-            &path,
-            "food/doc.md",
-            content,
-            false,
-            legacy_row,
-            &config_no_validation(),
-            &test_schema(),
-            &test_schema().fingerprint(),
-            "",
-            &HashMap::new(),
-        )
-        .await
-        .unwrap();
+            let outcome = process_file(
+                &path,
+                "food/doc.md",
+                content,
+                false,
+                legacy_row,
+                &config,
+                &test_schema(),
+                &test_schema().fingerprint(),
+                &payload_hash_for(&test_schema()),
+                &fp,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
 
-        assert!(
-            matches!(outcome, FileOutcome::Ready(_)),
-            "an unchanged legacy file must still be fully reprocessed on upgrade, which \
-             is what rewrites its Qdrant payload with the derived domain"
-        );
+            match outcome {
+                FileOutcome::Ready(_) => assert!(stored_chunking.is_empty()),
+                FileOutcome::Refresh(rf) => {
+                    assert!(!stored_chunking.is_empty());
+                    assert!(
+                        rf.payload_changed,
+                        "an unknown payload hash under a moved schema must refresh Qdrant"
+                    );
+                }
+                other => panic!(
+                    "an unchanged legacy file must still be reprocessed on upgrade, got {}",
+                    outcome_name(&other)
+                ),
+            }
+        }
     }
 
     #[tokio::test]
     async fn upgraded_deployments_revalidate_once() {
         // Rows written before schema tracking existed carry an empty schema_hash, which
         // never equals a real fingerprint — so the first run after upgrading reprocesses
-        // every file exactly once.
+        // every file exactly once. (Such rows also predate the chunking fingerprint, so
+        // that reprocess is the full path, not a #351 refresh.)
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("doc.md");
         let content = "---\ntitle: Test\n---\nBody.";
@@ -8001,6 +9026,7 @@ mod tests {
             chunk_count: 1,
             indexed_at: "now".into(),
             schema_hash: String::new(),
+            payload_hash: String::new(),
             chunking_fingerprint: String::new(),
             mtime: 0,
             size: 0,
@@ -8015,6 +9041,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             &test_schema().fingerprint(),
+            &payload_hash_for(&test_schema()),
             "",
             &HashMap::new(),
         )
@@ -8040,6 +9067,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             "fingerprint-xyz",
+            "payload-xyz",
             "",
             &HashMap::new(),
         )
@@ -8047,7 +9075,11 @@ mod tests {
         .unwrap();
 
         match outcome {
-            FileOutcome::Ready(pf) => assert_eq!(pf.schema_hash, "fingerprint-xyz"),
+            FileOutcome::Ready(pf) => {
+                assert_eq!(pf.schema_hash, "fingerprint-xyz");
+                // #351: and the payload hash, which `upsert_pending` stores.
+                assert_eq!(pf.payload_hash, "payload-xyz");
+            }
             other => panic!("expected Ready, got {}", outcome_name(&other)),
         }
     }
@@ -8060,6 +9092,7 @@ mod tests {
             FileOutcome::ValidatorError => "ValidatorError",
             FileOutcome::Empty { .. } => "Empty",
             FileOutcome::Ready(_) => "Ready",
+            FileOutcome::Refresh(_) => "Refresh",
             FileOutcome::Rejected { .. } => "Rejected",
         }
     }
@@ -8308,6 +9341,16 @@ mod tests {
         async fn collection_point_count(&self, _collection: &str) -> Result<u64> {
             Ok(0)
         }
+
+        async fn refresh_file_payload(
+            &self,
+            _collection: &str,
+            _file_path: &str,
+            _set: HashMap<String, serde_json::Value>,
+            _delete_keys: Vec<String>,
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     struct TrackingMockVectorStore {
@@ -8321,6 +9364,15 @@ mod tests {
         /// exactly once per run, without needing a real Qdrant to ensure.
         ensure_collection_calls: Mutex<usize>,
         drop_collection_calls: Mutex<usize>,
+        /// Every `refresh_file_payload` call (#351): file, keys set, keys deleted.
+        refresh_calls: Mutex<Vec<PayloadRefreshCall>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct PayloadRefreshCall {
+        file_path: String,
+        set: HashMap<String, serde_json::Value>,
+        delete_keys: Vec<String>,
     }
 
     impl TrackingMockVectorStore {
@@ -8333,7 +9385,12 @@ mod tests {
                 upserted_points: Mutex::new(Vec::new()),
                 ensure_collection_calls: Mutex::new(0),
                 drop_collection_calls: Mutex::new(0),
+                refresh_calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn refresh_calls(&self) -> Vec<PayloadRefreshCall> {
+            self.refresh_calls.lock().unwrap().clone()
         }
     }
 
@@ -8387,6 +9444,21 @@ mod tests {
         async fn collection_point_count(&self, _collection: &str) -> Result<u64> {
             Ok(0)
         }
+
+        async fn refresh_file_payload(
+            &self,
+            _collection: &str,
+            file_path: &str,
+            set: HashMap<String, serde_json::Value>,
+            delete_keys: Vec<String>,
+        ) -> Result<()> {
+            self.refresh_calls.lock().unwrap().push(PayloadRefreshCall {
+                file_path: file_path.to_string(),
+                set,
+                delete_keys,
+            });
+            Ok(())
+        }
     }
 
     /// Drives #155's `detect_qdrant_wipe` tests: a `VectorStore` fake whose only
@@ -8430,6 +9502,16 @@ mod tests {
 
         async fn collection_point_count(&self, _collection: &str) -> Result<u64> {
             Ok(self.0)
+        }
+
+        async fn refresh_file_payload(
+            &self,
+            _collection: &str,
+            _file_path: &str,
+            _set: HashMap<String, serde_json::Value>,
+            _delete_keys: Vec<String>,
+        ) -> Result<()> {
+            unreachable!("FixedPointCountStore is only for collection_point_count")
         }
     }
 
@@ -8487,6 +9569,16 @@ mod tests {
 
         async fn collection_point_count(&self, _collection: &str) -> Result<u64> {
             Ok(0)
+        }
+
+        async fn refresh_file_payload(
+            &self,
+            _collection: &str,
+            _file_path: &str,
+            _set: HashMap<String, serde_json::Value>,
+            _delete_keys: Vec<String>,
+        ) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -8598,6 +9690,16 @@ mod tests {
 
         async fn collection_point_count(&self, _collection: &str) -> Result<u64> {
             Ok(0)
+        }
+
+        async fn refresh_file_payload(
+            &self,
+            _collection: &str,
+            _file_path: &str,
+            _set: HashMap<String, serde_json::Value>,
+            _delete_keys: Vec<String>,
+        ) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -8811,6 +9913,7 @@ mod tests {
             .collect();
         PendingFile {
             schema_hash: String::new(),
+            payload_hash: String::new(),
             chunking_fingerprint: String::new(),
             derived: Default::default(),
             file_path: file_path.to_string(),
@@ -9146,6 +10249,7 @@ mod tests {
             size: content.len() as i64,
             display_mtime: 1,
             schema_hash: String::new(),
+            payload_hash: String::new(),
             chunking_fingerprint: String::new(),
             derived: Default::default(),
         };

@@ -560,6 +560,7 @@ Indexing run complete discovered=42 indexed=5 skipped=36 invalid=0 empty=0 read_
 | `empty` | Files that produced no chunks (blank body after frontmatter) |
 | `read_errors` | Files that could not be read (permissions, encoding errors) |
 | `orphans_removed` | Qdrant points removed for files no longer on disk |
+| `refreshed` | Unchanged files revalidated under an edited schema, with metadata (and, when the edit shapes it, Qdrant payload) refreshed in place — no re-embedding |
 | `elapsed_secs` | Wall-clock time for the run |
 
 If a file you expected to be indexed shows up under `skipped`, its hash matches the last indexed version — it hasn't changed since the last run. If it shows under `invalid`, run `mcp-md-wiki validate` for details.

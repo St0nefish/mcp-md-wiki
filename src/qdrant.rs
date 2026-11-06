@@ -4,12 +4,13 @@ use anyhow::{Context, Result};
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     Condition, CountPointsBuilder, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
-    DeletePointsBuilder, Distance, FieldCondition, FieldType, Filter, Fusion, Match, Modifier,
-    NamedVectors, PointStruct, PrefetchQuery, PrefetchQueryBuilder, Query, QueryPointGroupsBuilder,
-    QueryPointsBuilder, Range, SearchPointsBuilder, SparseVectorParamsBuilder,
-    SparseVectorsConfigBuilder, TextIndexParamsBuilder, TokenizerType, UpsertPointsBuilder,
-    Value as QdrantValue, Vector, VectorInput, VectorParamsBuilder, VectorsConfigBuilder,
-    value::Kind, vectors_config::Config as VectorsConfigOneof,
+    DeletePayloadPointsBuilder, DeletePointsBuilder, Distance, FieldCondition, FieldType, Filter,
+    Fusion, Match, Modifier, NamedVectors, PointStruct, PrefetchQuery, PrefetchQueryBuilder, Query,
+    QueryPointGroupsBuilder, QueryPointsBuilder, Range, SearchPointsBuilder,
+    SetPayloadPointsBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
+    TextIndexParamsBuilder, TokenizerType, UpsertPointsBuilder, Value as QdrantValue, Vector,
+    VectorInput, VectorParamsBuilder, VectorsConfigBuilder, value::Kind,
+    vectors_config::Config as VectorsConfigOneof,
 };
 use tracing::{debug, error, info, warn};
 
@@ -79,6 +80,23 @@ pub trait VectorStore: Send + Sync {
     /// while this one decides whether to drop and rebuild the whole collection, so it
     /// cannot afford eventual-consistency noise turning into a false-positive wipe.
     async fn collection_point_count(&self, collection: &str) -> Result<u64>;
+    /// Rewrite the frontmatter part of every point of `file_path` in place (#351):
+    /// merge `set` into each point's payload (a key in `set` replaces that key's
+    /// value) and remove every key in `delete_keys`, leaving vectors and every other
+    /// key — chunk text, line range, heading and section keys — untouched. This is
+    /// how a schema edit that changes defaults or derived fields reaches Qdrant
+    /// without re-embedding. Callers never pass a key the chunk owns
+    /// ([`is_chunk_owned_payload_key`]).
+    ///
+    /// Not `overwrite_payload`, which replaces the whole payload and would drop the
+    /// chunk keys; a merge cannot remove a key, hence `delete_keys`.
+    async fn refresh_file_payload(
+        &self,
+        collection: &str,
+        file_path: &str,
+        set: HashMap<String, serde_json::Value>,
+        delete_keys: Vec<String>,
+    ) -> Result<()>;
 }
 
 pub trait RetrievalStore: Send + Sync {
@@ -350,6 +368,43 @@ pub const SECTION_LINE_START_KEY: &str = "section_line_start";
 /// The Qdrant payload key under which the attributed section's own
 /// file-relative subtree end line is stored — see [`SECTION_LINE_START_KEY`].
 pub const SECTION_LINE_END_KEY: &str = "section_line_end";
+
+/// The payload keys `ingest::upsert_pending` writes on every chunk on top of the
+/// document's frontmatter, whatever the config: the chunk's text, offset and line
+/// range plus the per-file `file_path`, `mtime` and [`PATH_ANCESTORS_KEY`].
+pub const CHUNK_PAYLOAD_KEYS: &[&str] = &[
+    "file_path",
+    "mtime",
+    "chunk_index",
+    CHUNK_TEXT_KEY,
+    CHUNK_BODY_OFFSET_KEY,
+    "line_start",
+    "line_end",
+    PATH_ANCESTORS_KEY,
+];
+
+/// The heading and section keys `ingest::upsert_pending` writes on every chunk only
+/// while `chunking.heading_metadata` is on (#286).
+pub const HEADING_PAYLOAD_KEYS: &[&str] = &[
+    HEADING_PATH_KEY,
+    HEADING_LEVEL_KEY,
+    HEADING_PREFIXES_KEY,
+    SECTION_KEY,
+    SECTION_LINE_START_KEY,
+    SECTION_LINE_END_KEY,
+];
+
+/// Whether the chunk itself owns payload key `key` under the given
+/// `chunking.heading_metadata` setting — [`CHUNK_PAYLOAD_KEYS`], plus
+/// [`HEADING_PAYLOAD_KEYS`] while it is on. The full path writes those after the
+/// frontmatter, so a frontmatter key spelled the same never reaches the payload;
+/// with `heading_metadata` off a frontmatter key named like a heading key does. A
+/// payload refresh (#351, [`VectorStore::refresh_file_payload`]) uses the same rule:
+/// it never sets or deletes a key the chunk owns. `schema::RESERVED_PAYLOAD_NAMES` is
+/// both lists plus `fm` (pinned by a test).
+pub fn is_chunk_owned_payload_key(key: &str, heading_metadata: bool) -> bool {
+    CHUNK_PAYLOAD_KEYS.contains(&key) || (heading_metadata && HEADING_PAYLOAD_KEYS.contains(&key))
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
@@ -1189,6 +1244,51 @@ impl QdrantStore {
         Ok(())
     }
 
+    /// See [`VectorStore::refresh_file_payload`]. Both calls select the file's points
+    /// with the same `file_path` match filter `delete_by_files` uses and wait for the
+    /// operation to be applied, so the next run (or a search) never reads a
+    /// half-refreshed file. `set` is applied first: a failure between the two calls
+    /// leaves a key that should have been removed, never a value missing.
+    pub async fn refresh_file_payload(
+        &self,
+        collection: &str,
+        file_path: &str,
+        set: HashMap<String, serde_json::Value>,
+        delete_keys: Vec<String>,
+    ) -> Result<()> {
+        let selector = || Filter::must([Condition::matches("file_path", file_path.to_string())]);
+
+        if !set.is_empty() {
+            self.client
+                .set_payload(
+                    SetPayloadPointsBuilder::new(collection, json_payload_to_qdrant(&set))
+                        .points_selector(selector())
+                        .wait(true),
+                )
+                .await
+                .with_context(|| format!("Failed to set payload for '{file_path}'"))?;
+        }
+        if !delete_keys.is_empty() {
+            self.client
+                .delete_payload(
+                    DeletePayloadPointsBuilder::new(collection, delete_keys.clone())
+                        .points_selector(selector())
+                        .wait(true),
+                )
+                .await
+                .with_context(|| format!("Failed to delete payload keys for '{file_path}'"))?;
+        }
+
+        debug!(
+            file = file_path,
+            set = set.len(),
+            deleted = delete_keys.len(),
+            "Refreshed payload in '{}'",
+            collection
+        );
+        Ok(())
+    }
+
     /// See [`VectorStore::collection_point_count`] for the full rationale (exact vs.
     /// `collection_info`'s approximate count, and why this exists on the trait at
     /// all). Mirrors `drop_collection`/`ensure_collection`'s existence-check pattern:
@@ -1249,6 +1349,16 @@ impl VectorStore for QdrantStore {
 
     async fn collection_point_count(&self, collection: &str) -> Result<u64> {
         QdrantStore::collection_point_count(self, collection).await
+    }
+
+    async fn refresh_file_payload(
+        &self,
+        collection: &str,
+        file_path: &str,
+        set: HashMap<String, serde_json::Value>,
+        delete_keys: Vec<String>,
+    ) -> Result<()> {
+        QdrantStore::refresh_file_payload(self, collection, file_path, set, delete_keys).await
     }
 }
 
@@ -1823,6 +1933,29 @@ mod tests {
     }
 
     #[test]
+    fn chunk_payload_keys_are_the_schema_reserved_names_but_fm() {
+        // Two views of one set: what a schema may not name (`schema` lint), and what a
+        // payload refresh may not touch (#351). `fm` is reserved for #350's namespace
+        // but not yet written by ingest.
+        let builtin: std::collections::BTreeSet<&str> = CHUNK_PAYLOAD_KEYS
+            .iter()
+            .chain(HEADING_PAYLOAD_KEYS)
+            .copied()
+            .collect();
+        assert!(is_chunk_owned_payload_key("text", false));
+        assert!(!is_chunk_owned_payload_key(SECTION_KEY, false));
+        assert!(is_chunk_owned_payload_key(SECTION_KEY, true));
+        assert!(!is_chunk_owned_payload_key("status", true));
+        let reserved: std::collections::BTreeSet<&str> = crate::schema::RESERVED_PAYLOAD_NAMES
+            .iter()
+            .copied()
+            .collect();
+        let only_reserved: Vec<&str> = reserved.difference(&builtin).copied().collect();
+        assert_eq!(only_reserved, vec!["fm"]);
+        assert!(builtin.is_subset(&reserved));
+    }
+
+    #[test]
     fn qdrant_value_roundtrip() {
         let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
         payload.insert("title".into(), serde_json::Value::String("Test Doc".into()));
@@ -1956,6 +2089,124 @@ mod tests {
                 result.payload.get("text").and_then(|v| v.as_str()),
                 Some("Hello world chunk"),
             );
+        })
+        .await;
+    }
+
+    /// #351: `refresh_file_payload` merges the new frontmatter into every point of
+    /// one file, deletes the keys a schema edit removed, and leaves the chunk keys and
+    /// every other file's points alone.
+    ///
+    /// Live-only, and runs only in CI's `qdrant-integration` tier (it is `#[ignore]`d,
+    /// like every test here that needs a server): what it proves is the server's
+    /// set/delete-payload semantics under a filter selector, which no fake can.
+    ///
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test refresh_file_payload_merges_deletes_and_keeps_chunk_keys -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn refresh_file_payload_merges_deletes_and_keeps_chunk_keys() {
+        use qdrant_client::qdrant::ScrollPointsBuilder;
+
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: live_test_collection(
+                "refresh_file_payload_merges_deletes_and_keeps_chunk_keys",
+            ),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+        let _ = store.client.delete_collection(&config.collection).await;
+        store
+            .ensure_collection(&config.collection, 4, &[], IndexFeatures::default())
+            .await
+            .unwrap();
+
+        with_collection_cleanup(&store, &config.collection, || async {
+            let point = |id: &str, file: &str, chunk: u64| {
+                let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
+                payload.insert("file_path".into(), serde_json::json!(file));
+                payload.insert("chunk_index".into(), serde_json::json!(chunk));
+                payload.insert(
+                    CHUNK_TEXT_KEY.into(),
+                    serde_json::json!(format!("chunk {chunk}")),
+                );
+                payload.insert("line_start".into(), serde_json::json!(1));
+                payload.insert("status".into(), serde_json::json!("draft"));
+                payload.insert("legacy".into(), serde_json::json!("gone soon"));
+                QdrantPoint {
+                    id: id.into(),
+                    vector: vec![1.0, 0.0, 0.0, 0.0],
+                    sparse: None,
+                    payload,
+                }
+            };
+            store
+                .upsert_points(
+                    &config.collection,
+                    vec![
+                        point("00000000-0000-0000-0000-000000000001", "a.md", 0),
+                        point("00000000-0000-0000-0000-000000000002", "a.md", 1),
+                        point("00000000-0000-0000-0000-000000000003", "b.md", 0),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let mut set = HashMap::new();
+            set.insert("status".to_string(), serde_json::json!("active"));
+            set.insert("domain".to_string(), serde_json::json!("food"));
+            store
+                .refresh_file_payload(&config.collection, "a.md", set, vec!["legacy".to_string()])
+                .await
+                .unwrap();
+
+            let read_all = || async {
+                let response = store
+                    .client
+                    .scroll(
+                        ScrollPointsBuilder::new(&config.collection)
+                            .limit(10)
+                            .with_payload(true),
+                    )
+                    .await
+                    .unwrap();
+                response
+                    .result
+                    .into_iter()
+                    .map(|p| qdrant_payload_to_json(&p.payload))
+                    .collect::<Vec<_>>()
+            };
+            let payloads = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                read_all,
+                |payloads: &Vec<HashMap<String, serde_json::Value>>| {
+                    payloads.len() == 3
+                        && payloads
+                            .iter()
+                            .filter(|p| p["file_path"] == "a.md")
+                            .all(|p| p.get("status") == Some(&serde_json::json!("active")))
+                },
+            )
+            .await;
+            assert_eq!(payloads.len(), 3);
+
+            for p in &payloads {
+                if p["file_path"] == "a.md" {
+                    assert_eq!(p["status"], "active", "set merges a new value in");
+                    assert_eq!(p["domain"], "food", "set adds a new key");
+                    assert!(!p.contains_key("legacy"), "a removed key is deleted");
+                    // Chunk keys survive the merge.
+                    let chunk = p["chunk_index"].as_i64().unwrap();
+                    assert_eq!(p[CHUNK_TEXT_KEY], format!("chunk {chunk}"));
+                    assert_eq!(p["line_start"], 1);
+                } else {
+                    assert_eq!(p["file_path"], "b.md");
+                    assert_eq!(p["status"], "draft", "another file's points are untouched");
+                    assert_eq!(p["legacy"], "gone soon");
+                    assert!(!p.contains_key("domain"));
+                }
+            }
         })
         .await;
     }

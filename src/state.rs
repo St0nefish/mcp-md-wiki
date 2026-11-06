@@ -276,9 +276,18 @@ pub struct IndexedFile {
     pub content_hash: String,
     pub chunk_count: i64,
     pub indexed_at: String,
-    /// Fingerprint of the schema this file was last validated against. Empty for rows
-    /// written before schema tracking existed, which forces one revalidation pass.
+    /// Fingerprint of the schema this file was last validated and projected against
+    /// (`ResolvedSchema::fingerprint`). Empty for rows written before schema tracking
+    /// existed, which forces one revalidation pass. A mismatch alone never re-embeds
+    /// (#351): it revalidates and refreshes the metadata, see `payload_hash`.
     pub schema_hash: String,
+    /// Fingerprint of the schema inputs that shape this file's Qdrant payload
+    /// frontmatter (`ingest::payload_hash_for`, over `ResolvedSchema::payload_fingerprint`)
+    /// as of the last index or refresh (#351). `''` means unknown — every row written
+    /// before this column existed — and is treated as current while `schema_hash`
+    /// matches, so upgrading writes nothing to Qdrant; once `schema_hash` moves, an
+    /// unknown value counts as changed and the payload is refreshed in place.
+    pub payload_hash: String,
     /// Fingerprint of the chunking configuration (`ingest::chunking_fingerprint`: every
     /// `chunking.*` setting that shapes chunk text or payload, plus
     /// `ingest::CHUNKER_VERSION`) this file was last chunked and embedded under. Empty
@@ -299,6 +308,20 @@ pub struct IndexedFile {
     pub size: i64,
 }
 
+/// Every column of one `indexed_files` row that [`StateDb::upsert_record`] writes —
+/// a struct rather than more positional arguments on [`StateDb::upsert`].
+#[derive(Debug, Clone, Copy)]
+pub struct IndexedFileRecord<'a> {
+    pub file_path: &'a str,
+    pub content_hash: &'a str,
+    pub chunk_count: i64,
+    pub schema_hash: &'a str,
+    pub payload_hash: &'a str,
+    pub chunking_fingerprint: &'a str,
+    pub mtime: i64,
+    pub size: i64,
+}
+
 /// One row from [`StateDb::scan_indexed_files`]: an `indexed_files` row plus the
 /// `documents.content_hash` for the same path, if a metadata row exists at all.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -306,6 +329,8 @@ pub struct ScanRow {
     pub file_path: String,
     pub content_hash: String,
     pub schema_hash: String,
+    /// `indexed_files.payload_hash` (#351); see [`IndexedFile::payload_hash`].
+    pub payload_hash: String,
     pub chunking_fingerprint: String,
     pub mtime: i64,
     pub size: i64,
@@ -441,6 +466,19 @@ impl StateDb {
             &pool,
             "indexed_files",
             "schema_hash",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
+
+        // Payload-shape fingerprint (#351, `ingest::payload_hash_for`). Unlike the
+        // columns above, '' here does NOT force anything: it means "unknown", which
+        // ingest treats as current while `schema_hash` still matches. Upgrading is
+        // therefore a no-op reindex — no re-embed, no Qdrant write — and a later
+        // schema edit refreshes the payload in place rather than re-embedding.
+        add_column_if_missing(
+            &pool,
+            "indexed_files",
+            "payload_hash",
             "TEXT NOT NULL DEFAULT ''",
         )
         .await?;
@@ -605,7 +643,7 @@ impl StateDb {
     #[cfg(test)]
     pub async fn get(&self, file_path: &str) -> Result<Option<IndexedFile>> {
         let row = sqlx::query_as::<_, IndexedFile>(
-            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, chunking_fingerprint, mtime, size
+            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, payload_hash, chunking_fingerprint, mtime, size
              FROM indexed_files WHERE file_path = ?",
         )
         .bind(file_path)
@@ -615,6 +653,10 @@ impl StateDb {
         Ok(row)
     }
 
+    /// Write a whole `indexed_files` row with an unknown (`''`) `payload_hash` — see
+    /// [`IndexedFile::payload_hash`]. Test-only shorthand: ingest writes rows through
+    /// [`Self::upsert_record`], which records the payload hash too.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         &self,
@@ -626,19 +668,63 @@ impl StateDb {
         mtime: i64,
         size: i64,
     ) -> Result<()> {
+        self.upsert_record(&IndexedFileRecord {
+            file_path,
+            content_hash,
+            chunk_count,
+            schema_hash,
+            payload_hash: "",
+            chunking_fingerprint,
+            mtime,
+            size,
+        })
+        .await
+    }
+
+    /// Write a whole `indexed_files` row (`INSERT OR REPLACE`, `indexed_at` now).
+    pub async fn upsert_record(&self, record: &IndexedFileRecord<'_>) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO indexed_files
                 (file_path, content_hash, chunk_count, indexed_at, schema_hash,
-                 chunking_fingerprint, mtime, size)
-             VALUES (?, ?, ?, datetime('now'), ?, ?, ?, ?)",
+                 payload_hash, chunking_fingerprint, mtime, size)
+             VALUES (?, ?, ?, datetime('now'), ?, ?, ?, ?, ?)",
         )
-        .bind(file_path)
-        .bind(content_hash)
-        .bind(chunk_count)
+        .bind(record.file_path)
+        .bind(record.content_hash)
+        .bind(record.chunk_count)
+        .bind(record.schema_hash)
+        .bind(record.payload_hash)
+        .bind(record.chunking_fingerprint)
+        .bind(record.mtime)
+        .bind(record.size)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Record that an already-indexed file was revalidated and its metadata (and, when
+    /// its payload hash moved, its Qdrant payload) refreshed under a new schema without
+    /// re-chunking or re-embedding it (#351): only `schema_hash`, `payload_hash` and the
+    /// stat baseline change. `content_hash`, `chunk_count`, `chunking_fingerprint` and
+    /// `indexed_at` describe the chunks still in Qdrant, which this does not touch.
+    pub async fn update_schema_hashes(
+        &self,
+        file_path: &str,
+        schema_hash: &str,
+        payload_hash: &str,
+        mtime: i64,
+        size: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE indexed_files SET schema_hash = ?, payload_hash = ?, mtime = ?, size = ?
+             WHERE file_path = ?",
+        )
         .bind(schema_hash)
-        .bind(chunking_fingerprint)
+        .bind(payload_hash)
         .bind(mtime)
         .bind(size)
+        .bind(file_path)
         .execute(&self.pool)
         .await?;
 
@@ -677,7 +763,7 @@ impl StateDb {
 
     pub async fn list_all(&self) -> Result<Vec<IndexedFile>> {
         let rows = sqlx::query_as::<_, IndexedFile>(
-            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, chunking_fingerprint, mtime, size
+            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, payload_hash, chunking_fingerprint, mtime, size
              FROM indexed_files ORDER BY file_path",
         )
         .fetch_all(&self.pool)
@@ -707,7 +793,7 @@ impl StateDb {
     /// query per row.
     pub async fn fetch_indexed_files_page(&self, limit: i64, offset: i64) -> Result<Vec<ScanRow>> {
         let rows: Vec<ScanRow> = sqlx::query_as(
-            "SELECT i.file_path, i.content_hash, i.schema_hash, i.chunking_fingerprint, i.mtime, i.size, \
+            "SELECT i.file_path, i.content_hash, i.schema_hash, i.payload_hash, i.chunking_fingerprint, i.mtime, i.size, \
                     i.chunk_count, d.content_hash AS doc_hash \
              FROM indexed_files i LEFT JOIN documents d ON d.file_path = i.file_path \
              ORDER BY i.file_path LIMIT ? OFFSET ?",
@@ -731,7 +817,7 @@ impl StateDb {
                 continue;
             }
             let mut builder = QueryBuilder::<Sqlite>::new(
-                "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, chunking_fingerprint, mtime, size \
+                "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, payload_hash, chunking_fingerprint, mtime, size \
                  FROM indexed_files WHERE file_path IN (",
             );
             let mut separated = builder.separated(", ");
@@ -892,6 +978,32 @@ impl StateDb {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    /// A document's stored `documents.frontmatter`, or `None` when it has no metadata
+    /// row (or the stored JSON is not an object).
+    ///
+    /// Ingest writes the same frontmatter (derived fields included) to this row and to
+    /// every chunk's Qdrant payload, so its keys are also the frontmatter keys that
+    /// payload carries, and its `description` is what chunking prepended. A payload
+    /// refresh (#351) reads it before rewriting the row, to know which keys a schema
+    /// edit removed and whether the prepended description changed.
+    pub async fn document_frontmatter(
+        &self,
+        file_path: &str,
+    ) -> Result<Option<serde_json::Map<String, Value>>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT frontmatter FROM documents WHERE file_path = ?")
+                .bind(file_path)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((json,)) = row else {
+            return Ok(None);
+        };
+        Ok(match serde_json::from_str::<Value>(&json) {
+            Ok(Value::Object(map)) => Some(map),
+            _ => None,
+        })
     }
 
     /// Remove a document's metadata. Projection rows cascade via the foreign key;
@@ -2105,6 +2217,129 @@ mod tests {
         let page = db.fetch_indexed_files_page(10, 0).await.unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].chunking_fingerprint, "");
+    }
+
+    #[tokio::test]
+    async fn upgrading_a_pre_payload_hash_db_adds_only_that_column() {
+        // #351: the shape of the release before `payload_hash` — every other column
+        // present with real values. They must survive untouched, and the new column
+        // must read back '' ("unknown"), which ingest treats as current while
+        // `schema_hash` matches, so the upgrade re-embeds and rewrites nothing.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pre-payload-hash.db");
+        let options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", path.to_str().unwrap()))
+                .unwrap()
+                .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE indexed_files (
+                file_path            TEXT PRIMARY KEY,
+                content_hash         TEXT NOT NULL,
+                chunk_count          INTEGER NOT NULL,
+                indexed_at           TEXT NOT NULL DEFAULT (datetime('now')),
+                schema_hash          TEXT NOT NULL DEFAULT '',
+                chunking_fingerprint TEXT NOT NULL DEFAULT '',
+                mtime                INTEGER NOT NULL DEFAULT 0,
+                size                 INTEGER NOT NULL DEFAULT -1
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO indexed_files
+                (file_path, content_hash, chunk_count, indexed_at, schema_hash,
+                 chunking_fingerprint, mtime, size)
+             VALUES ('a.md', 'hash-a', 4, 'then', 'schema-fp', 'chunk-fp', 123, 45)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = StateDb::new(&path).await.expect("upgrade must not fail");
+        let row = db.get("a.md").await.unwrap().unwrap();
+        assert_eq!(row.content_hash, "hash-a");
+        assert_eq!(row.chunk_count, 4);
+        assert_eq!(row.indexed_at, "then");
+        assert_eq!(row.schema_hash, "schema-fp");
+        assert_eq!(row.chunking_fingerprint, "chunk-fp");
+        assert_eq!((row.mtime, row.size), (123, 45));
+        assert_eq!(
+            row.payload_hash, "",
+            "a pre-existing row's payload hash is unknown"
+        );
+
+        let page = db.fetch_indexed_files_page(10, 0).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].payload_hash, "");
+        assert_eq!(page[0].schema_hash, "schema-fp");
+        let many = db.get_many(&["a.md".to_string()]).await.unwrap();
+        assert_eq!(many["a.md"].payload_hash, "");
+    }
+
+    #[tokio::test]
+    async fn upsert_record_and_update_schema_hashes_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::new(&dir.path().join("s.db")).await.unwrap();
+        db.upsert_record(&IndexedFileRecord {
+            file_path: "a.md",
+            content_hash: "h",
+            chunk_count: 3,
+            schema_hash: "s1",
+            payload_hash: "p1",
+            chunking_fingerprint: "c",
+            mtime: 1,
+            size: 2,
+        })
+        .await
+        .unwrap();
+        let row = db.get("a.md").await.unwrap().unwrap();
+        assert_eq!(
+            (row.schema_hash.as_str(), row.payload_hash.as_str()),
+            ("s1", "p1")
+        );
+        let indexed_at = row.indexed_at.clone();
+
+        db.update_schema_hashes("a.md", "s2", "p2", 5, 6)
+            .await
+            .unwrap();
+        let row = db.get("a.md").await.unwrap().unwrap();
+        assert_eq!(row.schema_hash, "s2");
+        assert_eq!(row.payload_hash, "p2");
+        assert_eq!((row.mtime, row.size), (5, 6));
+        // What describes the chunks still in Qdrant is untouched.
+        assert_eq!(row.content_hash, "h");
+        assert_eq!(row.chunk_count, 3);
+        assert_eq!(row.chunking_fingerprint, "c");
+        assert_eq!(row.indexed_at, indexed_at);
+
+        // The positional `upsert` writes an unknown payload hash.
+        db.upsert("a.md", "h", 3, "s3", "c", 1, 2).await.unwrap();
+        assert_eq!(db.get("a.md").await.unwrap().unwrap().payload_hash, "");
+    }
+
+    #[tokio::test]
+    async fn document_frontmatter_reads_the_stored_object() {
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::new(&dir.path().join("s.db")).await.unwrap();
+        assert_eq!(db.document_frontmatter("a.md").await.unwrap(), None);
+        let mut fm = HashMap::new();
+        fm.insert("title".to_string(), serde_json::json!("A"));
+        fm.insert("planning".to_string(), serde_json::json!({"effort": "low"}));
+        db.upsert_document_metadata("a.md", &fm, 0, "h", 1)
+            .await
+            .unwrap();
+        let stored = db.document_frontmatter("a.md").await.unwrap().unwrap();
+        assert_eq!(
+            Value::Object(stored),
+            serde_json::json!({"title": "A", "planning": {"effort": "low"}})
+        );
     }
 
     #[tokio::test]
