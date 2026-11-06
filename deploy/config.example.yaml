@@ -946,7 +946,9 @@ lint:
   #   dead_links — author-written links whose target is not indexed (error)
   #   orphans    — documents no other document links to (warning)
   #   stale      — documents not updated within the thresholds below (warning)
-  #   oversize   — documents past max_lines / max_bytes (warning)
+  #   oversize   — documents past max_lines / max_bytes (warning). Reads every
+  #                indexed file larger than max_lines bytes from disk (cost
+  #                proportional to corpus size); switch off to avoid that.
   #   tags       — tags used once (info) and tags outside a declared enum (error)
   dead_links: true
   orphans: true
@@ -1000,14 +1002,19 @@ contradictions:
   # pass on demand whatever this says.
   enabled: false
 
-  # Seconds between scheduled runs. Minimum 60.
+  # Seconds between scheduled runs. Minimum 60. The first run comes 300 seconds
+  # after `serve` starts (or after one interval, if that is shorter); a run that
+  # finds an indexing run in flight re-checks every 30 seconds for up to five
+  # minutes, then skips until the next interval.
   interval_secs: 86400
 
   # Nearest neighbours considered per changed document (1-20).
+  # A change applies to documents analysed after it: only documents whose
+  # content changed are re-scanned.
   top_k: 5
 
   # A neighbour below this dense cosine similarity is not a candidate pair.
-  # Range: 0.0-1.0.
+  # Range: 0.0-1.0. A change applies to documents analysed after it.
   min_similarity: 0.80
 
   # Most pairs a single run evaluates (and, with a judge, sends to the model).

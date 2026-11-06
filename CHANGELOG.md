@@ -349,7 +349,7 @@ schema rebuild and fails to start.
   the first index) for an external scheduler to poll. Severities are fixed: dead links
   and tags outside a declared enum are `error`, orphans / stale / oversize are
   `warning`, singleton tags are `info`. Read-only over the state DB, the schema tree
-  and (oversize only) the larger files; no reindex, no schema or state change.
+  and (oversize only) every indexed file larger than `lint.max_lines` bytes, read from disk; no reindex, no schema or state change.
   **Behavior change:** `lint` with no `--check` now runs every check `lint:` enables
   (all five by default) instead of dead links only, `--check` is repeatable, and
   `--json` prints a new envelope (`{"checks": [{check, severity, count, findings,
@@ -370,8 +370,9 @@ schema rebuild and fails to start.
   pair is evaluated once per version of its two documents, `max_pairs_per_run` caps a
   run (the rest carries over) and a failed judge call is stored with its `error` and
   retried. `contradictions.enabled` (default `false`) runs the same pass every
-  `interval_secs` (default 86400) inside `serve`, skipped while an indexing run is in
-  flight; `enabled`, `interval_secs`, `top_k`, `min_similarity` and
+  `interval_secs` (default 86400) inside `serve`, the first run five minutes after
+  startup, waiting up to five minutes for an in-flight indexing run to end before
+  skipping to the next interval; `enabled`, `interval_secs`, `top_k`, `min_similarity` and
   `max_pairs_per_run` are live-reloadable, the judge settings need a restart. The
   judge is **off by default** and no model is chosen for you: `judge: true` needs
   `CONTRADICTIONS_JUDGE_MODEL`, `CONTRADICTIONS_JUDGE_BASE_URL` (required for

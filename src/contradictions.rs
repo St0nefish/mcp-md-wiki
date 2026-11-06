@@ -354,6 +354,16 @@ pub async fn run_once<N: NeighborStore>(
         .map(|(path, _)| ((*path).clone(), hashes[*path].clone()))
         .collect();
     deps.state.mark_documents_analyzed(&done).await?;
+    // A fully processed document's still-neighbouring pairs were rewritten with
+    // current hashes above; a stored pair left with an outdated hash for it is one
+    // it no longer belongs to. A partly processed document keeps its rows.
+    let dropped = deps.state.delete_stale_contradiction_pairs(&done).await?;
+    if dropped > 0 {
+        debug!(
+            rows = dropped,
+            "Dropped contradiction pairs no longer neighbours of a changed document"
+        );
+    }
 
     info!(
         scanned = summary.documents_scanned,
@@ -983,6 +993,69 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pair_a_changed_document_no_longer_neighbours_is_dropped() {
+        let fx = fixture(&["a.md", "b.md", "c.md"]).await;
+        let judge = FakeJudge::conflicting(&[("a.md", "b.md")]);
+        let before = FakeNeighbors::default().with("a.md", &[("b.md", 0.9), ("c.md", 0.85)]);
+        fx.run(&before, Some(&judge), params()).await;
+        let listed = fx.state.list_contradiction_pairs(10).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            (listed[0].path_a.as_str(), listed[0].path_b.as_str()),
+            ("a.md", "b.md"),
+            "the conflict is stored"
+        );
+
+        // a.md changes and no longer has b.md as a neighbour, only c.md.
+        fx.change("a.md", "h-a-v2").await;
+        let after = FakeNeighbors::default().with("a.md", &[("c.md", 0.85)]);
+        fx.run(&after, Some(&judge), params()).await;
+
+        let rows = fx.state.list_contradiction_pairs(10).await.unwrap();
+        assert_eq!(rows.len(), 1, "the a/b row is gone: {rows:?}");
+        assert_eq!(
+            (rows[0].path_a.as_str(), rows[0].path_b.as_str()),
+            ("a.md", "c.md")
+        );
+        assert_eq!(rows[0].hash_a, "h-a-v2", "a pair still found is rewritten");
+    }
+
+    #[tokio::test]
+    async fn a_partly_processed_document_keeps_its_old_pairs() {
+        let fx = fixture(&["a.md", "b.md", "c.md"]).await;
+        let before = FakeNeighbors::default().with("a.md", &[("b.md", 0.9)]);
+        fx.run(&before, None, params()).await;
+
+        // a.md changes, its only neighbour is now c.md, but the cap stops the run
+        // before that pair is evaluated: a.md is not analysed, a/b is kept.
+        fx.change("a.md", "h-a-v2").await;
+        let after = FakeNeighbors::default().with("a.md", &[("c.md", 0.85)]);
+        let capped = RunParams {
+            max_pairs_per_run: 0,
+            ..params()
+        };
+        let s = fx.run(&after, None, capped).await;
+        assert_eq!(s.deferred_pairs, 1);
+        assert!(
+            fx.state
+                .get_contradiction_pair("a.md", "b.md")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // The next, uncapped run finishes a.md and drops a/b.
+        fx.run(&after, None, params()).await;
+        assert!(
+            fx.state
+                .get_contradiction_pair("a.md", "b.md")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

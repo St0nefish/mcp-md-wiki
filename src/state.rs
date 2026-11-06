@@ -1541,10 +1541,59 @@ impl StateDb {
         Ok(n)
     }
 
+    /// Delete the stored pairs of each `(path, current_hash)` document whose hash for
+    /// that document differs from `current_hash`, in one transaction. Called for a
+    /// document the job has just fully re-processed: a neighbour it still has was
+    /// rewritten with current hashes, so what remains stale is a pair the document no
+    /// longer belongs to. The other document of each dropped pair loses its analysed
+    /// marker, because neighbour lists are asymmetric: it may still rank the changed
+    /// document among its own neighbours, and only a rescan of it recreates the pair.
+    /// Returns the number of pair rows removed.
+    pub async fn delete_stale_contradiction_pairs(&self, docs: &[(String, String)]) -> Result<u64> {
+        if docs.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut removed = 0;
+        for (path, hash) in docs {
+            sqlx::query(
+                "DELETE FROM contradiction_docs WHERE file_path IN (
+                     SELECT CASE WHEN path_a = ?1 THEN path_b ELSE path_a END
+                     FROM contradiction_pairs
+                     WHERE (path_a = ?1 AND hash_a != ?2) OR (path_b = ?1 AND hash_b != ?2))",
+            )
+            .bind(path)
+            .bind(hash)
+            .execute(&mut *tx)
+            .await?;
+            removed += sqlx::query(
+                "DELETE FROM contradiction_pairs
+                 WHERE (path_a = ? AND hash_a != ?) OR (path_b = ? AND hash_b != ?)",
+            )
+            .bind(path)
+            .bind(hash)
+            .bind(path)
+            .bind(hash)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     /// Delete contradiction rows that mention a document no longer in `documents`
-    /// (a belt for `delete_document`'s braces: a removal that bypassed it, or a
-    /// `clear`). Returns the number of rows removed.
+    /// (a belt for `delete_document`'s braces: a removal that bypassed it). Returns
+    /// the number of rows removed. Does nothing while `documents` is empty: a
+    /// `--full` reindex clears the table before refilling it, and pruning against
+    /// that transient emptiness would wipe every judged pair.
     pub async fn prune_contradiction_data(&self) -> Result<u64> {
+        let (documents,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM documents")
+            .fetch_one(&self.pool)
+            .await?;
+        if documents == 0 {
+            return Ok(0);
+        }
         let mut removed = 0;
         for sql in [
             "DELETE FROM contradiction_docs
@@ -6631,6 +6680,90 @@ mod tests {
         assert_eq!(pairs[0].path_a, "a.md");
         // Nothing left to prune.
         assert_eq!(db.prune_contradiction_data().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_contradiction_data_keeps_everything_while_documents_is_empty() {
+        let (db, _dir) = test_db().await;
+        db.mark_documents_analyzed(&[("a.md".into(), "h".into())])
+            .await
+            .unwrap();
+        db.upsert_contradiction_pair(&pair("a.md", "b.md", "conflict", 0.9))
+            .await
+            .unwrap();
+
+        assert_eq!(db.prune_contradiction_data().await.unwrap(), 0);
+        assert_eq!(db.count_contradiction_pairs().await.unwrap(), 1);
+        assert_eq!(db.contradiction_analyzed_hashes().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_stale_pair_makes_the_other_document_rescan() {
+        let (db, _dir) = test_db().await;
+        let mut ab = pair("a.md", "b.md", "conflict", 0.9);
+        ab.hash_a = "old".into();
+        db.upsert_contradiction_pair(&ab).await.unwrap();
+        db.upsert_contradiction_pair(&pair("a.md", "c.md", "candidate", 0.9))
+            .await
+            .unwrap();
+        db.mark_documents_analyzed(&[("b.md".into(), "h-b".into()), ("c.md".into(), "h-c".into())])
+            .await
+            .unwrap();
+
+        db.delete_stale_contradiction_pairs(&[("a.md".into(), "h-a.md".into())])
+            .await
+            .unwrap();
+
+        let analyzed = db.contradiction_analyzed_hashes().await.unwrap();
+        assert!(
+            !analyzed.contains_key("b.md"),
+            "b.md lost its pair with a.md, so it must be rescanned to recreate it"
+        );
+        assert!(
+            analyzed.contains_key("c.md"),
+            "c.md's pair with a.md survived, so c.md stays analysed"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_stale_contradiction_pairs_drops_only_pairs_with_an_outdated_hash() {
+        let (db, _dir) = test_db().await;
+        // a-b: stale on a's side; a-c: current; b-c: unrelated to a.
+        let mut ab = pair("a.md", "b.md", "conflict", 0.9);
+        ab.hash_a = "old".into();
+        db.upsert_contradiction_pair(&ab).await.unwrap();
+        db.upsert_contradiction_pair(&pair("a.md", "c.md", "candidate", 0.9))
+            .await
+            .unwrap();
+        db.upsert_contradiction_pair(&pair("b.md", "c.md", "candidate", 0.9))
+            .await
+            .unwrap();
+        // z-a: a is on the `path_b` side and stale there.
+        let mut za = pair("0.md", "a.md", "candidate", 0.9);
+        za.hash_b = "old".into();
+        db.upsert_contradiction_pair(&za).await.unwrap();
+
+        assert_eq!(
+            db.delete_stale_contradiction_pairs(&[]).await.unwrap(),
+            0,
+            "nothing given, nothing deleted"
+        );
+        assert_eq!(
+            db.delete_stale_contradiction_pairs(&[("a.md".into(), "h-a.md".into())])
+                .await
+                .unwrap(),
+            2
+        );
+        let left: Vec<(String, String)> = db
+            .all_contradiction_pairs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.path_a, p.path_b))
+            .collect();
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&("a.md".into(), "c.md".into())));
+        assert!(left.contains(&("b.md".into(), "c.md".into())));
     }
 
     #[tokio::test]

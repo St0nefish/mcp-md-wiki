@@ -220,6 +220,17 @@ const SHUTDOWN_INDEX_WAIT: Duration = Duration::from_secs(75);
 /// it does not hand git any headroom it didn't already have.
 const SHUTDOWN_GIT_QUIESCE_WAIT: Duration = Duration::from_secs(30);
 
+/// How long the scheduled contradiction job (#355) waits after `serve` starts before
+/// its first tick, instead of a full `contradictions.interval_secs` (capped at that
+/// interval), so a restart does not push the next run a day out.
+const CONTRADICTION_INITIAL_DELAY: Duration = Duration::from_secs(300);
+
+/// A contradiction tick that finds an indexing run in flight re-checks every
+/// `CONTRADICTION_INDEXING_RETRY_DELAY`, at most `CONTRADICTION_INDEXING_RETRIES`
+/// times (five minutes in all), before giving up until the next interval.
+const CONTRADICTION_INDEXING_RETRY_DELAY: Duration = Duration::from_secs(30);
+const CONTRADICTION_INDEXING_RETRIES: u32 = 10;
+
 /// How long [`supervise_reindex_worker`] (#163) waits before respawning
 /// `reindex::run_worker` after it exits (panic, or — unreachably in production, since
 /// its own loop has no break — a plain return). A short, fixed delay rather than the
@@ -1943,6 +1954,7 @@ async fn reconcile_loop(shared_config: SharedConfig, ct: CancellationToken, on_f
         shared_config,
         ct,
         |config| config.indexing.reconcile_interval_secs,
+        None,
         || {
             debug!("Periodic reconcile sweep: marking a full reconcile");
             on_fire();
@@ -1961,22 +1973,30 @@ async fn reconcile_loop(shared_config: SharedConfig, ct: CancellationToken, on_f
 /// job that must stop promptly checks `ct.is_cancelled()` itself between its units of
 /// work. A job that is configured off still gets its tick — `run` is where it re-reads
 /// its own `enabled` flag, which is what lets a reload switch it on without a restart.
+///
+/// `initial_delay` replaces the interval for the first sleep only (capped at the
+/// interval, so it never makes the first run later than a regular one); `None` waits
+/// a full interval first.
 async fn periodic_job_loop<F, Fut>(
     shared_config: SharedConfig,
     ct: CancellationToken,
     interval_secs: impl Fn(&config::ResolvedConfig) -> u64,
+    initial_delay: Option<Duration>,
     mut run: F,
 ) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    let mut initial_delay = initial_delay;
     loop {
         // Read fresh every iteration (not captured once) so a reload's new
         // interval governs the very next sleep this task schedules, not just
         // sleeps scheduled after a restart.
         let secs = interval_secs(&config::load_shared_config(&shared_config));
+        let interval = Duration::from_secs(secs);
+        let wait = initial_delay.take().map_or(interval, |d| d.min(interval));
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(secs)) => {}
+            () = tokio::time::sleep(wait) => {}
             () = ct.cancelled() => {
                 break;
             }
@@ -2003,10 +2023,33 @@ struct ContradictionJob<N> {
 }
 
 impl<N: ingest::NeighborStore> ContradictionJob<N> {
+    /// Wait for an in-flight indexing run to end, polling every
+    /// `CONTRADICTION_INDEXING_RETRY_DELAY` for up to
+    /// `CONTRADICTION_INDEXING_RETRIES` attempts. `false` when indexing is still
+    /// running after that (the tick is skipped) or shutdown was requested meanwhile.
+    async fn wait_for_indexing_to_finish(&self, is_indexing: &impl Fn() -> bool) -> bool {
+        for _ in 0..CONTRADICTION_INDEXING_RETRIES {
+            if !is_indexing() {
+                return true;
+            }
+            debug!("Contradiction run postponed: an indexing run is in progress");
+            tokio::select! {
+                () = tokio::time::sleep(CONTRADICTION_INDEXING_RETRY_DELAY) => {}
+                () = self.ct.cancelled() => return false,
+            }
+        }
+        if is_indexing() {
+            debug!("Contradiction run skipped: indexing is still in progress");
+            return false;
+        }
+        true
+    }
+
     /// Run one pass if the job is enabled, no other run holds the lock and no
     /// indexing run is in flight (the metadata and vectors it reads would be
-    /// half-updated, and `clear` on a full reindex would prune what it stored).
-    /// `None` when nothing ran or the run failed (logged).
+    /// half-updated, and `clear` on a full reindex would prune what it stored). An
+    /// indexing run in flight is waited out for a bounded time rather than costing
+    /// the whole interval. `None` when nothing ran or the run failed (logged).
     async fn tick(
         &self,
         is_indexing: impl Fn() -> bool,
@@ -2015,8 +2058,12 @@ impl<N: ingest::NeighborStore> ContradictionJob<N> {
         if !cfg.contradictions.enabled {
             return None;
         }
-        if is_indexing() {
-            debug!("Contradiction run postponed: an indexing run is in progress");
+        if !self.wait_for_indexing_to_finish(&is_indexing).await {
+            return None;
+        }
+        // Re-read: a reload may have landed while this tick waited.
+        let cfg = config::load_shared_config(&self.shared_config);
+        if !cfg.contradictions.enabled {
             return None;
         }
         let result = async {
@@ -2752,6 +2799,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         Arc::clone(&shared_config),
         ct.child_token(),
         |cfg| cfg.contradictions.interval_secs,
+        Some(CONTRADICTION_INITIAL_DELAY),
         move || {
             let job = Arc::clone(&contradiction_job);
             async move {
@@ -4554,6 +4602,7 @@ mod tests {
             shared,
             ct.child_token(),
             |_| 3,
+            None,
             move || {
                 let finished = Arc::clone(&finished_for_run);
                 async move {
@@ -4580,6 +4629,70 @@ mod tests {
             1,
             "an in-flight run is awaited to completion, not dropped by cancel"
         );
+    }
+
+    /// Spawn a `periodic_job_loop` over a 100s interval with `initial_delay`, counting
+    /// its runs.
+    fn spawn_counting_loop(
+        dir: &std::path::Path,
+        initial_delay: Option<Duration>,
+    ) -> (
+        CancellationToken,
+        Arc<AtomicU32>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let ct = CancellationToken::new();
+        let runs = Arc::new(AtomicU32::new(0));
+        let runs_for_loop = Arc::clone(&runs);
+        let handle = tokio::spawn(periodic_job_loop(
+            reconcile_config(dir, 7),
+            ct.child_token(),
+            |_| 100,
+            initial_delay,
+            move || {
+                runs_for_loop.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(())
+            },
+        ));
+        (ct, runs, handle)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_job_loop_uses_the_initial_delay_for_the_first_sleep_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ct, runs, handle) = spawn_counting_loop(dir.path(), Some(Duration::from_secs(10)));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "still inside the delay");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "first run after the delay");
+
+        tokio::time::advance(Duration::from_secs(99)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "then a full interval");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+        ct.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_job_loop_caps_the_initial_delay_at_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ct, runs, handle) = spawn_counting_loop(dir.path(), Some(Duration::from_secs(500)));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(100)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        ct.cancel();
+        handle.await.unwrap();
     }
 
     // --- graceful shutdown: wait_for_indexing_to_settle ---
@@ -5567,13 +5680,62 @@ mod tests {
         assert_eq!(again, crate::contradictions::RunSummary::default());
     }
 
+    // The retry tests build the job on the real clock (a paused clock would time the
+    // SQLite pool out) and freeze time only for the wait itself.
+
     #[tokio::test]
-    async fn contradiction_tick_waits_for_an_indexing_run() {
+    async fn contradiction_tick_retries_while_indexing_and_runs_once_it_ends() {
         let dir = tempfile::tempdir().unwrap();
         let (job, _shared) = contradiction_job(dir.path(), true).await;
+        tokio::time::pause();
+        let polls = AtomicU32::new(0);
+        let waited = std::sync::atomic::AtomicU64::new(0);
+        let start = tokio::time::Instant::now();
+        // Indexing for the first three checks, then done: unfreeze for the run.
+        let summary = job
+            .tick(|| {
+                if polls.fetch_add(1, Ordering::SeqCst) < 3 {
+                    return true;
+                }
+                waited.store(start.elapsed().as_secs(), Ordering::SeqCst);
+                tokio::time::resume();
+                false
+            })
+            .await
+            .expect("the job ran once indexing ended");
+        assert_eq!(summary.pairs_evaluated, 1);
+        assert_eq!(
+            waited.load(Ordering::SeqCst),
+            (CONTRADICTION_INDEXING_RETRY_DELAY * 3).as_secs()
+        );
+    }
+
+    #[tokio::test]
+    async fn contradiction_tick_gives_up_after_the_bounded_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (job, _shared) = contradiction_job(dir.path(), true).await;
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
         assert!(job.tick(|| true).await.is_none());
+        assert_eq!(
+            start.elapsed().as_secs(),
+            (CONTRADICTION_INDEXING_RETRY_DELAY * CONTRADICTION_INDEXING_RETRIES).as_secs()
+        );
+        tokio::time::resume();
         assert_eq!(job.neighbors.lookups.load(Ordering::SeqCst), 0);
         assert!(job.tick(|| false).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn contradiction_tick_stops_waiting_for_indexing_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (job, _shared) = contradiction_job(dir.path(), true).await;
+        tokio::time::pause();
+        job.ct.cancel();
+        let start = tokio::time::Instant::now();
+        assert!(job.tick(|| true).await.is_none());
+        assert!(start.elapsed() < CONTRADICTION_INDEXING_RETRY_DELAY);
+        assert_eq!(job.neighbors.lookups.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
