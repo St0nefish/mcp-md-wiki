@@ -713,6 +713,14 @@ pub fn lower_field_filters(
                     ..Default::default()
                 }));
             }
+            // The tool layer refuses a correlated list filter with a query before it
+            // gets here (#349); query-mode lowering of one is #350's.
+            FieldFilter::Elem(_) => {
+                return Err(format!(
+                    "filter '{field}': {}",
+                    crate::mcp::CORRELATED_FILTER_QUERY_MODE
+                ));
+            }
         }
     }
     Ok(conditions)

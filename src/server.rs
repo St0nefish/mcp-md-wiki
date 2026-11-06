@@ -2204,6 +2204,25 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         Arc::new(RwLock::new(Arc::new(initial_schemas)));
     let schemas = schema::load_shared(&shared_schema_cache);
 
+    // Bring `document_fields` up to the current projection rules (#349) before
+    // anything serves a filter from it or the worker writes to it: on the first
+    // start after an upgrade this reprojects every document from stored frontmatter
+    // (no markdown read, no embedding, no Qdrant write); otherwise it is one pragma
+    // read. Opening the database also rebuilds an old-shaped table. Not fatal — the
+    // version stays unrecorded and the next index run retries.
+    match crate::state::StateDb::new(Path::new(&config.state_db_path())).await {
+        Ok(db) => match db.ensure_projection_current(&schemas, false).await {
+            Ok(Some(report)) => info!(
+                reprojected = report.reprojected,
+                unparseable = report.unparseable,
+                "document field index rebuilt for the current projection rules"
+            ),
+            Ok(None) => {}
+            Err(e) => error!("Could not bring the document field index up to date: {e:#}"),
+        },
+        Err(e) => error!("Could not open the state DB to check the field index: {e:#}"),
+    }
+
     if fresh_clone {
         info!("Fresh clone — running initial full index");
         ingest::scan_and_index(&config, true, crate::status::Trigger::Startup)
@@ -3442,6 +3461,9 @@ mod tests {
             "domain": "food",
             // An instant: grouping documents by exact timestamp is near-unique noise.
             "timestamp": "2026-07-31T12:00:00Z",
+            // A list of records: its `npcs[].role` rows are filterable, not a
+            // document-level breakdown (#349).
+            "npcs": [{ "role": "guard" }],
         }) {
             serde_json::Value::Object(m) => m.into_iter().collect(),
             _ => unreachable!(),
@@ -3484,6 +3506,7 @@ mod tests {
                 "a derived domain duplicates area by construction: {fields:?}"
             );
             assert!(!fields.contains(&"timestamp"), "{fields:?}");
+            assert!(fields.iter().all(|f| !f.contains("[]")), "{fields:?}");
         }
     }
 

@@ -3217,6 +3217,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enumerate_applies_a_correlated_list_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let db = StateDb::new(&canonical.join("state.db")).await.unwrap();
+        for (path, npcs) in [
+            (
+                "split.md",
+                serde_json::json!([{ "role": "guard", "level": 1 }, { "role": "cook", "level": 5 }]),
+            ),
+            (
+                "same.md",
+                serde_json::json!([{ "role": "cook", "level": 2 }, { "role": "guard", "level": 5 }]),
+            ),
+        ] {
+            let fm: HashMap<String, serde_json::Value> =
+                [("npcs".to_string(), npcs)].into_iter().collect();
+            db.upsert_document_metadata(path, &fm, 100, path, 1)
+                .await
+                .unwrap();
+        }
+
+        // {"npcs[]": {"role": "guard", "level": {"gte": 3}}}
+        let (status, json) = get_json(
+            &canonical,
+            "/api/enumerate?filters=%7B%22npcs%5B%5D%22%3A%7B%22role%22%3A%22guard%22%2C\
+             %22level%22%3A%7B%22gte%22%3A3%7D%7D%7D",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["total"], 1, "{json}");
+        assert_eq!(json["documents"][0]["file_path"], "same.md");
+    }
+
+    #[tokio::test]
     async fn enumerate_refuses_bad_filters_with_a_4xx() {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();

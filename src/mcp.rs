@@ -39,8 +39,10 @@ use crate::{
 const MAX_QUERY_LEN: usize = 4096;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
-/// Deepest dot-path `update_schema` will nest; see `build_schema_edit`.
-const MAX_SCHEMA_PATH_SEGMENTS: usize = 16;
+/// Deepest dot-path `update_schema` will nest; see `build_schema_edit`. The same
+/// limit the metadata projection flattens to (#349), so every declarable field is
+/// filterable.
+const MAX_SCHEMA_PATH_SEGMENTS: usize = crate::schema::MAX_FIELD_PATH_DEPTH;
 const MAX_CONTENT_LEN: usize = write::MAX_CONTENT_LEN;
 /// Cap on the number of operations a single `write_document` `frontmatter_patch`
 /// call may carry — a document write should rarely need more than a handful of
@@ -459,37 +461,39 @@ impl schemars::JsonSchema for SearchFiltersInput {
     // implementation rationale leaks into the emitted schema, only the shape a
     // caller needs to construct a valid `filters` value. The prose lives once,
     // on the `filters` property (`SearchParams::filters`); the structure here
-    // carries none of its own.
+    // carries none of its own. The last branch is a correlated list filter's
+    // value (#349, a key ending in `[]`): sub-field names mapped to the same
+    // condition shapes, inlined rather than referenced so the schema stays
+    // `$ref`-free (`tool_schema`, #288). A range bound may be a date string.
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let scalar = serde_json::json!({ "type": ["string", "number", "boolean"] });
+        let bound = serde_json::json!({ "type": ["number", "string"] });
+        let condition = serde_json::json!({
+            "anyOf": [
+                scalar,
+                { "type": "array", "items": scalar },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "any_of": { "type": "array", "items": scalar },
+                        "all_of": { "type": "array", "items": scalar },
+                        "gte": bound,
+                        "lte": bound,
+                        "gt": bound,
+                        "lt": bound
+                    }
+                }
+            ]
+        });
+        let mut branches = condition["anyOf"].as_array().cloned().unwrap_or_default();
+        branches.push(serde_json::json!({
+            "type": "object",
+            "additionalProperties": condition
+        }));
         schemars::json_schema!({
             "type": "object",
-            "additionalProperties": {
-                "anyOf": [
-                    { "type": ["string", "number", "boolean"] },
-                    {
-                        "type": "array",
-                        "items": { "type": ["string", "number", "boolean"] }
-                    },
-                    {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "any_of": {
-                                "type": "array",
-                                "items": { "type": ["string", "number", "boolean"] }
-                            },
-                            "all_of": {
-                                "type": "array",
-                                "items": { "type": ["string", "number", "boolean"] }
-                            },
-                            "gte": { "type": "number" },
-                            "lte": { "type": "number" },
-                            "gt": { "type": "number" },
-                            "lt": { "type": "number" }
-                        }
-                    }
-                ]
-            }
+            "additionalProperties": { "anyOf": branches }
         })
     }
 }
@@ -971,12 +975,107 @@ const MAX_LIST_FILTERS: usize = 20;
 /// unbounded number of bound SQL parameters.
 const MAX_FILTER_VALUES: usize = 500;
 
+/// Why a correlated list filter is refused with a `query` (#349): the Qdrant
+/// payload cannot express one yet.
+pub(crate) const CORRELATED_FILTER_QUERY_MODE: &str = "correlated list filters (a key ending \
+     in `[]`) are only supported when listing documents without a query; run the same \
+     filters without `query`";
+
+/// Why a date range (a date or timestamp bound, or a range on a `date`/`timestamp`
+/// field) is refused with a `query` (#349).
+pub(crate) const DATE_RANGE_QUERY_MODE: &str = "date and timestamp ranges are only supported \
+     when listing documents without a query; run the same filters without `query`";
+
+/// The filter operator names, which are never a sub-field of a correlated filter.
+const FILTER_OPERATORS: [&str; 6] = ["any_of", "all_of", "gte", "lte", "gt", "lt"];
+
+/// Parse a correlated list filter (#349): `field` is `list[]` and `raw` an object
+/// whose keys are sub-fields of the list's elements (`role`, `stats.level`) and
+/// whose values are ordinary filter conditions, all of which must hold within one
+/// element. One level only: the list may not itself sit inside a list, and a
+/// condition may not be another correlated filter. At most [`MAX_LIST_FILTERS`]
+/// row tests (each `all_of` value counts as one), so one call cannot build an
+/// unbounded join.
+fn parse_elem_filter(
+    field: &str,
+    list: &str,
+    raw: &serde_json::Value,
+) -> Result<FieldFilter, String> {
+    let example = format!("{{\"{field}\": {{\"role\": \"guard\", \"level\": {{\"gte\": 3}}}}}}");
+    let Some(map) = raw.as_object() else {
+        return Err(format!(
+            "filter '{field}': a key ending in `[]` is a correlated list filter and takes an \
+             object of conditions on the list's sub-fields, e.g. {example}"
+        ));
+    };
+    let path = crate::schema::FieldPath::parse(list);
+    let plain = path
+        .steps()
+        .iter()
+        .all(|step| matches!(step, crate::schema::PathStep::Field(name) if !name.is_empty()));
+    if list.is_empty() || !plain {
+        return Err(format!(
+            "filter '{field}': a correlated list filter names a list outside any other list, \
+             e.g. `npcs[]` or `campaign.npcs[]`"
+        ));
+    }
+    if map.is_empty() {
+        return Err(format!(
+            "filter '{field}': give at least one sub-field condition, e.g. {example}"
+        ));
+    }
+    let mut conditions = Vec::with_capacity(map.len());
+    let mut row_tests = 0usize;
+    for (sub, value) in map {
+        if sub.is_empty() || sub.len() > MAX_FILTER_STR_LEN {
+            return Err(format!(
+                "filter '{field}': sub-field names must be 1-{MAX_FILTER_STR_LEN} characters"
+            ));
+        }
+        if FILTER_OPERATORS.contains(&sub.as_str()) {
+            return Err(format!(
+                "filter '{field}': '{sub}' is an operator, not a sub-field; a correlated list \
+                 filter maps sub-fields to conditions, e.g. {example}"
+            ));
+        }
+        if sub.ends_with("[]") {
+            return Err(format!(
+                "filter '{field}': correlated list filters do not nest ('{sub}'); name the inner \
+                 list's sub-fields as conditions, e.g. '{sub}.name', which match anywhere in \
+                 the same element"
+            ));
+        }
+        let full = format!("{field}.{sub}");
+        let condition = parse_field_filter(&full, value)?;
+        row_tests += match &condition {
+            FieldFilter::AllOf(values) => values.len(),
+            _ => 1,
+        };
+        conditions.push((full, condition));
+    }
+    if row_tests > MAX_LIST_FILTERS {
+        return Err(format!(
+            "filter '{field}': too many conditions ({row_tests}, max {MAX_LIST_FILTERS}; each \
+             all_of value counts as one)"
+        ));
+    }
+    conditions.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(FieldFilter::Elem(conditions))
+}
+
 /// Translate one JSON filter value into a typed [`FieldFilter`].
 ///
 /// Accepts a scalar for equality, an array for any-of, or an object carrying
-/// `any_of` / `all_of` / `gte` / `lte` / `gt` / `lt`.
+/// `any_of` / `all_of` / `gte` / `lte` / `gt` / `lt`. A range bound may be a number
+/// or a date/RFC 3339 timestamp string, compared as epoch seconds the way a date
+/// field's `value_num` is stored (#349). A `field` ending in `[]` is a correlated
+/// list filter ([`parse_elem_filter`]).
 fn parse_field_filter(field: &str, raw: &serde_json::Value) -> Result<FieldFilter, String> {
     use serde_json::Value;
+
+    if let Some(list) = field.strip_suffix("[]") {
+        return parse_elem_filter(field, list, raw);
+    }
 
     // Scalar values go through the same canonicalization as the write path, so a JSON
     // `false` matches a stored boolean and `45` matches a stored integer. Also caps
@@ -1027,14 +1126,18 @@ fn parse_field_filter(field: &str, raw: &serde_json::Value) -> Result<FieldFilte
                 match map.get(key) {
                     None | Some(Value::Null) => Ok(None),
                     Some(Value::Number(n)) => Ok(n.as_f64()),
+                    Some(Value::String(s)) if document_fields::epoch_seconds(s).is_some() => {
+                        Ok(document_fields::epoch_seconds(s))
+                    }
                     Some(other) => Err(format!(
-                        "filter '{}': '{}' must be a number, got {}",
+                        "filter '{}': '{}' must be a number, or a date (YYYY-MM-DD) or RFC 3339 \
+                         timestamp, got {}",
                         field, key, other
                     )),
                 }
             };
 
-            let known = ["any_of", "all_of", "gte", "lte", "gt", "lt"];
+            let known = FILTER_OPERATORS;
             if let Some(unknown) = map.keys().find(|k| !known.contains(&k.as_str())) {
                 return Err(format!(
                     "filter '{}': unknown operator '{}'; expected one of {}",
@@ -1272,6 +1375,50 @@ fn build_query_conditions(
     schemas: &SchemaCache,
 ) -> Result<Vec<qdrant_client::qdrant::Condition>, McpError> {
     let filters = parse_filters(&params.filters)?;
+
+    if let Some((field, _)) = filters
+        .iter()
+        .find(|(_, f)| matches!(f, FieldFilter::Elem(_)))
+    {
+        return Err(McpError::invalid_params(
+            format!("filter '{field}': {CORRELATED_FILTER_QUERY_MODE}"),
+            None,
+        ));
+    }
+
+    // Date ranges are compared as epoch seconds in the metadata index only (#349):
+    // the Qdrant payload holds the date text under a keyword index, and a date
+    // string bound would otherwise be compared as a bare number against whatever
+    // an integer index holds.
+    if let Some(raw) = &params.filters {
+        for (field, value) in &raw.0 {
+            let date_bound = value.as_object().is_some_and(|ops| {
+                ["gte", "lte", "gt", "lt"]
+                    .iter()
+                    .any(|op| ops.get(*op).is_some_and(serde_json::Value::is_string))
+            });
+            if date_bound {
+                return Err(McpError::invalid_params(
+                    format!("filter '{field}': {DATE_RANGE_QUERY_MODE}"),
+                    None,
+                ));
+            }
+        }
+    }
+    if let Some((field, _)) = filters.iter().find(|(field, filter)| {
+        matches!(filter, FieldFilter::Range { .. })
+            && schemas.declared_types(field).iter().any(|ty| {
+                matches!(
+                    ty,
+                    crate::schema::FieldType::Date | crate::schema::FieldType::Timestamp
+                )
+            })
+    }) {
+        return Err(McpError::invalid_params(
+            format!("filter '{field}': {DATE_RANGE_QUERY_MODE}"),
+            None,
+        ));
+    }
 
     let indexed: std::collections::HashMap<String, IndexKind> =
         crate::qdrant::all_indexed_fields(config, schemas)
@@ -1835,7 +1982,12 @@ pub struct SearchParams {
 
     /// Frontmatter criteria keyed by field (dot-paths for nested fields): a
     /// scalar means equals (`{"type": "guide"}`), an array any-of, an object
-    /// all-of or a numeric range (`{"planning.prep_minutes": {"lt": 30}}`).
+    /// all-of or a range (`{"planning.prep_minutes": {"lt": 30}}`; a date field's
+    /// bound may be `"2024-01-01"`, listing only, no query). A list's object
+    /// fields are `npcs[].role`; a key
+    /// ending in `[]` needs every condition in one element
+    /// (`{"npcs[]": {"role": "guard", "level": {"gte": 3}}}`), only without
+    /// `query`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<SearchFiltersInput>,
 
@@ -3262,32 +3414,66 @@ impl<'a> SearchCtx<'a> {
         let declared = schemas.declared_field_paths();
         let path_needle = retrieval::normalize_path_needle(params.path_prefix.as_deref());
 
+        // A correlated list filter (#349) is checked condition by condition: each
+        // sub-field (`npcs[].role`) is a field of its own, refused the same ways.
+        let mut checks: Vec<(&String, &FieldFilter, Option<&String>)> = Vec::new();
         for (field, filter) in &filters {
+            match filter {
+                FieldFilter::Elem(conditions) => checks.extend(
+                    conditions
+                        .iter()
+                        .map(|(sub, condition)| (sub, condition, Some(field))),
+                ),
+                _ => checks.push((field, filter, None)),
+            }
+        }
+
+        for (field, filter, list) in checks {
             let known = declared.contains(field)
-                || builtin_filter_field(field, &config, &schemas)
+                || (list.is_none() && builtin_filter_field(field, &config, &schemas))
                 || index.field_in_use(field).await.unwrap_or(true);
             if !known {
                 let mut names: std::collections::BTreeSet<String> = declared.clone();
-                names.extend(
-                    config
-                        .effective_indexed_fields()
-                        .into_iter()
-                        .chain(schemas.root().derived_field_names().map(str::to_string)),
-                );
+                if list.is_none() {
+                    names.extend(
+                        config
+                            .effective_indexed_fields()
+                            .into_iter()
+                            .chain(schemas.root().derived_field_names().map(str::to_string)),
+                    );
+                }
                 if let Ok(in_use) = index.fields_in_use(None, 500).await {
                     names.extend(in_use.into_iter().map(|(name, _)| name));
                 }
                 names.remove("file_path");
+                if let Some(list) = list {
+                    let prefix = format!("{list}.");
+                    names.retain(|name| name.starts_with(&prefix));
+                }
                 let names: Vec<String> = names
                     .iter()
                     .map(|n| crate::server::sanitize_facet_value(n))
                     .collect();
-                return Err(McpError::invalid_params(
-                    format!(
+                let message = match list {
+                    Some(list) => format!(
+                        "filter '{}': unknown sub-field '{}'; fields of {}: {}",
+                        crate::server::sanitize_facet_value(list),
+                        crate::server::sanitize_facet_value(field),
+                        crate::server::sanitize_facet_value(list),
+                        if names.is_empty() {
+                            "none".to_string()
+                        } else {
+                            capped_list(&names)
+                        }
+                    ),
+                    None => format!(
                         "unknown filter field '{}'; filterable fields: {}",
                         crate::server::sanitize_facet_value(field),
                         capped_list(&names)
                     ),
+                };
+                return Err(McpError::invalid_params(
+                    message,
                     Some(serde_json::json!({ "filterable_fields": capped_vec(&names) })),
                 ));
             }
@@ -3295,7 +3481,31 @@ impl<'a> SearchCtx<'a> {
             let (values, needs_every_value) = match filter {
                 FieldFilter::AnyOf(values) => (values, false),
                 FieldFilter::AllOf(values) => (values, true),
-                FieldFilter::Range { .. } => continue,
+                FieldFilter::Range { .. } => {
+                    // A range compares the stored number, which a declared type with
+                    // no numeric mapping (`text`, `enum`, …) never stores (#349).
+                    // Refused only when every scope that types the field gives it
+                    // such a type; an undeclared field passes as before.
+                    let types = schemas.declared_types(field);
+                    let numeric = |ty: &crate::schema::FieldType| {
+                        ty.kind().numeric != crate::schema::NumericValue::None
+                    };
+                    if !types.is_empty() && !types.iter().any(numeric) {
+                        let names: Vec<&str> = types.iter().map(|ty| ty.name()).collect();
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "filter '{}': a range needs a numeric field, but it is declared \
+                                 `{}`, which stores no number; match it by value, or declare \
+                                 it `integer` or `number` (update_schema) to range over it",
+                                crate::server::sanitize_facet_value(field),
+                                names.join("`/`")
+                            ),
+                            Some(serde_json::json!({ "field": field, "declared_type": names })),
+                        ));
+                    }
+                    continue;
+                }
+                FieldFilter::Elem(_) => continue,
             };
             let Some(allowed) = schemas.filter_closed_values(field, path_needle) else {
                 continue;
@@ -9109,6 +9319,250 @@ mod tests {
             ok.structured_content.unwrap()["total"],
             serde_json::json!(1)
         );
+    }
+
+    #[tokio::test]
+    async fn search_correlated_list_filter_matches_within_one_element() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  npcs:\n    type: list\n    items:\n      type: object\n      fields:\n        \
+             role:\n          type: enum\n          values: [guard, cook]\n        level:\n          \
+             type: integer\n",
+        );
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "split.md",
+            serde_json::json!({ "npcs": [{ "role": "guard", "level": 1 }, { "role": "cook", "level": 5 }] }),
+        )
+        .await;
+        seed_document(
+            &server,
+            "same.md",
+            serde_json::json!({ "npcs": [{ "role": "cook", "level": 2 }, { "role": "guard", "level": 5 }] }),
+        )
+        .await;
+
+        let search = |filter: serde_json::Value, query: Option<&str>| {
+            let mut filters = serde_json::Map::new();
+            filters.insert("npcs[]".into(), filter);
+            server.search(Parameters(SearchParams {
+                query: query.map(str::to_string),
+                filters: Some(SearchFiltersInput(filters)),
+                ..Default::default()
+            }))
+        };
+
+        let found = search(
+            serde_json::json!({ "role": "guard", "level": { "gte": 3 } }),
+            None,
+        )
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+        assert_eq!(found["total"], serde_json::json!(1), "{found}");
+        assert_eq!(found["documents"][0]["file_path"], "same.md", "{found}");
+
+        // An unknown sub-field lists the list's fields, not every field.
+        let err = search(serde_json::json!({ "rank": "x" }), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains(
+                "filter 'npcs[]': unknown sub-field 'npcs[].rank'; fields of npcs[]: \
+                 npcs[].level, npcs[].role"
+            ),
+            "{}",
+            err.message
+        );
+        // A value outside the sub-field's closed set.
+        let err = search(serde_json::json!({ "role": "king" }), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains(
+                "filter 'npcs[].role': 'king' is not an allowed value; allowed: cook, guard"
+            ),
+            "{}",
+            err.message
+        );
+        // Query mode cannot lower one yet: refused in plain words, not ignored.
+        let err = search(serde_json::json!({ "role": "guard" }), Some("q"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message
+                .contains("filter 'npcs[]': correlated list filters")
+                && err
+                    .message
+                    .contains("only supported when listing documents without a query"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn search_refuses_ranges_that_could_never_compare_a_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  published:\n    type: date\n    indexed: true\n  count:\n    \
+             type: integer\n    indexed: true\n  code:\n    type: text\n  npcs:\n    \
+             type: list\n    items:\n      type: object\n      fields:\n        name:\n          \
+             type: text\n",
+        );
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "a.md",
+            serde_json::json!({ "code": "7", "loose": 3, "published": "2024-02-01",
+                                "npcs": [{ "name": "Ada" }] }),
+        )
+        .await;
+        let search = |field: &str, filter: serde_json::Value, query: Option<&str>| {
+            let mut filters = serde_json::Map::new();
+            filters.insert(field.into(), filter);
+            server.search(Parameters(SearchParams {
+                query: query.map(str::to_string),
+                filters: Some(SearchFiltersInput(filters)),
+                ..Default::default()
+            }))
+        };
+
+        // Declared text: no stored number, so a range is refused, not empty.
+        for (field, filter) in [
+            ("code", serde_json::json!({ "gte": 3 })),
+            ("npcs[]", serde_json::json!({ "name": { "gte": 1 } })),
+        ] {
+            let err = search(field, filter, None).await.unwrap_err();
+            assert!(
+                err.message.contains("a range needs a numeric field")
+                    && err.message.contains("declared `text`")
+                    && err.message.contains("`integer` or `number`"),
+                "{field}: {}",
+                err.message
+            );
+        }
+        // Undeclared and date fields range as before when listing.
+        search("loose", serde_json::json!({ "gte": 1 }), None)
+            .await
+            .unwrap();
+        search(
+            "published",
+            serde_json::json!({ "gte": "2024-01-01" }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // With a query a date range is refused in plain words — a date field, or
+        // a date bound on any field (never compared as a bare number).
+        for (field, filter) in [
+            ("published", serde_json::json!({ "gte": "2024-01-01" })),
+            ("published", serde_json::json!({ "gte": 1 })),
+            ("count", serde_json::json!({ "gte": "2024-01-01" })),
+        ] {
+            let err = search(field, filter.clone(), Some("q")).await.unwrap_err();
+            assert!(
+                err.message.contains(DATE_RANGE_QUERY_MODE),
+                "{field} {filter}: {}",
+                err.message
+            );
+            assert!(!err.message.contains("type: integer"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn correlated_filters_parse_with_caps_and_one_level_only() {
+        let parsed = parse_field_filter(
+            "npcs[]",
+            &serde_json::json!({ "role": "guard", "level": { "gte": 3 } }),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            FieldFilter::Elem(vec![
+                (
+                    "npcs[].level".into(),
+                    FieldFilter::Range {
+                        gte: Some(3.0),
+                        lte: None,
+                        gt: None,
+                        lt: None
+                    }
+                ),
+                (
+                    "npcs[].role".into(),
+                    FieldFilter::AnyOf(vec!["guard".into()])
+                ),
+            ])
+        );
+        let refused =
+            |field: &str, raw: serde_json::Value| parse_field_filter(field, &raw).unwrap_err();
+        assert!(refused("npcs[]", serde_json::json!("guard")).contains("takes an object"));
+        assert!(refused("npcs[]", serde_json::json!({})).contains("at least one"));
+        assert!(
+            refused("a[].b[]", serde_json::json!({ "c": 1 })).contains("outside any other list")
+        );
+        assert!(refused("[]", serde_json::json!({ "c": 1 })).contains("outside any other list"));
+        let nested = refused("npcs[]", serde_json::json!({ "gear[]": { "x": 1 } }));
+        assert!(nested.contains("do not nest"), "{nested}");
+        assert!(
+            nested.contains("e.g. 'gear[].name'"),
+            "the hint names a path the vocabulary check accepts: {nested}"
+        );
+        assert!(
+            refused("npcs[]", serde_json::json!({ "any_of": ["x"] })).contains("is an operator")
+        );
+        let many: serde_json::Map<String, serde_json::Value> = (0..=MAX_LIST_FILTERS)
+            .map(|i| (format!("f{i}"), serde_json::json!(1)))
+            .collect();
+        assert!(refused("npcs[]", serde_json::Value::Object(many)).contains("too many conditions"));
+        let values: Vec<String> = (0..=MAX_LIST_FILTERS).map(|i| format!("v{i}")).collect();
+        assert!(
+            refused(
+                "npcs[]",
+                serde_json::json!({ "tags": { "all_of": values } })
+            )
+            .contains("too many conditions"),
+            "each all_of value is a row test"
+        );
+        // A sub-condition is any ordinary filter, its own caps included.
+        let long = "x".repeat(MAX_FILTER_STR_LEN + 1);
+        assert!(refused("npcs[]", serde_json::json!({ "role": long })).contains("too long"));
+    }
+
+    #[test]
+    fn range_bounds_accept_dates_and_timestamps_as_epoch_seconds() {
+        let parsed = parse_field_filter(
+            "on",
+            &serde_json::json!({ "gte": "2024-01-02", "lt": "2024-01-03T00:00:00+01:00" }),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            FieldFilter::Range {
+                gte: crate::document_fields::epoch_seconds("2024-01-02"),
+                lte: None,
+                gt: None,
+                lt: Some(1_704_236_400.0),
+            }
+        );
+        let err = parse_field_filter("on", &serde_json::json!({ "gte": "soon" })).unwrap_err();
+        assert!(err.contains("must be a number, or a date"), "{err}");
+    }
+
+    #[test]
+    fn schema_path_depth_and_projection_depth_are_one_limit() {
+        assert_eq!(
+            MAX_SCHEMA_PATH_SEGMENTS,
+            crate::schema::MAX_FIELD_PATH_DEPTH
+        );
+        assert_eq!(MAX_SCHEMA_PATH_SEGMENTS, 16);
     }
 
     #[tokio::test]

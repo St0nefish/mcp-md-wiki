@@ -164,6 +164,59 @@ schema rebuild and fails to start.
 - A frontmatter key named like a heading/section payload key (`section_key`, …)
   still reaches the payload while `chunking.heading_metadata` is off, as before.
 
+### Schema-driven metadata projection and correlated list filters (#349)
+
+- **First start after upgrading rebuilds `document_fields` automatically.** The
+  table gains an `elem` column in its primary key, which SQLite cannot add in place,
+  so opening an older database drops the table; the server (and every `index` run)
+  then reprojects every document from the stored `documents.frontmatter` before
+  serving or indexing. **Reproject only: no markdown is re-read, nothing is
+  embedded, and Qdrant is not touched.** The projection version is kept in SQLite's
+  `PRAGMA user_version` and recorded only once a reproject completes with no
+  failed document, so an interrupted one simply reruns. A future change to the
+  projection rules bumps `state::PROJECTION_VERSION` and is caught up the same way.
+  `reproject-fields` now reads each document under its governing schema (it builds
+  the schema tree, refusing to run on an invalid schema file like `validate`).
+  Run against an old database first, a CLI command that does not reproject
+  (`status`, `lint`, `validate`) still rebuilds the table on open, leaving the
+  projection empty — enumeration filters match nothing, `/status` breakdowns are
+  blank — until the next `serve`, `index` or `reproject-fields`. An automatic
+  reproject that fails is retried once per process, then left to the next start
+  or a `reproject-fields`.
+- With a `query`, a date or timestamp range (a date-string bound, or any range on
+  a `date`/`timestamp` field) is refused in plain words: those ranges work only
+  when listing. A range on a field every scope declares `text`, `enum`, `list` of
+  non-numbers or `object` is refused in both modes, naming the type, instead of
+  silently matching nothing.
+- **Lists of objects are filterable.** `npcs: [{role: guard, level: 3}]` projects
+  as `npcs[].role`/`npcs[].level` rows keyed by element, in enumeration mode
+  (`search` without `query`, `/api/enumerate`): `{"npcs[].role": "guard"}` matches
+  any element, and the new **correlated list filter**
+  `{"npcs[]": {"role": "guard", "level": {"gte": 3}}}` requires every condition to
+  hold within **one** element. Its conditions are any ordinary filter form (one
+  level only, at most 20 row tests, each `all_of` value counting as one). With a
+  `query` it is refused in plain words (Qdrant lowering comes with #350). Unknown
+  sub-fields and values outside a sub-field's closed set are refused with the
+  options listed, like any other filter. Previously a list holding objects was
+  skipped entirely.
+- **Projection depth is 16 path steps** (was 4), the same limit `update_schema`
+  allows a schema to declare, so a declared field is always filterable. Deeper
+  values are still skipped with a warning; the 2000-row cap per document stays.
+- **Behavior change: a declared field's type now decides its `value_num`.** A field
+  declared `text` or `enum` that holds a number (`code: 42`) no longer gets a
+  numeric value, so a range filter (`gte`/`lte`/…) on it now matches nothing;
+  equality is unchanged. `integer`/`number` store the number, `boolean` 1/0, and an
+  undeclared field keeps the old JSON-type guess. Declare the field `integer` or
+  `number` if range filters on it are wanted.
+- **Dates are comparable.** `date` and `timestamp` fields store seconds since the
+  Unix epoch (UTC; a date is its midnight UTC, a timestamp is normalized from its
+  offset), and a range bound may be given as a date or RFC 3339 timestamp string:
+  `{"published": {"gte": "2024-01-01"}}`. Enumeration mode only; in query mode those
+  fields are still keyword-indexed.
+- `/status` and `/metrics` field breakdowns leave out `[]` fields; `get_schema`'s
+  `other_fields_in_use` lists an undeclared `npcs[].x` like any other undeclared
+  field and no longer lists a declared one.
+
 ### Security
 
 - **Symlinks and `.git` paths are refused on write and read, and skipped by

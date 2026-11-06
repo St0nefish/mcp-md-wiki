@@ -1346,6 +1346,9 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     // same flag also makes `chunk::chunk_markdown` keep every chunk within one
     // heading's section, which happened before these chunks got here.)
     heading_metadata: bool,
+    // The run's schema tree, which the metadata projection reads each document's
+    // field types from (#349) — the same cache the document was validated under.
+    schemas: &SchemaCache,
 ) -> Result<()> {
     // Flatten all chunk texts in order, recording boundaries
     let mut all_texts: Vec<String> = Vec::new();
@@ -1555,9 +1558,10 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
         }
 
         if let Err(e) = state
-            .upsert_document_metadata(
+            .upsert_document_metadata_with(
                 &pf.file_path,
                 &with_derived_fields(&pf.frontmatter, &pf.file_path, &pf.derived),
+                schemas.resolve_for(Path::new(&pf.file_path)),
                 // #164: same rationale as the Qdrant payload above — this is the
                 // user/search-facing mtime, so it must be the git-derived value, not
                 // the fs-stat pre-filter baseline.
@@ -1908,13 +1912,15 @@ async fn flush_pending_batch<E: EmbedStore, Q: VectorStore + NeighborStore>(
     embedder: &E,
     store: &Q,
     state: &StateDb,
-    collection: &str,
-    semantic_edges: &SemanticEdgesConfig,
-    heading_metadata: bool,
+    // The run's config: the Qdrant collection, `chunking.heading_metadata` (see
+    // `upsert_pending`) and `ui.semantic_edges`.
+    config: &ResolvedConfig,
+    schemas: &SchemaCache,
 ) -> Result<usize> {
     if pending.is_empty() {
         return Ok(0);
     }
+    let collection = config.qdrant.collection.as_str();
 
     // `mem::take` rather than `drain(..)`: hands `upsert_pending`/`update_semantic_edges`
     // an owned `Vec` (both want `&[PendingFile]`, satisfied either way) while leaving
@@ -1928,11 +1934,20 @@ async fn flush_pending_batch<E: EmbedStore, Q: VectorStore + NeighborStore>(
 
     INDEX_STATUS.set_phase(Phase::Embedding);
     info!("Embedding chunks for {} changed file(s)…", count);
-    upsert_pending(&batch, embedder, store, state, collection, heading_metadata).await?;
+    upsert_pending(
+        &batch,
+        embedder,
+        store,
+        state,
+        collection,
+        config.chunking.heading_metadata,
+        schemas,
+    )
+    .await?;
 
     // Precompute semantic (kNN) edges for the web UI graph view, same as the
     // pre-#160 single terminal call — no-ops when `semantic_edges.enabled` is false.
-    update_semantic_edges(&batch, store, state, collection, semantic_edges).await;
+    update_semantic_edges(&batch, store, state, collection, &config.ui.semantic_edges).await;
 
     // Hand status back to "Scanning": if more paths remain, the loop resumes
     // immediately after this call, and `/status` should reflect that rather than
@@ -2147,6 +2162,7 @@ async fn refresh_document<Q: VectorStore>(
     state: &StateDb,
     collection: &str,
     heading_metadata: bool,
+    schemas: &SchemaCache,
 ) -> Result<bool> {
     if rf.payload_changed {
         let set = frontmatter_payload(
@@ -2163,9 +2179,10 @@ async fn refresh_document<Q: VectorStore>(
     }
 
     if let Err(e) = state
-        .upsert_document_metadata(
+        .upsert_document_metadata_with(
             &rf.file_path,
             &with_derived_fields(&rf.frontmatter, &rf.file_path, &rf.derived),
+            schemas.resolve_for(Path::new(&rf.file_path)),
             rf.display_mtime,
             &rf.hash,
             rf.chunk_count,
@@ -3135,7 +3152,7 @@ async fn backfill_document_metadata(
         let chunk_count = indexed.get(rel_key).map(|e| e.chunk_count).unwrap_or(0);
 
         match state
-            .upsert_document_metadata(rel_key, &frontmatter, mtime, &hash, chunk_count)
+            .upsert_document_metadata_with(rel_key, &frontmatter, schema, mtime, &hash, chunk_count)
             .await
         {
             Ok(()) => filled += 1,
@@ -3732,6 +3749,15 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     // file aborts the run with nothing dropped, cleared or indexed.
     let schemas = build_run_schemas(&data_path, config)?;
 
+    // A database whose `document_fields` predates the current projection rules
+    // (#349) is reprojected from stored frontmatter before anything else reads or
+    // writes it — one pragma read when current, and never an embedding call. Not
+    // fatal: the run itself rewrites the projection of every file it touches, and
+    // the version stays unrecorded so the next run retries the rest.
+    if let Err(e) = state.ensure_projection_current(&schemas, false).await {
+        error!("Could not bring the document field index up to date: {e:#}");
+    }
+
     // Union of every `indexed` dot-path across the whole schema tree. Payload indexes
     // are collection-wide, so a field declared only in a deep scope still has to be
     // registered here or filtering on it silently fails.
@@ -4063,6 +4089,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
                     &state,
                     collection,
                     config.chunking.heading_metadata,
+                    &schemas,
                 )
                 .await?
                 {
@@ -4101,9 +4128,8 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
                         embedder,
                         store,
                         &state,
-                        collection,
-                        &config.ui.semantic_edges,
-                        config.chunking.heading_metadata,
+                        config,
+                        &schemas,
                     )
                     .await?;
                 }
@@ -4116,16 +4142,8 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     // Whatever never reached `PENDING_FLUSH_BATCH_SIZE` inside the loop above — for
     // a run smaller than one batch, this is the ONLY flush, identical in effect to
     // the pre-#160 single terminal call.
-    indexed_count += flush_pending_batch(
-        &mut pending,
-        embedder,
-        store,
-        &state,
-        collection,
-        &config.ui.semantic_edges,
-        config.chunking.heading_metadata,
-    )
-    .await?;
+    indexed_count +=
+        flush_pending_batch(&mut pending, embedder, store, &state, config, &schemas).await?;
 
     // ── Backfill metadata for unchanged files ────────────────────────────────
     let backfilled = if backfill_queue.is_empty() {
@@ -6911,6 +6929,67 @@ mod tests {
         let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
         assert_eq!(embedder.calls(), 0);
         assert!(store.refresh_calls().is_empty());
+    }
+
+    /// A projection-rules change (#349: an older `PROJECTION_VERSION` on disk) is
+    /// caught up at the start of an index run from stored frontmatter, under the
+    /// current schema, with no embedding call and no Qdrant write.
+    #[tokio::test]
+    async fn an_outdated_projection_version_reprojects_at_index_time_without_embedding() {
+        let dir = TempDir::new().unwrap();
+        let config = schema_test_config(&dir);
+        write_root_schema(&dir, "fields:\n  when:\n    type: date\n");
+        std::fs::write(
+            dir.path().join("doc.md"),
+            "---\ntitle: T\nwhen: 2024-01-02\nnpcs:\n  - role: guard\n---\n# T\n\nBody.\n",
+        )
+        .unwrap();
+        let (embedder, _) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 1, "precondition: the first run embeds");
+
+        let db = open_scan_test_db(&config).await;
+        assert_eq!(
+            db.projection_version().await.unwrap(),
+            crate::state::PROJECTION_VERSION
+        );
+        // An older version on disk with a projection of the old rules.
+        sqlx::query("DELETE FROM document_fields")
+            .execute(db.pool_for_test())
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version = 0")
+            .execute(db.pool_for_test())
+            .await
+            .unwrap();
+
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 0, "a reproject never embeds");
+        assert!(store.upserted_points.lock().unwrap().is_empty());
+        assert!(store.refresh_calls().is_empty());
+        assert_eq!(
+            db.projection_version().await.unwrap(),
+            crate::state::PROJECTION_VERSION
+        );
+        let rows: Vec<(String, i64, String, Option<f64>)> = sqlx::query_as(
+            "SELECT field, elem, value_text, value_num FROM document_fields \
+             WHERE file_path = 'doc.md' ORDER BY field",
+        )
+        .fetch_all(db.pool_for_test())
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("npcs[].role".to_string(), 0, "guard".to_string(), None),
+                (
+                    "when".to_string(),
+                    0,
+                    "2024-01-02".to_string(),
+                    Some(1_704_153_600.0)
+                ),
+            ],
+            "reprojected under the schema: a declared date gets epoch seconds"
+        );
     }
 
     #[tokio::test]
@@ -9938,7 +10017,16 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0, 2.0, 3.0]]);
         let store = MockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
+        let result = upsert_pending(
+            &pending,
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await;
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -10036,7 +10124,16 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = MockVectorStore::with_upsert_err("upsert failed");
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
+        let result = upsert_pending(
+            &pending,
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await;
 
         assert!(result.is_err());
         // State DB entry should be PRESERVED — old hash still differs, so file will be retried
@@ -10056,7 +10153,16 @@ mod tests {
         let embedder = MockEmbedClient::err("embedding service unavailable");
         let store = MockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
+        let result = upsert_pending(
+            &pending,
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(
@@ -10074,7 +10180,16 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = MockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
+        let result = upsert_pending(
+            &pending,
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(
@@ -10126,7 +10241,16 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = MockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
+        let result = upsert_pending(
+            &pending,
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await;
         assert!(result.is_ok(), "run failed: {:?}", result.err());
 
         let points = store.upserted_points.lock().unwrap();
@@ -10175,9 +10299,17 @@ mod tests {
             }
             let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]]);
             let store = MockVectorStore::all_ok();
-            upsert_pending(&[pf], &embedder, &store, &state, "test-col", false)
-                .await
-                .unwrap();
+            upsert_pending(
+                &[pf],
+                &embedder,
+                &store,
+                &state,
+                "test-col",
+                false,
+                &empty_schemas(),
+            )
+            .await
+            .unwrap();
 
             let (domain, node) = if derive {
                 (
@@ -10258,9 +10390,17 @@ mod tests {
 
         // Flag off: none of the new keys reach the payload at all.
         let store_off = MockVectorStore::all_ok();
-        upsert_pending(&pending, &embedder, &store_off, &state, "test-col", false)
-            .await
-            .unwrap();
+        upsert_pending(
+            &pending,
+            &embedder,
+            &store_off,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await
+        .unwrap();
         {
             let points = store_off.upserted_points.lock().unwrap();
             assert_eq!(points.len(), 2);
@@ -10273,9 +10413,17 @@ mod tests {
         // Flag on: every new key is present, and section_key carries the
         // section's file-relative line range.
         let store_on = MockVectorStore::all_ok();
-        upsert_pending(&pending, &embedder, &store_on, &state, "test-col", true)
-            .await
-            .unwrap();
+        upsert_pending(
+            &pending,
+            &embedder,
+            &store_on,
+            &state,
+            "test-col",
+            true,
+            &empty_schemas(),
+        )
+        .await
+        .unwrap();
         let points = store_on.upserted_points.lock().unwrap();
         assert_eq!(points.len(), 2);
 
@@ -10510,9 +10658,17 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]]);
         let store = MockVectorStore::all_ok();
 
-        upsert_pending(&pending, &embedder, &store, &state, "test-col", false)
-            .await
-            .unwrap();
+        upsert_pending(
+            &pending,
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await
+        .unwrap();
 
         let mtime_val = {
             let points = store.upserted_points.lock().unwrap();
@@ -10560,7 +10716,16 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = TrackingMockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
+        let result = upsert_pending(
+            &pending,
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await;
         assert!(result.is_ok());
         assert!(
             store.delete_by_files_calls.lock().unwrap().is_empty(),
@@ -10590,7 +10755,16 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]]);
         let store = TrackingMockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
+        let result = upsert_pending(
+            &pending,
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await;
         assert!(result.is_ok());
 
         let deleted_ids = store.deleted_ids.lock().unwrap().clone();
@@ -10628,7 +10802,16 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = TrackingMockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
+        let result = upsert_pending(
+            &pending,
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await;
         assert!(result.is_ok());
 
         let deleted_ids = store.deleted_ids.lock().unwrap().clone();
@@ -10662,7 +10845,16 @@ mod tests {
             chunk_sum_at_trim: Mutex::new(None),
         };
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
+        let result = upsert_pending(
+            &pending,
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await;
         assert!(result.is_ok());
 
         let observed = store
@@ -10709,7 +10901,16 @@ mod tests {
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]; 4]);
         let store = TrackingMockVectorStore::all_ok();
 
-        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col", false).await;
+        let result = upsert_pending(
+            &pending,
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &empty_schemas(),
+        )
+        .await;
         assert!(result.is_ok());
 
         let points = store.upserted_points.lock().unwrap();

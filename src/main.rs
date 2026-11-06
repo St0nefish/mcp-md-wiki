@@ -378,22 +378,7 @@ async fn main() -> anyhow::Result<()> {
             // Any invalid schema file fails the whole check, regardless of
             // --strict: the server refuses to start on the same tree, and there are
             // no rules to validate documents against that are known to be right.
-            let schemas =
-                match schema::SchemaCache::build(data_path, &cfg.frontmatter, &cfg.indexing) {
-                    Ok(schemas) => schemas,
-                    Err(e) => {
-                        eprintln!("SCHEMA ERRORS ({}):", e.invalid.len());
-                        for file in &e.invalid {
-                            eprintln!("  {}: {}", file.path.display(), file.reason);
-                        }
-                        eprintln!();
-                        anyhow::bail!(
-                            "{} schema file(s) are invalid; no document was validated, and the \
-                         server will refuse to start until they are fixed",
-                            e.invalid.len(),
-                        );
-                    }
-                };
+            let schemas = build_cli_schema_cache(&cfg, "no document was validated")?;
             // Lint findings (#347) are warnings: logged, never a failed check.
             schema::log_lint_findings(&schemas.lint_findings());
 
@@ -525,12 +510,17 @@ async fn main() -> anyhow::Result<()> {
             print_status(&status);
         }
         Commands::ReprojectFields => {
-            // No lock: this runs in its own process, so an in-process mutex would be
-            // uncontended and meaningless. Safety comes from `reproject_all_fields`
-            // re-reading each document inside the transaction that rewrites it.
-            let state = state::StateDb::new(std::path::Path::new(&cfg.state_db_path())).await?;
-            let count = state.reproject_all_fields().await?;
-            println!("Reprojected filterable fields for {} document(s)", count);
+            let report = reproject_fields(&cfg).await?;
+            println!(
+                "Reprojected filterable fields for {} document(s)",
+                report.reprojected
+            );
+            if report.unparseable > 0 {
+                println!(
+                    "{} document(s) have unreadable stored frontmatter; reindex them",
+                    report.unparseable
+                );
+            }
         }
         Commands::Health { port } => {
             let port = port.unwrap_or(cfg.mcp.port);
@@ -959,10 +949,94 @@ fn print_eval_report(report: &eval::EvalReport) {
     println!("MRR:      {:.4}", report.mrr);
 }
 
+/// The schema tree for a CLI command that reads documents under it. Any invalid
+/// schema file fails the command, listing every one: the server refuses to start
+/// on the same tree. `consequence` says what the command therefore did not do.
+fn build_cli_schema_cache(
+    cfg: &config::ResolvedConfig,
+    consequence: &str,
+) -> anyhow::Result<schema::SchemaCache> {
+    let data_path = Path::new(cfg.data_path());
+    match schema::SchemaCache::build(data_path, &cfg.frontmatter, &cfg.indexing) {
+        Ok(schemas) => Ok(schemas),
+        Err(e) => {
+            eprintln!("SCHEMA ERRORS ({}):", e.invalid.len());
+            for file in &e.invalid {
+                eprintln!("  {}: {}", file.path.display(), file.reason);
+            }
+            eprintln!();
+            anyhow::bail!(
+                "{} schema file(s) are invalid; {consequence}, and the server will refuse to \
+                 start until they are fixed",
+                e.invalid.len(),
+            );
+        }
+    }
+}
+
+/// `reproject-fields`: rebuild `document_fields` for every document from stored
+/// frontmatter, read under the schema governing each (#349), and record the current
+/// projection version. No lock: this runs in its own process, so an in-process mutex
+/// would be uncontended and meaningless. Safety comes from `reproject_all_fields`
+/// re-reading each document inside the transaction that rewrites it.
+async fn reproject_fields(cfg: &config::ResolvedConfig) -> anyhow::Result<state::ReprojectReport> {
+    let schemas = build_cli_schema_cache(cfg, "no document was reprojected")?;
+    let state = state::StateDb::new(Path::new(&cfg.state_db_path())).await?;
+    Ok(state
+        .ensure_projection_current(&schemas, true)
+        .await?
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use server::{FieldBreakdown, StatusResponse, StoreCounts, ValueCount};
+
+    // --- `reproject-fields` ----------------------------------------------------
+
+    #[tokio::test]
+    async fn reproject_fields_reads_documents_under_their_schema_and_records_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".schema.yaml"),
+            "fields:\n  code:\n    type: text\n",
+        )
+        .unwrap();
+        let cfg = mcp::make_test_resolved_config(dir.path());
+        let db = state::StateDb::new(Path::new(&cfg.state_db_path()))
+            .await
+            .unwrap();
+        let fm: std::collections::HashMap<String, serde_json::Value> =
+            [("code".to_string(), serde_json::json!(42))]
+                .into_iter()
+                .collect();
+        // Written under no schema: the number is guessed numeric.
+        db.upsert_document_metadata("c.md", &fm, 1, "h", 1)
+            .await
+            .unwrap();
+
+        let report = reproject_fields(&cfg).await.unwrap();
+        assert_eq!(report.reprojected, 1);
+        assert_eq!(
+            db.projection_version().await.unwrap(),
+            state::PROJECTION_VERSION
+        );
+        let rows: Vec<(String, Option<f64>)> =
+            sqlx::query_as("SELECT field, value_num FROM document_fields")
+                .fetch_all(db.pool_for_test())
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![("code".to_string(), None)], "declared text");
+
+        // An invalid schema file refuses the run.
+        std::fs::write(dir.path().join(".schema.yaml"), "fields: [not, a, map]\n").unwrap();
+        let err = reproject_fields(&cfg).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no document was reprojected"),
+            "{err}"
+        );
+    }
 
     // --- `get` argument parsing ---------------------------------------------
 

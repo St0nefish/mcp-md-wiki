@@ -133,7 +133,16 @@ fn over_size_limit_reason(bytes: u64) -> String {
 // advertised schema; without them it emits a flat string `enum`, and the one
 // caller-facing sentence lives on `RawFieldDef::ty`.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize, schemars::JsonSchema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum FieldType {
@@ -180,19 +189,29 @@ impl FieldType {
     }
 }
 
-/// How a declared [`FieldType`]'s values will carry a numeric `value_num` in the
-/// metadata projection once it is schema-driven (#349). Not read by production code
-/// yet: `document_fields::numeric_value` still derives `value_num` from the JSON
-/// value alone, which this mapping matches for every type today.
+/// The deepest field path, in [`FieldPath`] steps (each dot-separated name and each
+/// `[]` counts as one), that a schema may declare (`update_schema`) and that the
+/// metadata projection flattens (`document_fields::flatten_frontmatter`) — one limit,
+/// so a field a schema can declare is always a field a filter can reach (#349).
+pub const MAX_FIELD_PATH_DEPTH: usize = 16;
+
+/// How a declared [`FieldType`]'s values carry a numeric `value_num` in the
+/// metadata projection (`document_fields::flatten_frontmatter`, #349). A field no
+/// schema declares keeps the JSON-type guess (`document_fields::numeric_value`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumericValue {
-    /// No numeric value.
+    /// No numeric value, even when the JSON value is a number: a `text` field
+    /// holding `42` is text.
     None,
     /// The JSON number itself.
     Number,
     /// `1.0` for true, `0.0` for false, as `document_fields::numeric_value` stores a
     /// boolean.
     Boolean,
+    /// Seconds since the Unix epoch, UTC (`document_fields::epoch_seconds`): a date
+    /// is its midnight UTC, a timestamp is normalized from its offset, so range
+    /// filters order dates and timestamps on one axis.
+    Epoch,
 }
 
 /// The kind of value a [`FieldType`] describes, for the cascade's same-kind rule
@@ -218,9 +237,9 @@ pub enum KindFamily {
 /// Everything a declared [`FieldType`] means to the layers that interpret it (#346):
 /// what a value must look like (validation), how its type is named and described,
 /// which Qdrant payload index serves it (and so which range filters work on it:
-/// [`IndexKind::supports_range`]), and whether `get_schema` lists the values
-/// documents use. It also carries the `value_num` mapping the schema-driven
-/// projection (#349) will consume, which nothing reads yet ([`Self::numeric`]).
+/// [`IndexKind::supports_range`]), how its values reach the metadata projection's
+/// `value_num` ([`Self::numeric`], #349), and whether `get_schema` lists the values
+/// documents use.
 /// One row per type in [`FIELD_KINDS`], read through [`FieldType::kind`], so these
 /// mappings cannot drift apart.
 #[derive(Debug, Clone, Copy)]
@@ -237,9 +256,8 @@ pub struct FieldKind {
     pub accepts: fn(&Value) -> bool,
     /// The payload index kind an `indexed` field of this type gets.
     pub index: IndexKind,
-    /// How a value of this type will map to a numeric `value_num` once the projection
-    /// is schema-driven (#349). Not read by production code yet; see
-    /// [`NumericValue`].
+    /// How a value of this type maps to the metadata projection's numeric
+    /// `value_num` (#349); see [`NumericValue`].
     pub numeric: NumericValue,
     /// Whether `get_schema`'s `values_in_use` lists the values documents use for an
     /// open field of this type: free text, timestamps and containers have no
@@ -309,7 +327,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
         describe: "a date (YYYY-MM-DD)",
         accepts: accepts_date,
         index: IndexKind::Keyword,
-        numeric: NumericValue::None,
+        numeric: NumericValue::Epoch,
         vocabulary: true,
     },
     FieldKind {
@@ -318,7 +336,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
         describe: "an RFC 3339 timestamp",
         accepts: accepts_timestamp,
         index: IndexKind::Keyword,
-        numeric: NumericValue::None,
+        numeric: NumericValue::Epoch,
         vocabulary: false,
     },
     FieldKind {
@@ -3619,10 +3637,41 @@ impl SchemaCache {
     /// Every field path declared anywhere in the tree — the root and every
     /// scope — for `search`'s unknown-filter-field check and for `get_schema`'s
     /// `other_fields_in_use`, so the two agree on what counts as undeclared.
+    ///
+    /// Includes the paths through a list's element schema (`npcs[]`, `npcs[].role`),
+    /// which the flat view leaves out: the metadata projection writes `npcs[].role`
+    /// rows, and a correlated `npcs[]` filter names those sub-fields (#349). The flat
+    /// view itself — what Qdrant payload indexes and the fingerprint read — is
+    /// unchanged.
     pub fn declared_field_paths(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for schema in std::iter::once(self.root()).chain(self.scopes.iter().map(|(_, s)| s)) {
+            for (name, node) in schema.fields.tree() {
+                collect_declared_paths(name, node, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Every type some scope (the root included) gives the values stored under
+    /// `field`, through the flat view or, for a `[]` path, the tree — what `search`
+    /// reads to tell a range filter on a field that stores no number from one that
+    /// does, and a date field from others (#349). A `list` contributes its `items`
+    /// type, which its rows are projected under, or nothing when it has none (its
+    /// elements are guessed from their JSON type). Empty when no scope types it.
+    pub fn declared_types(&self, field: &str) -> BTreeSet<FieldType> {
         std::iter::once(self.root())
-            .chain(self.scopes.iter().map(|(_, schema)| schema))
-            .flat_map(|schema| schema.fields.keys().cloned())
+            .chain(self.scopes.iter().map(|(_, s)| s))
+            .filter_map(|schema| {
+                let def = schema
+                    .fields
+                    .get(field)
+                    .or_else(|| schema.fields.lookup(field))?;
+                match def.ty? {
+                    FieldType::List => def.items.as_deref().and_then(|items| items.ty),
+                    ty => Some(ty),
+                }
+            })
             .collect()
     }
 
@@ -3680,7 +3729,13 @@ impl SchemaCache {
 
         let mut closed: Option<BTreeSet<String>> = None;
         for schema in governing {
-            match schema.fields.get(field) {
+            // The flat view, then the tree for a path through a list's elements
+            // (`npcs[].role`, #349), which the flat view does not hold.
+            match schema
+                .fields
+                .get(field)
+                .or_else(|| schema.fields.lookup(field))
+            {
                 None => {}
                 Some(FieldDef { values: None, .. }) => return None,
                 Some(FieldDef {
@@ -3692,6 +3747,20 @@ impl SchemaCache {
             }
         }
         closed
+    }
+}
+
+/// Every declared path at or below `node` (at `path`), through `fields` (`a.b`) and
+/// `items` (`a[]`, `a[].b`) alike, for [`SchemaCache::declared_field_paths`].
+fn collect_declared_paths(path: &str, node: &FieldDef, out: &mut BTreeSet<String>) {
+    if node.declared_in.is_some() {
+        out.insert(path.to_string());
+    }
+    for (name, child) in &node.fields {
+        collect_declared_paths(&format!("{path}.{name}"), child, out);
+    }
+    if let Some(items) = &node.items {
+        collect_declared_paths(&format!("{path}[]"), items, out);
     }
 }
 
@@ -4174,6 +4243,36 @@ mod tests {
 
     fn empty_config() -> FrontmatterConfig {
         FrontmatterConfig::default()
+    }
+
+    #[test]
+    fn declared_paths_reach_list_elements_but_the_flat_view_does_not() {
+        let tmp = TempDir::new().unwrap();
+        write_schema(
+            tmp.path(),
+            "",
+            "fields:\n  npcs:\n    type: list\n    items:\n      type: object\n      fields:\n        \
+             role:\n          type: enum\n          values: [guard, cook]\n          indexed: true\n",
+        );
+        write_schema(tmp.path(), "food", "fields:\n  status:\n    type: text\n");
+        let cache = SchemaCache::build_for_test(tmp.path(), &empty_config());
+
+        let declared = cache.declared_field_paths();
+        for path in ["npcs", "npcs[]", "npcs[].role", "status"] {
+            assert!(declared.contains(path), "{path}: {declared:?}");
+        }
+        assert_eq!(
+            cache.filter_closed_values("npcs[].role", None),
+            Some(BTreeSet::from(["cook".to_string(), "guard".to_string()]))
+        );
+        // Qdrant payload indexes still never see a `[]` path (#350's job).
+        assert!(
+            cache
+                .all_indexed_fields()
+                .iter()
+                .all(|f| !f.name.contains("[]"))
+        );
+        assert!(!cache.root().fields.contains_key("npcs[].role"));
     }
 
     // -- flattening ---------------------------------------------------------
@@ -7260,7 +7359,7 @@ mod tests {
                 json!("2024-01-31"),
                 json!("2024-13-01"),
                 K::Keyword,
-                NumericValue::None,
+                NumericValue::Epoch,
                 true,
             ),
             (
@@ -7269,7 +7368,7 @@ mod tests {
                 json!("2024-01-31T10:00:00Z"),
                 json!("2024-01-31"),
                 K::Keyword,
-                NumericValue::None,
+                NumericValue::Epoch,
                 false,
             ),
             (
@@ -7329,14 +7428,22 @@ mod tests {
                 ty == FieldType::Number,
                 "{name}: equality filters"
             );
-            // The `value_num` mapping #349 will consume agrees with what the
-            // JSON-driven projection stores today.
+            // The `value_num` the schema-driven projection (#349) stores for an
+            // accepted value of this type.
             assert_eq!(kind.numeric, numeric, "{name}");
-            let numeric_of_good = crate::document_fields::numeric_value(&good);
+            let numeric_of_good = crate::document_fields::declared_numeric(numeric, &good);
             match numeric {
                 NumericValue::Number => assert_eq!(numeric_of_good, good.as_f64()),
                 NumericValue::Boolean => assert_eq!(numeric_of_good, Some(1.0)),
-                NumericValue::None => {}
+                NumericValue::Epoch => assert_eq!(
+                    numeric_of_good,
+                    crate::document_fields::epoch_seconds(good.as_str().unwrap()),
+                    "{name}"
+                ),
+                NumericValue::None => assert_eq!(numeric_of_good, None, "{name}"),
+            }
+            if numeric == NumericValue::Epoch {
+                assert!(numeric_of_good.is_some(), "{name}: {good} has an epoch");
             }
             assert_eq!(kind.vocabulary, vocabulary, "{name}");
         }
