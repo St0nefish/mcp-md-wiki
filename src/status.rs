@@ -513,7 +513,9 @@ impl IndexStatus {
         });
     }
 
-    /// Record whether a Qdrant payload index is in place for `field`.
+    /// Record whether a Qdrant payload index is in place for `field` — the payload
+    /// key the index is on (`fm.tags` for a frontmatter field since #350; `mtime`,
+    /// `text`, `file_path` and the other built-ins unprefixed).
     pub fn record_payload_index(&self, field: &str, error: Option<String>) {
         self.with(|inner| {
             let state = match error {

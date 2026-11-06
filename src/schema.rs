@@ -214,6 +214,32 @@ pub enum NumericValue {
     Epoch,
 }
 
+/// How a scalar of a declared type is written into the Qdrant payload's `fm` object
+/// (#350, `document_fields::payload_frontmatter`), so the payload index of its
+/// [`FieldKind::index`] kind holds a value it can index and a filter's lowered value
+/// compares against the same representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadValue {
+    /// As written: a container type's scalar is not coerced.
+    AsIs,
+    /// A string (`document_fields::canonical_text`): a `text` or `enum` field holding
+    /// `3` is written `"3"`, which a keyword match on `"3"` finds.
+    Text,
+    /// A JSON integer, including an integral float (`3.0` → `3`), which validation
+    /// accepts (#347) and an integer index would otherwise not hold.
+    Integer,
+    /// A JSON number, as written: the float index holds integers too, and the same
+    /// path declared `integer` in another scope may own an integer index, which
+    /// would not hold `3.0`.
+    Float,
+    /// A boolean, as written.
+    Bool,
+    /// RFC 3339 UTC text (`document_fields::payload_datetime`): `2024-01-02` →
+    /// `2024-01-02T00:00:00Z`, for the datetime index; text that is no date stays as
+    /// written.
+    Datetime,
+}
+
 /// The kind of value a [`FieldType`] describes, for the cascade's same-kind rule
 /// (#348): a scope may retype an inherited field only within its family, and a
 /// change across families is a [`lint_cascade`] warning.
@@ -259,6 +285,9 @@ pub struct FieldKind {
     /// How a value of this type maps to the metadata projection's numeric
     /// `value_num` (#349); see [`NumericValue`].
     pub numeric: NumericValue,
+    /// How a value of this type is written into the Qdrant payload (#350); see
+    /// [`PayloadValue`].
+    pub payload: PayloadValue,
     /// Whether `get_schema`'s `values_in_use` lists the values documents use for an
     /// open field of this type: free text, timestamps and containers have no
     /// vocabulary worth listing.
@@ -274,6 +303,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
         accepts: Value::is_string,
         index: IndexKind::Keyword,
         numeric: NumericValue::None,
+        payload: PayloadValue::Text,
         vocabulary: false,
     },
     FieldKind {
@@ -283,6 +313,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
         accepts: accepts_integer,
         index: IndexKind::Integer,
         numeric: NumericValue::Number,
+        payload: PayloadValue::Integer,
         vocabulary: true,
     },
     FieldKind {
@@ -292,6 +323,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
         accepts: Value::is_number,
         index: IndexKind::Float,
         numeric: NumericValue::Number,
+        payload: PayloadValue::Float,
         vocabulary: true,
     },
     FieldKind {
@@ -301,6 +333,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
         accepts: Value::is_boolean,
         index: IndexKind::Bool,
         numeric: NumericValue::Boolean,
+        payload: PayloadValue::Bool,
         vocabulary: true,
     },
     FieldKind {
@@ -310,6 +343,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
         accepts: accepts_enum,
         index: IndexKind::Keyword,
         numeric: NumericValue::None,
+        payload: PayloadValue::Text,
         vocabulary: true,
     },
     FieldKind {
@@ -319,6 +353,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
         accepts: Value::is_array,
         index: IndexKind::Keyword,
         numeric: NumericValue::None,
+        payload: PayloadValue::AsIs,
         vocabulary: true,
     },
     FieldKind {
@@ -326,8 +361,9 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
         family: KindFamily::String,
         describe: "a date (YYYY-MM-DD)",
         accepts: accepts_date,
-        index: IndexKind::Keyword,
+        index: IndexKind::Datetime,
         numeric: NumericValue::Epoch,
+        payload: PayloadValue::Datetime,
         vocabulary: true,
     },
     FieldKind {
@@ -335,8 +371,9 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
         family: KindFamily::String,
         describe: "an RFC 3339 timestamp",
         accepts: accepts_timestamp,
-        index: IndexKind::Keyword,
+        index: IndexKind::Datetime,
         numeric: NumericValue::Epoch,
+        payload: PayloadValue::Datetime,
         vocabulary: false,
     },
     FieldKind {
@@ -346,6 +383,7 @@ pub static FIELD_KINDS: [FieldKind; 9] = [
         accepts: Value::is_object,
         index: IndexKind::Keyword,
         numeric: NumericValue::None,
+        payload: PayloadValue::AsIs,
         vocabulary: false,
     },
 ];
@@ -1357,9 +1395,11 @@ fn check_unique_paths(
 }
 
 /// Top-level names the indexer writes into every chunk's Qdrant payload itself
-/// (`ingest::upsert_pending`), plus `fm`, reserved for the frontmatter namespace
-/// (#350). A frontmatter field of the same name is overwritten in the payload by the
-/// built-in value, so a query-mode filter on it never sees what the document says.
+/// (`ingest::upsert_pending`), plus `fm`, the frontmatter namespace (#350). Since
+/// #350 a frontmatter field of the same name lives under `fm` and is no longer
+/// overwritten, but the names stay reserved (a lint warning): a filter on
+/// `file_path` addresses the built-in, not the frontmatter field, and one name
+/// meaning two things in one payload is a trap for whoever reads it.
 pub const RESERVED_PAYLOAD_NAMES: &[&str] = &[
     "file_path",
     "mtime",
@@ -1416,8 +1456,8 @@ pub fn lint_raw(file: &SchemaFile, is_root: bool) -> Vec<String> {
         {
             warnings.push(format!(
                 "field '{key}': '{name}' is reserved — the search index stores its own \
-                 value under that name, which hides a frontmatter field of the same \
-                 name from search filters; rename the field"
+                 value under that name, so the two are easily confused (a `file_path` \
+                 filter always means the document's path); rename the field"
             ));
         }
         lint_field(key, raw, &mut warnings);
@@ -2668,6 +2708,17 @@ impl ResolvedSchema {
         ty.map_or(IndexKind::Keyword, |ty| ty.kind().index)
     }
 
+    /// The payload index kind a declared field needs (#350): its own type's
+    /// ([`Self::index_kind`]), except that a `list` whose `items` declare a type is
+    /// indexed as that type — Qdrant indexes each element of an array, so `scores:
+    /// {type: list, items: {type: integer}}` needs an integer index for a range on it.
+    pub fn index_kind_of(def: &FieldDef) -> IndexKind {
+        match (def.ty, def.items.as_deref().and_then(|items| items.ty)) {
+            (Some(FieldType::List), Some(item_ty)) => Self::index_kind(Some(item_ty)),
+            (ty, _) => Self::index_kind(ty),
+        }
+    }
+
     /// A stable fingerprint of this schema.
     ///
     /// Used to detect that a document needs revalidating because the rules changed,
@@ -2734,9 +2785,21 @@ impl ResolvedSchema {
     /// document without touching Qdrant; one that moves this too also refreshes the
     /// payload in place. Neither re-embeds. Every input here is also an input of
     /// `fingerprint`, so a change here always moves both.
+    ///
+    /// Since #350 the payload's `fm` object is coerced by each declared field's type
+    /// ([`FieldKind::payload`]), so the coercion of every typed node of the tree —
+    /// through `fields` and `items` alike — is hashed too, after
+    /// [`PAYLOAD_SHAPE_VERSION`]: a type change that changes how a value is written
+    /// (`text` → `integer`) refreshes the payload without re-embedding, and one that
+    /// does not (`text` → `enum`, both strings) moves nothing here.
     pub fn payload_fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
+        hasher.update(PAYLOAD_SHAPE_VERSION.to_le_bytes());
+        hasher.update([0xfbu8]);
+        for (name, node) in self.fields.tree() {
+            hash_payload_coercion(&mut hasher, name, node);
+        }
         for (path, def) in &self.fields {
             let Some(default) = &def.default else {
                 continue;
@@ -2761,6 +2824,32 @@ impl ResolvedSchema {
             hasher.update([0xffu8]);
         }
         hex::encode(hasher.finalize())
+    }
+}
+
+/// The version of the Qdrant payload's frontmatter shape (#350: frontmatter under
+/// `fm`, coerced by declared type), folded into
+/// [`ResolvedSchema::payload_fingerprint`]. Bump it when the payload's frontmatter
+/// shape or the coercion rules change for an unchanged schema; a moved payload hash
+/// refreshes every payload in place, with no re-embedding.
+pub const PAYLOAD_SHAPE_VERSION: u32 = 1;
+
+/// Each typed node at or below `node` (at `path`) as
+/// [`ResolvedSchema::payload_fingerprint`] hashes it: the path and the type's
+/// [`FieldKind::payload`] coercion, through `fields` (`a.b`) and `items` (`a[]`).
+fn hash_payload_coercion(hasher: &mut sha2::Sha256, path: &str, node: &FieldDef) {
+    use sha2::Digest;
+    if let Some(ty) = node.ty {
+        hasher.update(path.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(format!("{:?}", ty.kind().payload).as_bytes());
+        hasher.update([0xffu8]);
+    }
+    for (name, child) in &node.fields {
+        hash_payload_coercion(hasher, &format!("{path}.{name}"), child);
+    }
+    if let Some(items) = &node.items {
+        hash_payload_coercion(hasher, &format!("{path}[]"), items);
     }
 }
 
@@ -3532,15 +3621,24 @@ impl SchemaCache {
     ///
     /// When two scopes declare the same path with different types, the first wins and a
     /// warning is emitted: one collection cannot hold two index kinds for one path.
+    ///
+    /// Includes the sub-fields of a list's objects (`npcs[].role`) that are declared
+    /// `indexed` (#350): their payload index (`fm.npcs[].role`) serves both a plain
+    /// filter on the sub-field and a correlated `npcs[]` filter's nested condition.
+    /// A path ending in `[]` is left out — a filter key ending in `[]` is a correlated
+    /// filter, never a field of its own. Names are field paths; the payload key each
+    /// is indexed under is [`IndexedField::payload_key`].
     pub fn all_indexed_fields(&self) -> Vec<IndexedField> {
         let mut fields: Vec<IndexedField> = Vec::new();
 
         let mut add = |schema: &ResolvedSchema| {
-            for (path, def) in &schema.fields {
-                if !def.indexed {
-                    continue;
-                }
-                let kind = ResolvedSchema::index_kind(def.ty);
+            let mut declared: Vec<(String, &FieldDef)> = Vec::new();
+            for (name, node) in schema.fields.tree() {
+                collect_indexed_nodes(name, node, &mut declared);
+            }
+            for (path, def) in declared {
+                let path = &path;
+                let kind = ResolvedSchema::index_kind_of(def);
                 match fields.iter_mut().find(|f| &f.name == path) {
                     Some(existing) if existing.kind == kind => {}
                     // Keyword is the fallback for an undeclared type, so an explicit
@@ -3747,6 +3845,25 @@ impl SchemaCache {
             }
         }
         closed
+    }
+}
+
+/// Every declared node at or below `node` (at `path`) marked `indexed`, through
+/// `fields` and `items`, except one at a path ending in `[]`, for
+/// [`SchemaCache::all_indexed_fields`].
+fn collect_indexed_nodes<'a>(
+    path: &str,
+    node: &'a FieldDef,
+    out: &mut Vec<(String, &'a FieldDef)>,
+) {
+    if node.declared_in.is_some() && node.indexed && !path.ends_with("[]") {
+        out.push((path.to_string(), node));
+    }
+    for (name, child) in &node.fields {
+        collect_indexed_nodes(&format!("{path}.{name}"), child, out);
+    }
+    if let Some(items) = &node.items {
+        collect_indexed_nodes(&format!("{path}[]"), items, out);
     }
 }
 
@@ -4265,14 +4382,47 @@ mod tests {
             cache.filter_closed_values("npcs[].role", None),
             Some(BTreeSet::from(["cook".to_string(), "guard".to_string()]))
         );
-        // Qdrant payload indexes still never see a `[]` path (#350's job).
-        assert!(
-            cache
-                .all_indexed_fields()
-                .iter()
-                .all(|f| !f.name.contains("[]"))
+        // Since #350 an `indexed` list sub-field gets a payload index of its own type,
+        // keyed `fm.npcs[].role`; the flat view still leaves it out.
+        let indexed = cache.all_indexed_fields();
+        assert_eq!(
+            indexed,
+            vec![IndexedField {
+                name: "npcs[].role".into(),
+                kind: IndexKind::Keyword,
+            }]
         );
+        assert_eq!(indexed[0].payload_key(), "fm.npcs[].role");
         assert!(!cache.root().fields.contains_key("npcs[].role"));
+    }
+
+    #[test]
+    fn indexed_fields_take_the_list_item_type_and_skip_bracket_terminal_paths() {
+        let tmp = TempDir::new().unwrap();
+        write_schema(
+            tmp.path(),
+            "",
+            "fields:\n  scores:\n    type: list\n    indexed: true\n    items:\n      type: \
+             integer\n      indexed: true\n  when:\n    type: date\n    indexed: true\n  npcs:\n    \
+             type: list\n    items:\n      type: object\n      fields:\n        met:\n          \
+             type: timestamp\n          indexed: true\n        hp:\n          type: integer\n",
+        );
+        let cache = SchemaCache::build_for_test(tmp.path(), &empty_config());
+        let indexed: Vec<(String, IndexKind)> = cache
+            .all_indexed_fields()
+            .into_iter()
+            .map(|f| (f.name, f.kind))
+            .collect();
+        assert_eq!(
+            indexed,
+            vec![
+                ("npcs[].met".to_string(), IndexKind::Datetime),
+                ("scores".to_string(), IndexKind::Integer),
+                ("when".to_string(), IndexKind::Datetime),
+            ],
+            "`scores[]` (a path ending in `[]`) is not a filter field; an unindexed \
+             sub-field gets no index"
+        );
     }
 
     // -- flattening ---------------------------------------------------------
@@ -6369,8 +6519,9 @@ mod tests {
     }
 
     /// #351: the payload fingerprint moves with exactly what reaches the Qdrant payload
-    /// frontmatter — defaults and derived rules — and not with validation-only edits,
-    /// all of which still move `fingerprint`.
+    /// frontmatter — defaults, derived rules and (#350) how each declared type writes
+    /// its values — and not with validation-only edits, all of which still move
+    /// `fingerprint`.
     #[test]
     fn payload_fingerprint_tracks_defaults_and_derived_only() {
         let resolve = |yaml: &str| {
@@ -6393,8 +6544,8 @@ mod tests {
                 "fields:\n  status:\n    values: [draft, done]\n    default: draft\n    indexed: true\n",
             ),
             (
-                "a field with no default",
-                "fields:\n  status:\n    values: [draft, done]\n    default: draft\n  owner:\n    type: text\n",
+                "an untyped field with no default",
+                "fields:\n  status:\n    values: [draft, done]\n    default: draft\n  owner:\n    required: true\n",
             ),
         ] {
             let edited = resolve(yaml);
@@ -6444,6 +6595,41 @@ mod tests {
         assert_eq!(
             derived.payload_fingerprint(),
             derived_with_default.payload_fingerprint()
+        );
+
+        // #350: how a declared type writes its values into the payload is payload
+        // input — at any depth, list items included — so a retype that changes the
+        // written value refreshes the payload; text → enum (both strings) does not.
+        let typed = resolve(
+            "fields:\n  count:\n    type: text\n  npcs:\n    type: list\n    items:\n      \
+             type: object\n      fields:\n        met:\n          type: text\n",
+        );
+        for (what, yaml) in [
+            (
+                "text → integer",
+                "fields:\n  count:\n    type: integer\n  npcs:\n    type: list\n    items:\n      \
+                 type: object\n      fields:\n        met:\n          type: text\n",
+            ),
+            (
+                "a list item's sub-field text → date",
+                "fields:\n  count:\n    type: text\n  npcs:\n    type: list\n    items:\n      \
+                 type: object\n      fields:\n        met:\n          type: date\n",
+            ),
+        ] {
+            assert_ne!(
+                resolve(yaml).payload_fingerprint(),
+                typed.payload_fingerprint(),
+                "{what}"
+            );
+        }
+        assert_eq!(
+            resolve(
+                "fields:\n  count:\n    type: enum\n  npcs:\n    type: list\n    items:\n      \
+                 type: object\n      fields:\n        met:\n          type: text\n",
+            )
+            .payload_fingerprint(),
+            typed.payload_fingerprint(),
+            "text → enum writes the same strings"
         );
     }
 
@@ -7358,7 +7544,7 @@ mod tests {
                 "date",
                 json!("2024-01-31"),
                 json!("2024-13-01"),
-                K::Keyword,
+                K::Datetime,
                 NumericValue::Epoch,
                 true,
             ),
@@ -7367,7 +7553,7 @@ mod tests {
                 "timestamp",
                 json!("2024-01-31T10:00:00Z"),
                 json!("2024-01-31"),
-                K::Keyword,
+                K::Datetime,
                 NumericValue::Epoch,
                 false,
             ),
@@ -7406,7 +7592,10 @@ mod tests {
             assert_eq!(kind.index, index);
             assert_eq!(
                 kind.index.supports_range(),
-                matches!(ty, FieldType::Integer | FieldType::Number),
+                matches!(
+                    ty,
+                    FieldType::Integer | FieldType::Number | FieldType::Date | FieldType::Timestamp
+                ),
                 "{name}: range filters"
             );
             // Equality filters, as the Qdrant lowering applies them to the index kind:
@@ -7414,6 +7603,7 @@ mod tests {
             let sample = match index {
                 K::Integer => "3",
                 K::Bool => "true",
+                K::Datetime => "2024-01-31",
                 _ => "x",
             };
             let lowered = crate::qdrant::lower_field_filters(
@@ -7446,6 +7636,18 @@ mod tests {
                 assert!(numeric_of_good.is_some(), "{name}: {good} has an epoch");
             }
             assert_eq!(kind.vocabulary, vocabulary, "{name}");
+            // How the Qdrant payload writes an accepted value (#350): a value the
+            // payload index of this kind holds.
+            let written = crate::document_fields::payload_scalar(kind.payload, &good);
+            let expected_written = match ty {
+                FieldType::Text | FieldType::Integer | FieldType::Boolean => good.clone(),
+                FieldType::Number => json!(3.5),
+                // An array value is not a scalar: the coercion leaves it alone.
+                FieldType::Enum | FieldType::List | FieldType::Object => good.clone(),
+                FieldType::Date => json!("2024-01-31T00:00:00Z"),
+                FieldType::Timestamp => json!("2024-01-31T10:00:00Z"),
+            };
+            assert_eq!(written, expected_written, "{name}");
         }
         assert_eq!(ResolvedSchema::index_kind(None), K::Keyword);
     }

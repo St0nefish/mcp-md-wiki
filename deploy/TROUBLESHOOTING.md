@@ -412,6 +412,29 @@ rebuild succeeds, `schema_error` clears, and every document written or changed w
 the schema was refused is indexed. A server that would not start just needs starting
 again once the file is fixed.
 
+### Filtered search finds too little right after an upgrade
+
+The release that moved frontmatter under the payload's `fm` key (#350) re-embeds the
+whole corpus on its first reconcile. Until that finishes, points written by the older
+version keep their frontmatter at the top level, which no query-mode filter (nor the
+CLI/web `domain`/`type`/`tags` filters) reads any more, so filtered searches with a
+`query` miss those documents. Unfiltered search and searches without a `query`
+(SQLite) are unaffected, and `section`/`heading_prefix` results say "results may be
+incomplete" meanwhile.
+
+**Fix:** none needed — watch `/status` (`phase`, `chunks_total`) until the run
+completes. A run that fails is retried with backoff and by the next periodic sweep.
+
+### `Payload index on '…' is … but the field now needs …; recreating it`
+
+A WARN from `ensure_collection`: a field's declared type changed (say `text` →
+`integer`), so its Qdrant payload index is deleted and recreated with the new kind.
+Filters on that field run unindexed — correct, slower — for the moment in between.
+`Dropping the payload index on '…'` (INFO) is the same reconcile removing an
+unprefixed index an older version created before frontmatter moved under `fm.`. A
+failure is logged at ERROR and recorded in `/status` under `payload_indexes`, keyed by
+payload key (`fm.<field>`), until a later startup or indexing run succeeds.
+
 ### Qdrant connection refused
 
 Qdrant isn't running or hasn't finished starting.

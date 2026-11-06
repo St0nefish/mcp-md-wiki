@@ -125,8 +125,11 @@ frontmatter:
   # Example: [title, description, type, tags]
   required: []
 
-  # Frontmatter fields to store as Qdrant payload fields, enabling filtered
-  # search. These become keyword-indexed payload fields on each point.
+  # Frontmatter fields to give a Qdrant payload index, enabling filtered
+  # search with a query. Every point carries the whole frontmatter under its
+  # `fm` payload key; each field listed here gets a keyword index on
+  # `fm.<field>` (shown under that name in /status), reconciled on every
+  # startup and indexing run.
   # A field a root `.schema.yaml` derives (`derived:`, e.g. `domain` from the
   # top-level folder) still needs an index to be filtered on in query mode;
   # declare it `indexed: true` there, since that file replaces this block.

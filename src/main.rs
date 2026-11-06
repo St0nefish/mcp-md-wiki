@@ -869,9 +869,7 @@ fn print_search_results(results: &[qdrant::SearchResult], explain: bool, hybrid:
         return;
     }
     for (i, r) in results.iter().enumerate() {
-        let title = r
-            .payload
-            .get("title")
+        let title = qdrant::frontmatter_value(&r.payload, "title")
             .and_then(|v| v.as_str())
             .unwrap_or("(untitled)");
         let file_path = r

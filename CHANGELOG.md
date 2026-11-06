@@ -14,6 +14,69 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+### FULL RE-EMBED on the first reconcile after upgrading: typed, namespaced Qdrant payload (#350)
+
+**Coordinate the release with the owner.** This release changes what every Qdrant
+point carries, and bumps `ingest::CHUNKER_VERSION` (2 → 3) to rewrite them: every
+file's chunking fingerprint goes stale, so **the first reconcile after the new
+version starts (startup, the periodic sweep, or `/admin/reload`) re-chunks and
+re-embeds the whole corpus** — one embedding call per chunk of every document,
+with the time and embedding-endpoint cost of a full `index --full` (but without
+dropping the collection). No operator step is needed to start it. While it runs:
+
+- points still in the old shape match **no** frontmatter filter (query-mode
+  `filters`, and the CLI/web `domain`/`type`/`tags` filters, now address `fm.*`
+  keys), so filtered search results are **incomplete until the re-embed finishes**;
+  unfiltered search, `get_document` and enumeration mode (`search` without a
+  `query`, which reads SQLite) are unaffected. The sticky `stale_chunking` latch
+  behind `IndexStatus::is_bulk_indexing` is set by the reconcile scan and stays set
+  through retries until a run completes, so `section` and `heading_prefix` results
+  carry the "results may be incomplete" note for the whole transition;
+- `/status` shows the run's progress (`chunks_total`, `phase`).
+
+Rolling back to an older binary afterwards would face the opposite mismatch and
+re-embed again (its `CHUNKER_VERSION` differs too).
+
+- **Payload shape.** Frontmatter moves from the top level of each point's payload
+  into one `fm` object, with its own structure (`fm.planning.prep_minutes`,
+  `fm.npcs[].role`); `title` and `description` live there too. The built-in keys —
+  `file_path`, `mtime`, `chunk_index`, `text`, `text_body_offset`, `line_start`,
+  `line_end`, `path_ancestors`, the heading/section keys — stay at the top level, so
+  a frontmatter key can no longer collide with one.
+- **Typed values.** A declared field's value is written as its type: `integer` as an
+  integer (an integral `3.0`, which validation accepts, as `3`, so it matches an
+  integer filter), `number` as the number written, `text`/`enum` as a string, `boolean` as is,
+  `date`/`timestamp` as RFC 3339 UTC text (`2024-01-02` → `2024-01-02T00:00:00Z`,
+  offsets normalized to `Z`). Undeclared fields are written as they are. Dates are
+  parsed by the same function as the metadata index's epoch seconds, so both search
+  modes place a date at the same instant.
+- **Datetime indexes and ranges with a query.** `date`/`timestamp` fields declared
+  `indexed` get a Qdrant datetime index (was keyword), and a range on them works
+  with a `query` (`{"published": {"gte": "2024-01-01"}}`, date-only bounds at
+  midnight UTC, compared at microsecond precision), lifting #349's refusal. Equality
+  on such a field matches the instant (enumeration mode compares the text as
+  written, so a timestamp spelled with another offset for the same instant matches
+  only in query mode).
+- **Correlated list filters with a query.** `{"npcs[]": {...}}` runs as a Qdrant
+  nested filter, every condition within one element, lifting #349's refusal. List
+  sub-fields declared `indexed: true` (`npcs[].role`) get payload indexes
+  (`fm.npcs[].role`), which a query-mode filter on them — plain or correlated —
+  needs; a `list` with typed `items` is indexed as the item type.
+- **Payload indexes are reconciled on every startup and indexing run.** One whose
+  kind no longer matches the declared type is deleted and recreated, a missing one is
+  created, and the unprefixed index an older version left on a declared field's name
+  (`tags`) is dropped — no more "delete the payload index and reindex" after a type
+  change. **`/status` and `/metrics` now name indexes by payload key**: `fm.tags`,
+  `fm.planning.prep_minutes` (`file_path`, `mtime`, `path_ancestors`, `text` and the
+  heading keys unchanged); update dashboards or alerts on
+  `kb_payload_index_ok{field=...}`.
+- A schema `type` change that writes values differently (`text` → `integer`) now
+  refreshes the payload in place through #351's path (no re-embed); one that does
+  not (`text` → `enum`) changes nothing in Qdrant.
+- The reserved-name lint for top-level schema fields (`file_path`, `text`, …, `fm`)
+  stays, reworded: frontmatter no longer collides with those keys, but a `file_path`
+  filter always means the document's path.
+
 ### Breaking: `domain` derivation and the root-edit guard are opt-in (#345)
 
 **Upgrade action required right after deploying.** Two policies that were
@@ -142,9 +205,9 @@ schema rebuild and fails to start.
   index in non-strict mode, and a strict-mode rejection still keeps its last good
   version), its metadata index row and links are rewritten, and — only when the
   edit changed what goes into its Qdrant payload, i.e. a field `default` or the root
-  `derived:` block — its payload is updated **in place** (merging the new
-  frontmatter keys and deleting the ones the edit removed; chunk text, line ranges
-  and heading keys are untouched). No embedding call, no point upsert.
+  `derived:` block — its payload is updated **in place** (with #350, one write
+  replacing the `fm` object, which drops a key the edit removed; chunk text, line
+  ranges and heading keys are untouched). No embedding call, no point upsert.
 - **Exception:** with `chunking.prepend_description` on (the default), a document's
   `description` is prepended to every chunk's embedded text, and a schema `default`
   for `description` can change it. A document whose prepended description a schema
@@ -161,8 +224,9 @@ schema rebuild and fails to start.
   re-embedded and nothing is written to Qdrant. The first schema edit after the
   upgrade refreshes the payload of the documents it governs once (their payload hash
   was unknown), still without re-embedding.
-- A frontmatter key named like a heading/section payload key (`section_key`, …)
-  still reaches the payload while `chunking.heading_metadata` is off, as before.
+- Since #350 (same release) the frontmatter is one `fm` payload key, which the
+  refresh sets as a whole, so a frontmatter key named like a heading/section payload
+  key (`section_key`, …) no longer meets the chunk's own key in either mode.
 
 ### Schema-driven metadata projection and correlated list filters (#349)
 
@@ -183,11 +247,9 @@ schema rebuild and fails to start.
   blank — until the next `serve`, `index` or `reproject-fields`. An automatic
   reproject that fails is retried once per process, then left to the next start
   or a `reproject-fields`.
-- With a `query`, a date or timestamp range (a date-string bound, or any range on
-  a `date`/`timestamp` field) is refused in plain words: those ranges work only
-  when listing. A range on a field every scope declares `text`, `enum`, `list` of
-  non-numbers or `object` is refused in both modes, naming the type, instead of
-  silently matching nothing.
+- Date and timestamp ranges work with a `query` too (#350, same release). A range
+  on a field every scope declares `text`, `enum`, `list` of non-numbers or `object`
+  is refused in both modes, naming the type, instead of silently matching nothing.
 - **Lists of objects are filterable.** `npcs: [{role: guard, level: 3}]` projects
   as `npcs[].role`/`npcs[].level` rows keyed by element, in enumeration mode
   (`search` without `query`, `/api/enumerate`): `{"npcs[].role": "guard"}` matches
@@ -195,7 +257,7 @@ schema rebuild and fails to start.
   `{"npcs[]": {"role": "guard", "level": {"gte": 3}}}` requires every condition to
   hold within **one** element. Its conditions are any ordinary filter form (one
   level only, at most 20 row tests, each `all_of` value counting as one). With a
-  `query` it is refused in plain words (Qdrant lowering comes with #350). Unknown
+  `query` it runs as a Qdrant nested filter (#350, same release). Unknown
   sub-fields and values outside a sub-field's closed set are refused with the
   options listed, like any other filter. Previously a list holding objects was
   skipped entirely.
@@ -211,8 +273,8 @@ schema rebuild and fails to start.
 - **Dates are comparable.** `date` and `timestamp` fields store seconds since the
   Unix epoch (UTC; a date is its midnight UTC, a timestamp is normalized from its
   offset), and a range bound may be given as a date or RFC 3339 timestamp string:
-  `{"published": {"gte": "2024-01-01"}}`. Enumeration mode only; in query mode those
-  fields are still keyword-indexed.
+  `{"published": {"gte": "2024-01-01"}}` — in query mode too, on a datetime index
+  (#350).
 - `/status` and `/metrics` field breakdowns leave out `[]` fields; `get_schema`'s
   `other_fields_in_use` lists an undeclared `npcs[].x` like any other undeclared
   field and no longer lists a declared one.

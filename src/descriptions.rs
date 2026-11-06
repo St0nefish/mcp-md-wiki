@@ -253,20 +253,10 @@ pub const ENUMERATION_SENTENCE: &str = "Without `query`, every match is listed i
 /// Never names a granularity that isn't enabled. `hybrid` is `search.hybrid`:
 /// the `query` text says the query is matched literally as well as
 /// semantically only when the sparse arm actually runs (#309).
-/// `search`'s `filters` description when a no-query listing is available — the
-/// same text as the `SearchParams::filters` doc comment.
-pub const FILTERS_WITH_LISTING: &str = "Frontmatter criteria keyed by field (dot-paths for \
-     nested fields): a scalar means equals (`{\"type\": \"guide\"}`), an array any-of, an \
-     object all-of or a range (`{\"planning.prep_minutes\": {\"lt\": 30}}`; a date field's \
-     bound may be `\"2024-01-01\"`, listing only, no query). A list's object fields are \
-     `npcs[].role`; a key ending in `[]` needs every condition in one element \
-     (`{\"npcs[]\": {\"role\": \"guard\", \"level\": {\"gte\": 3}}}`), only without `query`.";
-
-/// `search`'s `filters` description on a server where every search needs a query.
-pub const FILTERS_QUERY_ONLY: &str = "Frontmatter criteria keyed by field (dot-paths for \
-     nested fields): a scalar means equals (`{\"type\": \"guide\"}`), an array any-of, an \
-     object all-of or a numeric range (`{\"planning.prep_minutes\": {\"lt\": 30}}`).";
-
+///
+/// `filters` is not among them: since #350 every filter form — date bounds and
+/// correlated list filters included — works with and without a query, so its
+/// `SearchParams::filters` doc comment is right on every server.
 pub fn search_property_descriptions(
     effective: &[Granularity],
     hybrid: bool,
@@ -297,11 +287,7 @@ pub fn search_property_descriptions(
             text("Sort descending (when listing without a query)."),
         ));
         out.push(("min_score", text("Relevance floor (with a query).")));
-        out.push(("filters", text(FILTERS_WITH_LISTING)));
     } else {
-        // Date bounds and correlated list filters work only when listing (#349),
-        // which this server cannot do, so they are not offered.
-        out.push(("filters", text(FILTERS_QUERY_ONLY)));
         out.push((
             "query",
             Some(format!("{query_lead} Required on this server.")),

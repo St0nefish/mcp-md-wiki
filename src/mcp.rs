@@ -975,17 +975,6 @@ const MAX_LIST_FILTERS: usize = 20;
 /// unbounded number of bound SQL parameters.
 const MAX_FILTER_VALUES: usize = 500;
 
-/// Why a correlated list filter is refused with a `query` (#349): the Qdrant
-/// payload cannot express one yet.
-pub(crate) const CORRELATED_FILTER_QUERY_MODE: &str = "correlated list filters (a key ending \
-     in `[]`) are only supported when listing documents without a query; run the same \
-     filters without `query`";
-
-/// Why a date range (a date or timestamp bound, or a range on a `date`/`timestamp`
-/// field) is refused with a `query` (#349).
-pub(crate) const DATE_RANGE_QUERY_MODE: &str = "date and timestamp ranges are only supported \
-     when listing documents without a query; run the same filters without `query`";
-
 /// The filter operator names, which are never a sub-field of a correlated filter.
 const FILTER_OPERATORS: [&str; 6] = ["any_of", "all_of", "gte", "lte", "gt", "lt"];
 
@@ -1070,7 +1059,10 @@ fn parse_elem_filter(
 /// or a date/RFC 3339 timestamp string, compared as epoch seconds the way a date
 /// field's `value_num` is stored (#349). A `field` ending in `[]` is a correlated
 /// list filter ([`parse_elem_filter`]).
-fn parse_field_filter(field: &str, raw: &serde_json::Value) -> Result<FieldFilter, String> {
+pub(crate) fn parse_field_filter(
+    field: &str,
+    raw: &serde_json::Value,
+) -> Result<FieldFilter, String> {
     use serde_json::Value;
 
     if let Some(list) = field.strip_suffix("[]") {
@@ -1376,57 +1368,22 @@ fn build_query_conditions(
 ) -> Result<Vec<qdrant_client::qdrant::Condition>, McpError> {
     let filters = parse_filters(&params.filters)?;
 
-    if let Some((field, _)) = filters
-        .iter()
-        .find(|(_, f)| matches!(f, FieldFilter::Elem(_)))
-    {
-        return Err(McpError::invalid_params(
-            format!("filter '{field}': {CORRELATED_FILTER_QUERY_MODE}"),
-            None,
-        ));
-    }
-
-    // Date ranges are compared as epoch seconds in the metadata index only (#349):
-    // the Qdrant payload holds the date text under a keyword index, and a date
-    // string bound would otherwise be compared as a bare number against whatever
-    // an integer index holds.
-    if let Some(raw) = &params.filters {
-        for (field, value) in &raw.0 {
-            let date_bound = value.as_object().is_some_and(|ops| {
-                ["gte", "lte", "gt", "lt"]
-                    .iter()
-                    .any(|op| ops.get(*op).is_some_and(serde_json::Value::is_string))
-            });
-            if date_bound {
-                return Err(McpError::invalid_params(
-                    format!("filter '{field}': {DATE_RANGE_QUERY_MODE}"),
-                    None,
-                ));
-            }
-        }
-    }
-    if let Some((field, _)) = filters.iter().find(|(field, filter)| {
-        matches!(filter, FieldFilter::Range { .. })
-            && schemas.declared_types(field).iter().any(|ty| {
-                matches!(
-                    ty,
-                    crate::schema::FieldType::Date | crate::schema::FieldType::Timestamp
-                )
-            })
-    }) {
-        return Err(McpError::invalid_params(
-            format!("filter '{field}': {DATE_RANGE_QUERY_MODE}"),
-            None,
-        ));
-    }
-
     let indexed: std::collections::HashMap<String, IndexKind> =
         crate::qdrant::all_indexed_fields(config, schemas)
             .into_iter()
             .map(|f| (f.name, f.kind))
             .collect();
 
-    if let Some((field, _)) = filters.iter().find(|(f, _)| !indexed.contains_key(f)) {
+    // A correlated list filter (#350: a nested condition) is checked sub-field by
+    // sub-field: `npcs[].role` must be indexed like any other field.
+    let mut named: Vec<&String> = Vec::with_capacity(filters.len());
+    for (field, filter) in &filters {
+        match filter {
+            FieldFilter::Elem(subs) => named.extend(subs.iter().map(|(sub, _)| sub)),
+            _ => named.push(field),
+        }
+    }
+    if let Some(field) = named.into_iter().find(|f| !indexed.contains_key(*f)) {
         return Err(McpError::invalid_params(
             format!(
                 "filter '{field}' is not indexed for Qdrant queries; mark it `indexed: true` \
@@ -1983,11 +1940,9 @@ pub struct SearchParams {
     /// Frontmatter criteria keyed by field (dot-paths for nested fields): a
     /// scalar means equals (`{"type": "guide"}`), an array any-of, an object
     /// all-of or a range (`{"planning.prep_minutes": {"lt": 30}}`; a date field's
-    /// bound may be `"2024-01-01"`, listing only, no query). A list's object
-    /// fields are `npcs[].role`; a key
-    /// ending in `[]` needs every condition in one element
-    /// (`{"npcs[]": {"role": "guard", "level": {"gte": 3}}}`), only without
-    /// `query`.
+    /// bound may be `"2024-01-01"`). A list's object fields are `npcs[].role`; a
+    /// key ending in `[]` needs every condition in one element
+    /// (`{"npcs[]": {"role": "guard", "level": {"gte": 3}}}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<SearchFiltersInput>,
 
@@ -6420,8 +6375,7 @@ fn build_chunk_search_payload(
         row.insert(
             "title".into(),
             serde_json::json!(
-                payload
-                    .get("title")
+                crate::qdrant::frontmatter_value(payload, "title")
                     .and_then(|v| v.as_str())
                     .unwrap_or("(untitled)")
             ),
@@ -6443,14 +6397,12 @@ fn build_chunk_search_payload(
             snippet.push('…');
         }
         row.insert("text".into(), serde_json::json!(snippet));
-        if let Some(t) = payload
-            .get("type")
+        if let Some(t) = crate::qdrant::frontmatter_value(payload, "type")
             .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
         {
             row.insert("type".into(), t.clone());
         }
-        if let Some(tags) = payload
-            .get("tags")
+        if let Some(tags) = crate::qdrant::frontmatter_value(payload, "tags")
             .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
         {
             row.insert("tags".into(), tags.clone());
@@ -8038,21 +7990,22 @@ mod tests {
         // `tags: Vec<String>` array filter always used; `domain`/`type` (formerly
         // single-value scalar matches) now go through that same shape too, since
         // `filters` no longer distinguishes "one value" from "any of these values".
+        // Keys are under the payload's `fm` namespace (#350).
         assert!(
             conditions.contains(&qdrant_client::qdrant::Condition::matches(
-                "domain",
+                "fm.domain",
                 vec!["sysadmin".to_string()]
             ))
         );
         assert!(
             conditions.contains(&qdrant_client::qdrant::Condition::matches(
-                "type",
+                "fm.type",
                 vec!["guide".to_string()]
             ))
         );
         assert!(
             conditions.contains(&qdrant_client::qdrant::Condition::matches(
-                "tags",
+                "fm.tags",
                 vec!["rust".to_string(), "rag".to_string()]
             ))
         );
@@ -9389,18 +9342,81 @@ mod tests {
             "{}",
             err.message
         );
-        // Query mode cannot lower one yet: refused in plain words, not ignored.
-        let err = search(serde_json::json!({ "role": "guard" }), Some("q"))
-            .await
-            .unwrap_err();
+        // Query mode lowers one to a nested condition (#350) — but, like any field,
+        // only over sub-fields with a payload index; these are not `indexed`.
+        let mut filters = serde_json::Map::new();
+        filters.insert("npcs[]".into(), serde_json::json!({ "role": "guard" }));
+        let params = SearchParams {
+            query: Some("q".into()),
+            filters: Some(SearchFiltersInput(filters)),
+            ..Default::default()
+        };
+        let schemas = crate::schema::load_shared(&server.schema_cache);
+        let err = build_query_conditions(&params, &server.config(), &schemas).unwrap_err();
         assert!(
             err.message
-                .contains("filter 'npcs[]': correlated list filters")
-                && err
-                    .message
-                    .contains("only supported when listing documents without a query"),
+                .contains("filter 'npcs[].role' is not indexed for Qdrant queries"),
             "{}",
             err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn query_mode_lowers_correlated_and_date_filters_over_indexed_fields() {
+        use qdrant_client::qdrant::condition::ConditionOneOf;
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  published:\n    type: date\n    indexed: true\n  npcs:\n    type: list\n    \
+             items:\n      type: object\n      fields:\n        role:\n          type: enum\n          \
+             values: [guard, cook]\n          indexed: true\n        level:\n          type: \
+             integer\n          indexed: true\n",
+        );
+        let server = schema_tool_server(&tmp);
+        let schemas = crate::schema::load_shared(&server.schema_cache);
+        let lower = |field: &str, filter: serde_json::Value| {
+            let mut filters = serde_json::Map::new();
+            filters.insert(field.into(), filter);
+            let params = SearchParams {
+                query: Some("q".into()),
+                filters: Some(SearchFiltersInput(filters)),
+                ..Default::default()
+            };
+            build_query_conditions(&params, &server.config(), &schemas)
+        };
+
+        let nested = lower(
+            "npcs[]",
+            serde_json::json!({ "role": "guard", "level": { "gte": 3 } }),
+        )
+        .unwrap();
+        let Some(ConditionOneOf::Nested(n)) = &nested[0].condition_one_of else {
+            panic!("expected a nested condition: {nested:?}");
+        };
+        assert_eq!(n.key, "fm.npcs");
+        let keys: Vec<String> = n
+            .filter
+            .as_ref()
+            .unwrap()
+            .must
+            .iter()
+            .map(|c| match &c.condition_one_of {
+                Some(ConditionOneOf::Field(f)) => f.key.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(keys, vec!["level", "role"]);
+
+        let dated = lower("published", serde_json::json!({ "gte": "2024-01-01" })).unwrap();
+        let Some(ConditionOneOf::Field(f)) = &dated[0].condition_one_of else {
+            panic!("{dated:?}");
+        };
+        assert_eq!(f.key, "fm.published");
+        assert_eq!(
+            f.datetime_range.unwrap().gte.unwrap().seconds,
+            1_704_067_200,
+            "midnight UTC, as the metadata index's epoch seconds"
         );
     }
 
@@ -9459,20 +9475,26 @@ mod tests {
         .await
         .unwrap();
 
-        // With a query a date range is refused in plain words — a date field, or
-        // a date bound on any field (never compared as a bare number).
+        // With a query (#350) a date range lowers too, on the epoch-seconds axis the
+        // metadata index uses: a date field takes a date or a numeric (epoch) bound,
+        // and a date bound on a numeric field compares as its epoch seconds, exactly
+        // as the listing compares `value_num`.
+        let schemas = crate::schema::load_shared(&server.schema_cache);
         for (field, filter) in [
             ("published", serde_json::json!({ "gte": "2024-01-01" })),
             ("published", serde_json::json!({ "gte": 1 })),
             ("count", serde_json::json!({ "gte": "2024-01-01" })),
         ] {
-            let err = search(field, filter.clone(), Some("q")).await.unwrap_err();
-            assert!(
-                err.message.contains(DATE_RANGE_QUERY_MODE),
-                "{field} {filter}: {}",
-                err.message
-            );
-            assert!(!err.message.contains("type: integer"), "{}", err.message);
+            let mut filters = serde_json::Map::new();
+            filters.insert(field.into(), filter.clone());
+            let params = SearchParams {
+                query: Some("q".into()),
+                filters: Some(SearchFiltersInput(filters)),
+                ..Default::default()
+            };
+            let conditions = build_query_conditions(&params, &server.config(), &schemas)
+                .unwrap_or_else(|e| panic!("{field} {filter}: {}", e.message));
+            assert_eq!(conditions.len(), 1, "{field} {filter}");
         }
     }
 
@@ -18932,7 +18954,8 @@ mod tests {
     ) -> crate::qdrant::SearchResult {
         let mut payload = HashMap::new();
         payload.insert("file_path".to_string(), serde_json::json!(file_path));
-        payload.insert("title".to_string(), serde_json::json!(title));
+        // Frontmatter under `fm`, as `ingest::upsert_pending` writes it (#350).
+        payload.insert("fm".to_string(), serde_json::json!({ "title": title }));
         payload.insert("text".to_string(), serde_json::json!("some body text"));
         crate::qdrant::SearchResult {
             score,
@@ -18984,6 +19007,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["notes/a.md", "notes/b.md"]
         );
+        assert_eq!(
+            arr.iter()
+                .map(|e| e["title"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["A", "B"],
+            "the title is read from the payload's `fm` object (#350)"
+        );
+    }
+
+    #[test]
+    fn build_chunk_search_payload_reads_type_and_tags_from_fm() {
+        let mut result = payload_search_result("/data/notes/a.md", "A", 0.9);
+        result.payload.insert(
+            "fm".to_string(),
+            serde_json::json!({ "title": "A", "type": "guide", "tags": ["x"] }),
+        );
+        // A top-level key of the shape before #350 is not frontmatter any more.
+        result
+            .payload
+            .insert("type".to_string(), serde_json::json!("stale"));
+        let structured = chunk_payload(&[result], false, false, false);
+        let row = &structured["results"][0];
+        assert_eq!(row["type"], "guide");
+        assert_eq!(row["tags"], serde_json::json!(["x"]));
     }
 
     #[test]
@@ -19025,15 +19072,10 @@ mod tests {
         result
             .payload
             .insert("chunk_index".to_string(), serde_json::json!(3));
-        result
-            .payload
-            .insert("domain".to_string(), serde_json::json!("notes"));
-        result
-            .payload
-            .insert("tags".to_string(), serde_json::json!([]));
-        result
-            .payload
-            .insert("type".to_string(), serde_json::json!(""));
+        result.payload.insert(
+            "fm".to_string(),
+            serde_json::json!({ "title": "A", "domain": "notes", "tags": [], "type": "" }),
+        );
         for explain in [false, true] {
             let structured = chunk_payload(std::slice::from_ref(&result), explain, false, false);
             let text = structured.to_string();

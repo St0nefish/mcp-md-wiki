@@ -35,7 +35,8 @@ pub enum FieldFilter {
     /// satisfied by the rows of ONE element of the list (one `document_fields.elem`),
     /// not merely somewhere in the document. Each entry is the projected field path
     /// of a sub-field (`npcs[].role`) and its condition, any of the other forms —
-    /// never another `Elem`. Enumeration mode only: query mode refuses it.
+    /// never another `Elem`. Query mode lowers it to one Qdrant nested condition on
+    /// the list (`qdrant::lower_field_filters`, #350).
     Elem(Vec<(String, FieldFilter)>),
 }
 
@@ -1265,10 +1266,9 @@ impl StateDb {
     /// row (or the stored JSON is not an object).
     ///
     /// Ingest writes the same frontmatter (derived fields included) to this row and to
-    /// every chunk's Qdrant payload, so its keys are also the frontmatter keys that
-    /// payload carries, and its `description` is what chunking prepended. A payload
-    /// refresh (#351) reads it before rewriting the row, to know which keys a schema
-    /// edit removed and whether the prepended description changed.
+    /// every chunk's Qdrant payload, so its `description` is what chunking prepended.
+    /// A payload refresh (#351) reads it before rewriting the row, to know whether the
+    /// prepended description changed; with no row it takes the full path.
     pub async fn document_frontmatter(
         &self,
         file_path: &str,
@@ -2323,6 +2323,248 @@ impl DocumentIndex for StateDb {
             links,
             total: total.max(0) as u64,
         })
+    }
+}
+
+/// The shared fixture of the SQLite/Qdrant filter parity checks (#350): one typed
+/// schema, documents exercising every declared kind (an integral float under
+/// `integer`, timestamps at several offsets and with fractional seconds, a list of
+/// objects whose elements split the conditions of a correlated filter), and a
+/// matrix of `search` filters with the documents each must find. The offline half
+/// (`state::tests`, evaluating the lowered conditions against the production
+/// payload) runs in the fast tier; the live half
+/// (`qdrant::tests::sqlite_and_qdrant_filters_agree_on_the_typed_fixture`) seeds a
+/// real Qdrant through the same builders in the `qdrant-integration` tier.
+#[cfg(test)]
+pub(crate) mod filter_parity {
+    use super::*;
+    use crate::schema::SchemaCache;
+    use std::path::Path;
+
+    /// The root schema: every field `indexed`, so query mode accepts each filter.
+    pub const SCHEMA_YAML: &str = "fields:
+  type:
+    type: enum
+    values: [guide, recipe, reference]
+    indexed: true
+  tags:
+    type: list
+    indexed: true
+    items:
+      type: text
+  count:
+    type: integer
+    indexed: true
+  rating:
+    type: number
+    indexed: true
+  tested:
+    type: boolean
+    indexed: true
+  published:
+    type: date
+    indexed: true
+  seen:
+    type: timestamp
+    indexed: true
+  npcs:
+    type: list
+    items:
+      type: object
+      fields:
+        role:
+          type: enum
+          values: [guard, cook]
+          indexed: true
+        level:
+          type: integer
+          indexed: true
+";
+
+    /// The documents, by path.
+    pub fn docs() -> Vec<(&'static str, HashMap<String, Value>)> {
+        let doc = |v: Value| -> HashMap<String, Value> {
+            v.as_object().unwrap().clone().into_iter().collect()
+        };
+        vec![
+            (
+                "a.md",
+                doc(serde_json::json!({
+                    "title": "A", "type": "guide", "tags": ["x", "y"], "count": 3,
+                    "rating": 4.5, "tested": true, "published": "2024-01-02",
+                    "seen": "2024-01-02T10:00:00+02:00",
+                    "npcs": [{"role": "guard", "level": 1}, {"role": "cook", "level": 5}]
+                })),
+            ),
+            (
+                "b.md",
+                doc(serde_json::json!({
+                    "title": "B", "type": "recipe", "tags": ["y"], "count": 3.0,
+                    "rating": 2.0, "tested": false, "published": "2024-01-03",
+                    "seen": "2024-01-01T23:30:00-01:00",
+                    "npcs": [{"role": "cook", "level": 2}, {"role": "guard", "level": 5}]
+                })),
+            ),
+            (
+                "c.md",
+                doc(serde_json::json!({
+                    "title": "C", "type": "reference", "tags": ["z"], "count": 7,
+                    "rating": 3.25, "tested": true, "published": "2023-12-31",
+                    "seen": "2024-01-02T00:00:00.5Z", "npcs": []
+                })),
+            ),
+            (
+                "d.md",
+                doc(serde_json::json!({ "title": "D", "type": "guide", "count": 12 })),
+            ),
+        ]
+    }
+
+    /// `(filter key, filter JSON, documents it must find)`, in `search`'s `filters`
+    /// syntax — parsed by the production parser (`mcp::parse_field_filter`).
+    pub fn cases() -> Vec<(&'static str, Value, Vec<&'static str>)> {
+        use serde_json::json;
+        vec![
+            ("type", json!("guide"), vec!["a.md", "d.md"]),
+            ("type", json!(["recipe", "reference"]), vec!["b.md", "c.md"]),
+            ("tags", json!({"all_of": ["x", "y"]}), vec!["a.md"]),
+            ("tags", json!(["y", "z"]), vec!["a.md", "b.md", "c.md"]),
+            // `3.0` is written as the integer 3 in the payload.
+            ("count", json!(3), vec!["a.md", "b.md"]),
+            ("count", json!({"gte": 5}), vec!["c.md", "d.md"]),
+            ("rating", json!({"gte": 3}), vec!["a.md", "c.md"]),
+            ("rating", json!({"lt": 2.5}), vec!["b.md"]),
+            ("tested", json!(true), vec!["a.md", "c.md"]),
+            ("tested", json!(false), vec!["b.md"]),
+            ("published", json!("2024-01-02"), vec!["a.md"]),
+            (
+                "published",
+                json!({"gte": "2024-01-02"}),
+                vec!["a.md", "b.md"],
+            ),
+            (
+                "published",
+                json!({"lte": "2024-01-02"}),
+                vec!["a.md", "c.md"],
+            ),
+            // a: 08:00Z, b: 00:30Z, c: 00:00:00.5Z — all on 2024-01-02 in UTC.
+            (
+                "seen",
+                json!({"gte": "2024-01-02"}),
+                vec!["a.md", "b.md", "c.md"],
+            ),
+            (
+                "seen",
+                json!({"lt": "2024-01-02T08:00:00Z"}),
+                vec!["b.md", "c.md"],
+            ),
+            (
+                "seen",
+                json!({"lte": "2024-01-02T10:00:00+02:00"}),
+                vec!["a.md", "b.md", "c.md"],
+            ),
+            (
+                "seen",
+                json!({"gt": "2024-01-02T00:00:00.5Z"}),
+                vec!["a.md", "b.md"],
+            ),
+            (
+                "seen",
+                json!({"gte": "2024-01-02T00:00:00.5Z"}),
+                vec!["a.md", "b.md", "c.md"],
+            ),
+            // Correlated: both conditions within one element. a's guard is level 1.
+            (
+                "npcs[]",
+                json!({"role": "guard", "level": {"gte": 3}}),
+                vec!["b.md"],
+            ),
+            (
+                "npcs[]",
+                json!({"role": "guard", "level": {"lte": 1}}),
+                vec!["a.md"],
+            ),
+            (
+                "npcs[]",
+                json!({"role": "cook", "level": {"lte": 2}}),
+                vec!["b.md"],
+            ),
+            // Uncorrelated: any element.
+            ("npcs[].role", json!("guard"), vec!["a.md", "b.md"]),
+            ("npcs[].level", json!({"gte": 5}), vec!["a.md", "b.md"]),
+        ]
+    }
+
+    /// The schema cache built from [`SCHEMA_YAML`] at the root of `root`.
+    pub fn schemas(root: &Path) -> SchemaCache {
+        std::fs::write(root.join(crate::schema::SCHEMA_FILE_NAME), SCHEMA_YAML).unwrap();
+        SchemaCache::build_for_test(root, &crate::config::FrontmatterConfig::default())
+    }
+
+    /// Every indexed field's kind, as `mcp::build_query_conditions` passes it.
+    pub fn indexed(schemas: &SchemaCache) -> HashMap<String, crate::qdrant::IndexKind> {
+        schemas
+            .all_indexed_fields()
+            .into_iter()
+            .map(|f| (f.name, f.kind))
+            .collect()
+    }
+
+    /// A state DB at `db_path` holding every document's production projection.
+    pub async fn seed_db(db_path: &Path, schemas: &SchemaCache) -> StateDb {
+        let db = StateDb::new(db_path).await.unwrap();
+        for (path, fm) in docs() {
+            db.upsert_document_metadata_with(
+                path,
+                &fm,
+                schemas.resolve_for(Path::new(path)),
+                100,
+                "h",
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        db
+    }
+
+    /// The frontmatter part of `path`'s production Qdrant payload.
+    pub fn payload(
+        path: &str,
+        fm: &HashMap<String, Value>,
+        schemas: &SchemaCache,
+    ) -> HashMap<String, Value> {
+        crate::ingest::frontmatter_payload(
+            fm,
+            path,
+            &Default::default(),
+            schemas.resolve_for(Path::new(path)),
+        )
+    }
+
+    /// `(field, filter)` parsed as `search` parses it.
+    pub fn parse(field: &str, raw: &Value) -> Vec<(String, FieldFilter)> {
+        vec![(
+            field.to_string(),
+            crate::mcp::parse_field_filter(field, raw).unwrap(),
+        )]
+    }
+
+    /// The paths the metadata index (enumeration mode) finds for `filters`, sorted.
+    pub async fn sqlite_paths(db: &StateDb, filters: Vec<(String, FieldFilter)>) -> Vec<String> {
+        let mut paths: Vec<String> = db
+            .query_documents(&DocumentQuery {
+                filters,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .documents
+            .into_iter()
+            .map(|d| d.file_path)
+            .collect();
+        paths.sort();
+        paths
     }
 }
 
@@ -3876,14 +4118,46 @@ mod tests {
         (db, dir)
     }
 
-    /// Navigate a dot-path into a JSON object the same way Qdrant addresses a
-    /// nested payload field natively.
-    fn payload_at<'a>(payload: &'a Value, key: &str) -> Option<&'a Value> {
-        let mut cur = payload;
+    /// The values at payload key `key` — a dot-path where a `name[]` segment steps
+    /// into every element of that array (`fm.npcs[].role`) — the way Qdrant
+    /// addresses a nested payload field natively. A key that reaches nothing gives
+    /// no values.
+    fn payload_at<'a>(payload: &'a Value, key: &str) -> Vec<&'a Value> {
+        let mut current: Vec<&Value> = vec![payload];
         for part in key.split('.') {
-            cur = cur.as_object()?.get(part)?;
+            let (name, elements) = match part.strip_suffix("[]") {
+                Some(name) => (name, true),
+                None => (part, false),
+            };
+            current = current
+                .into_iter()
+                .filter_map(|v| v.as_object()?.get(name))
+                .flat_map(|v| match (elements, v) {
+                    (true, Value::Array(items)) => items.iter().collect::<Vec<_>>(),
+                    (true, _) => Vec::new(),
+                    (false, v) => vec![v],
+                })
+                .collect();
         }
-        Some(cur)
+        current
+    }
+
+    /// Whether a datetime payload value is inside a `DatetimeRange`, at the
+    /// microsecond precision the bounds are rounded to (`qdrant::epoch_to_timestamp`).
+    fn qdrant_datetime_range_matches(
+        val: &Value,
+        range: &qdrant_client::qdrant::DatetimeRange,
+    ) -> bool {
+        let Some(epoch) = val.as_str().and_then(crate::document_fields::epoch_seconds) else {
+            return false;
+        };
+        let at = qdrant::epoch_to_timestamp(epoch);
+        let at = (at.seconds, at.nanos);
+        let bound = |t: &Option<qdrant_client::qdrant::Timestamp>| t.map(|t| (t.seconds, t.nanos));
+        bound(&range.gte).is_none_or(|b| at >= b)
+            && bound(&range.lte).is_none_or(|b| at <= b)
+            && bound(&range.gt).is_none_or(|b| at > b)
+            && bound(&range.lt).is_none_or(|b| at < b)
     }
 
     fn qdrant_range_matches(val: &Value, range: &qdrant_client::qdrant::Range) -> bool {
@@ -3948,37 +4222,89 @@ mod tests {
             .expect("every lowered condition sets one variant")
         {
             ConditionOneOf::Field(fc) => {
-                let Some(val) = payload_at(payload, &fc.key) else {
-                    return false;
-                };
-                if let Some(range) = &fc.range {
-                    qdrant_range_matches(val, range)
-                } else if let Some(m) = &fc.r#match {
-                    qdrant_match_matches(val, m)
-                } else {
-                    panic!(
-                        "equivalence test's evaluator only models match/range field \
-                         conditions"
-                    )
-                }
+                // Every value at the key is a candidate: Qdrant matches an array (or
+                // a `[]` projection) when any element does.
+                let values = payload_at(payload, &fc.key);
+                let candidates: Vec<&Value> = values
+                    .iter()
+                    .flat_map(|v| match v {
+                        Value::Array(items) => items.iter().collect::<Vec<_>>(),
+                        other => vec![*other],
+                    })
+                    .collect();
+                candidates.into_iter().any(|val| {
+                    if let Some(range) = &fc.range {
+                        qdrant_range_matches(val, range)
+                    } else if let Some(range) = &fc.datetime_range {
+                        qdrant_datetime_range_matches(val, range)
+                    } else if let Some(m) = &fc.r#match {
+                        qdrant_match_matches(val, m)
+                    } else {
+                        panic!(
+                            "equivalence test's evaluator only models match/range/datetime \
+                             field conditions: {fc:?}"
+                        )
+                    }
+                })
+            }
+            ConditionOneOf::IsNull(n) => payload_at(payload, &n.key)
+                .first()
+                .is_none_or(|v| v.is_null()),
+            ConditionOneOf::Nested(n) => {
+                // Every condition of the nested filter must hold within ONE element of
+                // the array at the key (Qdrant's nested object filter).
+                let filter = n.filter.as_ref().expect("a nested condition has a filter");
+                assert!(
+                    filter.should.is_empty()
+                        && filter.must_not.is_empty()
+                        && filter.min_should.is_none(),
+                    "unexpected nested Filter shape from lower_field_filters: {filter:?}"
+                );
+                payload_at(payload, &n.key)
+                    .into_iter()
+                    .filter_map(|v| v.as_array())
+                    .flatten()
+                    .any(|element| {
+                        filter
+                            .must
+                            .iter()
+                            .all(|c| qdrant_condition_matches(c, element))
+                    })
             }
             ConditionOneOf::Filter(f) => {
-                // The only `Filter` shape `lower_field_filters` produces is a bare
-                // `should` OR (multi-value boolean equality) — must/must_not/
-                // min_should here would mean this evaluator is out of date.
-                assert!(
-                    f.must.is_empty() && f.must_not.is_empty() && f.min_should.is_none(),
-                    "unexpected Filter shape from lower_field_filters: {f:?}"
-                );
-                f.should
-                    .iter()
-                    .any(|c| qdrant_condition_matches(c, payload))
+                // `lower_field_filters` produces a bare `should` OR (multi-value
+                // boolean or datetime equality) and `unsatisfiable`'s must + must_not
+                // pair; anything else means this evaluator is out of date.
+                assert!(f.min_should.is_none(), "unexpected Filter shape: {f:?}");
+                (f.should.is_empty()
+                    || f.should
+                        .iter()
+                        .any(|c| qdrant_condition_matches(c, payload)))
+                    && f.must.iter().all(|c| qdrant_condition_matches(c, payload))
+                    && !f
+                        .must_not
+                        .iter()
+                        .any(|c| qdrant_condition_matches(c, payload))
             }
             other => panic!(
                 "equivalence test's evaluator does not model condition variant {other:?} — \
                  lower_field_filters should not be producing this shape"
             ),
         }
+    }
+
+    /// The frontmatter part of the Qdrant payload production writes for `fm` under
+    /// `schema` (`ingest::frontmatter_payload`, #350), as one JSON object.
+    fn production_payload(
+        path: &str,
+        fm: &HashMap<String, Value>,
+        schema: &crate::schema::ResolvedSchema,
+    ) -> Value {
+        Value::Object(
+            crate::ingest::frontmatter_payload(fm, path, &Default::default(), schema)
+                .into_iter()
+                .collect(),
+        )
     }
 
     /// Seed [`equivalence_db`], run `filters` through both the real
@@ -4011,8 +4337,9 @@ mod tests {
             .expect("query mode should accept this filter");
         let mut qdrant_paths: Vec<&str> = equivalence_docs()
             .into_iter()
-            .filter(|(_, fm)| {
-                let payload = Value::Object(fm.clone().into_iter().collect());
+            .filter(|(path, fm)| {
+                let payload =
+                    production_payload(path, fm, &crate::schema::ResolvedSchema::default());
                 conditions
                     .iter()
                     .all(|c| qdrant_condition_matches(c, &payload))
@@ -4031,6 +4358,89 @@ mod tests {
         assert_eq!(
             qdrant_paths, expected_sorted,
             "query mode (Qdrant conditions) produced a different document set than expected"
+        );
+    }
+
+    /// #350: every case of the shared typed fixture (`filter_parity`) finds the same
+    /// documents through the metadata index (enumeration mode) and through the
+    /// lowered Qdrant conditions evaluated offline against the payload production
+    /// writes — `fm.` keys, kind coercion, datetime ranges and nested conditions
+    /// included. `qdrant::tests::sqlite_and_qdrant_filters_agree_on_the_typed_fixture`
+    /// runs the same matrix against a live Qdrant.
+    #[tokio::test]
+    async fn typed_fixture_filters_agree_offline_across_both_modes() {
+        let dir = TempDir::new().unwrap();
+        let schemas = filter_parity::schemas(dir.path());
+        let db = filter_parity::seed_db(&dir.path().join("state.db"), &schemas).await;
+        let indexed = filter_parity::indexed(&schemas);
+
+        for (field, raw, expected) in filter_parity::cases() {
+            let filters = filter_parity::parse(field, &raw);
+            let sql = filter_parity::sqlite_paths(&db, filters.clone()).await;
+            assert_eq!(sql, expected, "enumeration mode: {field} {raw}");
+
+            let conditions = qdrant::lower_field_filters(&filters, &indexed)
+                .unwrap_or_else(|e| panic!("query mode refused {field} {raw}: {e}"));
+            let mut offline: Vec<String> = filter_parity::docs()
+                .into_iter()
+                .filter(|(path, fm)| {
+                    let payload = Value::Object(
+                        filter_parity::payload(path, fm, &schemas)
+                            .into_iter()
+                            .collect(),
+                    );
+                    conditions
+                        .iter()
+                        .all(|c| qdrant_condition_matches(c, &payload))
+                })
+                .map(|(path, _)| path.to_string())
+                .collect();
+            offline.sort();
+            assert_eq!(offline, expected, "query mode (offline): {field} {raw}");
+        }
+    }
+
+    /// The one documented divergence of the typed fixture (#350): equality on a
+    /// timestamp compares the instant in query mode (the payload holds RFC 3339 UTC
+    /// text) but the text as written in enumeration mode (`value_text`), so the same
+    /// instant spelled with another offset matches only with a query. Pinned so a
+    /// change to either side is deliberate.
+    #[tokio::test]
+    async fn timestamp_equality_matches_the_instant_only_in_query_mode() {
+        let dir = TempDir::new().unwrap();
+        let schemas = filter_parity::schemas(dir.path());
+        let db = filter_parity::seed_db(&dir.path().join("state.db"), &schemas).await;
+        let indexed = filter_parity::indexed(&schemas);
+        // a.md's `seen` is written `2024-01-02T10:00:00+02:00`.
+        let filters = filter_parity::parse("seen", &serde_json::json!("2024-01-02T08:00:00Z"));
+
+        assert!(
+            filter_parity::sqlite_paths(&db, filters.clone())
+                .await
+                .is_empty()
+        );
+        let conditions = qdrant::lower_field_filters(&filters, &indexed).unwrap();
+        let matched: Vec<&str> = filter_parity::docs()
+            .into_iter()
+            .filter(|(path, fm)| {
+                let payload = Value::Object(
+                    filter_parity::payload(path, fm, &schemas)
+                        .into_iter()
+                        .collect(),
+                );
+                conditions
+                    .iter()
+                    .all(|c| qdrant_condition_matches(c, &payload))
+            })
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(matched, vec!["a.md"]);
+        // Spelled as written, both modes agree.
+        let as_written =
+            filter_parity::parse("seen", &serde_json::json!("2024-01-02T10:00:00+02:00"));
+        assert_eq!(
+            filter_parity::sqlite_paths(&db, as_written).await,
+            vec!["a.md".to_string()]
         );
     }
 

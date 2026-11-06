@@ -13,7 +13,9 @@
 //! the rules here requires no re-read of markdown and no re-embedding; bump
 //! `state::PROJECTION_VERSION` so existing databases reproject on next open.
 
-use crate::schema::{FieldDef, FieldType, MAX_FIELD_PATH_DEPTH, NumericValue, ResolvedSchema};
+use crate::schema::{
+    FieldDef, FieldType, MAX_FIELD_PATH_DEPTH, NumericValue, PayloadValue, ResolvedSchema,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::warn;
@@ -102,19 +104,49 @@ pub fn numeric_value(value: &Value) -> Option<f64> {
     }
 }
 
-/// Seconds since the Unix epoch (UTC, fractional seconds kept) of a `date`
-/// (`YYYY-MM-DD`, read as midnight UTC) or an RFC 3339 `timestamp` (normalized from
-/// its offset), or `None` for anything else. The one parser behind a date field's
-/// `value_num` and a date-string range bound in a filter, so a stored date and a
-/// filter bound always land on the same axis (#349).
-pub(crate) fn epoch_seconds(text: &str) -> Option<f64> {
+/// The instant a `date` (`YYYY-MM-DD`, read as midnight UTC) or an RFC 3339
+/// `timestamp` (normalized from its offset to UTC) names, or `None` for anything
+/// else. The one date parser: [`epoch_seconds`] (a date field's `value_num`, and a
+/// date-string range bound in a filter) and [`payload_datetime`] (the Qdrant
+/// payload's datetime text, #350) both read through it, so the metadata index and
+/// the Qdrant payload cannot place one value at two instants.
+pub(crate) fn parse_instant(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(text) {
-        return Some(ts.timestamp() as f64 + f64::from(ts.timestamp_subsec_nanos()) / 1e9);
+        return Some(ts.with_timezone(&chrono::Utc));
     }
     chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
         .ok()
         .and_then(|date| date.and_hms_opt(0, 0, 0))
-        .map(|midnight| midnight.and_utc().timestamp() as f64)
+        .map(|midnight| midnight.and_utc())
+}
+
+/// Seconds since the Unix epoch (UTC, fractional seconds kept) of a `date` or an
+/// RFC 3339 `timestamp` ([`parse_instant`]), or `None` for anything else. Behind a
+/// date field's `value_num` and a date-string range bound in a filter, so a stored
+/// date and a filter bound always land on the same axis (#349).
+pub(crate) fn epoch_seconds(text: &str) -> Option<f64> {
+    parse_instant(text)
+        .map(|ts| ts.timestamp() as f64 + f64::from(ts.timestamp_subsec_nanos()) / 1e9)
+}
+
+/// The RFC 3339 UTC text a `date` or `timestamp` value is written as in the Qdrant
+/// payload (#350): [`parse_instant`]'s instant with a `Z` offset, so a date-only
+/// `2024-01-02` becomes `2024-01-02T00:00:00Z` and `2024-01-02T10:00:00+02:00`
+/// becomes `2024-01-02T08:00:00Z`; fractional seconds are kept, to the microsecond
+/// (below). `None` when the text
+/// is not a date or timestamp — the caller then keeps it as written, and Qdrant's
+/// datetime index does not place it on the axis, the same way [`epoch_seconds`]
+/// leaves it without a `value_num`.
+///
+/// Rounded to the microsecond first — the most fractional digits Qdrant documents
+/// for a datetime, and the precision `qdrant::epoch_to_timestamp` rounds filter
+/// bounds to — so a nanosecond timestamp is written with at most six.
+pub(crate) fn payload_datetime(text: &str) -> Option<String> {
+    use chrono::SubsecRound;
+    parse_instant(text).map(|ts| {
+        ts.round_subsecs(6)
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+    })
 }
 
 /// The `value_num` a scalar of a declared type stores, per that type's
@@ -140,8 +172,10 @@ fn scalar_numeric(node: Option<&FieldDef>, value: &Value) -> Option<f64> {
 /// The schema node a list's elements are read under: its `items`, or — for a
 /// scalar type that also accepts a list of itself (`enum`, and any scalar type a
 /// non-strict document gives a list) — the node itself. `None` (guess) for an
-/// untyped node or a `list` without `items`.
-fn element_node(node: Option<&FieldDef>) -> Option<&FieldDef> {
+/// untyped node or a `list` without `items`. Also how the Qdrant payload decides
+/// which node coerces a list's elements (`ingest::frontmatter_payload`, #350), so
+/// the two read a list's elements under the same type.
+pub(crate) fn element_node(node: Option<&FieldDef>) -> Option<&FieldDef> {
     let node = node?;
     if let Some(items) = node.items.as_deref() {
         return Some(items);
@@ -287,6 +321,96 @@ fn flatten_value(
             }
         }
     }
+}
+
+/// The frontmatter object a document's Qdrant payload carries under
+/// `qdrant::FRONTMATTER_KEY` (#350), read under `schema` (the one governing it).
+///
+/// The structure is the frontmatter's own — nested objects and lists stay nested, so
+/// Qdrant addresses `fm.planning.prep_minutes` and `fm.npcs[].role` natively — and
+/// every scalar a schema node types is coerced by that type's
+/// [`crate::schema::FieldKind::payload`]: `integer` writes an integer (an integral
+/// `3.0` as `3`), `number` its JSON number as written, `text`/`enum` a string (`canonical_text`),
+/// `date`/`timestamp` RFC 3339 UTC text ([`payload_datetime`]). A value its type
+/// cannot represent (validation would refuse it in strict mode) and every scalar no
+/// schema types are written as they are. A list's elements are read under the same
+/// node the metadata projection reads them under ([`element_node`]), an object's
+/// children under its `fields`, so the payload and `document_fields` agree on which
+/// type governs each value. Unlike the projection, nothing is capped or left out:
+/// the payload keeps the whole record, `title` and `description` included.
+pub fn payload_frontmatter(
+    frontmatter: &HashMap<String, Value>,
+    schema: &ResolvedSchema,
+) -> serde_json::Map<String, Value> {
+    frontmatter
+        .iter()
+        .map(|(key, value)| {
+            let node = schema.fields.tree().get(key.as_str());
+            (key.clone(), payload_value(value, node))
+        })
+        .collect()
+}
+
+/// `value` as [`payload_frontmatter`] writes it under schema node `node`.
+fn payload_value(value: &Value, node: Option<&FieldDef>) -> Value {
+    let Some(node) = node else {
+        return value.clone();
+    };
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, child)| {
+                    (
+                        key.clone(),
+                        payload_value(child, node.fields.get(key.as_str())),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(items) => {
+            let items_node = element_node(Some(node));
+            Value::Array(
+                items
+                    .iter()
+                    .map(|item| payload_value(item, items_node))
+                    .collect(),
+            )
+        }
+        Value::Null => Value::Null,
+        scalar => match node.ty {
+            Some(ty) => payload_scalar(ty.kind().payload, scalar),
+            None => scalar.clone(),
+        },
+    }
+}
+
+/// A scalar coerced per [`PayloadValue`]; one the coercion does not apply to is
+/// returned as it is.
+pub(crate) fn payload_scalar(coercion: PayloadValue, value: &Value) -> Value {
+    let coerced = match coercion {
+        PayloadValue::AsIs | PayloadValue::Bool => None,
+        PayloadValue::Text => canonical_text(value).map(Value::String),
+        PayloadValue::Integer => integral(value).map(Value::from),
+        // A JSON number stays as written: a float index holds integers too, and an
+        // `integer` declaration of the same path in another scope (whose integer
+        // index is the one the collection keeps, `SchemaCache::all_indexed_fields`)
+        // does not hold floats, so `3` must not become `3.0`.
+        PayloadValue::Float => None,
+        PayloadValue::Datetime => value.as_str().and_then(payload_datetime).map(Value::String),
+    };
+    coerced.unwrap_or_else(|| value.clone())
+}
+
+/// An integer-valued number as an `i64`: an integer, or an integral float within
+/// `i64`'s range (`3.0`), the same values `schema::accepts_integer` accepts short of
+/// a `u64` above `i64::MAX`, which stays as written.
+fn integral(value: &Value) -> Option<i64> {
+    if let Some(i) = value.as_i64() {
+        return Some(i);
+    }
+    let f = value.as_f64().filter(|_| value.as_u64().is_none())?;
+    (f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64)
+        .then_some(f as i64)
 }
 
 fn push_leaf(

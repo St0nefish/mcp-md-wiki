@@ -4,12 +4,13 @@ use anyhow::{Context, Result};
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     Condition, CountPointsBuilder, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
-    DeletePayloadPointsBuilder, DeletePointsBuilder, Distance, FieldCondition, FieldType, Filter,
-    Fusion, Match, Modifier, NamedVectors, PointStruct, PrefetchQuery, PrefetchQueryBuilder, Query,
-    QueryPointGroupsBuilder, QueryPointsBuilder, Range, SearchPointsBuilder,
-    SetPayloadPointsBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
-    TextIndexParamsBuilder, TokenizerType, UpsertPointsBuilder, Value as QdrantValue, Vector,
-    VectorInput, VectorParamsBuilder, VectorsConfigBuilder, value::Kind,
+    DatetimeRange, DeleteFieldIndexCollectionBuilder, DeletePointsBuilder, Distance,
+    FieldCondition, FieldType, Filter, Fusion, Match, Modifier, NamedVectors, PayloadSchemaType,
+    PointStruct, PrefetchQuery, PrefetchQueryBuilder, Query, QueryPointGroupsBuilder,
+    QueryPointsBuilder, Range, SearchPointsBuilder, SetPayloadPointsBuilder,
+    SparseVectorParamsBuilder, SparseVectorsConfigBuilder, TextIndexParamsBuilder, Timestamp,
+    TokenizerType, UpsertPointsBuilder, Value as QdrantValue, Vector, VectorInput,
+    VectorParamsBuilder, VectorsConfigBuilder, value::Kind,
     vectors_config::Config as VectorsConfigOneof,
 };
 use tracing::{debug, error, info, warn};
@@ -81,21 +82,20 @@ pub trait VectorStore: Send + Sync {
     /// cannot afford eventual-consistency noise turning into a false-positive wipe.
     async fn collection_point_count(&self, collection: &str) -> Result<u64>;
     /// Rewrite the frontmatter part of every point of `file_path` in place (#351):
-    /// merge `set` into each point's payload (a key in `set` replaces that key's
-    /// value) and remove every key in `delete_keys`, leaving vectors and every other
-    /// key — chunk text, line range, heading and section keys — untouched. This is
-    /// how a schema edit that changes defaults or derived fields reaches Qdrant
-    /// without re-embedding. Callers never pass a key the chunk owns
-    /// ([`is_chunk_owned_payload_key`]).
+    /// merge `set` into each point's payload (a key in `set` replaces that key's whole
+    /// value), leaving vectors and every other key — chunk text, line range, heading
+    /// and section keys — untouched. This is how a schema edit that changes defaults,
+    /// derived fields or a type's coercion reaches Qdrant without re-embedding.
+    /// Callers pass only the [`FRONTMATTER_KEY`] namespace (#350), so replacing its
+    /// value drops a frontmatter key the schema removed with no separate delete.
     ///
     /// Not `overwrite_payload`, which replaces the whole payload and would drop the
-    /// chunk keys; a merge cannot remove a key, hence `delete_keys`.
+    /// chunk keys.
     async fn refresh_file_payload(
         &self,
         collection: &str,
         file_path: &str,
         set: HashMap<String, serde_json::Value>,
-        delete_keys: Vec<String>,
     ) -> Result<()>;
 }
 
@@ -196,13 +196,20 @@ pub enum IndexKind {
     Integer,
     Float,
     Bool,
+    /// A `date` or `timestamp` field (#350): the payload holds RFC 3339 UTC text
+    /// (`document_fields::payload_datetime`) and a range lowers to a
+    /// `DatetimeRange`.
+    Datetime,
 }
 
 impl IndexKind {
-    /// Whether a numeric range filter (`gte`/`lte`/`gt`/`lt`) works on a field of
-    /// this kind.
+    /// Whether a range filter (`gte`/`lte`/`gt`/`lt`) works on a field of this kind:
+    /// a numeric one, or (#350) a datetime one, whose bounds are instants.
     pub fn supports_range(self) -> bool {
-        matches!(self, IndexKind::Integer | IndexKind::Float)
+        matches!(
+            self,
+            IndexKind::Integer | IndexKind::Float | IndexKind::Datetime
+        )
     }
 
     fn to_qdrant(self) -> FieldType {
@@ -211,11 +218,51 @@ impl IndexKind {
             IndexKind::Integer => FieldType::Integer,
             IndexKind::Float => FieldType::Float,
             IndexKind::Bool => FieldType::Bool,
+            IndexKind::Datetime => FieldType::Datetime,
         }
     }
 }
 
-/// A payload field to index, and how.
+/// The payload key the document's frontmatter lives under (#350): every chunk's
+/// payload carries `fm: {...}` (the frontmatter with schema defaults and derived
+/// fields, values coerced by declared type — `document_fields::payload_frontmatter`)
+/// next to the built-in top-level keys (`CHUNK_PAYLOAD_KEYS`,
+/// `HEADING_PAYLOAD_KEYS`), so no frontmatter key can collide with one.
+pub const FRONTMATTER_KEY: &str = "fm";
+
+/// The built-in filter fields that are top-level payload keys rather than
+/// frontmatter: `file_path`, which `config.effective_indexed_fields()` always lists.
+const TOP_LEVEL_FILTER_FIELDS: &[&str] = &["file_path"];
+
+/// The payload key a filter or index on field path `field` addresses (#350):
+/// `fm.<field>` (`fm.planning.prep_minutes`, `fm.npcs[].role`), except a built-in
+/// top-level field ([`TOP_LEVEL_FILTER_FIELDS`]), which stays as it is. The one
+/// spelling of the namespace, used by index creation ([`IndexedField::payload_key`]),
+/// filter lowering ([`lower_field_filters`]) and `retrieval::plain_search_filters`.
+pub fn payload_key(field: &str) -> String {
+    if TOP_LEVEL_FILTER_FIELDS.contains(&field) {
+        field.to_string()
+    } else {
+        format!("{FRONTMATTER_KEY}.{field}")
+    }
+}
+
+/// The value of top-level frontmatter field `field` in a chunk payload — under
+/// [`FRONTMATTER_KEY`] (#350). The one reader of frontmatter off a search result
+/// (`title`, `type`, `tags` in the MCP, web and CLI search results).
+pub fn frontmatter_value<'a>(
+    payload: &'a HashMap<String, serde_json::Value>,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    payload
+        .get(FRONTMATTER_KEY)
+        .and_then(|fm| fm.as_object())
+        .and_then(|fm| fm.get(field))
+}
+
+/// A payload field to index, and how. `name` is the field path filters name
+/// (`tags`, `npcs[].role`, the built-in `file_path`); the payload key the index is
+/// created on is [`Self::payload_key`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedField {
     pub name: String,
@@ -228,6 +275,12 @@ impl IndexedField {
             name: name.into(),
             kind: IndexKind::Keyword,
         }
+    }
+
+    /// The payload key this field's index is created on ([`payload_key`]) — also the
+    /// name `/status` and `/metrics` report it under.
+    pub fn payload_key(&self) -> String {
+        payload_key(&self.name)
     }
 }
 
@@ -286,7 +339,9 @@ pub const CHUNK_BODY_OFFSET_KEY: &str = "text_body_offset";
 /// breadcrumb/description prefix, which repeats per chunk and would otherwise
 /// fill much of a short snippet. A payload written before the offset existed
 /// falls back to dropping a leading `description` paragraph when the payload
-/// carries one, else returns the text as stored.
+/// carries one — under [`FRONTMATTER_KEY`], or at the top level where a payload
+/// from before #350 kept it (every payload without the offset is one) — else
+/// returns the text as stored.
 pub fn chunk_body_text(payload: &std::collections::HashMap<String, serde_json::Value>) -> &str {
     let text = payload
         .get(CHUNK_TEXT_KEY)
@@ -295,8 +350,8 @@ pub fn chunk_body_text(payload: &std::collections::HashMap<String, serde_json::V
     if let Some(offset) = payload.get(CHUNK_BODY_OFFSET_KEY).and_then(|v| v.as_u64()) {
         return text.get(offset as usize..).unwrap_or(text);
     }
-    payload
-        .get("description")
+    frontmatter_value(payload, "description")
+        .or_else(|| payload.get("description"))
         .and_then(|v| v.as_str())
         .and_then(|d| text.strip_prefix(d))
         .and_then(|rest| rest.strip_prefix("\n\n"))
@@ -369,9 +424,13 @@ pub const SECTION_LINE_START_KEY: &str = "section_line_start";
 /// file-relative subtree end line is stored — see [`SECTION_LINE_START_KEY`].
 pub const SECTION_LINE_END_KEY: &str = "section_line_end";
 
-/// The payload keys `ingest::upsert_pending` writes on every chunk on top of the
-/// document's frontmatter, whatever the config: the chunk's text, offset and line
-/// range plus the per-file `file_path`, `mtime` and [`PATH_ANCESTORS_KEY`].
+/// The payload keys `ingest::upsert_pending` writes on every chunk next to the
+/// document's frontmatter ([`FRONTMATTER_KEY`]), whatever the config: the chunk's text,
+/// offset and line range plus the per-file `file_path`, `mtime` and
+/// [`PATH_ANCESTORS_KEY`]. Test-only since #350, when the payload refresh stopped
+/// needing to tell chunk keys from frontmatter keys: the tests that pin
+/// `schema::RESERVED_PAYLOAD_NAMES` and the refresh/full-path equality read it.
+#[cfg(test)]
 pub const CHUNK_PAYLOAD_KEYS: &[&str] = &[
     "file_path",
     "mtime",
@@ -384,7 +443,9 @@ pub const CHUNK_PAYLOAD_KEYS: &[&str] = &[
 ];
 
 /// The heading and section keys `ingest::upsert_pending` writes on every chunk only
-/// while `chunking.heading_metadata` is on (#286).
+/// while `chunking.heading_metadata` is on (#286). Test-only, like
+/// [`CHUNK_PAYLOAD_KEYS`].
+#[cfg(test)]
 pub const HEADING_PAYLOAD_KEYS: &[&str] = &[
     HEADING_PATH_KEY,
     HEADING_LEVEL_KEY,
@@ -396,12 +457,11 @@ pub const HEADING_PAYLOAD_KEYS: &[&str] = &[
 
 /// Whether the chunk itself owns payload key `key` under the given
 /// `chunking.heading_metadata` setting — [`CHUNK_PAYLOAD_KEYS`], plus
-/// [`HEADING_PAYLOAD_KEYS`] while it is on. The full path writes those after the
-/// frontmatter, so a frontmatter key spelled the same never reaches the payload;
-/// with `heading_metadata` off a frontmatter key named like a heading key does. A
-/// payload refresh (#351, [`VectorStore::refresh_file_payload`]) uses the same rule:
-/// it never sets or deletes a key the chunk owns. `schema::RESERVED_PAYLOAD_NAMES` is
-/// both lists plus `fm` (pinned by a test).
+/// [`HEADING_PAYLOAD_KEYS`] while it is on. Since #350 frontmatter lives under
+/// [`FRONTMATTER_KEY`], so no frontmatter key collides with one, and a payload
+/// refresh (#351, [`VectorStore::refresh_file_payload`]) sets only that key.
+/// `schema::RESERVED_PAYLOAD_NAMES` is both lists plus `fm` (pinned by a test).
+#[cfg(test)]
 pub fn is_chunk_owned_payload_key(key: &str, heading_metadata: bool) -> bool {
     CHUNK_PAYLOAD_KEYS.contains(&key) || (heading_metadata && HEADING_PAYLOAD_KEYS.contains(&key))
 }
@@ -611,12 +671,47 @@ pub(crate) fn unsatisfiable(field: &str) -> Condition {
 /// `document_fields.value_text`) — this re-parses them back to the Qdrant-native
 /// type so a keyword-shaped string never gets compared against an integer or
 /// boolean payload value, which would just never match.
-fn match_condition(field: &str, values: &[String], kind: IndexKind) -> Result<Condition, String> {
+///
+/// `key` is the payload key the condition addresses (`fm.type`, or `role` relative
+/// to a nested condition's element); `field` is the filter's field path, for
+/// messages. Equality on a datetime field (#350) matches the instant: each value
+/// lowers to a `DatetimeRange` with `gte` = `lte` = that instant.
+fn match_condition(
+    key: &str,
+    field: &str,
+    values: &[String],
+    kind: IndexKind,
+) -> Result<Condition, String> {
     if values.is_empty() {
-        return Ok(unsatisfiable(field));
+        return Ok(unsatisfiable(key));
     }
+    let key = key.to_string();
     match kind {
-        IndexKind::Keyword => Ok(Condition::matches(field.to_string(), values.to_vec())),
+        IndexKind::Datetime => {
+            let instants: Vec<Condition> = values
+                .iter()
+                .map(|v| {
+                    let at = crate::document_fields::epoch_seconds(v)
+                        .map(epoch_to_timestamp)
+                        .ok_or_else(|| {
+                            format!(
+                                "filter '{field}': '{v}' is not a date (YYYY-MM-DD) or RFC 3339 \
+                                 timestamp, as this field's declared type needs"
+                            )
+                        })?;
+                    Ok(Condition::datetime_range(
+                        key.clone(),
+                        DatetimeRange {
+                            gte: Some(at),
+                            lte: Some(at),
+                            ..Default::default()
+                        },
+                    ))
+                })
+                .collect::<Result<_, String>>()?;
+            Ok(one_or_any(instants))
+        }
+        IndexKind::Keyword => Ok(Condition::matches(key, values.to_vec())),
         IndexKind::Integer => {
             let ints: Vec<i64> = values
                 .iter()
@@ -629,7 +724,7 @@ fn match_condition(field: &str, values: &[String], kind: IndexKind) -> Result<Co
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            Ok(Condition::matches(field.to_string(), ints))
+            Ok(Condition::matches(key, ints))
         }
         IndexKind::Bool => {
             let bools: Vec<bool> = values
@@ -643,17 +738,14 @@ fn match_condition(field: &str, values: &[String], kind: IndexKind) -> Result<Co
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            if bools.len() == 1 {
-                Ok(Condition::matches(field.to_string(), bools[0]))
-            } else {
-                // No `MatchValue` variant matches "any of these booleans" directly —
-                // OR the individual equality conditions together instead.
-                Ok(Condition::from(Filter::should(
-                    bools
-                        .into_iter()
-                        .map(|b| Condition::matches(field.to_string(), b)),
-                )))
-            }
+            // No `MatchValue` variant matches "any of these booleans" directly — OR
+            // the individual equality conditions together instead.
+            Ok(one_or_any(
+                bools
+                    .into_iter()
+                    .map(|b| Condition::matches(key.clone(), b))
+                    .collect(),
+            ))
         }
         IndexKind::Float => Err(format!(
             "filter '{field}': equality/any-of/all-of matching is not supported on a float \
@@ -677,33 +769,101 @@ fn match_condition(field: &str, values: &[String], kind: IndexKind) -> Result<Co
 /// field — Qdrant filters one correctly, just by a full scan rather than an index —
 /// so a caller that must refuse silently-slow filtering (the MCP `search` tool, per
 /// its rich `filters` contract) checks membership in `indexed` itself before calling.
+///
+/// Field paths become payload keys through [`payload_key`] (`fm.type`; the built-in
+/// `file_path` stays top-level). Since #350:
+///
+/// - a range on a [`IndexKind::Datetime`] field lowers to a `DatetimeRange`; its
+///   bounds are the epoch seconds the parsed filter carries — a date or timestamp
+///   bound through `document_fields::epoch_seconds`, the parser that also gives a
+///   stored date its `value_num`, so a date-only bound is midnight UTC on both
+///   backends and `lte: "2024-01-02"` excludes a timestamp later that day on both.
+///   Bounds are rounded to the microsecond ([`epoch_to_timestamp`]).
+/// - a correlated list filter ([`FieldFilter::Elem`], `{"npcs[]": {...}}`) lowers to
+///   one `Condition::nested` on the list (`fm.npcs`) whose `must` holds every
+///   sub-condition with its key relative to the element (`role`, `stats.level`), so
+///   all of them must hold within one element, as the metadata index's
+///   `elem`-correlated subqueries require. A sub-field's kind is looked up by its
+///   full path (`npcs[].role`).
 pub fn lower_field_filters(
     filters: &[(String, FieldFilter)],
     indexed: &HashMap<String, IndexKind>,
 ) -> Result<Vec<Condition>, String> {
     let mut conditions = Vec::with_capacity(filters.len());
     for (field, filter) in filters {
-        let kind = indexed.get(field).copied().unwrap_or(IndexKind::Keyword);
         match filter {
-            FieldFilter::AnyOf(values) => conditions.push(match_condition(field, values, kind)?),
-            FieldFilter::AllOf(values) => {
-                // ANDed together implicitly: every entry in the returned Vec becomes
-                // a separate `must` condition in the caller's `Filter::must(..)`.
-                for value in values {
-                    conditions.push(match_condition(field, std::slice::from_ref(value), kind)?);
+            FieldFilter::Elem(subs) => {
+                let list = field.strip_suffix("[]").unwrap_or(field);
+                let prefix = format!("{list}[].");
+                let mut inner = Vec::with_capacity(subs.len());
+                for (sub, condition) in subs {
+                    let relative = sub.strip_prefix(&prefix).ok_or_else(|| {
+                        format!("filter '{field}': sub-field '{sub}' is not a field of {list}[]")
+                    })?;
+                    if matches!(condition, FieldFilter::Elem(_)) {
+                        return Err(format!(
+                            "filter '{field}': correlated list filters do not nest"
+                        ));
+                    }
+                    let kind = indexed.get(sub).copied().unwrap_or(IndexKind::Keyword);
+                    lower_one(relative, sub, condition, kind, &mut inner)?;
                 }
+                conditions.push(Condition::nested(payload_key(list), Filter::must(inner)));
             }
-            FieldFilter::Range { gte, lte, gt, lt } => {
-                if !kind.supports_range() {
-                    return Err(format!(
-                        "filter '{field}': a numeric range (gte/lte/gt/lt) was requested but \
-                         the field is indexed as {kind:?}; declare it `type: integer` or \
-                         `type: number` in the governing directory's schema (update_schema) to use \
-                         a range filter"
-                    ));
-                }
-                conditions.push(Condition::from(FieldCondition {
-                    key: field.clone(),
+            other => {
+                let kind = indexed.get(field).copied().unwrap_or(IndexKind::Keyword);
+                lower_one(&payload_key(field), field, other, kind, &mut conditions)?;
+            }
+        }
+    }
+    Ok(conditions)
+}
+
+/// Lower one non-correlated filter on payload key `key` (field path `field`, for
+/// messages) into `out`; see [`lower_field_filters`].
+fn lower_one(
+    key: &str,
+    field: &str,
+    filter: &FieldFilter,
+    kind: IndexKind,
+    out: &mut Vec<Condition>,
+) -> Result<(), String> {
+    match filter {
+        FieldFilter::AnyOf(values) => out.push(match_condition(key, field, values, kind)?),
+        FieldFilter::AllOf(values) => {
+            // ANDed together implicitly: every entry becomes a separate `must`
+            // condition in the caller's `Filter::must(..)`.
+            for value in values {
+                out.push(match_condition(
+                    key,
+                    field,
+                    std::slice::from_ref(value),
+                    kind,
+                )?);
+            }
+        }
+        FieldFilter::Range { gte, lte, gt, lt } => {
+            if !kind.supports_range() {
+                return Err(format!(
+                    "filter '{field}': a range (gte/lte/gt/lt) was requested but the field is \
+                     indexed as {kind:?}; declare it `type: integer`, `type: number`, `type: \
+                     date` or `type: timestamp` in the governing directory's schema \
+                     (update_schema) to use a range filter"
+                ));
+            }
+            if kind == IndexKind::Datetime {
+                out.push(Condition::datetime_range(
+                    key.to_string(),
+                    DatetimeRange {
+                        gte: gte.map(epoch_to_timestamp),
+                        lte: lte.map(epoch_to_timestamp),
+                        gt: gt.map(epoch_to_timestamp),
+                        lt: lt.map(epoch_to_timestamp),
+                    },
+                ));
+            } else {
+                out.push(Condition::from(FieldCondition {
+                    key: key.to_string(),
                     range: Some(Range {
                         gte: *gte,
                         lte: *lte,
@@ -713,17 +873,35 @@ pub fn lower_field_filters(
                     ..Default::default()
                 }));
             }
-            // The tool layer refuses a correlated list filter with a query before it
-            // gets here (#349); query-mode lowering of one is #350's.
-            FieldFilter::Elem(_) => {
-                return Err(format!(
-                    "filter '{field}': {}",
-                    crate::mcp::CORRELATED_FILTER_QUERY_MODE
-                ));
-            }
+        }
+        FieldFilter::Elem(_) => {
+            return Err(format!(
+                "filter '{field}': correlated list filters do not nest"
+            ));
         }
     }
-    Ok(conditions)
+    Ok(())
+}
+
+/// One condition as is, several ORed (`Filter::should`).
+fn one_or_any(mut conditions: Vec<Condition>) -> Condition {
+    if conditions.len() == 1 {
+        conditions.remove(0)
+    } else {
+        Condition::from(Filter::should(conditions))
+    }
+}
+
+/// The Qdrant timestamp of `epoch` seconds since the Unix epoch (UTC), rounded to
+/// the microsecond — the precision Qdrant's datetime index keeps — so a bound that
+/// went through `f64` does not land a few nanoseconds off the stored instant (#350).
+/// A date's midnight is exact either way.
+pub(crate) fn epoch_to_timestamp(epoch: f64) -> Timestamp {
+    let micros = (epoch * 1e6).round() as i64;
+    Timestamp {
+        seconds: micros.div_euclid(1_000_000),
+        nanos: (micros.rem_euclid(1_000_000) * 1_000) as i32,
+    }
 }
 
 /// Build the `QueryPoints` request for [`QdrantStore::recommend_by_point_id`].
@@ -856,6 +1034,200 @@ fn build_query_groups_request(
     builder
 }
 
+/// A payload index [`QdrantStore::ensure_collection`] wants in place.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WantedIndex {
+    /// The payload key (`fm.tags`, `mtime`, `text`), also its `/status` name.
+    pub key: String,
+    pub field_type: FieldType,
+    /// Create it as the phrase-matching text index (the `text` index only).
+    pub phrase: bool,
+    /// What a failure to create it costs, for the log line.
+    pub degraded: &'static str,
+    /// Log a failure as a warning, not an error: the phrase index, which an older
+    /// server rejects and whose absence `status::IndexStatus::phrase_matching_available`
+    /// handles by turning phrase matching off.
+    pub soft_failure: bool,
+}
+
+/// One step of reconciling a collection's payload indexes (#350).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum IndexAction {
+    /// Create the index. Also issued for one that already exists with the same kind:
+    /// creating an identical index is a no-op, and re-asserting it lets a parameter
+    /// change (the text index's `phrase_matching`) and a recovered failure reach the
+    /// server and `/status` exactly as before #350.
+    Ensure(WantedIndex),
+    /// The key holds an index of another kind (a field retyped `text` → `integer`,
+    /// or `date` from keyword to datetime by #350 itself): delete it, then create the
+    /// wanted one. A filter on the field runs unindexed — correct, slower — for the
+    /// moment in between.
+    Replace {
+        wanted: WantedIndex,
+        existing: PayloadSchemaType,
+    },
+    /// An index on an unprefixed frontmatter key that the payload shape before #350
+    /// used (`tags` for what is now `fm.tags`): nothing reads it any more.
+    DropLegacy(String),
+}
+
+/// Every payload index `ensure_collection` keeps in place: one per field in
+/// `indexed_fields` (on its [`IndexedField::payload_key`], with its kind) plus the
+/// standing ones — an integer index on `mtime` (recency filters), a keyword index on
+/// [`PATH_ANCESTORS_KEY`] (#130: every point carries it, and a keyword index on an
+/// array indexes each element, which is what `path_filter_condition`'s
+/// `Condition::matches` needs to run as a lookup), the phrase-matching text index on
+/// `text` when `features.phrase` (`search.phrase`; when off no `text` entry is
+/// recorded at all, so phrase matching stays off), and keyword indexes on
+/// [`HEADING_PREFIXES_KEY`]/[`SECTION_KEY`] when `features.heading_metadata` (#286:
+/// those keys are only written when it is on). Every index is non-fatal: Qdrant
+/// filters correctly without one, by an unindexed scan.
+pub(crate) fn wanted_indexes(
+    indexed_fields: &[IndexedField],
+    features: IndexFeatures,
+) -> Vec<WantedIndex> {
+    let index = |key: &str, field_type: FieldType, degraded: &'static str| WantedIndex {
+        key: key.to_string(),
+        field_type,
+        phrase: false,
+        degraded,
+        soft_failure: false,
+    };
+    let mut wanted: Vec<WantedIndex> = indexed_fields
+        .iter()
+        .map(|f| {
+            index(
+                &f.payload_key(),
+                f.kind.to_qdrant(),
+                "Filters on this field may be slow or return incomplete results",
+            )
+        })
+        .collect();
+    let mut standing = vec![
+        index(
+            "mtime",
+            FieldType::Integer,
+            "Recency filters may be slow until this is resolved",
+        ),
+        index(
+            PATH_ANCESTORS_KEY,
+            FieldType::Keyword,
+            "path_prefix filtering may be slow until this is resolved",
+        ),
+    ];
+    if features.phrase {
+        standing.push(WantedIndex {
+            phrase: true,
+            soft_failure: true,
+            ..index(
+                CHUNK_TEXT_KEY,
+                FieldType::Text,
+                "This usually means the Qdrant server is too old to support \
+                 phrase_matching — phrase search (double-quoted terms in `search`) is \
+                 disabled for this process; ordinary term/semantic search is unaffected",
+            )
+        });
+    }
+    if features.heading_metadata {
+        for key in [HEADING_PREFIXES_KEY, SECTION_KEY] {
+            standing.push(index(
+                key,
+                FieldType::Keyword,
+                "heading_prefix filtering / section-granularity search may be slow until \
+                 this is resolved",
+            ));
+        }
+    }
+    // A declared field whose payload key equals a standing key cannot exist (every
+    // declared field is under `fm.`, and `file_path` is not standing), but keep the
+    // first if one ever did rather than asking for two kinds on one key.
+    for s in standing {
+        if !wanted.iter().any(|w| w.key == s.key) {
+            wanted.push(s);
+        }
+    }
+    wanted
+}
+
+/// The index kind on each key of a collection's `payload_schema`
+/// (`collection_info().result.payload_schema`). A kind this client cannot name is
+/// [`PayloadSchemaType::UnknownType`].
+fn existing_index_types(
+    schema: &HashMap<String, qdrant_client::qdrant::PayloadSchemaInfo>,
+) -> HashMap<String, PayloadSchemaType> {
+    schema
+        .iter()
+        .map(|(key, info)| {
+            (
+                key.clone(),
+                PayloadSchemaType::try_from(info.data_type)
+                    .unwrap_or(PayloadSchemaType::UnknownType),
+            )
+        })
+        .collect()
+}
+
+/// The `payload_schema` kind an index created as `field_type` reports.
+fn schema_type_of(field_type: FieldType) -> PayloadSchemaType {
+    match field_type {
+        FieldType::Keyword => PayloadSchemaType::Keyword,
+        FieldType::Integer => PayloadSchemaType::Integer,
+        FieldType::Float => PayloadSchemaType::Float,
+        FieldType::Geo => PayloadSchemaType::Geo,
+        FieldType::Text => PayloadSchemaType::Text,
+        FieldType::Bool => PayloadSchemaType::Bool,
+        FieldType::Datetime => PayloadSchemaType::Datetime,
+        FieldType::Uuid => PayloadSchemaType::Uuid,
+    }
+}
+
+/// Plan the reconcile of a collection's payload indexes (#350), given what it holds
+/// (`existing`, by key) and what it should hold (`wanted`, [`wanted_indexes`]):
+///
+/// - a wanted index that is missing, or present with the same kind, is
+///   [`IndexAction::Ensure`]d;
+/// - one present with a different kind is [`IndexAction::Replace`]d (delete, then
+///   create) — creating over an index of another kind is not a supported way to
+///   change it on every server version, so the delete is explicit. An existing kind
+///   this client cannot name ([`PayloadSchemaType::UnknownType`]) is never deleted,
+///   only ensured;
+/// - each name in `legacy` — a declared or configured field's path, which before
+///   #350 was its payload key too — that the collection holds an index on and that
+///   no wanted index uses is [`IndexAction::DropLegacy`]ed. Nothing else is ever
+///   dropped: an index this server did not create, or one under `fm.` that is no
+///   longer declared, is left alone.
+///
+/// Wanted indexes come first, in `wanted` order, then the drops in key order.
+pub(crate) fn plan_index_reconcile(
+    existing: &HashMap<String, PayloadSchemaType>,
+    wanted: &[WantedIndex],
+    legacy: &[String],
+) -> Vec<IndexAction> {
+    let mut actions: Vec<IndexAction> = wanted
+        .iter()
+        .map(|w| match existing.get(&w.key) {
+            Some(&kind)
+                if kind != schema_type_of(w.field_type)
+                    && kind != PayloadSchemaType::UnknownType =>
+            {
+                IndexAction::Replace {
+                    wanted: w.clone(),
+                    existing: kind,
+                }
+            }
+            _ => IndexAction::Ensure(w.clone()),
+        })
+        .collect();
+    let mut drops: Vec<&String> = legacy
+        .iter()
+        .filter(|name| existing.contains_key(*name) && !wanted.iter().any(|w| &w.key == *name))
+        .collect();
+    drops.sort();
+    drops.dedup();
+    actions.extend(drops.into_iter().cloned().map(IndexAction::DropLegacy));
+    actions
+}
+
 impl QdrantStore {
     pub fn new(config: &ResolvedQdrantConfig) -> Result<Self> {
         let client = Qdrant::from_url(&config.url)
@@ -894,15 +1266,15 @@ impl QdrantStore {
         indexed_fields: &[IndexedField],
         features: IndexFeatures,
     ) -> Result<()> {
-        let IndexFeatures {
-            phrase: enable_phrase,
-            heading_metadata: enable_heading_metadata,
-        } = features;
         let exists = self
             .client
             .collection_exists(collection)
             .await
             .context("Failed to check if collection exists")?;
+
+        // The payload indexes the collection already has, by key (#350); a fresh
+        // collection has none.
+        let mut existing_indexes: HashMap<String, PayloadSchemaType> = HashMap::new();
 
         if !exists {
             info!("Creating Qdrant collection '{}'", collection);
@@ -955,8 +1327,12 @@ impl QdrantStore {
                 .await
                 .context("Failed to fetch existing collection info for a dimension check")?;
 
-            let existing_size = info
-                .result
+            let result = info.result;
+            existing_indexes = result
+                .as_ref()
+                .map(|r| existing_index_types(&r.payload_schema))
+                .unwrap_or_default();
+            let existing_size = result
                 .and_then(|r| r.config)
                 .and_then(|c| c.params)
                 .and_then(|p| {
@@ -989,190 +1365,19 @@ impl QdrantStore {
             }
         }
 
-        for indexed in indexed_fields {
-            let kind = indexed.kind.to_qdrant();
-            debug!(
-                "Ensuring {:?} index on field '{}' in collection '{}'",
-                kind, indexed.name, collection
-            );
-            let result = self
-                .client
-                .create_field_index(CreateFieldIndexCollectionBuilder::new(
-                    collection,
-                    &indexed.name,
-                    kind,
-                ))
-                .await;
-
-            match result {
-                // Recorded on success too, so a field that recovers on a later run
-                // clears its previous failure instead of looking broken forever.
-                Ok(_) => crate::status::INDEX_STATUS.record_payload_index(&indexed.name, None),
-                Err(e) => {
-                    // Creating an index that already exists with the same type is a no-op,
-                    // so a failure here usually means the declared type changed and Qdrant
-                    // is holding an index of the old kind. Dropping and recreating it would
-                    // be destructive on a live collection, and failing the whole run because
-                    // of one field is worse than proceeding — so warn precisely and carry on.
-                    // Deliberate: failing the whole run — and therefore server startup — over
-                    // one field is worse than proceeding without its index, and dropping a
-                    // live index to recreate it is destructive. But a filter on this field
-                    // may now be slow or incomplete, so this is an error, not a warning.
-                    error!(
-                        "Could not ensure {:?} index on '{}' in collection '{}': {:#}. \
-                         Filters on this field may be slow or return incomplete results. \
-                         If its declared type changed, delete the payload index in Qdrant \
-                         and reindex.",
-                        kind, indexed.name, collection, e
-                    );
-                    // An error! that scrolls out of the log buffer leaves a silently
-                    // degraded filter behind; /status keeps it visible until it is fixed.
-                    crate::status::INDEX_STATUS.record_payload_index(
-                        &indexed.name,
-                        Some(crate::status::redact_error(&format!("{e:#}"))),
-                    );
-                }
-            }
-        }
-
-        // Ensure integer index on mtime for range-filter queries (idempotent).
-        //
-        // Non-fatal for the same reason as the schema-declared indexes above: Qdrant
-        // filters correctly without a payload index, just more slowly, so failing
-        // startup over one index is worse than proceeding loudly without it.
-        match self
-            .client
-            .create_field_index(CreateFieldIndexCollectionBuilder::new(
-                collection,
-                "mtime",
-                FieldType::Integer,
-            ))
-            .await
-        {
-            Ok(_) => crate::status::INDEX_STATUS.record_payload_index("mtime", None),
-            Err(e) => {
-                error!(
-                    "Could not ensure the integer index on 'mtime' in collection '{}': {:#}. \
-                     Recency filters may be slow until this is resolved.",
-                    collection, e
-                );
-                crate::status::INDEX_STATUS.record_payload_index(
-                    "mtime",
-                    Some(crate::status::redact_error(&format!("{e:#}"))),
-                );
-            }
-        }
-
-        // Keyword index on `path_ancestors` (#130), unconditional and non-fatal for
-        // the same reasons as the `mtime` index just above: it is a derived field
-        // every point carries going forward (not a schema-declared one, so it isn't
-        // in `indexed_fields`), and Qdrant filters correctly without the index —
-        // just by an unindexed scan — so a creation failure degrades performance,
-        // not correctness, and must not fail startup.
-        //
-        // A keyword index on an array-valued field indexes every element, which is
-        // exactly what `path_filter_condition`'s `Condition::matches` (single-value
-        // "does the array contain this element") needs to run as an index lookup
-        // rather than a full collection scan.
-        match self
-            .client
-            .create_field_index(CreateFieldIndexCollectionBuilder::new(
-                collection,
-                PATH_ANCESTORS_KEY,
-                FieldType::Keyword,
-            ))
-            .await
-        {
-            Ok(_) => crate::status::INDEX_STATUS.record_payload_index(PATH_ANCESTORS_KEY, None),
-            Err(e) => {
-                error!(
-                    "Could not ensure the keyword index on '{}' in collection '{}': {:#}. \
-                     path_prefix filtering may be slow until this is resolved.",
-                    PATH_ANCESTORS_KEY, collection, e
-                );
-                crate::status::INDEX_STATUS.record_payload_index(
-                    PATH_ANCESTORS_KEY,
-                    Some(crate::status::redact_error(&format!("{e:#}"))),
-                );
-            }
-        }
-
-        // Phrase-matching text index on `text` (search.phrase). Config-gated: when
-        // disabled, skip creation entirely and leave no "text" entry behind, so
-        // `IndexStatus::phrase_matching_available` reads `false` and quotes stay
-        // literal characters (see that method's doc comment).
-        //
-        // CRITICAL — graceful degradation: an older Qdrant server does not support
-        // `phrase_matching` and rejects this call. That must never fail startup, so
-        // this follows the exact same tolerate-and-record pattern as the indexes
-        // above: log a clear warning, record the failure, and carry on. Retrieval
-        // reads the recorded outcome (not this call's return value) before ever
-        // adding a phrase prefetch arm, so a query against a server that never
-        // confirmed support degrades to ordinary term+semantic retrieval instead of
-        // erroring.
-        if enable_phrase {
-            let text_index_params =
-                TextIndexParamsBuilder::new(TokenizerType::Word).phrase_matching(true);
-            match self
-                .client
-                .create_field_index(
-                    CreateFieldIndexCollectionBuilder::new(collection, "text", FieldType::Text)
-                        .field_index_params(text_index_params),
-                )
-                .await
-            {
-                Ok(_) => crate::status::INDEX_STATUS.record_payload_index("text", None),
-                Err(e) => {
-                    warn!(
-                        "Could not create the phrase-matching text index on 'text' in \
-                         collection '{}': {:#}. This usually means the Qdrant server is too \
-                         old to support phrase_matching — phrase search (double-quoted terms \
-                         in `search`) is disabled for this process; ordinary term/semantic \
-                         search is unaffected.",
-                        collection, e
-                    );
-                    crate::status::INDEX_STATUS.record_payload_index(
-                        "text",
-                        Some(crate::status::redact_error(&format!("{e:#}"))),
-                    );
-                }
-            }
-        }
-
-        // Keyword indexes on `heading_prefixes`/`section_key` (#286),
-        // created only when `chunking.heading_metadata` is on — unlike
-        // `path_ancestors` above, these payload fields are themselves only ever
-        // written when the flag is on, so an index with nothing to index is
-        // pure waste on a deployment that never enables it. Follows the same
-        // non-fatal tolerate-and-record pattern as every index above: Qdrant
-        // filters/groups correctly without the index, just by an unindexed
-        // scan, so a creation failure degrades performance, not correctness.
-        if enable_heading_metadata {
-            for key in [HEADING_PREFIXES_KEY, SECTION_KEY] {
-                match self
-                    .client
-                    .create_field_index(CreateFieldIndexCollectionBuilder::new(
-                        collection,
-                        key,
-                        FieldType::Keyword,
-                    ))
-                    .await
-                {
-                    Ok(_) => crate::status::INDEX_STATUS.record_payload_index(key, None),
-                    Err(e) => {
-                        error!(
-                            "Could not ensure the keyword index on '{}' in collection '{}': \
-                             {:#}. heading_prefix filtering / section-granularity search may be \
-                             slow until this is resolved.",
-                            key, collection, e
-                        );
-                        crate::status::INDEX_STATUS.record_payload_index(
-                            key,
-                            Some(crate::status::redact_error(&format!("{e:#}"))),
-                        );
-                    }
-                }
-            }
+        // #350: reconcile the payload indexes against what the collection holds —
+        // create a missing one, replace one whose kind changed, drop one the
+        // pre-#350 payload shape left on an unprefixed frontmatter key. Planned by a
+        // pure function (`plan_index_reconcile`) so every decision is testable
+        // without a server; this loop only carries the actions out.
+        let wanted = wanted_indexes(indexed_fields, features);
+        let legacy: Vec<String> = indexed_fields
+            .iter()
+            .filter(|f| f.payload_key() != f.name)
+            .map(|f| f.name.clone())
+            .collect();
+        for action in plan_index_reconcile(&existing_indexes, &wanted, &legacy) {
+            self.apply_index_action(collection, action).await;
         }
 
         info!(
@@ -1182,6 +1387,99 @@ impl QdrantStore {
         );
 
         Ok(())
+    }
+
+    /// Carry out one [`IndexAction`]. Never fails the caller: failing the run — and
+    /// therefore server startup — over one index is worse than proceeding without
+    /// it, since Qdrant filters correctly without an index, only more slowly. Every
+    /// outcome of a wanted index is recorded in `status::INDEX_STATUS` under its
+    /// payload key, success included, so one that recovers on a later run clears its
+    /// previous failure, and an error that scrolls out of the log stays visible on
+    /// `/status` until it is fixed.
+    async fn apply_index_action(&self, collection: &str, action: IndexAction) {
+        let wanted = match action {
+            IndexAction::DropLegacy(key) => {
+                info!(
+                    "Dropping the payload index on '{}' in collection '{}': frontmatter now \
+                     lives under '{FRONTMATTER_KEY}.' (#350), so nothing filters on it",
+                    key, collection
+                );
+                if let Err(e) = self
+                    .client
+                    .delete_field_index(DeleteFieldIndexCollectionBuilder::new(collection, &key))
+                    .await
+                {
+                    // Harmless to keep: nothing reads it. Logged, not recorded, since
+                    // `/status` lists the indexes filters use.
+                    warn!(
+                        "Could not drop the unused payload index on '{}' in collection \
+                         '{}': {:#}",
+                        key, collection, e
+                    );
+                }
+                return;
+            }
+            IndexAction::Replace { wanted, existing } => {
+                warn!(
+                    "Payload index on '{}' in collection '{}' is {:?} but the field now \
+                     needs {:?}; recreating it",
+                    wanted.key, collection, existing, wanted.field_type
+                );
+                if let Err(e) = self
+                    .client
+                    .delete_field_index(
+                        // Wait, so the create below never races the delete.
+                        DeleteFieldIndexCollectionBuilder::new(collection, &wanted.key).wait(true),
+                    )
+                    .await
+                {
+                    error!(
+                        "Could not delete the {:?} index on '{}' in collection '{}' to \
+                         recreate it as {:?}: {:#}. {}.",
+                        existing, wanted.key, collection, wanted.field_type, e, wanted.degraded
+                    );
+                    crate::status::INDEX_STATUS.record_payload_index(
+                        &wanted.key,
+                        Some(crate::status::redact_error(&format!("{e:#}"))),
+                    );
+                    return;
+                }
+                wanted
+            }
+            IndexAction::Ensure(wanted) => wanted,
+        };
+
+        debug!(
+            "Ensuring {:?} index on '{}' in collection '{}'",
+            wanted.field_type, wanted.key, collection
+        );
+        let mut request =
+            CreateFieldIndexCollectionBuilder::new(collection, &wanted.key, wanted.field_type);
+        if wanted.phrase {
+            request = request.field_index_params(
+                TextIndexParamsBuilder::new(TokenizerType::Word).phrase_matching(true),
+            );
+        }
+        match self.client.create_field_index(request).await {
+            Ok(_) => crate::status::INDEX_STATUS.record_payload_index(&wanted.key, None),
+            Err(e) => {
+                if wanted.soft_failure {
+                    warn!(
+                        "Could not create the {:?} index on '{}' in collection '{}': {:#}. {}.",
+                        wanted.field_type, wanted.key, collection, e, wanted.degraded
+                    );
+                } else {
+                    error!(
+                        "Could not ensure the {:?} index on '{}' in collection '{}': {:#}. {}.",
+                        wanted.field_type, wanted.key, collection, e, wanted.degraded
+                    );
+                }
+                crate::status::INDEX_STATUS.record_payload_index(
+                    &wanted.key,
+                    Some(crate::status::redact_error(&format!("{e:#}"))),
+                );
+            }
+        }
     }
 
     pub async fn upsert_points(&self, collection: &str, points: Vec<QdrantPoint>) -> Result<()> {
@@ -1252,45 +1550,32 @@ impl QdrantStore {
         Ok(())
     }
 
-    /// See [`VectorStore::refresh_file_payload`]. Both calls select the file's points
-    /// with the same `file_path` match filter `delete_by_files` uses and wait for the
+    /// See [`VectorStore::refresh_file_payload`]. The call selects the file's points
+    /// with the same `file_path` match filter `delete_by_files` uses and waits for the
     /// operation to be applied, so the next run (or a search) never reads a
-    /// half-refreshed file. `set` is applied first: a failure between the two calls
-    /// leaves a key that should have been removed, never a value missing.
+    /// half-refreshed file.
     pub async fn refresh_file_payload(
         &self,
         collection: &str,
         file_path: &str,
         set: HashMap<String, serde_json::Value>,
-        delete_keys: Vec<String>,
     ) -> Result<()> {
-        let selector = || Filter::must([Condition::matches("file_path", file_path.to_string())]);
-
-        if !set.is_empty() {
-            self.client
-                .set_payload(
-                    SetPayloadPointsBuilder::new(collection, json_payload_to_qdrant(&set))
-                        .points_selector(selector())
-                        .wait(true),
-                )
-                .await
-                .with_context(|| format!("Failed to set payload for '{file_path}'"))?;
+        if set.is_empty() {
+            return Ok(());
         }
-        if !delete_keys.is_empty() {
-            self.client
-                .delete_payload(
-                    DeletePayloadPointsBuilder::new(collection, delete_keys.clone())
-                        .points_selector(selector())
-                        .wait(true),
-                )
-                .await
-                .with_context(|| format!("Failed to delete payload keys for '{file_path}'"))?;
-        }
+        let selector = Filter::must([Condition::matches("file_path", file_path.to_string())]);
+        self.client
+            .set_payload(
+                SetPayloadPointsBuilder::new(collection, json_payload_to_qdrant(&set))
+                    .points_selector(selector)
+                    .wait(true),
+            )
+            .await
+            .with_context(|| format!("Failed to set payload for '{file_path}'"))?;
 
         debug!(
             file = file_path,
             set = set.len(),
-            deleted = delete_keys.len(),
             "Refreshed payload in '{}'",
             collection
         );
@@ -1364,9 +1649,8 @@ impl VectorStore for QdrantStore {
         collection: &str,
         file_path: &str,
         set: HashMap<String, serde_json::Value>,
-        delete_keys: Vec<String>,
     ) -> Result<()> {
-        QdrantStore::refresh_file_payload(self, collection, file_path, set, delete_keys).await
+        QdrantStore::refresh_file_payload(self, collection, file_path, set).await
     }
 }
 
@@ -1943,8 +2227,8 @@ mod tests {
     #[test]
     fn chunk_payload_keys_are_the_schema_reserved_names_but_fm() {
         // Two views of one set: what a schema may not name (`schema` lint), and what a
-        // payload refresh may not touch (#351). `fm` is reserved for #350's namespace
-        // but not yet written by ingest.
+        // payload refresh may not touch (#351). `fm` is reserved too: it is the
+        // frontmatter namespace (#350), which a refresh sets wholesale.
         let builtin: std::collections::BTreeSet<&str> = CHUNK_PAYLOAD_KEYS
             .iter()
             .chain(HEADING_PAYLOAD_KEYS)
@@ -2046,7 +2330,10 @@ mod tests {
 
         with_collection_cleanup(&store, &config.collection, || async {
             let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
-            payload.insert("title".into(), serde_json::json!("Test Document"));
+            payload.insert(
+                FRONTMATTER_KEY.into(),
+                serde_json::json!({ "title": "Test Document" }),
+            );
             payload.insert("file_path".into(), serde_json::json!("/data/test.md"));
             payload.insert("text".into(), serde_json::json!("Hello world chunk"));
 
@@ -2085,9 +2372,9 @@ mod tests {
             assert_eq!(results.len(), 1);
             let result = &results[0];
             assert_eq!(
-                result.payload.get("title").and_then(|v| v.as_str()),
+                frontmatter_value(&result.payload, "title").and_then(|v| v.as_str()),
                 Some("Test Document"),
-                "search results must include payload fields"
+                "search results must include payload fields, nested `fm` included"
             );
             assert_eq!(
                 result.payload.get("file_path").and_then(|v| v.as_str()),
@@ -2102,24 +2389,25 @@ mod tests {
     }
 
     /// #351: `refresh_file_payload` merges the new frontmatter into every point of
-    /// one file, deletes the keys a schema edit removed, and leaves the chunk keys and
-    /// every other file's points alone.
+    /// one file and leaves the chunk keys, every other key, and every other file's
+    /// points alone. Since #350 the frontmatter is the one `fm` key, which the set
+    /// replaces as a whole, so a key the schema dropped leaves `fm` with it.
     ///
     /// Live-only, and runs only in CI's `qdrant-integration` tier (it is `#[ignore]`d,
     /// like every test here that needs a server): what it proves is the server's
-    /// set/delete-payload semantics under a filter selector, which no fake can.
+    /// set-payload semantics under a filter selector, which no fake can.
     ///
     /// Requires a running Qdrant instance at localhost:6334.
-    /// Run with: cargo test refresh_file_payload_merges_deletes_and_keeps_chunk_keys -- --ignored
+    /// Run with: cargo test refresh_file_payload_replaces_fm_and_keeps_chunk_keys -- --ignored
     #[tokio::test]
     #[ignore]
-    async fn refresh_file_payload_merges_deletes_and_keeps_chunk_keys() {
+    async fn refresh_file_payload_replaces_fm_and_keeps_chunk_keys() {
         use qdrant_client::qdrant::ScrollPointsBuilder;
 
         let config = ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
             collection: live_test_collection(
-                "refresh_file_payload_merges_deletes_and_keeps_chunk_keys",
+                "refresh_file_payload_replaces_fm_and_keeps_chunk_keys",
             ),
         };
         let store = QdrantStore::new(&config).unwrap();
@@ -2139,8 +2427,12 @@ mod tests {
                     serde_json::json!(format!("chunk {chunk}")),
                 );
                 payload.insert("line_start".into(), serde_json::json!(1));
+                payload.insert(
+                    FRONTMATTER_KEY.into(),
+                    serde_json::json!({ "status": "draft", "legacy": "gone soon" }),
+                );
+                // Another top-level key the refresh does not name.
                 payload.insert("status".into(), serde_json::json!("draft"));
-                payload.insert("legacy".into(), serde_json::json!("gone soon"));
                 QdrantPoint {
                     id: id.into(),
                     vector: vec![1.0, 0.0, 0.0, 0.0],
@@ -2161,10 +2453,12 @@ mod tests {
                 .unwrap();
 
             let mut set = HashMap::new();
-            set.insert("status".to_string(), serde_json::json!("active"));
-            set.insert("domain".to_string(), serde_json::json!("food"));
+            set.insert(
+                FRONTMATTER_KEY.to_string(),
+                serde_json::json!({ "status": "active", "domain": "food" }),
+            );
             store
-                .refresh_file_payload(&config.collection, "a.md", set, vec!["legacy".to_string()])
+                .refresh_file_payload(&config.collection, "a.md", set)
                 .await
                 .unwrap();
 
@@ -2193,7 +2487,9 @@ mod tests {
                         && payloads
                             .iter()
                             .filter(|p| p["file_path"] == "a.md")
-                            .all(|p| p.get("status") == Some(&serde_json::json!("active")))
+                            .all(|p| {
+                                frontmatter_value(p, "status") == Some(&serde_json::json!("active"))
+                            })
                 },
             )
             .await;
@@ -2201,18 +2497,25 @@ mod tests {
 
             for p in &payloads {
                 if p["file_path"] == "a.md" {
-                    assert_eq!(p["status"], "active", "set merges a new value in");
-                    assert_eq!(p["domain"], "food", "set adds a new key");
-                    assert!(!p.contains_key("legacy"), "a removed key is deleted");
+                    assert_eq!(
+                        p[FRONTMATTER_KEY],
+                        serde_json::json!({ "status": "active", "domain": "food" }),
+                        "`fm` is replaced as a whole: a dropped key leaves it, nested \
+                         keys are not merged"
+                    );
+                    assert_eq!(p["status"], "draft", "a key outside `set` is untouched");
                     // Chunk keys survive the merge.
                     let chunk = p["chunk_index"].as_i64().unwrap();
                     assert_eq!(p[CHUNK_TEXT_KEY], format!("chunk {chunk}"));
                     assert_eq!(p["line_start"], 1);
                 } else {
                     assert_eq!(p["file_path"], "b.md");
-                    assert_eq!(p["status"], "draft", "another file's points are untouched");
-                    assert_eq!(p["legacy"], "gone soon");
-                    assert!(!p.contains_key("domain"));
+                    assert_eq!(
+                        p[FRONTMATTER_KEY],
+                        serde_json::json!({ "status": "draft", "legacy": "gone soon" }),
+                        "another file's points are untouched"
+                    );
+                    assert_eq!(p["status"], "draft");
                 }
             }
         })
@@ -3409,7 +3712,10 @@ mod tests {
         )];
         let indexed = HashMap::from([("type".to_string(), IndexKind::Keyword)]);
         let err = lower_field_filters(&filters, &indexed).unwrap_err();
-        assert!(err.contains("numeric range"), "got: {err}");
+        assert!(
+            err.contains("a range") && err.contains("indexed as Keyword"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -3463,6 +3769,343 @@ mod tests {
         assert_eq!(conditions.len(), 1);
     }
 
+    // ------------------------------------------------------------------
+    // #350: payload keys, datetime and nested lowering, index reconcile
+    // ------------------------------------------------------------------
+
+    fn field_of(c: &Condition) -> &FieldCondition {
+        match &c.condition_one_of {
+            Some(qdrant_client::qdrant::condition::ConditionOneOf::Field(f)) => f,
+            other => panic!("expected a field condition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frontmatter_filters_address_the_fm_namespace_and_file_path_stays_top_level() {
+        assert_eq!(payload_key("tags"), "fm.tags");
+        assert_eq!(payload_key("planning.prep"), "fm.planning.prep");
+        assert_eq!(payload_key("npcs[].role"), "fm.npcs[].role");
+        assert_eq!(payload_key("file_path"), "file_path");
+        assert_eq!(
+            IndexedField::keyword("file_path").payload_key(),
+            "file_path"
+        );
+
+        let conditions = lower_field_filters(
+            &[
+                ("type".to_string(), FieldFilter::AnyOf(vec!["guide".into()])),
+                (
+                    "file_path".to_string(),
+                    FieldFilter::AnyOf(vec!["a.md".into()]),
+                ),
+            ],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(field_of(&conditions[0]).key, "fm.type");
+        assert_eq!(field_of(&conditions[1]).key, "file_path");
+
+        let payload = HashMap::from([(
+            FRONTMATTER_KEY.to_string(),
+            serde_json::json!({"title": "T"}),
+        )]);
+        assert_eq!(
+            frontmatter_value(&payload, "title"),
+            Some(&serde_json::json!("T"))
+        );
+        assert_eq!(frontmatter_value(&HashMap::new(), "title"), None);
+    }
+
+    #[test]
+    fn a_datetime_range_lowers_to_a_datetime_range_on_the_epoch_axis() {
+        let bound = crate::document_fields::epoch_seconds("2024-01-02").unwrap();
+        let filters = vec![(
+            "published".to_string(),
+            FieldFilter::Range {
+                gte: Some(bound),
+                lte: None,
+                gt: None,
+                lt: Some(bound + 0.5),
+            },
+        )];
+        let indexed = HashMap::from([("published".to_string(), IndexKind::Datetime)]);
+        let conditions = lower_field_filters(&filters, &indexed).unwrap();
+        let field = field_of(&conditions[0]);
+        assert_eq!(field.key, "fm.published");
+        assert!(field.range.is_none(), "not a numeric range");
+        let range = field.datetime_range.unwrap();
+        assert_eq!(
+            range.gte,
+            Some(Timestamp {
+                seconds: 1_704_153_600,
+                nanos: 0
+            })
+        );
+        assert_eq!(
+            range.lt,
+            Some(Timestamp {
+                seconds: 1_704_153_600,
+                nanos: 500_000_000
+            })
+        );
+        assert!(range.lte.is_none() && range.gt.is_none());
+    }
+
+    #[test]
+    fn datetime_equality_matches_the_instant_and_rejects_a_non_date() {
+        let indexed = HashMap::from([("published".to_string(), IndexKind::Datetime)]);
+        let one = lower_field_filters(
+            &[(
+                "published".to_string(),
+                FieldFilter::AnyOf(vec!["2024-01-02".into()]),
+            )],
+            &indexed,
+        )
+        .unwrap();
+        let range = field_of(&one[0]).datetime_range.unwrap();
+        assert_eq!(range.gte, range.lte);
+        assert_eq!(range.gte.unwrap().seconds, 1_704_153_600);
+
+        let two = lower_field_filters(
+            &[(
+                "published".to_string(),
+                FieldFilter::AnyOf(vec!["2024-01-02".into(), "2024-01-03".into()]),
+            )],
+            &indexed,
+        )
+        .unwrap();
+        let Some(qdrant_client::qdrant::condition::ConditionOneOf::Filter(any)) =
+            &two[0].condition_one_of
+        else {
+            panic!("{two:?}");
+        };
+        assert_eq!(any.should.len(), 2);
+
+        let err = lower_field_filters(
+            &[(
+                "published".to_string(),
+                FieldFilter::AnyOf(vec!["soon".into()]),
+            )],
+            &indexed,
+        )
+        .unwrap_err();
+        assert!(err.contains("'soon' is not a date"), "{err}");
+    }
+
+    #[test]
+    fn epoch_bounds_round_to_the_microsecond() {
+        assert_eq!(
+            epoch_to_timestamp(1_704_153_600.5),
+            Timestamp {
+                seconds: 1_704_153_600,
+                nanos: 500_000_000
+            }
+        );
+        // An f64 just short of the instant still lands on it.
+        let t = epoch_to_timestamp(1_704_153_600.123_456_7);
+        assert_eq!((t.seconds, t.nanos), (1_704_153_600, 123_457_000));
+        // Before the epoch: seconds floor, nanos stay positive.
+        assert_eq!(
+            epoch_to_timestamp(-1.5),
+            Timestamp {
+                seconds: -2,
+                nanos: 500_000_000
+            }
+        );
+    }
+
+    #[test]
+    fn a_correlated_filter_lowers_to_one_nested_condition_with_element_relative_keys() {
+        use qdrant_client::qdrant::condition::ConditionOneOf;
+        let filters = vec![(
+            "campaign.npcs[]".to_string(),
+            FieldFilter::Elem(vec![
+                (
+                    "campaign.npcs[].level".to_string(),
+                    FieldFilter::Range {
+                        gte: Some(3.0),
+                        lte: None,
+                        gt: None,
+                        lt: None,
+                    },
+                ),
+                (
+                    "campaign.npcs[].role".to_string(),
+                    FieldFilter::AllOf(vec!["guard".into(), "cook".into()]),
+                ),
+                (
+                    "campaign.npcs[].stats.met".to_string(),
+                    FieldFilter::AnyOf(vec!["2024-01-02".into()]),
+                ),
+            ]),
+        )];
+        let indexed = HashMap::from([
+            ("campaign.npcs[].level".to_string(), IndexKind::Integer),
+            ("campaign.npcs[].stats.met".to_string(), IndexKind::Datetime),
+        ]);
+        let conditions = lower_field_filters(&filters, &indexed).unwrap();
+        assert_eq!(
+            conditions.len(),
+            1,
+            "one nested condition for the whole filter"
+        );
+        let Some(ConditionOneOf::Nested(nested)) = &conditions[0].condition_one_of else {
+            panic!("{conditions:?}");
+        };
+        assert_eq!(nested.key, "fm.campaign.npcs");
+        let inner = &nested.filter.as_ref().unwrap().must;
+        let keys: Vec<&str> = inner.iter().map(|c| field_of(c).key.as_str()).collect();
+        assert_eq!(keys, vec!["level", "role", "role", "stats.met"]);
+        assert!(field_of(&inner[0]).range.is_some());
+        assert!(field_of(&inner[3]).datetime_range.is_some());
+    }
+
+    fn wanted(key: &str, field_type: FieldType) -> WantedIndex {
+        WantedIndex {
+            key: key.into(),
+            field_type,
+            phrase: false,
+            degraded: "",
+            soft_failure: false,
+        }
+    }
+
+    #[test]
+    fn reconcile_ensures_missing_and_same_kind_and_replaces_a_changed_kind() {
+        let existing = HashMap::from([
+            ("fm.count".to_string(), PayloadSchemaType::Keyword),
+            ("fm.tags".to_string(), PayloadSchemaType::Keyword),
+            ("fm.when".to_string(), PayloadSchemaType::UnknownType),
+            ("mtime".to_string(), PayloadSchemaType::Integer),
+        ]);
+        let want = vec![
+            wanted("fm.count", FieldType::Integer),
+            wanted("fm.tags", FieldType::Keyword),
+            wanted("fm.when", FieldType::Datetime),
+            wanted("fm.new", FieldType::Bool),
+            wanted("mtime", FieldType::Integer),
+        ];
+        let actions = plan_index_reconcile(&existing, &want, &[]);
+        assert_eq!(
+            actions,
+            vec![
+                IndexAction::Replace {
+                    wanted: want[0].clone(),
+                    existing: PayloadSchemaType::Keyword,
+                },
+                IndexAction::Ensure(want[1].clone()),
+                // A kind this client cannot name is never deleted.
+                IndexAction::Ensure(want[2].clone()),
+                IndexAction::Ensure(want[3].clone()),
+                IndexAction::Ensure(want[4].clone()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_drops_only_unprefixed_legacy_indexes_nothing_uses() {
+        let existing = HashMap::from([
+            ("tags".to_string(), PayloadSchemaType::Keyword),
+            ("type".to_string(), PayloadSchemaType::Keyword),
+            ("mtime".to_string(), PayloadSchemaType::Integer),
+            ("someone_elses".to_string(), PayloadSchemaType::Keyword),
+            ("fm.retired".to_string(), PayloadSchemaType::Keyword),
+        ]);
+        let want = vec![
+            wanted("fm.tags", FieldType::Keyword),
+            wanted("mtime", FieldType::Integer),
+        ];
+        // `mtime` is a declared field's name too, but a standing index uses that key.
+        let legacy = vec![
+            "tags".to_string(),
+            "mtime".to_string(),
+            "absent".to_string(),
+        ];
+        let actions = plan_index_reconcile(&existing, &want, &legacy);
+        assert_eq!(
+            actions[2..],
+            [IndexAction::DropLegacy("tags".into())],
+            "`type` is no declared field's legacy name, `someone_elses` and \
+             `fm.retired` were not created from a declared name: all left alone"
+        );
+    }
+
+    #[test]
+    fn wanted_indexes_name_fields_by_payload_key_and_gate_the_optional_ones() {
+        let fields = vec![
+            IndexedField::keyword("file_path"),
+            IndexedField {
+                name: "when".into(),
+                kind: IndexKind::Datetime,
+            },
+        ];
+        let keys = |features| -> Vec<(String, FieldType)> {
+            wanted_indexes(&fields, features)
+                .into_iter()
+                .map(|w| (w.key, w.field_type))
+                .collect()
+        };
+        assert_eq!(
+            keys(IndexFeatures::default()),
+            vec![
+                ("file_path".to_string(), FieldType::Keyword),
+                ("fm.when".to_string(), FieldType::Datetime),
+                ("mtime".to_string(), FieldType::Integer),
+                (PATH_ANCESTORS_KEY.to_string(), FieldType::Keyword),
+            ]
+        );
+        let all = wanted_indexes(
+            &fields,
+            IndexFeatures {
+                phrase: true,
+                heading_metadata: true,
+            },
+        );
+        let text = all.iter().find(|w| w.key == CHUNK_TEXT_KEY).unwrap();
+        assert!(text.phrase && text.soft_failure);
+        assert!(all.iter().any(|w| w.key == HEADING_PREFIXES_KEY));
+        assert!(all.iter().any(|w| w.key == SECTION_KEY));
+    }
+
+    #[test]
+    fn existing_index_types_read_the_payload_schema_kinds() {
+        let schema = HashMap::from([
+            (
+                "fm.when".to_string(),
+                qdrant_client::qdrant::PayloadSchemaInfo {
+                    data_type: PayloadSchemaType::Datetime as i32,
+                    params: None,
+                    points: None,
+                },
+            ),
+            (
+                "odd".to_string(),
+                qdrant_client::qdrant::PayloadSchemaInfo {
+                    data_type: 999,
+                    params: None,
+                    points: None,
+                },
+            ),
+        ]);
+        let kinds = existing_index_types(&schema);
+        assert_eq!(kinds["fm.when"], PayloadSchemaType::Datetime);
+        assert_eq!(kinds["odd"], PayloadSchemaType::UnknownType);
+        for ty in [
+            FieldType::Keyword,
+            FieldType::Integer,
+            FieldType::Float,
+            FieldType::Bool,
+            FieldType::Datetime,
+            FieldType::Text,
+        ] {
+            assert_eq!(
+                format!("{:?}", schema_type_of(ty)),
+                format!("{ty:?}"),
+                "FieldType and PayloadSchemaType name the same kind"
+            );
+        }
+    }
+
     /// Live counterpart to `state::tests`' offline query-mode/enumeration-mode
     /// filter-equivalence suite: seeds real points and confirms a live Qdrant
     /// server honors `lower_field_filters`'s output exactly the way this
@@ -3497,7 +4140,8 @@ mod tests {
             let make_point = |id: &str, file_path: &str, tags: &[&str]| {
                 let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
                 payload.insert("file_path".into(), serde_json::json!(file_path));
-                payload.insert("tags".into(), serde_json::json!(tags));
+                // Frontmatter under `fm` (#350), where the lowered key points.
+                payload.insert(FRONTMATTER_KEY.into(), serde_json::json!({ "tags": tags }));
                 QdrantPoint {
                     id: id.into(),
                     vector: vec![1.0, 0.0, 0.0, 0.0],
@@ -3564,6 +4208,195 @@ mod tests {
                 "a live Qdrant server must honor lower_field_filters's any_of the same way \
                  the offline equivalence tests in state.rs predict"
             );
+        })
+        .await;
+    }
+
+    /// #350: the SQLite/Qdrant parity check. Seeds the shared typed fixture
+    /// (`state::filter_parity`) into a state DB through the production projection and
+    /// into a live Qdrant through the production payload builder
+    /// (`ingest::frontmatter_payload`) and the real `ensure_collection` — so the
+    /// typed indexes (`fm.*`, datetime, `fm.npcs[].role`) are the ones production
+    /// creates — then runs every filter of the matrix on both and compares the
+    /// sorted `file_path` sets: keyword/integer (an integral float included)/
+    /// float/bool equality and ranges, date and timestamp ranges across offsets and
+    /// fractional seconds, correlated list filters (a cross-element negative case
+    /// included) and plain `[]` sub-field filters.
+    ///
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test sqlite_and_qdrant_filters_agree_on_the_typed_fixture -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn sqlite_and_qdrant_filters_agree_on_the_typed_fixture() {
+        use crate::state::filter_parity;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schemas = filter_parity::schemas(dir.path());
+        let db = filter_parity::seed_db(&dir.path().join("state.db"), &schemas).await;
+        let indexed = filter_parity::indexed(&schemas);
+
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: live_test_collection(
+                "sqlite_and_qdrant_filters_agree_on_the_typed_fixture",
+            ),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+        let _ = store.client.delete_collection(&config.collection).await;
+        let mut indexed_fields = schemas.all_indexed_fields();
+        indexed_fields.push(IndexedField::keyword("file_path"));
+        store
+            .ensure_collection(
+                &config.collection,
+                4,
+                &indexed_fields,
+                IndexFeatures::default(),
+            )
+            .await
+            .unwrap();
+
+        with_collection_cleanup(&store, &config.collection, || async {
+            let docs = filter_parity::docs();
+            let points: Vec<QdrantPoint> = docs
+                .iter()
+                .enumerate()
+                .map(|(i, (path, fm))| {
+                    let mut payload = filter_parity::payload(path, fm, &schemas);
+                    payload.insert("file_path".into(), serde_json::json!(path));
+                    QdrantPoint {
+                        id: format!("00000000-0000-0000-0000-{:012}", i + 1),
+                        vector: vec![1.0, 0.0, 0.0, 0.0],
+                        sparse: None,
+                        payload,
+                    }
+                })
+                .collect();
+            store
+                .upsert_points(&config.collection, points)
+                .await
+                .unwrap();
+            // Wait until every point is searchable before comparing.
+            retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    store
+                        .search(
+                            &config.collection,
+                            vec![1.0, 0.0, 0.0, 0.0],
+                            HashMap::new(),
+                            Vec::new(),
+                            10,
+                        )
+                        .await
+                        .unwrap()
+                },
+                |results| results.len() == docs.len(),
+            )
+            .await;
+
+            for (field, raw, expected) in filter_parity::cases() {
+                let filters = filter_parity::parse(field, &raw);
+                let sql = filter_parity::sqlite_paths(&db, filters.clone()).await;
+                let conditions = lower_field_filters(&filters, &indexed).unwrap();
+                let results = store
+                    .search(
+                        &config.collection,
+                        vec![1.0, 0.0, 0.0, 0.0],
+                        HashMap::new(),
+                        conditions,
+                        10,
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{field} {raw}: {e:#}"));
+                let mut live: Vec<String> = results
+                    .iter()
+                    .filter_map(|r| r.payload.get("file_path").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+                    .collect();
+                live.sort();
+                assert_eq!(live, sql, "Qdrant vs SQLite: {field} {raw}");
+                assert_eq!(sql, expected, "SQLite vs the fixture: {field} {raw}");
+            }
+        })
+        .await;
+    }
+
+    /// #350: `ensure_collection` replaces a payload index whose kind no longer matches
+    /// (as a field retyped `text` → `integer` leaves it), creates a missing one, and
+    /// drops an unprefixed index the pre-#350 shape left on a declared field's name —
+    /// read back from the server's own `payload_schema`.
+    ///
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test ensure_collection_reconciles_payload_index_kinds -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn ensure_collection_reconciles_payload_index_kinds() {
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: live_test_collection("ensure_collection_reconciles_payload_index_kinds"),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+        let _ = store.client.delete_collection(&config.collection).await;
+        // The state an older binary left: a keyword index on `fm.count` and the
+        // unprefixed `count` index of the pre-#350 shape.
+        store
+            .ensure_collection(&config.collection, 4, &[], IndexFeatures::default())
+            .await
+            .unwrap();
+
+        with_collection_cleanup(&store, &config.collection, || async {
+            for key in ["fm.count", "count"] {
+                store
+                    .client
+                    .create_field_index(
+                        CreateFieldIndexCollectionBuilder::new(
+                            &config.collection,
+                            key,
+                            FieldType::Keyword,
+                        )
+                        .wait(true),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let fields = [
+                IndexedField {
+                    name: "count".into(),
+                    kind: IndexKind::Integer,
+                },
+                IndexedField {
+                    name: "when".into(),
+                    kind: IndexKind::Datetime,
+                },
+            ];
+            store
+                .ensure_collection(&config.collection, 4, &fields, IndexFeatures::default())
+                .await
+                .unwrap();
+
+            let schema = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    let info = store
+                        .client
+                        .collection_info(&config.collection)
+                        .await
+                        .unwrap();
+                    existing_index_types(&info.result.unwrap().payload_schema)
+                },
+                |schema: &HashMap<String, PayloadSchemaType>| {
+                    schema.get("fm.count") == Some(&PayloadSchemaType::Integer)
+                        && !schema.contains_key("count")
+                },
+            )
+            .await;
+            assert_eq!(schema.get("fm.count"), Some(&PayloadSchemaType::Integer));
+            assert_eq!(schema.get("fm.when"), Some(&PayloadSchemaType::Datetime));
+            assert_eq!(schema.get("mtime"), Some(&PayloadSchemaType::Integer));
+            assert!(!schema.contains_key("count"), "{schema:?}");
         })
         .await;
     }

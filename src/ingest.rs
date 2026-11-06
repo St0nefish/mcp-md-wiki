@@ -525,9 +525,12 @@ pub fn compute_hash_from_bytes(content: &[u8]) -> String {
 /// History: `1` — #286 (heading model in `heading.rs`, section payload fields,
 /// normalized `heading_prefixes` and `section_key` paths joined with
 /// `heading::HEADING_KEY_SEPARATOR`). `2` — the `text_body_offset` payload field, so a
-/// search snippet starts past the breadcrumb/description prefix. There is no `0`: rows
-/// written before fingerprints existed carry `''`, which never matches.
-pub(crate) const CHUNKER_VERSION: u32 = 2;
+/// search snippet starts past the breadcrumb/description prefix. `3` — #350: frontmatter
+/// under the `fm` payload key, coerced by declared type, so every point is rewritten in
+/// the new shape (a full re-embed of the corpus on the first reconcile after upgrading).
+/// There is no `0`: rows written before fingerprints existed carry `''`, which never
+/// matches.
+pub(crate) const CHUNKER_VERSION: u32 = 3;
 
 /// [`chunking_fingerprint`] extended with `embedding.document_prefix`: the prefix is part
 /// of the text that gets embedded, so a change must make every file dirty. This is the
@@ -982,12 +985,10 @@ fn schema_hashes_current(
 
 /// Whether a [`FileOutcome::Refresh`] candidate can really be refreshed, given its
 /// stored `documents.frontmatter` (`None`: no metadata row, or one that could not be
-/// read). Returns the stored top-level keys — what the old payload carries, which a
-/// refresh must know to delete the ones the schema dropped — or `None` for the full
-/// re-chunk/re-embed path:
+/// read). `false` takes the full re-chunk/re-embed path:
 ///
-/// - without a stored row there is no record of the old payload keys, so a key the
-///   schema removed could never be deleted from Qdrant;
+/// - without a stored row there is no record of what the old chunks were built
+///   from (their prepended description included), so the document is rebuilt;
 /// - a schema reaches chunk text only through a `description` default, which
 ///   chunking prepends to every chunk under `chunking.prepend_description`. The
 ///   stored `description` is exactly what was prepended (it is never a derived
@@ -998,16 +999,18 @@ fn refresh_plan(
     rf: &RefreshFile,
     stored: Option<&serde_json::Map<String, serde_json::Value>>,
     chunking: &crate::config::ChunkingConfig,
-) -> Option<Vec<String>> {
-    let stored = stored?;
+) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
     if chunking.prepend_description {
         let prepended = rf.frontmatter.get("description").and_then(|v| v.as_str());
         let was_prepended = stored.get("description").and_then(|v| v.as_str());
         if prepended != was_prepended {
-            return None;
+            return false;
         }
     }
-    Some(stored.keys().cloned().collect())
+    true
 }
 
 /// Chunk a validated document: the full path's outcome (`Ready`, or `Empty`/`Invalid`
@@ -1390,7 +1393,7 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
             &pf.frontmatter,
             &pf.file_path,
             &pf.derived,
-            heading_metadata,
+            schemas.resolve_for(Path::new(&pf.file_path)),
         );
         // #130: every point for this file carries the same ancestor-path array —
         // computed once per file, not per chunk, same as `base_payload` itself.
@@ -2102,51 +2105,40 @@ fn with_derived_fields(
     out
 }
 
-/// The frontmatter part of every chunk payload for one document: its frontmatter
-/// (schema defaults applied) with the derived fields set ([`with_derived_fields`]),
-/// minus the keys the chunk's own data owns under `heading_metadata`
-/// ([`crate::qdrant::is_chunk_owned_payload_key`]), which the full path writes on top
-/// and so would overwrite anyway.
+/// The frontmatter part of every chunk payload for one document (#350): the single
+/// key [`crate::qdrant::FRONTMATTER_KEY`] holding its frontmatter (schema defaults
+/// applied) with the derived fields set ([`with_derived_fields`]), values coerced by
+/// the declared types of `schema`, the schema governing the document
+/// ([`crate::document_fields::payload_frontmatter`]). The chunk's own keys sit next to
+/// it at the top level, so none can collide with a frontmatter key.
 ///
 /// The one builder both writers use — `upsert_pending` for a full index, which adds
-/// the chunk keys on top, and [`refresh_document`] for a schema-only change (#351),
-/// which sends exactly this to [`VectorStore::refresh_file_payload`] — so a refreshed
-/// payload and a re-embedded one cannot disagree.
-fn frontmatter_payload(
+/// the chunk keys next to it, and [`refresh_document`] for a schema-only change
+/// (#351), which sends exactly this to [`VectorStore::refresh_file_payload`] — so a
+/// refreshed payload and a re-embedded one cannot disagree.
+pub(crate) fn frontmatter_payload(
     frontmatter: &HashMap<String, serde_json::Value>,
     rel_path: &str,
     derived: &std::collections::BTreeMap<String, crate::schema::DerivedField>,
-    heading_metadata: bool,
+    schema: &ResolvedSchema,
 ) -> HashMap<String, serde_json::Value> {
-    let mut payload = with_derived_fields(frontmatter, rel_path, derived);
-    payload.retain(|key, _| !crate::qdrant::is_chunk_owned_payload_key(key, heading_metadata));
-    payload
+    let with_derived = with_derived_fields(frontmatter, rel_path, derived);
+    HashMap::from([(
+        crate::qdrant::FRONTMATTER_KEY.to_string(),
+        serde_json::Value::Object(crate::document_fields::payload_frontmatter(
+            &with_derived,
+            schema,
+        )),
+    )])
 }
 
-/// The payload keys a refresh must delete (#351): `old_keys` (the document's stored
-/// frontmatter keys from before the refresh) that `new_payload` no longer carries,
-/// never a key the chunk owns under `heading_metadata`. Sorted, so the call is
-/// deterministic.
-fn removed_payload_keys(
-    old_keys: &[String],
-    new_payload: &HashMap<String, serde_json::Value>,
-    heading_metadata: bool,
-) -> Vec<String> {
-    let mut removed: Vec<String> = old_keys
-        .iter()
-        .filter(|key| {
-            !new_payload.contains_key(key.as_str())
-                && !crate::qdrant::is_chunk_owned_payload_key(key, heading_metadata)
-        })
-        .cloned()
-        .collect();
-    removed.sort();
-    removed.dedup();
-    removed
-}
-
-/// Apply a [`FileOutcome::Refresh`] (#351): no chunking, no embedding. `old_keys` are
-/// the document's stored frontmatter keys from before the refresh ([`refresh_plan`]).
+/// Apply a [`FileOutcome::Refresh`] (#351): no chunking, no embedding.
+///
+/// The payload refresh sets the one `fm` key (#350) and deletes nothing: setting a
+/// top-level key replaces its whole value, so a frontmatter key the schema dropped
+/// leaves `fm` with it. A refresh only runs when the file's indexing fingerprint
+/// (`CHUNKER_VERSION` included) matches, so its points are already in the `fm` shape
+/// and carry no top-level frontmatter keys to clear.
 ///
 /// Order matters for recovery: the Qdrant payload is refreshed first (only when the
 /// payload hash moved); then the metadata row and links; and the state row's hashes
@@ -2157,11 +2149,9 @@ fn removed_payload_keys(
 /// refresh was completely recorded.
 async fn refresh_document<Q: VectorStore>(
     rf: &RefreshFile,
-    old_keys: &[String],
     store: &Q,
     state: &StateDb,
     collection: &str,
-    heading_metadata: bool,
     schemas: &SchemaCache,
 ) -> Result<bool> {
     if rf.payload_changed {
@@ -2169,11 +2159,10 @@ async fn refresh_document<Q: VectorStore>(
             &rf.frontmatter,
             &rf.file_path,
             &rf.derived,
-            heading_metadata,
+            schemas.resolve_for(Path::new(&rf.file_path)),
         );
-        let delete_keys = removed_payload_keys(old_keys, &set, heading_metadata);
         store
-            .refresh_file_payload(collection, &rf.file_path, set, delete_keys)
+            .refresh_file_payload(collection, &rf.file_path, set)
             .await
             .with_context(|| format!("Failed to refresh the payload of '{}'", rf.file_path))?;
     }
@@ -3990,7 +3979,6 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         // #351: a refresh is confirmed against the stored metadata row; without one,
         // or when the description chunking prepends changed, the document takes the
         // full path after all (`refresh_plan`).
-        let mut refresh_old_keys: Vec<String> = Vec::new();
         let outcome = match outcome {
             FileOutcome::Refresh(rf) => {
                 let stored = match state.document_frontmatter(rel_key).await {
@@ -4005,15 +3993,11 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
                         None
                     }
                 };
-                match refresh_plan(&rf, stored.as_ref(), &config.chunking) {
-                    Some(keys) => {
-                        refresh_old_keys = keys;
-                        FileOutcome::Refresh(rf)
-                    }
-                    None => {
-                        debug!(file = %rel_key, "Refresh not possible; taking the full path");
-                        chunk_validated(*rf, &content, &chunking_fp, &config.chunking)
-                    }
+                if refresh_plan(&rf, stored.as_ref(), &config.chunking) {
+                    FileOutcome::Refresh(rf)
+                } else {
+                    debug!(file = %rel_key, "Refresh not possible; taking the full path");
+                    chunk_validated(*rf, &content, &chunking_fp, &config.chunking)
                 }
             }
             other => other,
@@ -4082,17 +4066,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
             FileOutcome::Refresh(rf) => {
                 // Valid under the new rules, like `Ready` below.
                 INDEX_STATUS.record_strict_rejection(rel_key, None);
-                if refresh_document(
-                    &rf,
-                    &refresh_old_keys,
-                    store,
-                    &state,
-                    collection,
-                    config.chunking.heading_metadata,
-                    &schemas,
-                )
-                .await?
-                {
+                if refresh_document(&rf, store, &state, collection, &schemas).await? {
                     refreshed += 1;
                 }
             }
@@ -6421,12 +6395,12 @@ mod tests {
             )
         );
         assert_eq!(
-            CHUNKER_VERSION, 2,
+            CHUNKER_VERSION, 3,
             "bumped? update the golden hash below too (sha256 of the canonical string)"
         );
         assert_eq!(
             chunking_fingerprint(&default),
-            "23b2eb529f4afa12f1c3a6377e5a61ec43b630715a9119ff06a8c6af128b1c89",
+            "502cf1309b1a49f7cc94741d212c9aae6c967548feabe92bb2697b6a73a97f39",
             "golden fingerprint drifted — see this test's comment"
         );
     }
@@ -7010,8 +6984,8 @@ mod tests {
         assert_eq!(embedder.calls(), 1);
         {
             let points = store.upserted_points.lock().unwrap();
-            assert_eq!(points[0].payload["status"], "draft");
-            assert_eq!(points[0].payload["legacy"], "x");
+            assert_eq!(points[0].payload["fm"]["status"], "draft");
+            assert_eq!(points[0].payload["fm"]["legacy"], "x");
         }
 
         // A changed default, a removed one, and a new derived field.
@@ -7032,15 +7006,12 @@ mod tests {
         assert_eq!(calls.len(), 1, "{calls:?}");
         let call = &calls[0];
         assert_eq!(call.file_path, "food/doc.md");
-        assert_eq!(call.set["status"], "active");
-        assert_eq!(call.set["domain"], "food");
-        assert_eq!(call.set["title"], "T");
-        assert_eq!(call.delete_keys, vec!["legacy".to_string()]);
-        assert!(
-            call.set
-                .keys()
-                .all(|k| !crate::qdrant::is_chunk_owned_payload_key(k, false)),
-            "a refresh never touches a chunk key"
+        // #350: the refresh sets only `fm`, wholesale — the removed default is gone
+        // from it — so no key needs deleting and no chunk key is touched.
+        assert_eq!(call.set.keys().collect::<Vec<_>>(), vec!["fm"]);
+        assert_eq!(
+            call.set["fm"],
+            serde_json::json!({"title": "T", "status": "active", "domain": "food"})
         );
 
         let db = open_scan_test_db(&config).await;
@@ -7059,12 +7030,43 @@ mod tests {
         assert_eq!(frontmatter_part, call.set);
     }
 
+    /// #350: a retype that changes how a value is written into the payload moves the
+    /// payload fingerprint, so it reaches Qdrant through the refresh path (no
+    /// re-embedding), coerced — and the refresh still equals the full path's
+    /// frontmatter part.
+    #[tokio::test]
+    async fn a_retype_refreshes_the_payload_with_the_coerced_value() {
+        let dir = TempDir::new().unwrap();
+        let config = schema_test_config(&dir);
+        write_root_schema(&dir, "fields:\n  count:\n    required: false\n");
+        std::fs::write(
+            dir.path().join("doc.md"),
+            "---\ncount: 3\n---\n# T\n\nBody.\n",
+        )
+        .unwrap();
+        let (_, first) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert!(first.upserted_points.lock().unwrap()[0].payload["fm"]["count"].is_i64());
+
+        write_root_schema(&dir, "fields:\n  count:\n    type: enum\n");
+        let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
+        assert_eq!(embedder.calls(), 0, "a retype does not embed");
+        let calls = store.refresh_calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].set["fm"]["count"], "3", "{:?}", calls[0].set);
+
+        let (_, full) = index_with_fakes(&config, &["doc.md"], true).await;
+        let points = full.upserted_points.lock().unwrap();
+        let mut frontmatter_part = points[0].payload.clone();
+        frontmatter_part.retain(|k, _| !crate::qdrant::is_chunk_owned_payload_key(k, false));
+        assert_eq!(frontmatter_part, calls[0].set);
+    }
+
     #[tokio::test]
     async fn refresh_and_full_path_agree_on_heading_named_keys_in_both_modes() {
-        // A frontmatter key spelled like a heading/section key reaches the payload
-        // only while `chunking.heading_metadata` is off (with it on, the chunk's own
-        // value wins). A refresh follows the same rule, so in both modes it sets
-        // exactly the full path's frontmatter part.
+        // A frontmatter key spelled like a heading/section key lives under `fm`
+        // (#350), so it reaches the payload whatever `chunking.heading_metadata` says
+        // and never meets the chunk's own top-level key. A refresh sets exactly the
+        // full path's frontmatter part in both modes, and sets nothing else.
         for heading_metadata in [false, true] {
             let dir = TempDir::new().unwrap();
             let mut config = schema_test_config(&dir);
@@ -7078,10 +7080,14 @@ mod tests {
             let (_, first) = index_with_fakes(&config, &["doc.md"], false).await;
             {
                 let points = first.upserted_points.lock().unwrap();
+                assert_eq!(points[0].payload["fm"]["section_key"], "authored");
+                assert_eq!(
+                    points[0].payload.contains_key("section_key"),
+                    heading_metadata,
+                    "the top-level key is the chunk's own, written only with the flag on"
+                );
                 if heading_metadata {
                     assert_ne!(points[0].payload["section_key"], "authored");
-                } else {
-                    assert_eq!(points[0].payload["section_key"], "authored");
                 }
             }
 
@@ -7090,11 +7096,11 @@ mod tests {
             assert_eq!(embedder.calls(), 0);
             let calls = store.refresh_calls();
             assert_eq!(calls.len(), 1, "heading_metadata={heading_metadata}");
-            assert_eq!(calls[0].set.contains_key("section_key"), !heading_metadata);
-            assert!(
-                calls[0].delete_keys.is_empty(),
-                "{:?}",
-                calls[0].delete_keys
+            assert_eq!(calls[0].set["fm"]["section_key"], "authored");
+            assert_eq!(
+                calls[0].set.keys().collect::<Vec<_>>(),
+                vec!["fm"],
+                "the refresh never names the chunk's own top-level key"
             );
 
             let (_, full) = index_with_fakes(&config, &["doc.md"], true).await;
@@ -7111,8 +7117,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_metadata_row_falls_back_to_the_full_path() {
-        // Without the stored frontmatter a refresh cannot know which keys to delete
-        // from Qdrant, so the document is re-embedded instead.
+        // Without the stored frontmatter a refresh cannot tell what the existing
+        // chunks were built from, so the document is re-embedded instead.
         let dir = TempDir::new().unwrap();
         let config = schema_test_config(&dir);
         write_root_schema(&dir, "fields:\n  legacy:\n    default: x\n");
@@ -7127,7 +7133,7 @@ mod tests {
         assert!(store.refresh_calls().is_empty());
         let payload = store.upserted_points.lock().unwrap()[0].payload.clone();
         assert!(!payload.contains_key("legacy"));
-        assert_eq!(payload["status"], "draft");
+        assert_eq!(payload["fm"], serde_json::json!({"status": "draft"}));
         assert_eq!(
             stored_frontmatter(&db, "doc.md").await,
             serde_json::json!({"status": "draft"})
@@ -7153,7 +7159,7 @@ mod tests {
         let (embedder, store) = index_with_fakes(&config, &["doc.md"], false).await;
         assert_eq!(embedder.calls(), 1);
         assert_eq!(
-            store.upserted_points.lock().unwrap()[0].payload["status"],
+            store.upserted_points.lock().unwrap()[0].payload["fm"]["status"],
             "active"
         );
         assert!(store.refresh_calls().is_empty());
@@ -9426,7 +9432,6 @@ mod tests {
             _collection: &str,
             _file_path: &str,
             _set: HashMap<String, serde_json::Value>,
-            _delete_keys: Vec<String>,
         ) -> Result<()> {
             Ok(())
         }
@@ -9443,7 +9448,7 @@ mod tests {
         /// exactly once per run, without needing a real Qdrant to ensure.
         ensure_collection_calls: Mutex<usize>,
         drop_collection_calls: Mutex<usize>,
-        /// Every `refresh_file_payload` call (#351): file, keys set, keys deleted.
+        /// Every `refresh_file_payload` call (#351): file and keys set.
         refresh_calls: Mutex<Vec<PayloadRefreshCall>>,
     }
 
@@ -9451,7 +9456,6 @@ mod tests {
     struct PayloadRefreshCall {
         file_path: String,
         set: HashMap<String, serde_json::Value>,
-        delete_keys: Vec<String>,
     }
 
     impl TrackingMockVectorStore {
@@ -9529,12 +9533,10 @@ mod tests {
             _collection: &str,
             file_path: &str,
             set: HashMap<String, serde_json::Value>,
-            delete_keys: Vec<String>,
         ) -> Result<()> {
             self.refresh_calls.lock().unwrap().push(PayloadRefreshCall {
                 file_path: file_path.to_string(),
                 set,
-                delete_keys,
             });
             Ok(())
         }
@@ -9588,7 +9590,6 @@ mod tests {
             _collection: &str,
             _file_path: &str,
             _set: HashMap<String, serde_json::Value>,
-            _delete_keys: Vec<String>,
         ) -> Result<()> {
             unreachable!("FixedPointCountStore is only for collection_point_count")
         }
@@ -9655,7 +9656,6 @@ mod tests {
             _collection: &str,
             _file_path: &str,
             _set: HashMap<String, serde_json::Value>,
-            _delete_keys: Vec<String>,
         ) -> Result<()> {
             Ok(())
         }
@@ -9776,7 +9776,6 @@ mod tests {
             _collection: &str,
             _file_path: &str,
             _set: HashMap<String, serde_json::Value>,
-            _delete_keys: Vec<String>,
         ) -> Result<()> {
             Ok(())
         }
@@ -10321,14 +10320,213 @@ mod tests {
             };
             {
                 let points = store.upserted_points.lock().unwrap();
-                assert_eq!(points[0].payload.get("domain"), Some(&domain));
-                assert_eq!(points[0].payload.get("node"), node.as_ref());
+                let fm = &points[0].payload;
+                assert_eq!(
+                    crate::qdrant::frontmatter_value(fm, "domain"),
+                    Some(&domain)
+                );
+                assert_eq!(crate::qdrant::frontmatter_value(fm, "node"), node.as_ref());
+                assert!(
+                    !fm.contains_key("domain"),
+                    "frontmatter is under `fm` (#350)"
+                );
             }
 
             let summaries = state.all_document_summaries().await.unwrap();
             assert_eq!(summaries[0].frontmatter["domain"], domain);
             assert_eq!(summaries[0].frontmatter.get("node"), node.as_ref());
         }
+    }
+
+    /// #350: the whole payload of one chunk, pinned — the built-in keys at the top
+    /// level, the frontmatter under `fm` with nested objects and lists kept
+    /// structurally and each declared value coerced by its type (an integral float
+    /// under `integer`, a number under `number`, an enum written as a number, dates
+    /// and timestamps as RFC 3339 UTC), undeclared values as written, and a derived
+    /// field set from the path.
+    #[tokio::test]
+    async fn upsert_pending_payload_shape_golden() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  count:\n    type: integer\n  rating:\n    type: number\n  \
+             code:\n    type: enum\n  published:\n    type: date\n  seen:\n    type: timestamp\n  \
+             planning:\n    fields:\n      prep:\n        type: integer\n  npcs:\n    type: list\n    \
+             items:\n      type: object\n      fields:\n        met:\n          type: date\n",
+        )
+        .unwrap();
+        let schemas =
+            SchemaCache::build_for_test(dir.path(), &crate::config::FrontmatterConfig::default());
+        let state = test_state_db(&dir).await;
+        let mut pf = make_pending("food/a.md", 1, 0);
+        pf.derived = derived_spec(&[("domain", 0)]);
+        pf.frontmatter = serde_json::json!({
+            "title": "A",
+            "count": 3.0,
+            "rating": 4,
+            "code": 7,
+            "published": "2024-01-02",
+            "seen": "2024-01-02T10:00:00.250+02:00",
+            "planning": {"prep": 20.0, "notes": "free"},
+            "npcs": [{"met": "2023-12-31", "name": "Ada"}],
+            "loose": 2.0,
+            "tags": ["x"]
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .collect();
+        let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]]);
+        let store = MockVectorStore::all_ok();
+        upsert_pending(
+            &[pf],
+            &embedder,
+            &store,
+            &state,
+            "test-col",
+            false,
+            &schemas,
+        )
+        .await
+        .unwrap();
+
+        let points = store.upserted_points.lock().unwrap();
+        let payload: serde_json::Value = points[0].payload.clone().into_iter().collect();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "file_path": "food/a.md",
+                "mtime": 1_700_000_000,
+                "chunk_index": 0,
+                "text": "chunk 0",
+                "text_body_offset": 0,
+                "line_start": 1,
+                "line_end": 10,
+                "path_ancestors": ["food", "food/a.md"],
+                "fm": {
+                    "title": "A",
+                    "domain": "food",
+                    "count": 3,
+                    "rating": 4,
+                    "code": "7",
+                    "published": "2024-01-02T00:00:00Z",
+                    "seen": "2024-01-02T08:00:00.250Z",
+                    "planning": {"prep": 20, "notes": "free"},
+                    "npcs": [{"met": "2023-12-31T00:00:00Z", "name": "Ada"}],
+                    "loose": 2.0,
+                    "tags": ["x"]
+                }
+            })
+        );
+        // Integers are JSON integers (Qdrant's integer index); a `number` keeps the
+        // JSON number written (a float index holds integers too).
+        assert!(payload["fm"]["count"].is_i64());
+        assert!(payload["fm"]["rating"].is_i64());
+        assert!(payload["fm"]["loose"].is_f64(), "undeclared: as written");
+    }
+
+    /// The frontmatter coercion on its own (#350): a value its type cannot represent
+    /// is written as it is — an unparseable date stays its text, a fractional value
+    /// under `integer` stays a float — a scalar under `text` is its canonical text
+    /// (what the metadata index's `value_text` holds), list elements follow `items`,
+    /// and an undeclared field is never coerced.
+    #[test]
+    fn frontmatter_payload_keeps_values_their_type_cannot_represent() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  when:\n    type: date\n  count:\n    type: integer\n  label:\n    \
+             type: text\n  scores:\n    type: list\n    items:\n      type: number\n",
+        )
+        .unwrap();
+        let schemas =
+            SchemaCache::build_for_test(dir.path(), &crate::config::FrontmatterConfig::default());
+        let fm: HashMap<String, serde_json::Value> = serde_json::json!({
+            "when": "someday", "count": 2.5, "label": true, "scores": [1, 2.5], "other": "2024-01-02"
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .collect();
+        let payload = frontmatter_payload(
+            &fm,
+            "a.md",
+            &Default::default(),
+            schemas.resolve_for(Path::new("a.md")),
+        );
+        assert_eq!(
+            serde_json::Value::Object(payload["fm"].as_object().unwrap().clone()),
+            serde_json::json!({
+                "when": "someday",
+                "count": 2.5,
+                "label": "true",
+                "scores": [1, 2.5],
+                "other": "2024-01-02"
+            })
+        );
+    }
+
+    /// One path declared `integer` at the root and `number` below (#350): the
+    /// collection keeps the first kind, an integer index, so the `number` scope's
+    /// integer values must stay JSON integers for that index to hold them.
+    #[test]
+    fn a_number_scope_under_an_integer_index_keeps_integers_integral() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  n:\n    type: integer\n    indexed: true\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(
+            dir.path().join("sub").join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  n:\n    type: number\n",
+        )
+        .unwrap();
+        let schemas =
+            SchemaCache::build_for_test(dir.path(), &crate::config::FrontmatterConfig::default());
+        assert_eq!(
+            schemas
+                .all_indexed_fields()
+                .into_iter()
+                .map(|f| (f.name, f.kind))
+                .collect::<Vec<_>>(),
+            vec![("n".to_string(), crate::qdrant::IndexKind::Integer)]
+        );
+        let fm: HashMap<String, serde_json::Value> =
+            HashMap::from([("n".to_string(), serde_json::json!(3))]);
+        let payload = frontmatter_payload(
+            &fm,
+            "sub/a.md",
+            &Default::default(),
+            schemas.resolve_for(Path::new("sub/a.md")),
+        );
+        assert!(payload["fm"]["n"].is_i64(), "{payload:?}");
+    }
+
+    /// A nanosecond timestamp is written with at most six fractional digits (#350),
+    /// rounded the way query bounds are (`qdrant::epoch_to_timestamp`).
+    #[test]
+    fn payload_datetimes_round_to_the_microsecond() {
+        assert_eq!(
+            crate::document_fields::payload_datetime("2024-01-02T10:00:00.123456789+02:00")
+                .as_deref(),
+            Some("2024-01-02T08:00:00.123457Z")
+        );
+        assert_eq!(
+            crate::document_fields::payload_datetime("2024-01-02T00:00:00.5Z").as_deref(),
+            Some("2024-01-02T00:00:00.500Z")
+        );
+        assert_eq!(
+            crate::document_fields::payload_datetime("2024-01-02").as_deref(),
+            Some("2024-01-02T00:00:00Z")
+        );
+        let bound = crate::qdrant::epoch_to_timestamp(
+            crate::document_fields::epoch_seconds("2024-01-02T10:00:00.123456789+02:00").unwrap(),
+        );
+        assert_eq!(bound.nanos, 123_457_000, "a bound rounds the same way");
     }
 
     /// #286: `heading_path`/`heading_level`/`heading_prefixes`/

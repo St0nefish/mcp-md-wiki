@@ -717,9 +717,7 @@ fn to_api_result(r: &SearchResult, data_path: &Path) -> ApiSearchResult {
     ApiSearchResult {
         score: r.score,
         file_path: retrieval::relative_to_data(file_path_raw, data_path),
-        title: r
-            .payload
-            .get("title")
+        title: crate::qdrant::frontmatter_value(&r.payload, "title")
             .and_then(|v| v.as_str())
             .unwrap_or("(untitled)")
             .to_string(),
@@ -2725,7 +2723,8 @@ mod tests {
             "file_path".to_string(),
             serde_json::json!("/data/food/a.md"),
         );
-        payload.insert("title".to_string(), serde_json::json!("A Doc"));
+        // Frontmatter under `fm`, as `ingest::upsert_pending` writes it (#350).
+        payload.insert("fm".to_string(), serde_json::json!({"title": "A Doc"}));
         payload.insert("text".to_string(), serde_json::json!("chunk text"));
         payload.insert("line_start".to_string(), serde_json::json!(1));
         payload.insert("line_end".to_string(), serde_json::json!(10));
