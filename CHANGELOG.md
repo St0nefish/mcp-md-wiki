@@ -340,6 +340,48 @@ schema rebuild and fails to start.
 
 ### Added
 
+- **Corpus health checks** (#354, milestone 2). `mcp-md-wiki lint` gains `orphans`,
+  `stale`, `oversize` and `tags` next to `dead-links`, driven by a new `lint:` config
+  section (per-check switches, `orphan_entry_points`, `stale_after_days` /
+  `draft_stale_after_days` / `stale_field`, `max_lines` / `max_bytes`, `tags_field`;
+  all live-reloadable, defaults in `deploy/config.example.yaml`), and the same report
+  is served at `GET /status/lint?check=&limit=` (behind the `/status` auth; 503 before
+  the first index) for an external scheduler to poll. Severities are fixed: dead links
+  and tags outside a declared enum are `error`, orphans / stale / oversize are
+  `warning`, singleton tags are `info`. Read-only over the state DB, the schema tree
+  and (oversize only) every indexed file larger than `lint.max_lines` bytes, read from disk; no reindex, no schema or state change.
+  **Behavior change:** `lint` with no `--check` now runs every check `lint:` enables
+  (all five by default) instead of dead links only, `--check` is repeatable, and
+  `--json` prints a new envelope (`{"checks": [{check, severity, count, findings,
+  ...}]}`) rather than the old dead-link document list; `--limit` now caps findings
+  per check. The exit code is unchanged (0 unless there is no state DB), and
+  `GET /status/links` is unchanged.
+- **Report-only contradiction detection** (#355). New `mcp-md-wiki contradictions`
+  subcommand (`--json`, `--no-judge`, `--list`) and `GET /status/contradictions?limit=`
+  (behind the `/status` auth; 503 before the first index), driven by a new
+  `contradictions:` config section. For each document whose content changed since
+  it was last analysed, a run finds its nearest neighbours from the vector already
+  stored for its first chunk (no embedding calls; a conflict confined to a later
+  section can be missed), keeps those scoring at least `min_similarity` (at most
+  `top_k` per document) and — only when a judge is configured — has an LLM decide
+  whether each pair conflicts; otherwise pairs are stored as `candidate`. Findings
+  go to the state DB; **no document is modified** and no schema field is written
+  (`contested` / `contradictions` / `confidence` metadata fields are deferred). A
+  pair is evaluated once per version of its two documents, `max_pairs_per_run` caps a
+  run (the rest carries over) and a failed judge call is stored with its `error` and
+  retried. `contradictions.enabled` (default `false`) runs the same pass every
+  `interval_secs` (default 86400) inside `serve`, the first run five minutes after
+  startup, waiting up to five minutes for an in-flight indexing run to end before
+  skipping to the next interval; `enabled`, `interval_secs`, `top_k`, `min_similarity` and
+  `max_pairs_per_run` are live-reloadable, the judge settings need a restart. The
+  judge is **off by default** and no model is chosen for you: `judge: true` needs
+  `CONTRADICTIONS_JUDGE_MODEL`, `CONTRADICTIONS_JUDGE_BASE_URL` (required for
+  `judge_provider: openai`, optional for `anthropic`) and, for `anthropic`, an API key
+  from `judge_api_key_env`. **With `judge_provider: anthropic` the text of judged
+  documents is sent to Anthropic's API**; `openai` pointed at a self-hosted
+  OpenAI-compatible server keeps everything local. Upgrade: two additive tables
+  (`contradiction_docs`, `contradiction_pairs`) are created on open; no reindex, no
+  re-embed, nothing to do unless you turn the job on.
 - **Schema list element definitions (`items`) and one path grammar** (#346). A
   `.schema.yaml` field (and `update_schema`'s `set_field` `definition`) accepts
   `items:`, the definition of each element of a list — a scalar, or an `object` with

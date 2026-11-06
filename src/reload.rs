@@ -1245,6 +1245,221 @@ const DIFF_TABLE: &[DiffField] = &[
                    layer is never rebuilt.",
         }],
     },
+    // ── lint ─────────────────────────────────────────────────────────────────
+    // Every `lint.*` key is read from the live config on each `lint` run and each
+    // `GET /status/lint` request (`lint::run_health_checks`'s callers load a fresh
+    // snapshot), so a reload applies to the next one. No indexing is involved.
+    DiffField {
+        path: "lint.dead_links",
+        get: |c| Some(d(&c.lint.dead_links)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.dead_links",
+            note: "read fresh by the next lint run / GET /status/lint request when no check is named.",
+        }],
+    },
+    DiffField {
+        path: "lint.orphans",
+        get: |c| Some(d(&c.lint.orphans)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.orphans",
+            note: "read fresh by the next lint run / GET /status/lint request when no check is named.",
+        }],
+    },
+    DiffField {
+        path: "lint.stale",
+        get: |c| Some(d(&c.lint.stale)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.stale",
+            note: "read fresh by the next lint run / GET /status/lint request when no check is named.",
+        }],
+    },
+    DiffField {
+        path: "lint.oversize",
+        get: |c| Some(d(&c.lint.oversize)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.oversize",
+            note: "read fresh by the next lint run / GET /status/lint request when no check is named.",
+        }],
+    },
+    DiffField {
+        path: "lint.tags",
+        get: |c| Some(d(&c.lint.tags)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.tags",
+            note: "read fresh by the next lint run / GET /status/lint request when no check is named.",
+        }],
+    },
+    DiffField {
+        path: "lint.orphan_entry_points",
+        get: |c| Some(d(&c.lint.orphan_entry_points)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.orphan_entry_points",
+            note: "read fresh by the next orphan check (lint.rs).",
+        }],
+    },
+    DiffField {
+        path: "lint.stale_after_days",
+        get: |c| Some(d(&c.lint.stale_after_days)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.stale_after_days",
+            note: "read fresh by the next stale check (lint.rs).",
+        }],
+    },
+    DiffField {
+        path: "lint.draft_stale_after_days",
+        get: |c| Some(d(&c.lint.draft_stale_after_days)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.draft_stale_after_days",
+            note: "read fresh by the next stale check (lint.rs).",
+        }],
+    },
+    DiffField {
+        path: "lint.stale_field",
+        get: |c| Some(d(&c.lint.stale_field)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.stale_field",
+            note: "read fresh by the next stale check (lint.rs); the frontmatter is read from \
+                   the state DB, so no reindex is needed.",
+        }],
+    },
+    DiffField {
+        path: "lint.max_lines",
+        get: |c| Some(d(&c.lint.max_lines)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.max_lines",
+            note: "read fresh by the next oversize check (lint.rs).",
+        }],
+    },
+    DiffField {
+        path: "lint.max_bytes",
+        get: |c| Some(d(&c.lint.max_bytes)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.max_bytes",
+            note: "read fresh by the next oversize check (lint.rs); unset falls back to \
+                   search.section_max_bytes.",
+        }],
+    },
+    DiffField {
+        path: "lint.tags_field",
+        get: |c| Some(d(&c.lint.tags_field)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "lint.tags_field",
+            note: "read fresh by the next tag audit (lint.rs).",
+        }],
+    },
+    // ── contradictions (#355) ────────────────────────────────────────────────
+    // The scheduled job is always spawned (server.rs run_server) and every run loads a
+    // fresh snapshot, so the tuning keys apply to the next tick. The judge client
+    // (provider, endpoint, model, key, timeout, document budget) is built once at
+    // startup; its env-only values (CONTRADICTIONS_JUDGE_MODEL, _BASE_URL, the key
+    // itself) cannot change in a running process, so they have no row of their own.
+    DiffField {
+        path: "contradictions.enabled",
+        get: |c| Some(d(&c.contradictions.enabled)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "contradictions.enabled",
+            note: "the scheduled job re-reads it on every tick (server.rs run_server), so a \
+                   reload switches it on or off without a restart.",
+        }],
+    },
+    DiffField {
+        path: "contradictions.interval_secs",
+        get: |c| Some(d(&c.contradictions.interval_secs)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "contradictions.interval_secs",
+            note: "read fresh before every sleep of the scheduled job (server.rs \
+                   periodic_job_loop), so the new interval governs the next one.",
+        }],
+    },
+    DiffField {
+        path: "contradictions.top_k",
+        get: |c| Some(d(&c.contradictions.top_k)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "contradictions.top_k",
+            note: "read fresh by the next run (contradictions.rs run_once).",
+        }],
+    },
+    DiffField {
+        path: "contradictions.min_similarity",
+        get: |c| Some(d(&c.contradictions.min_similarity)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "contradictions.min_similarity",
+            note: "read fresh by the next run (contradictions.rs run_once).",
+        }],
+    },
+    DiffField {
+        path: "contradictions.max_pairs_per_run",
+        get: |c| Some(d(&c.contradictions.max_pairs_per_run)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "contradictions.max_pairs_per_run",
+            note: "read fresh by the next run (contradictions.rs run_once).",
+        }],
+    },
+    DiffField {
+        path: "contradictions.judge",
+        get: |c| Some(d(&c.contradictions.judge)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "contradictions.judge",
+            note: "whether the scheduled job holds a judge client at all is decided once at \
+                   startup (server.rs run_server); a reload cannot add or remove it.",
+        }],
+    },
+    DiffField {
+        path: "contradictions.judge_provider",
+        get: |c| Some(d(&c.contradictions.judge_provider)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "contradictions.judge_provider",
+            note: "the judge client is built once at startup (judge.rs build_judge); a reload \
+                   cannot hand the running job a client for another wire format.",
+        }],
+    },
+    DiffField {
+        path: "contradictions.judge_api_key_env",
+        get: |c| Some(d(&c.contradictions.judge_api_key_env)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "contradictions.judge_api_key_env",
+            note: "the judge client bakes in the key resolved at startup (judge.rs build_judge).",
+        }],
+    },
+    DiffField {
+        path: "contradictions.judge_timeout_secs",
+        get: |c| Some(d(&c.contradictions.judge_timeout_secs)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "contradictions.judge_timeout_secs",
+            note: "the judge client bakes in its request timeout at construction (judge.rs).",
+        }],
+    },
+    DiffField {
+        path: "contradictions.judge_max_document_bytes",
+        get: |c| Some(d(&c.contradictions.judge_max_document_bytes)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "contradictions.judge_max_document_bytes",
+            note: "the scheduled job's judge settings are resolved once at startup \
+                   (server.rs run_server).",
+        }],
+    },
 ];
 
 /// Compare every YAML-reloadable setting between `old` and `new`, recording each one
@@ -1750,6 +1965,83 @@ mod tests {
         assert_eq!(report.applied[0].setting, "search.phrase");
         assert!(report.restart_required.is_empty());
         assert!(report.reindex_required.is_empty());
+    }
+
+    #[test]
+    fn lint_settings_are_reported_as_applied() {
+        let mut old = base_config();
+        let mut new = base_config();
+        old.lint.orphans = true;
+        new.lint.orphans = false;
+        old.lint.stale_after_days = 365;
+        new.lint.stale_after_days = 30;
+        new.lint.max_bytes = Some(5000);
+        new.lint.orphan_entry_points = vec!["index.md".into()];
+
+        let report = diff(&old, &new);
+        let mut applied: Vec<&str> = report.applied.iter().map(|c| c.setting.as_str()).collect();
+        applied.sort_unstable();
+        assert_eq!(
+            applied,
+            [
+                "lint.max_bytes",
+                "lint.orphan_entry_points",
+                "lint.orphans",
+                "lint.stale_after_days"
+            ]
+        );
+        assert!(report.restart_required.is_empty());
+        assert!(report.reindex_required.is_empty());
+        assert!(report.reindex_scheduled.is_empty());
+    }
+
+    #[test]
+    fn contradictions_tuning_is_applied_and_judge_wiring_needs_a_restart() {
+        let mut old = base_config();
+        let mut new = base_config();
+        new.contradictions.enabled = true;
+        new.contradictions.interval_secs = 3600;
+        new.contradictions.top_k = 8;
+        new.contradictions.min_similarity = 0.9;
+        new.contradictions.max_pairs_per_run = 10;
+        new.contradictions.judge = true;
+        new.contradictions.judge_provider = crate::judge::Provider::Anthropic;
+        new.contradictions.judge_api_key_env = "OTHER_KEY".into();
+        new.contradictions.judge_timeout_secs = 30;
+        new.contradictions.judge_max_document_bytes = 1000;
+        old.contradictions.judge = false;
+
+        let report = diff(&old, &new);
+        let mut applied: Vec<&str> = report.applied.iter().map(|c| c.setting.as_str()).collect();
+        applied.sort_unstable();
+        assert_eq!(
+            applied,
+            [
+                "contradictions.enabled",
+                "contradictions.interval_secs",
+                "contradictions.max_pairs_per_run",
+                "contradictions.min_similarity",
+                "contradictions.top_k",
+            ]
+        );
+        let mut restart: Vec<&str> = report
+            .restart_required
+            .iter()
+            .map(|c| c.setting.as_str())
+            .collect();
+        restart.sort_unstable();
+        assert_eq!(
+            restart,
+            [
+                "contradictions.judge",
+                "contradictions.judge_api_key_env",
+                "contradictions.judge_max_document_bytes",
+                "contradictions.judge_provider",
+                "contradictions.judge_timeout_secs",
+            ]
+        );
+        assert!(report.reindex_required.is_empty());
+        assert!(report.reindex_scheduled.is_empty());
     }
 
     #[test]

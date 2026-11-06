@@ -6683,6 +6683,9 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
         search: crate::config::SearchConfig::default(),
         reranking: None,
         ui: crate::config::UiConfig::default(),
+        lint: crate::config::LintConfig::default(),
+        contradictions: crate::config::ContradictionsConfig::default(),
+        contradictions_judge: None,
         provenance: Default::default(),
     })
 }
@@ -14544,6 +14547,9 @@ mod tests {
             search: crate::config::SearchConfig::default(),
             reranking: None,
             ui: crate::config::UiConfig::default(),
+            lint: crate::config::LintConfig::default(),
+            contradictions: crate::config::ContradictionsConfig::default(),
+            contradictions_judge: None,
             provenance: Default::default(),
         });
 
@@ -14809,6 +14815,9 @@ mod tests {
             search: crate::config::SearchConfig::default(),
             reranking: None,
             ui: crate::config::UiConfig::default(),
+            lint: crate::config::LintConfig::default(),
+            contradictions: crate::config::ContradictionsConfig::default(),
+            contradictions_judge: None,
             provenance: Default::default(),
         });
 

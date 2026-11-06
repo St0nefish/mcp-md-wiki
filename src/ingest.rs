@@ -1637,7 +1637,7 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
 /// — for the same reason `VectorStore`/`EmbedStore` above are traits:
 /// `update_semantic_edges` runs against a fake in tests, with no live Qdrant service
 /// required.
-trait NeighborStore: Send + Sync {
+pub(crate) trait NeighborStore: Send + Sync {
     async fn recommend_by_point_id(
         &self,
         collection: &str,
@@ -4535,6 +4535,9 @@ mod tests {
             search: Default::default(),
             reranking: None,
             ui: Default::default(),
+            lint: Default::default(),
+            contradictions: Default::default(),
+            contradictions_judge: None,
             provenance: Default::default(),
         }
     }

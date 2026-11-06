@@ -4,7 +4,7 @@ mcp-md-wiki can act as an **OAuth 2.1 resource server**: MCP clients get an acce
 token from your identity provider (the *authorization server*, AS) and present it on
 every request, and the server verifies it locally against the provider's published
 signing keys. This is the recommended way to protect `/mcp`, `/status`, `/metrics`,
-`/status/links`, `POST /admin/reload` and `POST /admin/sync`.
+`/status/links`, `/status/lint`, `/status/contradictions`, `POST /admin/reload` and `POST /admin/sync`.
 
 The validator, JWKS handling, RFC 9728 metadata, `WWW-Authenticate` challenges and
 the auth middleware itself live in a separate, general-purpose crate,

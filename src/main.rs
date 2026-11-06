@@ -1,5 +1,6 @@
 mod chunk;
 mod config;
+mod contradictions;
 mod descriptions;
 mod document_fields;
 mod embed;
@@ -7,6 +8,7 @@ mod eval;
 mod git;
 mod heading;
 mod ingest;
+mod judge;
 mod lint;
 mod mcp;
 mod qdrant;
@@ -139,13 +141,6 @@ struct GetArgs {
     end_line: Option<usize>,
 }
 
-/// Checks the `lint` subcommand can run.
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum LintCheck {
-    /// Broken internal markdown links across the corpus
-    DeadLinks,
-}
-
 #[derive(Subcommand)]
 enum Commands {
     /// Start the server (MCP + webhook endpoints) [default]
@@ -181,21 +176,53 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Run corpus-wide lint checks against the last indexed state (#354)
+    /// Run corpus health checks against the last indexed state (#354)
     ///
-    /// Read-only: reads the state DB, never creates it. Findings are reported, not
-    /// failed on: the exit code is 0 whether or not anything is found, and non-zero
-    /// only when there is no state DB to read (run `index` first). That keeps the
-    /// command safe to run from cron or CI without turning link rot into an outage.
+    /// Checks: dead-links, orphans, stale, oversize and tags (singleton tags and tags
+    /// outside a declared enum). With no `--check`, every check the `lint:` config
+    /// section enables runs; naming checks runs exactly those, whatever the config
+    /// says. Read-only: reads the state DB (never creates it), the schema tree and,
+    /// for oversize, the larger files; no Qdrant, no embeddings. Findings are
+    /// reported, not failed on: the exit code is 0 whether or not anything is found,
+    /// and non-zero only when there is no state DB to read (run `index` first). That
+    /// keeps the command safe to run from cron or CI without turning link rot into an
+    /// outage.
     Lint {
-        /// Which check to run (more will be added; dead-links is the default)
-        #[arg(long, value_enum, default_value_t = LintCheck::DeadLinks)]
-        check: LintCheck,
-        /// Emit the report as JSON on stdout
+        /// Which check to run; repeatable (default: the checks `lint:` enables)
+        #[arg(long, value_enum)]
+        check: Vec<lint::Check>,
+        /// Emit the report as JSON on stdout: {"checks": [{check, severity, count,
+        /// findings, ...}]}
         #[arg(long)]
         json: bool,
-        /// Maximum broken links to list (the true count is always reported)
+        /// Maximum findings to list per check (the true count is always reported)
         #[arg(long, default_value_t = lint::DEFAULT_DEAD_LINK_LIMIT)]
+        limit: usize,
+    },
+    /// Find documents that make conflicting claims, report-only (#355)
+    ///
+    /// For every document whose content changed since the last run, finds its nearest
+    /// neighbours in Qdrant (by the vector stored for its first chunk; no embedding
+    /// call) and records each close pair. With a judge configured (`contradictions.judge`
+    /// plus the `CONTRADICTIONS_JUDGE_*` environment variables) an LLM decides whether
+    /// each pair conflicts; without one, pairs are recorded as `candidate`. Nothing is
+    /// written to any document. Runs once whatever `contradictions.enabled` says, needs
+    /// Qdrant and an existing index, and exits 0 whether or not conflicts are found. A
+    /// pair already evaluated for the current text of both documents is not evaluated
+    /// again, so repeat runs only pay for what changed. With a judge, the text of judged
+    /// pairs is sent to the judge's endpoint.
+    Contradictions {
+        /// Emit JSON on stdout: the run summary, or with --list the stored pairs
+        #[arg(long)]
+        json: bool,
+        /// Record candidate pairs without asking the judge, even if one is configured
+        #[arg(long, conflicts_with = "list")]
+        no_judge: bool,
+        /// Only print the pairs stored by earlier runs; run nothing (needs no Qdrant)
+        #[arg(long)]
+        list: bool,
+        /// With --list, the most pairs to show (the true count is always reported)
+        #[arg(long, default_value_t = contradictions::DEFAULT_LIST_LIMIT, requires = "list")]
         limit: usize,
     },
     /// Print collection stats and state DB info
@@ -467,16 +494,105 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("no index at {state_db_path}; run `mcp-md-wiki index` first");
             }
             let state = state::StateDb::new(std::path::Path::new(&state_db_path)).await?;
-            match check {
-                LintCheck::DeadLinks => {
-                    let limit = limit.clamp(1, lint::MAX_DEAD_LINK_LIMIT);
-                    let report =
-                        lint::dead_links(&state, Path::new(cfg.data_path()), limit).await?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
-                    } else {
-                        lint::write_dead_links(&mut std::io::stdout().lock(), &report)?;
+            let checks = if check.is_empty() {
+                lint::enabled_checks(&cfg.lint)
+            } else {
+                check
+            };
+            // The schema tree gives the tag check its permitted values. An invalid
+            // tree must not stop the other checks: the tag check says it was skipped.
+            let schemas = if checks.contains(&lint::Check::Tags) {
+                match schema::SchemaCache::build(
+                    &cfg.canonical_data_path(),
+                    &cfg.frontmatter,
+                    &cfg.indexing,
+                ) {
+                    Ok(schemas) => Some(schemas),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: {} schema file(s) are invalid (run `validate` for \
+                             details); tags outside a declared enum are not checked",
+                            e.invalid.len()
+                        );
+                        None
                     }
+                }
+            } else {
+                None
+            };
+            let ctx =
+                lint::HealthContext::new(&state, &cfg, schemas.as_ref(), lint::now_epoch_seconds());
+            let report = lint::run_health_checks(&ctx, &checks, limit).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                lint::write_health(&mut std::io::stdout().lock(), &report)?;
+            }
+        }
+        Commands::Contradictions {
+            json,
+            no_judge,
+            list,
+            limit,
+        } => {
+            let state_db_path = cfg.state_db_path();
+            if !std::path::Path::new(&state_db_path).exists() {
+                anyhow::bail!("no index at {state_db_path}; run `mcp-md-wiki index` first");
+            }
+            let state = state::StateDb::new(std::path::Path::new(&state_db_path)).await?;
+            if list {
+                let report = contradictions::pairs_report(&state, limit).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    contradictions::write_pairs(&mut std::io::stdout().lock(), &report)?;
+                }
+            } else {
+                let judge = match (&cfg.contradictions_judge, no_judge) {
+                    (Some(j), false) => Some(
+                        judge::build_judge(
+                            j.provider,
+                            &j.base_url,
+                            &j.model,
+                            j.api_key.clone(),
+                            j.request_timeout,
+                        )
+                        .context("Failed to build the contradiction judge")?,
+                    ),
+                    _ => None,
+                };
+                let max_document_bytes = cfg
+                    .contradictions_judge
+                    .as_ref()
+                    .map_or(cfg.contradictions.judge_max_document_bytes, |j| {
+                        j.max_document_bytes
+                    });
+                let qdrant = qdrant::QdrantStore::new(&cfg.qdrant)?;
+                let data_path = cfg.canonical_data_path();
+                let deps = contradictions::RunDeps {
+                    state: &state,
+                    neighbors: &qdrant,
+                    collection: &cfg.qdrant.collection,
+                    judge: judge.as_deref(),
+                    data_path: &data_path,
+                    params: contradictions::RunParams::new(&cfg.contradictions, max_document_bytes),
+                };
+                // Ctrl-C stops the run between pairs; what was evaluated is kept.
+                let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = std::sync::Arc::clone(&interrupted);
+                tokio::spawn(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+                let summary = contradictions::run_once(&deps, &|| {
+                    interrupted.load(std::sync::atomic::Ordering::SeqCst)
+                })
+                .await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    contradictions::write_summary(&mut std::io::stdout().lock(), &summary)?;
                 }
             }
         }
@@ -1209,6 +1325,37 @@ mod tests {
             Cli::try_parse_from(["mcp-md-wiki", "get", "notes.md", "--start-line", "-3"]).is_err(),
             "a negative line number should never reach the range validator"
         );
+    }
+
+    #[test]
+    fn contradictions_flags_parse_and_conflict_where_they_should() {
+        let parsed =
+            Cli::try_parse_from(["mcp-md-wiki", "contradictions", "--json", "--no-judge"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Contradictions {
+                json: true,
+                no_judge: true,
+                list: false,
+                ..
+            })
+        ));
+        let parsed =
+            Cli::try_parse_from(["mcp-md-wiki", "contradictions", "--list", "--limit", "7"])
+                .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Contradictions {
+                list: true,
+                limit: 7,
+                ..
+            })
+        ));
+        // A listing runs no judge, and `--limit` only means something for a listing.
+        assert!(
+            Cli::try_parse_from(["mcp-md-wiki", "contradictions", "--list", "--no-judge"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["mcp-md-wiki", "contradictions", "--limit", "7"]).is_err());
     }
 
     fn render(status: &StatusResponse) -> String {
