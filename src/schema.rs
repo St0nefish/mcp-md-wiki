@@ -4,12 +4,21 @@
 //! `CLAUDE.md` cascades. Deeper files refine shallower ones, so a `recipes/` folder can
 //! require `planning.cook_minutes` without that field meaning anything elsewhere.
 //!
-//! Internally a schema is a **flat map keyed by dot-path** (`planning.prep_minutes`).
-//! Nested YAML is accepted as authoring sugar and flattened at parse time: merging
-//! nested structures raises questions a flat set simply does not have — whether
-//! redefining a container replaces its children, what happens when one level calls a
-//! path a leaf and another calls it a container — and none of those ambiguities buy
-//! anything.
+//! A resolved schema is a **tree** of [`FieldDef`] nodes (#346): an object's child
+//! fields hang off its node, and a list's element schema is its `items` node. Paths
+//! into it use one grammar, [`FieldPath`]: `a.b` (a child field), `a[]` (the elements
+//! of list `a`), `a[].b` (a field of each element). Nested `fields:` and a flat
+//! dot-path key are two spellings of the same node, so authoring style never changes
+//! the result. Cascading merges node by node and **attribute by attribute**
+//! ([`ResolvedSchema::merged_with`]): a deeper scope that redeclares a field only
+//! overrides the attributes it writes, and redefining a container never drops its
+//! inherited children. Each node records which scope set each attribute.
+//!
+//! Most consumers read the schema's **flat dot-path view** ([`ResolvedFields`]):
+//! every declared field outside a list's `items`, keyed by dot-path
+//! (`planning.prep_minutes`), containers included. Fields under `items` (`a[]…`) live
+//! only in the tree for now — reachable through [`ResolvedFields::lookup`] — and are
+//! not validated, indexed or offered as filter vocabulary.
 //!
 //! Deployments with no schema files keep working: the global `frontmatter` block in
 //! `config.yaml` becomes the implicit root schema via [`ResolvedSchema::from_config`].
@@ -141,19 +150,244 @@ pub enum FieldType {
 }
 
 impl FieldType {
-    fn describe(self) -> &'static str {
-        match self {
-            FieldType::Text => "text",
-            FieldType::Integer => "an integer",
-            FieldType::Number => "a number",
-            FieldType::Boolean => "a boolean",
-            FieldType::Enum => "a scalar value",
-            FieldType::List => "a list",
-            FieldType::Date => "a date (YYYY-MM-DD)",
-            FieldType::Timestamp => "an RFC 3339 timestamp",
-            FieldType::Object => "an object",
+    /// Every type, in declaration order (the order of [`FIELD_KINDS`]).
+    pub const ALL: [FieldType; 9] = [
+        FieldType::Text,
+        FieldType::Integer,
+        FieldType::Number,
+        FieldType::Boolean,
+        FieldType::Enum,
+        FieldType::List,
+        FieldType::Date,
+        FieldType::Timestamp,
+        FieldType::Object,
+    ];
+
+    /// How this type behaves in every layer that interprets a declared type.
+    pub fn kind(self) -> &'static FieldKind {
+        &FIELD_KINDS[self as usize]
+    }
+
+    /// The name a schema file, `get_schema` and the web UI spell this type with —
+    /// the same lowercase name it (de)serializes as.
+    pub fn name(self) -> &'static str {
+        self.kind().name
+    }
+}
+
+/// How a declared [`FieldType`]'s values will carry a numeric `value_num` in the
+/// metadata projection once it is schema-driven (#349). Not read by production code
+/// yet: `document_fields::numeric_value` still derives `value_num` from the JSON
+/// value alone, which this mapping matches for every type today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericValue {
+    /// No numeric value.
+    None,
+    /// The JSON number itself.
+    Number,
+    /// `1.0` for true, `0.0` for false, as `document_fields::numeric_value` stores a
+    /// boolean.
+    Boolean,
+}
+
+/// Everything a declared [`FieldType`] means to the layers that interpret it (#346):
+/// what a value must look like (validation), how its type is named and described,
+/// which Qdrant payload index serves it (and so which range filters work on it:
+/// [`IndexKind::supports_range`]), and whether `get_schema` lists the values
+/// documents use. It also carries the `value_num` mapping the schema-driven
+/// projection (#349) will consume, which nothing reads yet ([`Self::numeric`]).
+/// One row per type in [`FIELD_KINDS`], read through [`FieldType::kind`], so these
+/// mappings cannot drift apart.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldKind {
+    /// The lowercase name; matches the type's serde spelling.
+    pub name: &'static str,
+    /// The expected value in a type-mismatch message ("expected an integer").
+    pub describe: &'static str,
+    /// Whether a value satisfies the type ([`check_type`]).
+    pub accepts: fn(&Value) -> bool,
+    /// The payload index kind an `indexed` field of this type gets.
+    pub index: IndexKind,
+    /// How a value of this type will map to a numeric `value_num` once the projection
+    /// is schema-driven (#349). Not read by production code yet; see
+    /// [`NumericValue`].
+    pub numeric: NumericValue,
+    /// Whether `get_schema`'s `values_in_use` lists the values documents use for an
+    /// open field of this type: free text, timestamps and containers have no
+    /// vocabulary worth listing.
+    pub vocabulary: bool,
+}
+
+/// One row per [`FieldType`], in declaration order (`FieldType as usize` indexes it).
+pub static FIELD_KINDS: [FieldKind; 9] = [
+    FieldKind {
+        name: "text",
+        describe: "text",
+        accepts: Value::is_string,
+        index: IndexKind::Keyword,
+        numeric: NumericValue::None,
+        vocabulary: false,
+    },
+    FieldKind {
+        name: "integer",
+        describe: "an integer",
+        accepts: accepts_integer,
+        index: IndexKind::Integer,
+        numeric: NumericValue::Number,
+        vocabulary: true,
+    },
+    FieldKind {
+        name: "number",
+        describe: "a number",
+        accepts: Value::is_number,
+        index: IndexKind::Float,
+        numeric: NumericValue::Number,
+        vocabulary: true,
+    },
+    FieldKind {
+        name: "boolean",
+        describe: "a boolean",
+        accepts: Value::is_boolean,
+        index: IndexKind::Bool,
+        numeric: NumericValue::Boolean,
+        vocabulary: true,
+    },
+    FieldKind {
+        name: "enum",
+        describe: "a scalar value",
+        accepts: accepts_enum,
+        index: IndexKind::Keyword,
+        numeric: NumericValue::None,
+        vocabulary: true,
+    },
+    FieldKind {
+        name: "list",
+        describe: "a list",
+        accepts: Value::is_array,
+        index: IndexKind::Keyword,
+        numeric: NumericValue::None,
+        vocabulary: true,
+    },
+    FieldKind {
+        name: "date",
+        describe: "a date (YYYY-MM-DD)",
+        accepts: accepts_date,
+        index: IndexKind::Keyword,
+        numeric: NumericValue::None,
+        vocabulary: true,
+    },
+    FieldKind {
+        name: "timestamp",
+        describe: "an RFC 3339 timestamp",
+        accepts: accepts_timestamp,
+        index: IndexKind::Keyword,
+        numeric: NumericValue::None,
+        vocabulary: false,
+    },
+    FieldKind {
+        name: "object",
+        describe: "an object",
+        accepts: Value::is_object,
+        index: IndexKind::Keyword,
+        numeric: NumericValue::None,
+        vocabulary: false,
+    },
+];
+
+fn accepts_integer(value: &Value) -> bool {
+    value.as_i64().is_some() || value.as_u64().is_some()
+}
+
+/// Enum accepts a scalar, or an array of scalars — the latter preserves how the
+/// pre-cascade `allowed` map treated tag lists.
+fn accepts_enum(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().all(|v| !v.is_array() && !v.is_object()),
+        other => !other.is_null(),
+    }
+}
+
+fn accepts_date(value: &Value) -> bool {
+    value.as_str().is_some_and(is_date)
+}
+
+fn accepts_timestamp(value: &Value) -> bool {
+    value.as_str().is_some_and(is_timestamp)
+}
+
+/// One step of a [`FieldPath`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathStep {
+    /// A named child field (`.name`, or the leading name).
+    Field(String),
+    /// The elements of a list (`[]`).
+    Items,
+}
+
+/// A path into a schema's field tree, in the one grammar every schema path uses
+/// (#346): dot-separated names, each optionally followed by `[]` for the elements of
+/// that list — `a.b`, `a[]`, `a[].b`, `a[][]`.
+///
+/// Parsing is total and lossless: a path always starts with a name (possibly
+/// empty), only a trailing `[]` on a segment means "elements", and
+/// [`FieldPath::render`] gives back exactly the text that was parsed. A name that
+/// merely contains brackets elsewhere (`a[0]`, `a[]b`) is just a name. Callers that
+/// need stricter names (`update_schema` refuses empty or whitespace-padded ones)
+/// check the parsed steps.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FieldPath(Vec<PathStep>);
+
+impl FieldPath {
+    pub fn parse(path: &str) -> Self {
+        let mut steps = Vec::new();
+        for segment in path.split('.') {
+            let mut name = segment;
+            let mut items = 0usize;
+            while let Some(rest) = name.strip_suffix("[]") {
+                name = rest;
+                items += 1;
+            }
+            steps.push(PathStep::Field(name.to_string()));
+            steps.extend(std::iter::repeat_n(PathStep::Items, items));
+        }
+        Self(steps)
+    }
+
+    pub fn steps(&self) -> &[PathStep] {
+        &self.0
+    }
+
+    /// Number of steps — each a level of nesting (a name or a `[]`).
+    pub fn depth(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The path's text: names joined by `.`, `[]` appended for each `Items` step.
+    pub fn render(&self) -> String {
+        render_steps(&self.0)
+    }
+}
+
+impl std::fmt::Display for FieldPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.render())
+    }
+}
+
+fn render_steps(steps: &[PathStep]) -> String {
+    let mut out = String::new();
+    for (i, step) in steps.iter().enumerate() {
+        match step {
+            PathStep::Field(name) => {
+                if i > 0 {
+                    out.push('.');
+                }
+                out.push_str(name);
+            }
+            PathStep::Items => out.push_str("[]"),
         }
     }
+    out
 }
 
 /// Placeholder inside a `values:` list that splices in the inherited value set at that
@@ -170,7 +404,7 @@ pub const VALUES_SENTINEL: &str = "$values";
 /// [`schemars::JsonSchema`] impl. `deny_unknown_fields` here becomes
 /// `additionalProperties: false` in that advertised schema, so a client's own
 /// validation — not just our runtime error — can catch a typo'd key.
-#[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RawFieldDef {
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
@@ -235,18 +469,44 @@ pub struct RawFieldDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(description = "For type object: whether extra child keys are allowed.")]
     pub open: Option<bool>,
-    /// Nested authoring sugar, flattened into dot-paths at parse time.
+    /// Nested child field definitions; a key may itself be a path (`a.b`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(description = "Nested field definitions (dot-path shorthand).")]
     pub fields: Option<BTreeMap<String, RawFieldDef>>,
+    /// For `list`: the schema of each element, a scalar definition or an `object`
+    /// with its own `fields`. Declaring `items` makes a typeless field a `list`, the
+    /// way `fields` makes it an `object`. The same node is reachable as the path
+    /// `name[]` (and its fields as `name[].child`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "For type list: the definition of each element.")]
+    pub items: Option<Box<RawFieldDef>>,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// A merged field definition, keyed elsewhere by its dot-path.
-#[derive(Debug, Clone, PartialEq)]
+/// Which scope set each attribute of a resolved [`FieldDef`] (#346), as a
+/// [`scope_label`]; `None` when no scope set it (the attribute is at its default).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttrOrigins {
+    pub ty: Option<String>,
+    pub required: Option<String>,
+    pub indexed: Option<String>,
+    pub values: Option<String>,
+    pub default: Option<String>,
+    pub open: Option<String>,
+}
+
+/// A merged field definition: one node of a [`ResolvedSchema`]'s field tree.
+///
+/// In the flat view ([`ResolvedFields`]) each entry is keyed by its dot-path and
+/// carries no `fields` (every child is an entry of its own); `items` stays attached,
+/// since the element schema has no flat-view entry.
+///
+/// Equality compares what the node means — its attributes, `items`, children, and
+/// whether it is declared — not provenance (`declared_in`'s label, `set_by`).
+#[derive(Debug, Clone)]
 pub struct FieldDef {
     pub ty: Option<FieldType>,
     pub required: bool,
@@ -256,41 +516,147 @@ pub struct FieldDef {
     pub values: Option<Vec<String>>,
     pub default: Option<Value>,
     pub open: bool,
+    /// The element schema of a list.
+    pub items: Option<Box<FieldDef>>,
+    /// Child fields by name (one path step each).
+    pub fields: BTreeMap<String, FieldDef>,
+    /// The scope that last declared this field. `None` for an implicit node: one that
+    /// exists only because a deeper path was declared (`a.b` alone leaves `a`
+    /// implicit), which has default attributes and no flat-view entry.
+    pub declared_in: Option<String>,
+    /// Which scope set each attribute.
+    pub set_by: AttrOrigins,
+}
+
+impl Default for FieldDef {
+    /// An implicit node: every attribute at the value a field no scope declares gets.
+    fn default() -> Self {
+        Self {
+            ty: None,
+            required: false,
+            indexed: false,
+            values: None,
+            default: None,
+            open: true,
+            items: None,
+            fields: BTreeMap::new(),
+            declared_in: None,
+            set_by: AttrOrigins::default(),
+        }
+    }
+}
+
+impl PartialEq for FieldDef {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty
+            && self.required == other.required
+            && self.indexed == other.indexed
+            && self.values == other.values
+            && self.default == other.default
+            && self.open == other.open
+            && self.items == other.items
+            && self.fields == other.fields
+            && self.declared_in.is_some() == other.declared_in.is_some()
+    }
 }
 
 impl FieldDef {
-    /// Merge one child scope's explicit declarations (`raw`) onto the definition it
-    /// inherits from its nearest ancestor (`inherited`, `None` when no ancestor scope
-    /// declares this field at all).
+    /// Merge one scope's explicit declaration of this field (`raw`) onto the node as
+    /// inherited, recursively for `raw`'s nested `fields` and `items`.
     ///
-    /// Per-attribute inheritance: every attribute `raw` leaves unset (`None`) falls
-    /// through to `inherited`'s value for that attribute, and only defaults outright
-    /// (`false`/`true`/absent) when there is no inherited definition either. This is
-    /// the whole of [`ResolvedSchema::merged_with`]'s per-field logic — see that
-    /// function's doc for why, and [`Self::merge_values`] for the one attribute
-    /// (`values`) that has an in-band way to request a merge instead of a plain
-    /// override.
+    /// Per-attribute inheritance: every attribute `raw` leaves unset (`None`) keeps
+    /// the inherited value; an implicit node's defaults are exactly what a field no
+    /// ancestor declares gets (`required`/`indexed` false, `open` true, nothing
+    /// else). `values` is the one attribute with an in-band way to request a merge
+    /// instead of a plain override — see [`Self::merge_values`]. A declaration with
+    /// nested `fields` and no `type` sets `type: object` (with `items`, `type: list`),
+    /// as its own attribute, at this scope. Children the inherited node has and
+    /// `raw` does not mention are kept: redefining a container never drops them.
     ///
-    /// `origin`/`path` are used only to attribute a `warn!` if `raw` uses the
-    /// deprecated `extend: true` or an unsatisfiable `$values` sentinel — they do not
-    /// affect the result.
-    fn merged(raw: &RawFieldDef, inherited: Option<&FieldDef>, origin: &str, path: &str) -> Self {
-        Self {
-            ty: raw.ty.or(inherited.and_then(|f| f.ty)),
-            required: raw
-                .required
-                .unwrap_or(inherited.is_some_and(|f| f.required)),
-            indexed: raw.indexed.unwrap_or(inherited.is_some_and(|f| f.indexed)),
-            values: Self::merge_values(raw, inherited, origin, path),
-            default: raw
-                .default
-                .clone()
-                .or_else(|| inherited.and_then(|f| f.default.clone())),
-            open: raw.open.unwrap_or(inherited.is_none_or(|f| f.open)),
+    /// `origin` is the scope label recorded as `declared_in` and in `set_by`; `path`
+    /// only attributes a `warn!` for the deprecated `extend: true` or an
+    /// unsatisfiable `$values` sentinel.
+    fn merge_node(&mut self, raw: &RawFieldDef, origin: &str, path: &str) {
+        let container_ty = if raw.fields.is_some() {
+            Some(FieldType::Object)
+        } else if raw.items.is_some() {
+            Some(FieldType::List)
+        } else {
+            None
+        };
+        let label = || Some(origin.to_string());
+        if let Some(ty) = raw.ty.or(container_ty) {
+            self.ty = Some(ty);
+            self.set_by.ty = label();
+        }
+        if let Some(required) = raw.required {
+            self.required = required;
+            self.set_by.required = label();
+        }
+        if let Some(indexed) = raw.indexed {
+            self.indexed = indexed;
+            self.set_by.indexed = label();
+        }
+        if raw.extend || raw.values.is_some() {
+            self.values = Self::merge_values(raw, self.values.as_deref(), origin, path);
+            self.set_by.values = label();
+        }
+        if let Some(default) = &raw.default {
+            self.default = Some(default.clone());
+            self.set_by.default = label();
+        }
+        if let Some(open) = raw.open {
+            self.open = open;
+            self.set_by.open = label();
+        }
+        self.declared_in = label();
+
+        for (key, child) in raw.fields.iter().flatten() {
+            let steps = FieldPath::parse(key);
+            node_in_children(&mut self.fields, steps.steps(), origin).merge_node(
+                child,
+                origin,
+                &format!("{path}.{key}"),
+            );
+        }
+        if let Some(items) = &raw.items {
+            self.items.get_or_insert_with(Default::default).merge_node(
+                items,
+                origin,
+                &format!("{path}[]"),
+            );
         }
     }
 
-    /// Resolve `raw.values` against `inherited`'s value set.
+    /// The node at `rest` below this one, if any.
+    fn descendant(&self, rest: &[PathStep]) -> Option<&FieldDef> {
+        let Some((first, rest)) = rest.split_first() else {
+            return Some(self);
+        };
+        match first {
+            PathStep::Field(name) => self.fields.get(name)?.descendant(rest),
+            PathStep::Items => self.items.as_deref()?.descendant(rest),
+        }
+    }
+
+    /// This node as a flat-view entry: without its children, which are entries of
+    /// their own.
+    fn flat_entry(&self) -> FieldDef {
+        FieldDef {
+            ty: self.ty,
+            required: self.required,
+            indexed: self.indexed,
+            values: self.values.clone(),
+            default: self.default.clone(),
+            open: self.open,
+            items: self.items.clone(),
+            fields: BTreeMap::new(),
+            declared_in: self.declared_in.clone(),
+            set_by: self.set_by.clone(),
+        }
+    }
+
+    /// Resolve `raw.values` against the inherited value set.
     ///
     /// - `raw.values` is `None` (the field's `values` is never mentioned at all): plain
     ///   per-attribute inheritance, same as every other attribute — take whatever the
@@ -308,12 +674,10 @@ impl FieldDef {
     ///   so at most one of these two paths ever contributes the sentinel.
     fn merge_values(
         raw: &RawFieldDef,
-        inherited: Option<&FieldDef>,
+        inherited_values: Option<&[String]>,
         origin: &str,
         path: &str,
     ) -> Option<Vec<String>> {
-        let inherited_values = inherited.and_then(|f| f.values.as_deref());
-
         let tokens: Vec<String> = if raw.extend {
             warn!(
                 scope = %origin,
@@ -376,6 +740,54 @@ impl FieldDef {
     }
 }
 
+/// The node at `steps` (a parsed [`FieldPath`], so it starts with a name) under
+/// `children`, created — implicit, with default attributes — along with every
+/// missing node on the way.
+///
+/// Except before a `[]` step: a path through a list's elements (`tags[]`,
+/// `npcs[].name`) says the node it passes through is a list, so an implicit node
+/// there is declared by `origin` as a `type: list` — otherwise an element schema
+/// declared only by a flat `tags[]` key would hang off a field with no flat-view
+/// entry, invisible to `get_schema` and the fingerprint. A node already declared
+/// keeps its own attributes.
+fn node_in_children<'a>(
+    children: &'a mut BTreeMap<String, FieldDef>,
+    steps: &[PathStep],
+    origin: &str,
+) -> &'a mut FieldDef {
+    fn items_of<'n>(node: &'n mut FieldDef, origin: &str) -> &'n mut FieldDef {
+        if node.declared_in.is_none() {
+            node.declared_in = Some(origin.to_string());
+            if node.ty.is_none() {
+                node.ty = Some(FieldType::List);
+                node.set_by.ty = Some(origin.to_string());
+            }
+        }
+        node.items.get_or_insert_with(Default::default)
+    }
+
+    let (first, rest) = steps
+        .split_first()
+        .expect("a parsed field path has at least one step");
+    let name = match first {
+        PathStep::Field(name) => name.clone(),
+        // A parsed path always starts with a name; an `Items` step here would only
+        // come from a hand-built path, and the empty name is what parsing `[]` gives.
+        PathStep::Items => String::new(),
+    };
+    let mut node = children.entry(name).or_default();
+    if matches!(first, PathStep::Items) {
+        node = items_of(node, origin);
+    }
+    for step in rest {
+        node = match step {
+            PathStep::Field(name) => node.fields.entry(name.clone()).or_default(),
+            PathStep::Items => items_of(node, origin),
+        };
+    }
+    node
+}
+
 /// One parsed schema file, before merging with ancestors.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -436,22 +848,13 @@ impl SchemaFile {
         for (name, raw) in &self.fields {
             validate_raw(name, raw)?;
         }
-        // Nested `fields:` and a flat dot-path key spell the same path, and
-        // `flattened()` would silently keep only one of the two declarations.
+        // Nested `fields:` (or `items:`) and a flat path key spell the same node, and
+        // the merge would silently layer one declaration over the other.
         let mut seen = BTreeSet::new();
         for (name, raw) in &self.fields {
             check_unique_paths(name, raw, &mut seen)?;
         }
         Ok(())
-    }
-
-    /// Flatten nested authoring sugar into dot-path entries.
-    fn flattened(&self) -> BTreeMap<String, RawFieldDef> {
-        let mut out = BTreeMap::new();
-        for (name, raw) in &self.fields {
-            flatten_raw(name, raw, &mut out);
-        }
-        out
     }
 }
 
@@ -462,14 +865,31 @@ fn validate_raw(path: &str, raw: &RawFieldDef) -> Result<(), String> {
         && let Some(ty) = raw.ty
         && ty != FieldType::Object
     {
-        // Otherwise the field flattens to BOTH a scalar leaf and a set of dot-path
+        // Otherwise the field resolves to BOTH a scalar leaf and a set of dot-path
         // children, and any document satisfying the leaf can never satisfy the
         // children — producing an error that blames the document for a broken schema.
         return Err(format!(
             "field '{path}' declares type '{}' but also nested fields; a field is \
              either a value or a container, not both",
-            format!("{ty:?}").to_lowercase()
+            ty.name()
         ));
+    }
+
+    if raw.items.is_some() {
+        if raw.fields.is_some() {
+            return Err(format!(
+                "field '{path}' declares both nested fields and items; a field is either \
+                 an object or a list, not both"
+            ));
+        }
+        if let Some(ty) = raw.ty
+            && ty != FieldType::List
+        {
+            return Err(format!(
+                "field '{path}' declares type '{}' but also items; only a list has items",
+                ty.name()
+            ));
+        }
     }
 
     if let Some(values) = &raw.values {
@@ -516,10 +936,14 @@ fn validate_raw(path: &str, raw: &RawFieldDef) -> Result<(), String> {
     for (name, child) in raw.fields.iter().flatten() {
         validate_raw(&format!("{path}.{name}"), child)?;
     }
+    if let Some(items) = &raw.items {
+        validate_raw(&format!("{path}[]"), items)?;
+    }
     Ok(())
 }
 
-/// Mirror of [`flatten_raw`]'s keys: error if two declarations flatten to one path.
+/// Error if two declarations in one file spell the same node — a nested `fields:`
+/// (or `items:`) entry and a flat path key, in [`FieldPath`]'s grammar.
 fn check_unique_paths(
     path: &str,
     raw: &RawFieldDef,
@@ -534,38 +958,66 @@ fn check_unique_paths(
     for (name, child) in raw.fields.iter().flatten() {
         check_unique_paths(&format!("{path}.{name}"), child, seen)?;
     }
+    if let Some(items) = &raw.items {
+        check_unique_paths(&format!("{path}[]"), items, seen)?;
+    }
     Ok(())
 }
 
-/// The part of dot-path `path` below `key`, when `key` is a whole-segment prefix of it
-/// (`planning` of `planning.method` is `method`; `plan` is not a prefix).
-fn below_key<'p>(path: &'p str, key: &str) -> Option<&'p str> {
-    path.strip_prefix(key)?.strip_prefix('.')
+// Raw-tree navigation for `SchemaFile::apply_inheriting`. A path (`a.b`, `a[]`,
+// `a[].b`) is parsed once into [`PathStep`]s; a key in a `fields:` map may itself be
+// a multi-step path (`planning.method`, `npcs[]`), so each key is parsed too and
+// matched as a whole-step prefix of the target (`plan` is not a prefix of
+// `planning.method`).
+
+/// The steps of `steps` below map key `key`, when `key` is a whole-step prefix of
+/// them (`Some(&[])` for an exact match).
+fn below_key<'s>(steps: &'s [PathStep], key: &str) -> Option<&'s [PathStep]> {
+    steps.strip_prefix(FieldPath::parse(key).steps())
 }
 
-/// Whether [`find_field_mut`] would find `path`, without needing a mutable borrow.
-fn has_field_path(fields: &BTreeMap<String, RawFieldDef>, path: &str) -> bool {
-    fields.contains_key(path)
-        || fields.iter().any(|(key, raw)| {
-            below_key(path, key)
-                .zip(raw.fields.as_ref())
-                .is_some_and(|(rest, children)| has_field_path(children, rest))
-        })
+/// Whether [`find_field_mut`] would find `steps` among `fields`, without needing a
+/// mutable borrow.
+fn has_field_path(fields: &BTreeMap<String, RawFieldDef>, steps: &[PathStep]) -> bool {
+    fields.iter().any(|(key, raw)| match below_key(steps, key) {
+        Some([]) => true,
+        Some(rest) => has_path_below(raw, rest),
+        None => false,
+    })
 }
 
-/// Find the declaration of dot-path `path` among `fields`, whether it is a flat
-/// dot-path key or reached through nested `fields:` (or a mix, at any level).
+/// [`has_field_path`] below a definition, for the non-empty `rest` of a path.
+fn has_path_below(raw: &RawFieldDef, rest: &[PathStep]) -> bool {
+    match rest.first() {
+        None => true,
+        Some(PathStep::Items) => raw
+            .items
+            .as_deref()
+            .is_some_and(|items| has_path_below(items, &rest[1..])),
+        Some(PathStep::Field(_)) => raw
+            .fields
+            .as_ref()
+            .is_some_and(|children| has_field_path(children, rest)),
+    }
+}
+
+/// Find the declaration of `steps` among `fields`, whether it is a flat path key or
+/// reached through nested `fields:`/`items:` (or a mix, at any level). An exact key
+/// wins over a nested declaration of the same path.
 fn find_field_mut<'a>(
     fields: &'a mut BTreeMap<String, RawFieldDef>,
-    path: &str,
+    steps: &[PathStep],
 ) -> Option<&'a mut RawFieldDef> {
-    if fields.contains_key(path) {
-        return fields.get_mut(path);
+    if let Some(exact) = fields
+        .keys()
+        .find(|key| below_key(steps, key).is_some_and(<[PathStep]>::is_empty))
+        .cloned()
+    {
+        return fields.get_mut(&exact);
     }
     for (key, raw) in fields.iter_mut() {
-        if let Some(rest) = below_key(path, key)
-            && let Some(children) = raw.fields.as_mut()
-            && let Some(found) = find_field_mut(children, rest)
+        if let Some(rest) = below_key(steps, key)
+            && let Some(found) = find_path_below_mut(raw, rest)
         {
             return Some(found);
         }
@@ -573,89 +1025,187 @@ fn find_field_mut<'a>(
     None
 }
 
+/// [`find_field_mut`] below a definition, for the non-empty `rest` of a path.
+fn find_path_below_mut<'a>(
+    raw: &'a mut RawFieldDef,
+    rest: &[PathStep],
+) -> Option<&'a mut RawFieldDef> {
+    match rest.first()? {
+        PathStep::Items => {
+            let items = raw.items.as_deref_mut()?;
+            if rest.len() == 1 {
+                Some(items)
+            } else {
+                find_path_below_mut(items, &rest[1..])
+            }
+        }
+        PathStep::Field(_) => find_field_mut(raw.fields.as_mut()?, rest),
+    }
+}
+
 /// An empty `type: object` container, for a missing parent of a nested edit. Every
 /// other attribute is left unset so it inherits from an ancestor scope.
 fn empty_container() -> RawFieldDef {
     RawFieldDef {
         ty: Some(FieldType::Object),
-        required: None,
-        indexed: None,
-        values: None,
-        extend: false,
-        default: None,
-        open: None,
         fields: Some(BTreeMap::new()),
+        ..RawFieldDef::default()
     }
 }
 
-/// Like [`find_field_mut`], but declares `path` (with `leaf()`) when absent, creating
-/// any missing parents as `type: object` containers. Errors when a parent on the way
-/// is declared as a non-object type. `full` is the path the caller asked for, for
-/// error messages.
+/// The missing parent a nested edit creates on the way to its target: an object
+/// container when the next step is a name, a `type: list` when it is `[]`.
+fn missing_parent(next: &PathStep) -> RawFieldDef {
+    match next {
+        PathStep::Field(_) => empty_container(),
+        PathStep::Items => RawFieldDef {
+            ty: Some(FieldType::List),
+            ..RawFieldDef::default()
+        },
+    }
+}
+
+/// Like [`find_field_mut`], but declares `steps` (with `leaf()`) when absent,
+/// creating any missing parents (see [`missing_parent`]). Errors when a parent on the
+/// way cannot hold the next step: a non-object under a name, a non-list under `[]`.
+/// `full` is the path the caller asked for, for error messages.
 fn field_entry_mut<'a>(
     fields: &'a mut BTreeMap<String, RawFieldDef>,
-    path: &str,
+    steps: &[PathStep],
     full: &str,
     leaf: impl FnOnce() -> RawFieldDef,
 ) -> Result<&'a mut RawFieldDef, String> {
-    if has_field_path(fields, path) {
-        return find_field_mut(fields, path).ok_or_else(|| unreachable_lookup(full));
+    if has_field_path(fields, steps) {
+        return find_field_mut(fields, steps).ok_or_else(|| unreachable_lookup(full));
     }
-    // Longest existing key that is a dot-prefix of `path`; failing that, the first
-    // segment becomes a new container. No dot at all means a plain top-level field.
+    // Longest existing key that is a strict prefix of `steps`; failing that, the
+    // first step becomes a new parent. A single step is a plain field of this map.
     let parent = fields
         .keys()
-        .filter(|k| below_key(path, k).is_some())
-        .max_by_key(|k| k.len())
-        .cloned()
-        .or_else(|| {
-            path.split_once('.').map(|(head, _)| {
-                fields.insert(head.to_string(), empty_container());
-                head.to_string()
-            })
-        });
-    let Some(parent) = parent else {
-        return Ok(fields.entry(path.to_string()).or_insert_with(leaf));
+        .filter(|k| below_key(steps, k).is_some_and(|rest| !rest.is_empty()))
+        .max_by_key(|k| FieldPath::parse(k).depth())
+        .cloned();
+    let (parent, rest) = match parent {
+        Some(parent) => {
+            let depth = FieldPath::parse(&parent).depth();
+            (parent, &steps[depth..])
+        }
+        None => {
+            let (PathStep::Field(head), rest) = steps
+                .split_first()
+                .ok_or_else(|| unreachable_lookup(full))?
+            else {
+                return Err(unreachable_lookup(full));
+            };
+            let Some(next) = rest.first() else {
+                return Ok(fields.entry(head.clone()).or_insert_with(leaf));
+            };
+            fields.insert(head.clone(), missing_parent(next));
+            (head.clone(), rest)
+        }
     };
-    let rest = &path[parent.len() + 1..];
     let container = fields
         .get_mut(&parent)
         .ok_or_else(|| unreachable_lookup(full))?;
-    if let Some(ty) = container.ty
-        && ty != FieldType::Object
-    {
-        return Err(format!(
-            "'{parent}' is a {} field, not a container, so '{full}' cannot be nested \
-             under it",
-            format!("{ty:?}").to_lowercase()
-        ));
+    entry_below(container, &parent, rest, full, leaf)
+}
+
+/// [`field_entry_mut`] below definition `def` (spelled `name` in messages), for the
+/// non-empty `rest` of a path.
+fn entry_below<'a>(
+    def: &'a mut RawFieldDef,
+    name: &str,
+    rest: &[PathStep],
+    full: &str,
+    leaf: impl FnOnce() -> RawFieldDef,
+) -> Result<&'a mut RawFieldDef, String> {
+    let Some(first) = rest.first() else {
+        return Err(unreachable_lookup(full));
+    };
+    match first {
+        PathStep::Field(_) => {
+            if let Some(ty) = def.ty
+                && ty != FieldType::Object
+            {
+                return Err(format!(
+                    "'{name}' is a {} field, not a container, so '{full}' cannot be nested \
+                     under it",
+                    ty.name()
+                ));
+            }
+            // A typeless parent that carries `values:` is a leniently-enforced scalar
+            // (see the README); nesting under it would retype it as an object.
+            if def.ty.is_none() && def.values.is_some() {
+                return Err(format!(
+                    "'{name}' is a scalar field with a values list, not a container, so \
+                     '{full}' cannot be nested under it"
+                ));
+            }
+            if def.ty.is_none() && def.items.is_some() {
+                return Err(format!(
+                    "'{name}' is a list field, not a container, so '{full}' cannot be \
+                     nested under it"
+                ));
+            }
+            let children = def.fields.get_or_insert_with(BTreeMap::new);
+            field_entry_mut(children, rest, full, leaf)
+        }
+        PathStep::Items => {
+            if let Some(ty) = def.ty
+                && ty != FieldType::List
+            {
+                return Err(format!(
+                    "'{name}' is a {} field, not a list, so '{full}' cannot describe its \
+                     elements",
+                    ty.name()
+                ));
+            }
+            if def.ty.is_none() && def.fields.is_some() {
+                return Err(format!(
+                    "'{name}' is a container, not a list, so '{full}' cannot describe its \
+                     elements"
+                ));
+            }
+            // A typeless parent that carries `values:` is a leniently-enforced scalar;
+            // giving it `items` would retype it as a list. A parent whose type is only
+            // inherited from an ancestor scope (an `enum` declared above, say) is not
+            // caught here: the edit sees this file alone, not the resolved
+            // definitions of the path's parents.
+            if def.ty.is_none() && def.values.is_some() {
+                return Err(format!(
+                    "'{name}' is a scalar field with a values list, not a list, so '{full}' \
+                     cannot describe its elements"
+                ));
+            }
+            let Some(next) = rest.get(1) else {
+                return Ok(def.items.get_or_insert_with(|| Box::new(leaf())));
+            };
+            let items = def
+                .items
+                .get_or_insert_with(|| Box::new(missing_parent(next)));
+            entry_below(items, &format!("{name}[]"), &rest[1..], full, leaf)
+        }
     }
-    // A typeless parent that carries `values:` is a leniently-enforced scalar (see the
-    // README); nesting under it would make `flatten_raw` retype it as an object.
-    if container.ty.is_none() && container.values.is_some() {
-        return Err(format!(
-            "'{parent}' is a scalar field with a values list, not a container, so \
-             '{full}' cannot be nested under it"
-        ));
-    }
-    let children = container.fields.get_or_insert_with(BTreeMap::new);
-    field_entry_mut(children, rest, full, leaf)
 }
 
 fn unreachable_lookup(full: &str) -> String {
     format!("internal error: lost track of field '{full}' while editing the schema")
 }
 
-/// Remove the declaration of dot-path `path`, wherever it nests. Returns whether one
-/// was found. An emptied container stays: it may still carry `open: false`.
-fn remove_field_path(fields: &mut BTreeMap<String, RawFieldDef>, path: &str) -> bool {
-    if fields.remove(path).is_some() {
+/// Remove the declaration of `steps`, wherever it nests. Returns whether one was
+/// found. An emptied container stays: it may still carry `open: false`.
+fn remove_field_path(fields: &mut BTreeMap<String, RawFieldDef>, steps: &[PathStep]) -> bool {
+    if let Some(exact) = fields
+        .keys()
+        .find(|key| below_key(steps, key).is_some_and(<[PathStep]>::is_empty))
+        .cloned()
+    {
+        fields.remove(&exact);
         return true;
     }
     for (key, raw) in fields.iter_mut() {
-        if let Some(rest) = below_key(path, key)
-            && let Some(children) = raw.fields.as_mut()
-            && remove_field_path(children, rest)
+        if let Some(rest) = below_key(steps, key)
+            && remove_path_below(raw, rest)
         {
             return true;
         }
@@ -663,21 +1213,19 @@ fn remove_field_path(fields: &mut BTreeMap<String, RawFieldDef>, path: &str) -> 
     false
 }
 
-fn flatten_raw(path: &str, raw: &RawFieldDef, out: &mut BTreeMap<String, RawFieldDef>) {
-    if let Some(children) = &raw.fields {
-        // The container itself is still a definition (it may declare `open: false`),
-        // but without its nested children, which become their own entries.
-        let mut container = raw.clone();
-        container.fields = None;
-        if container.ty.is_none() {
-            container.ty = Some(FieldType::Object);
-        }
-        out.insert(path.to_string(), container);
-        for (name, child) in children {
-            flatten_raw(&format!("{path}.{name}"), child, out);
-        }
-    } else {
-        out.insert(path.to_string(), raw.clone());
+/// [`remove_field_path`] below a definition, for the non-empty `rest` of a path.
+fn remove_path_below(raw: &mut RawFieldDef, rest: &[PathStep]) -> bool {
+    match rest.first() {
+        None => false,
+        Some(PathStep::Items) if rest.len() == 1 => raw.items.take().is_some(),
+        Some(PathStep::Items) => raw
+            .items
+            .as_deref_mut()
+            .is_some_and(|items| remove_path_below(items, &rest[1..])),
+        Some(PathStep::Field(_)) => raw
+            .fields
+            .as_mut()
+            .is_some_and(|children| remove_field_path(children, rest)),
     }
 }
 
@@ -735,13 +1283,15 @@ impl SchemaFile {
         edit: &SchemaEdit,
         inherited: Option<&FieldDef>,
     ) -> Result<String, String> {
+        let path = FieldPath::parse(edit.field());
+        let steps = path.steps();
         match edit {
             SchemaEdit::AddValues { field, values } => {
                 // What this scope inherits for the field. A local list only carries it
                 // when it splices it in (a sentinel or the deprecated `extend`); one
                 // without replaces the inherited set outright.
                 let (local_exists, local_values, inherits) =
-                    match find_field_mut(&mut self.fields, field) {
+                    match find_field_mut(&mut self.fields, steps) {
                         Some(def) => (
                             true,
                             def.values.clone(),
@@ -778,7 +1328,7 @@ impl SchemaFile {
                         ))
                     };
                 }
-                let def = field_entry_mut(&mut self.fields, field, field, || RawFieldDef {
+                let def = field_entry_mut(&mut self.fields, steps, field, || RawFieldDef {
                     // `enum` unless an ancestor already supplies a type or a values
                     // list, which this declaration keeps through per-attribute
                     // inheritance. A brand-new field qualifies, and so does one an
@@ -794,13 +1344,7 @@ impl SchemaFile {
                     // whatever an ancestor scope already said about `required`,
                     // `indexed`, or `open` for this field — see per-attribute
                     // inheritance in `ResolvedSchema::merged_with`.
-                    required: None,
-                    indexed: None,
-                    values: None,
-                    extend: false,
-                    default: None,
-                    open: None,
-                    fields: None,
+                    ..RawFieldDef::default()
                 })?;
                 // No local list: a fresh one would REPLACE the inherited set, so it
                 // splices that set in first. `extend: true` already means a leading
@@ -837,7 +1381,7 @@ impl SchemaFile {
                 }
             }
             SchemaEdit::RemoveValues { field, values } => {
-                let def = find_field_mut(&mut self.fields, field)
+                let def = find_field_mut(&mut self.fields, steps)
                     .ok_or_else(|| format!("field '{}' is not declared in this scope", field))?;
                 let existing = def
                     .values
@@ -854,12 +1398,12 @@ impl SchemaFile {
             SchemaEdit::SetField { field, definition } => {
                 // The placeholder is overwritten immediately; only the slot's location
                 // (and its missing parents) matter here.
-                let slot = field_entry_mut(&mut self.fields, field, field, empty_container)?;
+                let slot = field_entry_mut(&mut self.fields, steps, field, empty_container)?;
                 *slot = definition.as_ref().clone();
                 Ok(format!("declared '{}'", field))
             }
             SchemaEdit::RemoveField { field } => {
-                if !remove_field_path(&mut self.fields, field) {
+                if !remove_field_path(&mut self.fields, steps) {
                     return Err(format!("field '{}' is not declared in this scope", field));
                 }
                 Ok(format!("removed declaration of '{}'", field))
@@ -882,13 +1426,136 @@ impl SchemaFile {
     }
 }
 
+/// A resolved schema's fields: the field tree, and the flat dot-path view most
+/// consumers read (#346).
+///
+/// The flat view holds every declared field outside a list's `items`, keyed by
+/// dot-path (`planning.prep_minutes`) — containers included, as entries of their own
+/// with no children attached ([`FieldDef`]'s flat-view shape). Implicit nodes (only
+/// a deeper path was declared) and everything under `items` (`a[]`, `a[].b`) are
+/// absent from it: those are reached through [`Self::lookup`] or [`Self::tree`]. The
+/// map-like methods (`get`, `contains_key`, `keys`, iteration, indexing) all read the
+/// flat view. Both views, and the per-field origin map, are built together from the
+/// tree, so they cannot disagree.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResolvedFields {
+    tree: BTreeMap<String, FieldDef>,
+    flat: BTreeMap<String, FieldDef>,
+    origin: BTreeMap<String, String>,
+}
+
+impl ResolvedFields {
+    fn from_tree(tree: BTreeMap<String, FieldDef>) -> Self {
+        let mut flat = BTreeMap::new();
+        let mut origin = BTreeMap::new();
+        for (name, node) in &tree {
+            collect_flat(name, node, &mut flat, &mut origin);
+        }
+        Self { tree, flat, origin }
+    }
+
+    /// The top-level fields of the tree, by name.
+    pub fn tree(&self) -> &BTreeMap<String, FieldDef> {
+        &self.tree
+    }
+
+    /// The declared field at `path` in [`FieldPath`]'s grammar — `a.b`, and also
+    /// `a[]` and `a[].b`, which the flat view does not hold. Unlike the flat view's
+    /// entries, the node comes with its children. `None` when nothing declares it.
+    pub fn lookup(&self, path: &str) -> Option<&FieldDef> {
+        let path = FieldPath::parse(path);
+        let (PathStep::Field(name), rest) = path.steps().split_first()? else {
+            return None;
+        };
+        self.tree
+            .get(name)?
+            .descendant(rest)
+            .filter(|node| node.declared_in.is_some())
+    }
+
+    pub fn get<Q>(&self, path: &Q) -> Option<&FieldDef>
+    where
+        String: std::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.flat.get(path)
+    }
+
+    pub fn contains_key<Q>(&self, path: &Q) -> bool
+    where
+        String: std::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.flat.contains_key(path)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.flat.keys()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &FieldDef> {
+        self.flat.values()
+    }
+
+    pub fn iter(&self) -> std::collections::btree_map::Iter<'_, String, FieldDef> {
+        self.flat.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.flat.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.flat.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a ResolvedFields {
+    type Item = (&'a String, &'a FieldDef);
+    type IntoIter = std::collections::btree_map::Iter<'a, String, FieldDef>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.flat.iter()
+    }
+}
+
+impl<Q> std::ops::Index<&Q> for ResolvedFields
+where
+    String: std::borrow::Borrow<Q>,
+    Q: Ord + ?Sized,
+{
+    type Output = FieldDef;
+
+    fn index(&self, path: &Q) -> &FieldDef {
+        self.flat
+            .get(path)
+            .expect("no field at this path in the flat view")
+    }
+}
+
+/// Add `node` (at dot-path `path`) and its declared descendants to the flat view.
+/// `items` subtrees are left out: paths through a list's elements are not part of the
+/// flat view (#346).
+fn collect_flat(
+    path: &str,
+    node: &FieldDef,
+    flat: &mut BTreeMap<String, FieldDef>,
+    origin: &mut BTreeMap<String, String>,
+) {
+    if let Some(declared_in) = &node.declared_in {
+        flat.insert(path.to_string(), node.flat_entry());
+        origin.insert(path.to_string(), declared_in.clone());
+    }
+    for (name, child) in &node.fields {
+        collect_flat(&format!("{path}.{name}"), child, flat, origin);
+    }
+}
+
 /// A fully merged schema for one directory.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedSchema {
-    pub fields: BTreeMap<String, FieldDef>,
-    /// Which schema file contributed each field's current definition. Drives error
-    /// messages and `get_schema` provenance.
-    pub origin: BTreeMap<String, String>,
+    /// The field tree and its flat dot-path view; see [`ResolvedFields`].
+    pub fields: ResolvedFields,
     /// Near-duplicate gate override from the `dedup:` cascade (#272). `None` means
     /// "use `write.dedup_enabled`": the cache is built without `WriteConfig`, so the
     /// global value is resolved at the gate, not baked in here.
@@ -902,6 +1569,13 @@ pub struct ResolvedSchema {
 }
 
 impl ResolvedSchema {
+    /// Which scope last declared each flat-view field — the scope that contributed its
+    /// current definition (the [`FieldDef::declared_in`] of each entry). Drives error
+    /// messages and `get_schema` provenance.
+    pub fn origin(&self) -> &BTreeMap<String, String> {
+        &self.fields.origin
+    }
+
     /// Adapt the global `frontmatter` config block into the implicit root schema.
     ///
     /// **Deprecated fallback**, used only when the knowledge base has no root
@@ -909,46 +1583,48 @@ impl ResolvedSchema {
     /// Lossless with respect to the pre-cascade behavior: `allowed` becomes `enum`
     /// fields, which still accept either a scalar or an array of scalars.
     pub fn from_config(config: &FrontmatterConfig) -> Self {
-        let blank = || FieldDef {
-            ty: None,
-            required: false,
-            indexed: false,
-            values: None,
-            default: None,
-            open: true,
-        };
-        let mut fields: BTreeMap<String, FieldDef> = BTreeMap::new();
+        // The root scope's label, like a root schema file's: where the rules come
+        // from on the host is deployment detail, not something a caller can locate
+        // or edit.
+        let root = scope_label(Path::new(""));
+        let mut tree: BTreeMap<String, FieldDef> = BTreeMap::new();
+        fn declare<'t>(
+            tree: &'t mut BTreeMap<String, FieldDef>,
+            name: &str,
+            root: &str,
+        ) -> &'t mut FieldDef {
+            let node = node_in_children(tree, FieldPath::parse(name).steps(), root);
+            node.declared_in = Some(root.to_string());
+            node
+        }
 
         for name in &config.required {
-            fields.entry(name.clone()).or_insert_with(blank).required = true;
+            let node = declare(&mut tree, name, &root);
+            node.required = true;
+            node.set_by.required = Some(root.clone());
         }
         for name in &config.indexed_fields {
-            fields.entry(name.clone()).or_insert_with(blank).indexed = true;
+            let node = declare(&mut tree, name, &root);
+            node.indexed = true;
+            node.set_by.indexed = Some(root.clone());
         }
         for (name, default) in &config.defaults {
-            fields.entry(name.clone()).or_insert_with(blank).default =
-                Some(Value::String(default.clone()));
+            let node = declare(&mut tree, name, &root);
+            node.default = Some(Value::String(default.clone()));
+            node.set_by.default = Some(root.clone());
         }
         for (name, values) in &config.allowed {
             // Deliberately leaves `ty` unset. Declaring these `Enum` would subject
             // numbers, booleans, and non-string array elements to value checking that
             // the pre-cascade validator exempted, newly rejecting documents that used
             // to pass. Undeclared type keeps the lenient path.
-            let field = fields.entry(name.clone()).or_insert_with(blank);
-            field.values = Some(values.clone());
+            let node = declare(&mut tree, name, &root);
+            node.values = Some(values.clone());
+            node.set_by.values = Some(root.clone());
         }
 
-        let origin = fields
-            .keys()
-            // The root scope's label, like a root schema file's: where the rules
-            // come from on the host is deployment detail, not something a caller
-            // can locate or edit.
-            .map(|k| (k.clone(), scope_label(Path::new(""))))
-            .collect();
-
         Self {
-            fields,
-            origin,
+            fields: ResolvedFields::from_tree(tree),
             ..Self::default()
         }
     }
@@ -967,7 +1643,8 @@ impl ResolvedSchema {
     /// (`type`, `required`, `indexed`, `default`, `open`, `values`) — every attribute it
     /// leaves unset still inherits from the parent's definition of that same field. A
     /// child that writes `required: true` and nothing else, say, does not reset the
-    /// parent's `values` or `default` to nothing; it only tightens `required`.
+    /// parent's `values` or `default` to nothing; it only tightens `required`. The
+    /// same holds at every depth of the tree, `items` included.
     ///
     /// This is deliberately NOT the old rule (a redefinition replacing the whole
     /// definition wholesale, `extend: true` as the sole opt-in to union `values`): that
@@ -976,27 +1653,22 @@ impl ResolvedSchema {
     /// let a root-level `required: true` on `tags` go unenforced everywhere, since
     /// every domain redeclared `tags` for its own `values` list. Per-attribute
     /// inheritance means only fields whose redefinition genuinely intends to override a
-    /// given attribute do — see [`FieldDef::merged`] for the exact per-attribute rule.
+    /// given attribute do — see [`FieldDef::merge_node`] for the exact per-attribute
+    /// rule.
     ///
     /// `values` is the one attribute with an in-band way to request a merge instead of
     /// a plain override — see [`FieldDef::merge_values`] for the `$values` placeholder
     /// and the deprecated `extend: true` alias for it.
     fn merged_with(&self, child: &SchemaFile, origin: &str) -> Self {
-        let mut fields = self.fields.clone();
-        let mut origins = self.origin.clone();
-
-        for (path, raw) in child.flattened() {
-            let inherited = self.fields.get(&path);
-            let def = FieldDef::merged(&raw, inherited, origin, &path);
-
-            origins.insert(path.clone(), origin.to_string());
-            fields.insert(path, def);
+        let mut tree = self.fields.tree.clone();
+        for (key, raw) in &child.fields {
+            let path = FieldPath::parse(key);
+            node_in_children(&mut tree, path.steps(), origin).merge_node(raw, origin, key);
         }
 
         let dedup = child.dedup.as_ref();
         Self {
-            fields,
-            origin: origins,
+            fields: ResolvedFields::from_tree(tree),
             dedup_enabled: dedup.and_then(|d| d.enabled).or(self.dedup_enabled),
             dedup_threshold: dedup.and_then(|d| d.threshold).or(self.dedup_threshold),
             related_min_score: dedup
@@ -1006,17 +1678,12 @@ impl ResolvedSchema {
         }
     }
 
-    /// The payload index kind a declared type needs.
+    /// The payload index kind a declared type needs ([`FieldKind::index`]).
     ///
     /// Numeric and boolean fields need their own index kinds for range and comparison
     /// filters to work; everything else, including undeclared fields, is a keyword.
     pub fn index_kind(ty: Option<FieldType>) -> IndexKind {
-        match ty {
-            Some(FieldType::Integer) => IndexKind::Integer,
-            Some(FieldType::Number) => IndexKind::Float,
-            Some(FieldType::Boolean) => IndexKind::Bool,
-            _ => IndexKind::Keyword,
-        }
+        ty.map_or(IndexKind::Keyword, |ty| ty.kind().index)
     }
 
     /// A stable fingerprint of this schema.
@@ -1025,38 +1692,73 @@ impl ResolvedSchema {
     /// even though its content did not. Must not depend on map iteration order, or
     /// every incremental run would look like a schema change.
     ///
+    /// Hashes the flat view in dot-path order. A field's `items` element schema is
+    /// hashed only when present, so a schema that uses none hashes exactly as it did
+    /// before `items` existed (#346) — changing the bytes of a field without `items`
+    /// would re-validate (and re-embed) the whole corpus.
+    ///
     /// Deliberately excludes `dedup_enabled`/`dedup_threshold` (#272): the near-duplicate
     /// gate affects neither validation nor indexing, so changing it must not mark a
-    /// subtree's documents for revalidation.
+    /// subtree's documents for revalidation. Provenance (`origin`, `set_by`) is not
+    /// hashed either.
     pub fn fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         for (path, def) in &self.fields {
             hasher.update(path.as_bytes());
             hasher.update([0u8]);
-            hasher.update(format!("{:?}", def.ty).as_bytes());
-            hasher.update([def.required as u8, def.indexed as u8, def.open as u8]);
-            // Presence discriminant: `Some(vec![])` ("nothing is permitted", per
-            // `check_values`/`check_values_lenient`) and `None` ("unconstrained")
-            // enforce opposite rules but would otherwise hash identically — the
-            // loop below contributes zero bytes either way when the list is empty
-            // or absent. Emitted unconditionally, before the loop, so the two
-            // states always diverge regardless of list contents (#152).
-            hasher.update([def.values.is_some() as u8]);
-            if let Some(values) = &def.values {
-                let mut sorted = values.clone();
-                sorted.sort();
-                for value in sorted {
-                    hasher.update(value.as_bytes());
-                    hasher.update([1u8]);
-                }
-            }
-            if let Some(default) = &def.default {
-                hasher.update(default.to_string().as_bytes());
-            }
+            hash_attributes(&mut hasher, def);
             hasher.update([0xffu8]);
         }
         hex::encode(hasher.finalize())
+    }
+}
+
+/// A field's attributes as [`ResolvedSchema::fingerprint`] hashes them, then its
+/// `items` (when present) behind a `0xfe` marker. Every other byte this writes is
+/// either fixed-width or UTF-8 text, which never contains `0xfe` or `0xff`, so the
+/// markers cannot collide with attribute bytes.
+fn hash_attributes(hasher: &mut sha2::Sha256, def: &FieldDef) {
+    use sha2::Digest;
+    hasher.update(format!("{:?}", def.ty).as_bytes());
+    hasher.update([def.required as u8, def.indexed as u8, def.open as u8]);
+    // Presence discriminant: `Some(vec![])` ("nothing is permitted", per
+    // `check_values`/`check_values_lenient`) and `None` ("unconstrained")
+    // enforce opposite rules but would otherwise hash identically — the
+    // loop below contributes zero bytes either way when the list is empty
+    // or absent. Emitted unconditionally, before the loop, so the two
+    // states always diverge regardless of list contents (#152).
+    hasher.update([def.values.is_some() as u8]);
+    if let Some(values) = &def.values {
+        let mut sorted = values.clone();
+        sorted.sort();
+        for value in sorted {
+            hasher.update(value.as_bytes());
+            hasher.update([1u8]);
+        }
+    }
+    if let Some(default) = &def.default {
+        hasher.update(default.to_string().as_bytes());
+    }
+    if let Some(items) = &def.items {
+        hasher.update([0xfeu8]);
+        hash_subtree(hasher, items);
+    }
+}
+
+/// An element schema and everything below it, for [`hash_attributes`]: the node's
+/// attributes and declared-ness, then each child by name (sorted), each framed by
+/// `0xfd` and `0xff`.
+fn hash_subtree(hasher: &mut sha2::Sha256, node: &FieldDef) {
+    use sha2::Digest;
+    hasher.update([node.declared_in.is_some() as u8]);
+    hash_attributes(hasher, node);
+    for (name, child) in &node.fields {
+        hasher.update([0xfdu8]);
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        hash_subtree(hasher, child);
+        hasher.update([0xffu8]);
     }
 }
 
@@ -2070,29 +2772,13 @@ fn kind_of(value: &Value) -> &'static str {
 
 /// Check a value against a declared type. Returns a human-readable reason on failure.
 pub fn check_type(ty: FieldType, value: &Value) -> Result<(), String> {
-    let ok = match ty {
-        FieldType::Text => value.is_string(),
-        FieldType::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
-        FieldType::Number => value.is_number(),
-        FieldType::Boolean => value.is_boolean(),
-        // Enum accepts a scalar, or an array of scalars — the latter preserves how the
-        // pre-cascade `allowed` map treated tag lists.
-        FieldType::Enum => match value {
-            Value::Array(items) => items.iter().all(|v| !v.is_array() && !v.is_object()),
-            other => !other.is_null(),
-        },
-        FieldType::List => value.is_array(),
-        FieldType::Date => value.as_str().map(is_date).unwrap_or(false),
-        FieldType::Timestamp => value.as_str().map(is_timestamp).unwrap_or(false),
-        FieldType::Object => value.is_object(),
-    };
-
-    if ok {
+    let kind = ty.kind();
+    if (kind.accepts)(value) {
         Ok(())
     } else {
         Err(format!(
             "expected {}, got {}",
-            ty.describe(),
+            kind.describe,
             kind_of(value)
         ))
     }
@@ -2176,6 +2862,211 @@ pub fn check_values(value: &Value, permitted: &[String]) -> Result<(), String> {
     }
 }
 
+/// The flat dot-path resolver the field tree replaced (#346), kept verbatim as a
+/// reference: `resolver_equivalence` tests assert the tree's flat view, origins and
+/// fingerprint equal what this computes, so the refactor provably changed nothing a
+/// consumer of the flat view can observe.
+#[cfg(test)]
+mod flat_reference {
+    use super::*;
+
+    /// The flat model's merged definition.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(super) struct RefDef {
+        pub ty: Option<FieldType>,
+        pub required: bool,
+        pub indexed: bool,
+        pub values: Option<Vec<String>>,
+        pub default: Option<Value>,
+        pub open: bool,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub(super) struct RefResolved {
+        pub fields: BTreeMap<String, RefDef>,
+        pub origin: BTreeMap<String, String>,
+    }
+
+    impl SchemaFile {
+        /// Flatten nested authoring sugar into dot-path entries.
+        pub(super) fn flattened(&self) -> BTreeMap<String, RawFieldDef> {
+            let mut out = BTreeMap::new();
+            for (name, raw) in &self.fields {
+                flatten_raw(name, raw, &mut out);
+            }
+            out
+        }
+    }
+
+    fn flatten_raw(path: &str, raw: &RawFieldDef, out: &mut BTreeMap<String, RawFieldDef>) {
+        if let Some(children) = &raw.fields {
+            // The container itself is still a definition (it may declare `open: false`),
+            // but without its nested children, which become their own entries.
+            let mut container = raw.clone();
+            container.fields = None;
+            if container.ty.is_none() {
+                container.ty = Some(FieldType::Object);
+            }
+            out.insert(path.to_string(), container);
+            for (name, child) in children {
+                flatten_raw(&format!("{path}.{name}"), child, out);
+            }
+        } else {
+            out.insert(path.to_string(), raw.clone());
+        }
+    }
+
+    fn merged(raw: &RawFieldDef, inherited: Option<&RefDef>, origin: &str, path: &str) -> RefDef {
+        RefDef {
+            ty: raw.ty.or(inherited.and_then(|f| f.ty)),
+            required: raw
+                .required
+                .unwrap_or(inherited.is_some_and(|f| f.required)),
+            indexed: raw.indexed.unwrap_or(inherited.is_some_and(|f| f.indexed)),
+            values: FieldDef::merge_values(
+                raw,
+                inherited.and_then(|f| f.values.as_deref()),
+                origin,
+                path,
+            ),
+            default: raw
+                .default
+                .clone()
+                .or_else(|| inherited.and_then(|f| f.default.clone())),
+            open: raw.open.unwrap_or(inherited.is_none_or(|f| f.open)),
+        }
+    }
+
+    pub(super) fn from_config(config: &FrontmatterConfig) -> RefResolved {
+        let blank = || RefDef {
+            ty: None,
+            required: false,
+            indexed: false,
+            values: None,
+            default: None,
+            open: true,
+        };
+        let mut fields: BTreeMap<String, RefDef> = BTreeMap::new();
+        for name in &config.required {
+            fields.entry(name.clone()).or_insert_with(blank).required = true;
+        }
+        for name in &config.indexed_fields {
+            fields.entry(name.clone()).or_insert_with(blank).indexed = true;
+        }
+        for (name, default) in &config.defaults {
+            fields.entry(name.clone()).or_insert_with(blank).default =
+                Some(Value::String(default.clone()));
+        }
+        for (name, values) in &config.allowed {
+            fields.entry(name.clone()).or_insert_with(blank).values = Some(values.clone());
+        }
+        let origin = fields
+            .keys()
+            .map(|k| (k.clone(), scope_label(Path::new(""))))
+            .collect();
+        RefResolved { fields, origin }
+    }
+
+    pub(super) fn merged_with(base: &RefResolved, child: &SchemaFile, origin: &str) -> RefResolved {
+        let mut fields = base.fields.clone();
+        let mut origins = base.origin.clone();
+        for (path, raw) in child.flattened() {
+            let def = merged(&raw, base.fields.get(&path), origin, &path);
+            origins.insert(path.clone(), origin.to_string());
+            fields.insert(path, def);
+        }
+        RefResolved {
+            fields,
+            origin: origins,
+        }
+    }
+
+    /// `merge_cascade` over the flat model: shallowest first, a root file replacing
+    /// the config root, every other scope merging onto its nearest ancestor.
+    pub(super) fn merge_cascade(
+        files: &BTreeMap<PathBuf, SchemaFile>,
+        config_root: &RefResolved,
+    ) -> Vec<(PathBuf, RefResolved)> {
+        let mut order: Vec<&PathBuf> = files.keys().collect();
+        order.sort_by(|a, b| {
+            a.components()
+                .count()
+                .cmp(&b.components().count())
+                .then_with(|| a.cmp(b))
+        });
+        let mut scopes: Vec<(PathBuf, RefResolved)> = Vec::new();
+        for rel_dir in order {
+            let file = &files[rel_dir];
+            let origin = scope_label(rel_dir);
+            let merged = if rel_dir.as_os_str().is_empty() {
+                merged_with(&RefResolved::default(), file, &origin)
+            } else {
+                let parent = scopes
+                    .iter()
+                    .rev()
+                    .find(|(scope, _)| path_covers(scope, rel_dir))
+                    .map(|(_, schema)| schema)
+                    .unwrap_or(config_root);
+                merged_with(parent, file, &origin)
+            };
+            scopes.push((rel_dir.clone(), merged));
+        }
+        scopes
+    }
+
+    pub(super) fn fingerprint(schema: &RefResolved) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for (path, def) in &schema.fields {
+            hasher.update(path.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(format!("{:?}", def.ty).as_bytes());
+            hasher.update([def.required as u8, def.indexed as u8, def.open as u8]);
+            hasher.update([def.values.is_some() as u8]);
+            if let Some(values) = &def.values {
+                let mut sorted = values.clone();
+                sorted.sort();
+                for value in sorted {
+                    hasher.update(value.as_bytes());
+                    hasher.update([1u8]);
+                }
+            }
+            if let Some(default) = &def.default {
+                hasher.update(default.to_string().as_bytes());
+            }
+            hasher.update([0xffu8]);
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    /// Panic unless `new`'s flat view, origins and fingerprint equal `old`'s.
+    pub(super) fn assert_equivalent(new: &ResolvedSchema, old: &RefResolved, context: &str) {
+        let new_fields: BTreeMap<String, RefDef> = new
+            .fields
+            .iter()
+            .map(|(path, def)| {
+                (
+                    path.clone(),
+                    RefDef {
+                        ty: def.ty,
+                        required: def.required,
+                        indexed: def.indexed,
+                        values: def.values.clone(),
+                        default: def.default.clone(),
+                        open: def.open,
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(new_fields, old.fields, "{context}: flat fields differ");
+        assert_eq!(new.origin(), &old.origin, "{context}: origins differ");
+        assert_eq!(
+            new.fingerprint(),
+            fingerprint(old),
+            "{context}: fingerprints differ"
+        );
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3256,10 +4147,10 @@ mod tests {
         let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let new = cache.resolve_for(Path::new("new/doc.md"));
         assert!(new.fields["a"].required);
-        assert_eq!(new.origin["a"], "new/");
+        assert_eq!(new.origin()["a"], "new/");
         let old = cache.resolve_for(Path::new("old/doc.md"));
         assert!(old.fields["b"].required);
-        assert_eq!(old.origin["b"], "old/");
+        assert_eq!(old.origin()["b"], "old/");
 
         let (_, name) = cache.raw_file_at(Path::new("new")).unwrap();
         assert_eq!(name, Some(SCHEMA_FILE_NAME));
@@ -3435,6 +4326,7 @@ mod tests {
             values: Some(values.iter().map(|v| v.to_string()).collect()),
             default: None,
             open: true,
+            ..FieldDef::default()
         }
     }
 
@@ -3646,6 +4538,7 @@ mod tests {
             values: Some(vec!["x".into()]),
             default: None,
             open: true,
+            ..FieldDef::default()
         };
         let mut file = SchemaFile::default();
         file.apply_inheriting(
@@ -4328,7 +5221,8 @@ mod tests {
 
         let resolved = remapped.resolve_for(Path::new("new/doc.md"));
         assert_eq!(
-            resolved.origin["x"], "new/",
+            resolved.origin()["x"],
+            "new/",
             "provenance must name the field's NEW governing directory, not the old one"
         );
     }
@@ -4359,5 +5253,681 @@ mod tests {
                 .contains_key("w"),
             "a scope the remap function declines still resolves exactly as before"
         );
+    }
+
+    // -- tree model (#346) --------------------------------------------------
+
+    fn file(yaml: &str) -> SchemaFile {
+        let file: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+        file.validate_self().unwrap();
+        file
+    }
+
+    fn files(entries: &[(&str, &str)]) -> BTreeMap<PathBuf, SchemaFile> {
+        entries
+            .iter()
+            .map(|(dir, yaml)| (PathBuf::from(dir), file(yaml)))
+            .collect()
+    }
+
+    fn legacy_config() -> FrontmatterConfig {
+        FrontmatterConfig {
+            required: vec!["title".into(), "planning.method".into()],
+            indexed_fields: vec!["type".into(), "tags".into(), "planning.method".into()],
+            defaults: HashMap::from([("status".into(), "draft".into())]),
+            allowed: HashMap::from([
+                ("type".into(), vec!["note".into(), "recipe".into()]),
+                ("tags".into(), vec!["a".into(), "b".into()]),
+            ]),
+        }
+    }
+
+    /// Fixtures covering every feature the README's schema-file section describes:
+    /// nested vs flat authoring, `$values` splicing (leading, trailing, alone, with
+    /// nothing to inherit), the deprecated `extend`, defaults, `open: false`,
+    /// containers defaulting to `object`, typeless values-only fields, `values: []`,
+    /// a multi-level per-attribute cascade, sibling scopes, a dotted key under an
+    /// undeclared parent, the config-root fallback, and a root file replacing it.
+    fn equivalence_fixtures() -> Vec<(
+        &'static str,
+        FrontmatterConfig,
+        BTreeMap<PathBuf, SchemaFile>,
+    )> {
+        vec![
+            ("config root only", legacy_config(), BTreeMap::new()),
+            (
+                "config root fallback under child scopes",
+                legacy_config(),
+                files(&[
+                    (
+                        "food",
+                        "fields:\n  tags:\n    values: [$values, c]\n  planning:\n    \
+                         fields:\n      method:\n        type: enum\n        values: [oven]\n",
+                    ),
+                    (
+                        "food/recipes",
+                        "fields:\n  planning.method:\n    values: [braise, $values]\n  \
+                         title:\n    indexed: true\n",
+                    ),
+                ]),
+            ),
+            (
+                "root file replaces config root",
+                legacy_config(),
+                files(&[
+                    (
+                        "",
+                        "fields:\n  title:\n    type: text\n    required: true\n",
+                    ),
+                    ("notes", "fields:\n  tags:\n    values: [$values]\n"),
+                ]),
+            ),
+            (
+                "nested and flat authoring across scopes",
+                empty_config(),
+                files(&[
+                    (
+                        "",
+                        "fields:\n  planning:\n    type: object\n    open: false\n    fields:\n      \
+                         prep_minutes:\n        type: integer\n        indexed: true\n      \
+                         method:\n        values: [oven]\n  a:\n    type: object\n    fields:\n      \
+                         b:\n        type: text\n  a-b:\n    type: text\n  \
+                         deep.er.path:\n    type: boolean\n",
+                    ),
+                    (
+                        "kitchen",
+                        "fields:\n  planning.prep_minutes:\n    required: true\n  \
+                         planning:\n    open: true\n  a.c:\n    type: date\n",
+                    ),
+                    (
+                        "kitchen/recipes",
+                        "fields:\n  planning:\n    fields:\n      method:\n        \
+                         values: [$values, braise]\n        default: oven\n  deep:\n    \
+                         fields:\n      er:\n        required: true\n",
+                    ),
+                    ("garden", "fields:\n  planning:\n    required: true\n"),
+                ]),
+            ),
+            (
+                "values splicing and extend",
+                empty_config(),
+                files(&[
+                    (
+                        "",
+                        "fields:\n  tags:\n    type: list\n    values: [b, a]\n  \
+                         status:\n    values: [draft, done]\n    default: draft\n  \
+                         closed:\n    type: text\n    values: []\n  open_text:\n    type: text\n",
+                    ),
+                    (
+                        "x",
+                        "fields:\n  tags:\n    values: [c, $values]\n  status:\n    \
+                         extend: true\n    values: [archived]\n  lonely:\n    \
+                         values: [$values]\n  closed:\n    values: [$values, now]\n",
+                    ),
+                    (
+                        "x/y",
+                        "fields:\n  tags:\n    values: [$values, a, d]\n  status:\n    \
+                         values: [only]\n  open_text:\n    required: true\n",
+                    ),
+                ]),
+            ),
+            (
+                "three levels each setting a different attribute",
+                empty_config(),
+                files(&[
+                    ("", "fields:\n  rating:\n    type: integer\n"),
+                    ("a", "fields:\n  rating:\n    required: true\n"),
+                    (
+                        "a/b",
+                        "fields:\n  rating:\n    indexed: true\n    default: 3\n",
+                    ),
+                    (
+                        "a/b/c",
+                        "fields:\n  rating:\n    type: number\n    required: false\n",
+                    ),
+                ]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn tree_resolver_matches_the_flat_reference_resolver() {
+        for (name, config, files) in equivalence_fixtures() {
+            let new_root = ResolvedSchema::from_config(&config);
+            let old_root = flat_reference::from_config(&config);
+            flat_reference::assert_equivalent(&new_root, &old_root, &format!("{name}: config"));
+
+            let new = merge_cascade(&files, &new_root);
+            let old = flat_reference::merge_cascade(&files, &old_root);
+            assert_eq!(new.len(), old.len(), "{name}");
+            for ((new_dir, new_schema), (old_dir, old_schema)) in new.iter().zip(&old) {
+                assert_eq!(new_dir, old_dir, "{name}");
+                flat_reference::assert_equivalent(
+                    new_schema,
+                    old_schema,
+                    &format!("{name}: {}", scope_label(new_dir)),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_flat_view_keeps_containers_and_omits_implicit_parents() {
+        let resolved = ResolvedSchema::default().merged_with(
+            &file(
+                "fields:\n  planning:\n    fields:\n      method:\n        type: text\n  \
+                 deep.er:\n    type: text\n",
+            ),
+            "s/",
+        );
+        assert_eq!(resolved.fields["planning"].ty, Some(FieldType::Object));
+        assert!(
+            resolved.fields["planning"].fields.is_empty(),
+            "a flat-view entry carries no children; each is an entry of its own"
+        );
+        assert!(resolved.fields.contains_key("planning.method"));
+        assert!(
+            !resolved.fields.contains_key("deep"),
+            "a parent only reached through a dotted key is not declared"
+        );
+        assert!(resolved.fields.contains_key("deep.er"));
+        // The tree holds the implicit parent, undeclared.
+        let deep = &resolved.fields.tree()["deep"];
+        assert!(deep.declared_in.is_none());
+        assert!(deep.fields["er"].declared_in.is_some());
+        assert!(resolved.fields.lookup("deep").is_none());
+        assert_eq!(
+            resolved.fields.lookup("planning").unwrap().fields["method"].ty,
+            Some(FieldType::Text),
+            "lookup returns the tree node with its children"
+        );
+    }
+
+    #[test]
+    fn attribute_origins_name_the_scope_that_set_each_attribute() {
+        let resolved = ResolvedSchema::default()
+            .merged_with(&file("fields:\n  rating:\n    type: integer\n"), "/")
+            .merged_with(&file("fields:\n  rating:\n    required: true\n"), "a/")
+            .merged_with(&file("fields:\n  rating:\n    default: 3\n"), "a/b/");
+        let rating = &resolved.fields["rating"];
+        assert_eq!(rating.set_by.ty.as_deref(), Some("/"));
+        assert_eq!(rating.set_by.required.as_deref(), Some("a/"));
+        assert_eq!(rating.set_by.default.as_deref(), Some("a/b/"));
+        assert_eq!(rating.set_by.indexed, None);
+        assert_eq!(rating.declared_in.as_deref(), Some("a/b/"));
+        assert_eq!(resolved.origin()["rating"], "a/b/");
+
+        // A nested container's implied `type: object` is set by the scope that nests.
+        let nested = ResolvedSchema::default().merged_with(
+            &file("fields:\n  planning:\n    fields:\n      x:\n        type: text\n"),
+            "n/",
+        );
+        assert_eq!(nested.fields["planning"].set_by.ty.as_deref(), Some("n/"));
+    }
+
+    #[test]
+    fn items_resolve_into_the_tree_but_not_the_flat_view() {
+        let resolved = ResolvedSchema::default().merged_with(
+            &file(
+                "fields:\n  npcs:\n    items:\n      type: object\n      fields:\n        \
+                 name:\n          type: text\n          required: true\n  \
+                 tags:\n    type: list\n    items:\n      type: enum\n      values: [a, b]\n",
+            ),
+            "/",
+        );
+        // `items` makes a typeless field a list, the way `fields` makes an object.
+        assert_eq!(resolved.fields["npcs"].ty, Some(FieldType::List));
+        assert_eq!(
+            resolved.fields.keys().collect::<Vec<_>>(),
+            vec!["npcs", "tags"],
+            "nothing under items reaches the flat view"
+        );
+        assert!(resolved.origin().keys().all(|k| !k.contains("[]")));
+
+        let element = resolved.fields.lookup("npcs[]").expect("items node");
+        assert_eq!(element.ty, Some(FieldType::Object));
+        let name = resolved
+            .fields
+            .lookup("npcs[].name")
+            .expect("element field");
+        assert_eq!(name.ty, Some(FieldType::Text));
+        assert!(name.required);
+        assert_eq!(name.declared_in.as_deref(), Some("/"));
+        assert_eq!(
+            resolved.fields.lookup("tags[]").unwrap().values,
+            Some(vec!["a".into(), "b".into()])
+        );
+        // The flat entry keeps its element schema attached.
+        assert_eq!(
+            resolved.fields["tags"].items.as_ref().unwrap().ty,
+            Some(FieldType::Enum)
+        );
+        assert!(resolved.fields.lookup("npcs[].missing").is_none());
+    }
+
+    #[test]
+    fn items_inherit_per_attribute_down_the_cascade() {
+        let resolved = ResolvedSchema::default()
+            .merged_with(
+                &file(
+                    "fields:\n  npcs:\n    type: list\n    items:\n      type: object\n      \
+                     fields:\n        name:\n          type: text\n        role:\n          \
+                     type: enum\n          values: [ally, foe]\n",
+                ),
+                "/",
+            )
+            .merged_with(
+                &file(
+                    "fields:\n  npcs:\n    required: true\n    items:\n      fields:\n        \
+                     name:\n          required: true\n  npcs[].role:\n    \
+                     values: [$values, neutral]\n",
+                ),
+                "campaign/",
+            );
+        let npcs = &resolved.fields["npcs"];
+        assert_eq!(npcs.ty, Some(FieldType::List), "the inherited type stays");
+        assert!(npcs.required);
+
+        let element = resolved.fields.lookup("npcs[]").unwrap();
+        assert_eq!(element.ty, Some(FieldType::Object));
+        assert_eq!(
+            element.set_by.ty.as_deref(),
+            Some("campaign/"),
+            "nesting `fields` under items sets the element's object type at that scope"
+        );
+
+        let name = resolved.fields.lookup("npcs[].name").unwrap();
+        assert_eq!(name.ty, Some(FieldType::Text), "type inherited");
+        assert!(name.required, "required added by the child");
+        assert_eq!(name.set_by.ty.as_deref(), Some("/"));
+        assert_eq!(name.set_by.required.as_deref(), Some("campaign/"));
+
+        let role = resolved.fields.lookup("npcs[].role").unwrap();
+        assert_eq!(role.ty, Some(FieldType::Enum));
+        assert_eq!(
+            role.values,
+            Some(vec!["ally".into(), "foe".into(), "neutral".into()]),
+            "`$values` splices the inherited element values"
+        );
+    }
+
+    #[test]
+    fn items_count_toward_the_fingerprint_only_when_present() {
+        let plain =
+            ResolvedSchema::default().merged_with(&file("fields:\n  tags:\n    type: list\n"), "/");
+        let with_items = ResolvedSchema::default().merged_with(
+            &file("fields:\n  tags:\n    type: list\n    items:\n      type: text\n"),
+            "/",
+        );
+        let with_other_items = ResolvedSchema::default().merged_with(
+            &file("fields:\n  tags:\n    type: list\n    items:\n      type: integer\n"),
+            "/",
+        );
+        let with_element_field = ResolvedSchema::default().merged_with(
+            &file(
+                "fields:\n  tags:\n    type: list\n    items:\n      type: object\n      \
+                 fields:\n        x:\n          type: text\n",
+            ),
+            "/",
+        );
+        let prints = [
+            plain.fingerprint(),
+            with_items.fingerprint(),
+            with_other_items.fingerprint(),
+            with_element_field.fingerprint(),
+        ];
+        let distinct: BTreeSet<&String> = prints.iter().collect();
+        assert_eq!(distinct.len(), prints.len(), "{prints:?}");
+        assert_eq!(
+            plain.fingerprint(),
+            flat_reference::fingerprint(&flat_reference::merged_with(
+                &Default::default(),
+                &file("fields:\n  tags:\n    type: list\n"),
+                "/"
+            )),
+            "a schema without items hashes as it did before items existed"
+        );
+    }
+
+    #[test]
+    fn field_paths_parse_and_round_trip() {
+        use PathStep::{Field, Items};
+        let f = |s: &str| Field(s.to_string());
+        let cases: Vec<(&str, Vec<PathStep>)> = vec![
+            ("a", vec![f("a")]),
+            ("a.b", vec![f("a"), f("b")]),
+            ("a[]", vec![f("a"), Items]),
+            ("a[].b", vec![f("a"), Items, f("b")]),
+            ("a[][]", vec![f("a"), Items, Items]),
+            (
+                "a.b[].c[].d",
+                vec![f("a"), f("b"), Items, f("c"), Items, f("d")],
+            ),
+            // Brackets anywhere but a segment's end are part of the name.
+            ("a[0]", vec![f("a[0]")]),
+            ("a[]b", vec![f("a[]b")]),
+            // Empty names parse (callers that need non-empty names check them).
+            ("a..b", vec![f("a"), f(""), f("b")]),
+            ("[]", vec![f(""), Items]),
+            ("", vec![f("")]),
+        ];
+        for (text, steps) in cases {
+            let path = FieldPath::parse(text);
+            assert_eq!(path.steps(), steps.as_slice(), "parse {text:?}");
+            assert_eq!(path.render(), text, "render {text:?}");
+            assert_eq!(path.to_string(), text);
+            assert_eq!(path.depth(), steps.len());
+        }
+    }
+
+    #[test]
+    fn field_kind_table_covers_every_type_in_every_consumer() {
+        use crate::qdrant::IndexKind as K;
+        // (type, name, accepted, rejected, index kind, numeric, vocabulary)
+        let expected: [(FieldType, &str, Value, Value, K, NumericValue, bool); 9] = [
+            (
+                FieldType::Text,
+                "text",
+                json!("x"),
+                json!(1),
+                K::Keyword,
+                NumericValue::None,
+                false,
+            ),
+            (
+                FieldType::Integer,
+                "integer",
+                json!(3),
+                json!(3.5),
+                K::Integer,
+                NumericValue::Number,
+                true,
+            ),
+            (
+                FieldType::Number,
+                "number",
+                json!(3.5),
+                json!("3"),
+                K::Float,
+                NumericValue::Number,
+                true,
+            ),
+            (
+                FieldType::Boolean,
+                "boolean",
+                json!(true),
+                json!("true"),
+                K::Bool,
+                NumericValue::Boolean,
+                true,
+            ),
+            (
+                FieldType::Enum,
+                "enum",
+                json!(["a", 1]),
+                json!([{"a": 1}]),
+                K::Keyword,
+                NumericValue::None,
+                true,
+            ),
+            (
+                FieldType::List,
+                "list",
+                json!([]),
+                json!("a"),
+                K::Keyword,
+                NumericValue::None,
+                true,
+            ),
+            (
+                FieldType::Date,
+                "date",
+                json!("2024-01-31"),
+                json!("2024-13-01"),
+                K::Keyword,
+                NumericValue::None,
+                true,
+            ),
+            (
+                FieldType::Timestamp,
+                "timestamp",
+                json!("2024-01-31T10:00:00Z"),
+                json!("2024-01-31"),
+                K::Keyword,
+                NumericValue::None,
+                false,
+            ),
+            (
+                FieldType::Object,
+                "object",
+                json!({}),
+                json!([]),
+                K::Keyword,
+                NumericValue::None,
+                false,
+            ),
+        ];
+        assert_eq!(FieldType::ALL.len(), expected.len());
+        for (ty, (want_ty, name, good, bad, index, numeric, vocabulary)) in
+            FieldType::ALL.into_iter().zip(expected)
+        {
+            assert_eq!(ty, want_ty);
+            let kind = ty.kind();
+            // Display name (also proves `FIELD_KINDS` is in declaration order): serde's spelling, the Debug-lowercase spelling it replaced,
+            // and what `get_schema`/the web UI show.
+            assert_eq!(kind.name, name);
+            assert_eq!(ty.name(), name);
+            assert_eq!(serde_json::to_value(ty).unwrap(), json!(name));
+            assert_eq!(format!("{ty:?}").to_lowercase(), name);
+            assert_eq!(
+                serde_json::from_value::<FieldType>(json!(name)).unwrap(),
+                ty
+            );
+            // Validation.
+            assert!(check_type(ty, &good).is_ok(), "{name} accepts {good}");
+            let err = check_type(ty, &bad).unwrap_err();
+            assert!(err.contains(kind.describe), "{err}");
+            // Qdrant index kind and the filter operations it supports.
+            assert_eq!(ResolvedSchema::index_kind(Some(ty)), index, "{name}");
+            assert_eq!(kind.index, index);
+            assert_eq!(
+                kind.index.supports_range(),
+                matches!(ty, FieldType::Integer | FieldType::Number),
+                "{name}: range filters"
+            );
+            // Equality filters, as the Qdrant lowering applies them to the index kind:
+            // refused only on a float.
+            let sample = match index {
+                K::Integer => "3",
+                K::Bool => "true",
+                _ => "x",
+            };
+            let lowered = crate::qdrant::lower_field_filters(
+                &[(
+                    "f".to_string(),
+                    crate::state::FieldFilter::AnyOf(vec![sample.to_string()]),
+                )],
+                &HashMap::from([("f".to_string(), index)]),
+            );
+            assert_eq!(
+                lowered.is_err(),
+                ty == FieldType::Number,
+                "{name}: equality filters"
+            );
+            // The `value_num` mapping #349 will consume agrees with what the
+            // JSON-driven projection stores today.
+            assert_eq!(kind.numeric, numeric, "{name}");
+            let numeric_of_good = crate::document_fields::numeric_value(&good);
+            match numeric {
+                NumericValue::Number => assert_eq!(numeric_of_good, good.as_f64()),
+                NumericValue::Boolean => assert_eq!(numeric_of_good, Some(1.0)),
+                NumericValue::None => {}
+            }
+            assert_eq!(kind.vocabulary, vocabulary, "{name}");
+        }
+        assert_eq!(ResolvedSchema::index_kind(None), K::Keyword);
+    }
+
+    #[test]
+    fn items_round_trip_through_yaml_and_validate_their_shape() {
+        let original = file(
+            "fields:\n  npcs:\n    type: list\n    items:\n      type: object\n      fields:\n        \
+             name:\n          type: text\n",
+        );
+        let reparsed = file(&original.to_yaml().unwrap());
+        assert_eq!(reparsed.fields, original.fields);
+
+        for (yaml, needle) in [
+            (
+                "fields:\n  a:\n    type: text\n    items:\n      type: text\n",
+                "only a list has items",
+            ),
+            (
+                "fields:\n  a:\n    fields:\n      b:\n        type: text\n    items:\n      type: text\n",
+                "both nested fields and items",
+            ),
+            (
+                "fields:\n  a:\n    items:\n      values: [$valuez]\n",
+                "a[]",
+            ),
+            (
+                "fields:\n  a:\n    items:\n      type: text\n  a[]:\n    type: text\n",
+                "declared more than once",
+            ),
+        ] {
+            let parsed: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+            let err = parsed.validate_self().unwrap_err();
+            assert!(err.contains(needle), "{yaml}: {err}");
+        }
+    }
+
+    #[test]
+    fn edits_reach_list_items_through_the_path_grammar() {
+        let mut schema = SchemaFile::default();
+        schema
+            .apply(&SchemaEdit::SetField {
+                field: "npcs[].name".into(),
+                definition: Box::new(RawFieldDef {
+                    ty: Some(FieldType::Text),
+                    ..RawFieldDef::default()
+                }),
+            })
+            .unwrap();
+        let npcs = &schema.fields["npcs"];
+        assert_eq!(npcs.ty, Some(FieldType::List), "a missing list is created");
+        let element = npcs.items.as_deref().unwrap();
+        assert_eq!(element.ty, Some(FieldType::Object));
+        assert_eq!(
+            element.fields.as_ref().unwrap()["name"].ty,
+            Some(FieldType::Text)
+        );
+        schema.validate_self().unwrap();
+
+        schema
+            .apply(&SchemaEdit::AddValues {
+                field: "npcs[].role".into(),
+                values: vec!["foe".into(), "ally".into()],
+            })
+            .unwrap();
+        let resolved = ResolvedSchema::default().merged_with(&schema, "/");
+        assert_eq!(
+            resolved.fields.lookup("npcs[].role").unwrap().values,
+            Some(vec!["ally".into(), "foe".into()])
+        );
+        schema
+            .apply(&SchemaEdit::RemoveValues {
+                field: "npcs[].role".into(),
+                values: vec!["foe".into()],
+            })
+            .unwrap();
+
+        // A flat `[]` key is found and edited in place.
+        let mut flat = file("fields:\n  tags[]:\n    type: enum\n    values: [a]\n");
+        flat.apply(&SchemaEdit::AddValues {
+            field: "tags[]".into(),
+            values: vec!["b".into()],
+        })
+        .unwrap();
+        assert_eq!(
+            flat.fields["tags[]"].values,
+            Some(vec!["a".into(), "b".into()])
+        );
+
+        schema
+            .apply(&SchemaEdit::RemoveField {
+                field: "npcs[]".into(),
+            })
+            .unwrap();
+        assert!(schema.fields["npcs"].items.is_none());
+        assert!(
+            schema
+                .apply(&SchemaEdit::RemoveField {
+                    field: "npcs[]".into()
+                })
+                .is_err()
+        );
+
+        // `[]` under a non-list, and a name under a list, are refused.
+        let mut typed = file("fields:\n  title:\n    type: text\n  tags:\n    type: list\n");
+        let err = typed
+            .apply(&SchemaEdit::SetField {
+                field: "title[]".into(),
+                definition: Box::default(),
+            })
+            .unwrap_err();
+        assert!(err.contains("not a list"), "{err}");
+        let err = typed
+            .apply(&SchemaEdit::SetField {
+                field: "tags.x".into(),
+                definition: Box::default(),
+            })
+            .unwrap_err();
+        assert!(err.contains("not a container"), "{err}");
+    }
+
+    #[test]
+    fn items_cannot_be_added_under_a_typeless_values_field() {
+        // `values:` with no `type:` is a leniently-enforced scalar; `[]` under it would
+        // retype it as a list.
+        let mut schema = file("fields:\n  status:\n    values: [draft, done]\n");
+        let err = schema
+            .apply(&SchemaEdit::AddValues {
+                field: "status[]".into(),
+                values: vec!["x".into()],
+            })
+            .unwrap_err();
+        assert!(
+            err.contains("'status' is a scalar field with a values list, not a list"),
+            "{err}"
+        );
+        assert!(schema.fields["status"].items.is_none());
+    }
+
+    #[test]
+    fn a_flat_items_key_declares_its_implicit_parent_as_a_list() {
+        let resolved = ResolvedSchema::default().merged_with(
+            &file("fields:\n  tags[]:\n    type: enum\n    values: [a, b]\n"),
+            "s/",
+        );
+        let tags = &resolved.fields["tags"];
+        assert_eq!(tags.ty, Some(FieldType::List));
+        assert_eq!(tags.set_by.ty.as_deref(), Some("s/"));
+        assert_eq!(resolved.origin()["tags"], "s/");
+        assert_eq!(
+            tags.items.as_ref().unwrap().values,
+            Some(vec!["a".into(), "b".into()])
+        );
+        // The element schema reaches the fingerprint through its list's entry.
+        let without = ResolvedSchema::default()
+            .merged_with(&file("fields:\n  tags:\n    type: list\n"), "s/");
+        assert_ne!(resolved.fingerprint(), without.fingerprint());
+
+        // A parent declared elsewhere keeps its own attributes.
+        let declared = ResolvedSchema::default()
+            .merged_with(&file("fields:\n  tags:\n    required: true\n"), "/")
+            .merged_with(&file("fields:\n  tags[]:\n    type: text\n"), "s/");
+        assert_eq!(declared.fields["tags"].ty, None);
+        assert_eq!(declared.origin()["tags"], "/");
+        assert!(declared.fields["tags"].required);
     }
 }

@@ -68,6 +68,28 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   outpost) example applied to the UI router only, with `/mcp` and the other
   self-authenticating routes on a separate router.
 
+### Added
+
+- **Schema list element definitions (`items`) and one path grammar** (#346). A
+  `.schema.yaml` field (and `update_schema`'s `set_field` `definition`) accepts
+  `items:`, the definition of each element of a list — a scalar, or an `object` with
+  its own `fields:`; a typeless field with `items` is a `list`. Field paths, as
+  schema keys and as `update_schema`'s `field`, follow one grammar: `a.b`, `a[]` (a
+  list's elements), `a[].b` (a field of each element); `[]` steps count toward the
+  16-step depth cap. Item definitions cascade per attribute like any other field and
+  are shown by `get_schema` under the list field's `items`, but are **not enforced
+  on documents, indexed, or filterable yet**. Internally the resolved schema is now
+  a tree with per-attribute provenance and one per-type table (`FieldKind`) shared by
+  validation, Qdrant index kinds, range-filter support and type names; for every
+  schema that does not use `items` the result is unchanged, including its
+  fingerprint, so **upgrading triggers no revalidation and no reindex** (a golden test
+  pins the fingerprint). Two narrow edge cases now read differently: a schema key
+  ending in `[]` (`tags[]:`) or containing `[].` used to declare a literal field of
+  that name and now addresses list elements (a `tags[]:` key alone also declares
+  `tags` as a `list`), and `items:` is a new key, so a schema file that
+  uses it is rejected as invalid by an older binary — roll back only after removing
+  it.
+
 ### Fixed
 
 - **Moving or archiving a document keeps link anchors and titles.** The link

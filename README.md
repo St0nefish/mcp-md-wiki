@@ -463,9 +463,9 @@ Exactly one edit mode is required unless the call is a pure move (`new_path` alo
 |---|---|---|---|
 | `path` | string | no | Directory whose schema to edit; a partial directory resolves if it uniquely matches an existing scope (multiple matches are refused with the candidates listed, no match falls back to the literal path so a new scope can be introduced); omit for the root |
 | `operation` | string | yes | One of `add_values`, `remove_values`, `set_field`, `remove_field` |
-| `field` | string | yes | Field the operation targets (dot-path for nested fields) |
+| `field` | string | yes | Field the operation targets (dot-path for nested fields; `npcs[]` for a list's elements, `npcs[].name` for a field of each) |
 | `values` | string[] | conditional | For `add_values` / `remove_values` |
-| `definition` | object | conditional | For `set_field` — accepts the same keys as a `.schema.yaml` entry (`type`, `required`, `indexed`, `values`, `default`, `open`, `fields`). `values` replaces the inherited set unless it includes `$values`. The deprecated `extend` is still accepted but not advertised in the tool schema |
+| `definition` | object | conditional | For `set_field` — accepts the same keys as a `.schema.yaml` entry (`type`, `required`, `indexed`, `values`, `default`, `open`, `fields`, `items`). `values` replaces the inherited set unless it includes `$values`. The deprecated `extend` is still accepted but not advertised in the tool schema |
 | `dry_run` | boolean | no | Report the effect without writing (default: `false`) |
 | `force` | boolean | no | Apply even if existing documents would fail the new rules (default: `false`) |
 | `acknowledge_root_change` | boolean | no | Must be `true` to change the root schema with `add_values`, `set_field` or `remove_field`; `remove_values` and `dry_run` are exempt (default: `false`) |
@@ -513,17 +513,31 @@ fields:
     values: [$values, dinner, quick]   # the inherited values, then these (without $values the list replaces them)
 ```
 
-Nested authoring (as above) and flat dot-paths (`planning.prep_minutes:`) are equivalent — nesting is sugar flattened at parse time. Internally, schemas are a flat dot-path map.
+Nested authoring (as above) and flat dot-paths (`planning.prep_minutes:`) are equivalent — both name the same field in the resolved schema tree.
+
+**List elements (`items`).** A `list` field can describe its elements with `items:` — a scalar definition, or an `object` with its own `fields`. Declaring `items` on a field with no `type` makes it a `list`, the way `fields` makes it an `object`; `items` on any other type, or alongside `fields`, makes the file invalid:
+
+```yaml
+fields:
+  npcs:
+    items:
+      type: object
+      fields:
+        name: { type: text, required: true }
+        role: { type: enum, values: [ally, foe] }
+```
+
+**Paths.** Everywhere a schema names a field — a key under `fields:`, `update_schema`'s `field` — it uses one grammar: `a.b` is a child field, `a[]` the elements of list `a`, and `a[].b` a field of each element (`npcs[].role:` as a key is the same field as the nested form above). `items` definitions are merged down the cascade like any other field, shown by `get_schema` under the list field's `items`, and part of the schema fingerprint; they are **not yet enforced** on documents, indexed, or usable in `search` filters.
 
 **Types:** `text`, `integer`, `number`, `boolean`, `enum`, `list`, `date` (`YYYY-MM-DD`), `timestamp` (RFC 3339), `object`. Declared types are strictly enforced with no coercion — `prep_minutes: "45"` fails against `type: integer`. Undeclared fields are not type-checked and remain legal.
 
 A field can't declare both a scalar `type` and nested `fields:` — it's either a value or a container, not both (`type: object` is the exception, since `object` means "has nested fields"). `update_schema` enforces this the same way a hand-edited `.schema.yaml` does.
 
-Declaring one path twice in a file (nested under `fields:` and as a flat dot-path key) makes the file invalid (see [Invalid schema files](#invalid-schema-files)). `update_schema` takes a nested field as a dot-path (`planning.method`) and edits it in place; `add_values`/`set_field` create any missing parents as `type: object` fields.
+Declaring one path twice in a file (nested under `fields:`/`items:` and as a flat path key) makes the file invalid (see [Invalid schema files](#invalid-schema-files)). `update_schema` takes a nested field as a path (`planning.method`, `npcs[].role`) and edits it in place; `add_values`/`set_field` create any missing parents as `type: object` fields (`type: list` before a `[]`).
 
 ### Cascade and merge rules
 
-- The **set** of fields unions across cascade levels. Merging is per attribute: a field redefined at a deeper level overrides only the attributes it writes (`type`, `required`, `indexed`, `default`, `open`, `values`), and every attribute it leaves unwritten inherits from the nearest ancestor that declared the field.
+- The **set** of fields unions across cascade levels. Merging is per attribute: a field redefined at a deeper level overrides only the attributes it writes (`type`, `required`, `indexed`, `default`, `open`, `values`), and every attribute it leaves unwritten inherits from the nearest ancestor that declared the field. The same holds for nested fields and `items` at any depth, and redefining a container never drops the children it inherits.
 - `values` is the one attribute with an in-band merge: a list you write replaces the inherited set outright unless it contains the `$values` placeholder, which splices the inherited set in at that position (`[$values, dinner, quick]`: inherited first, then these, duplicates dropped). Any other `$`-prefixed token in the list makes the file invalid. `extend: true` is the deprecated spelling of a leading `$values`; it still works and logs a warning. See [deploy/USAGE.md](deploy/USAGE.md#cascade-and-merge-rules).
 - Resolution is a single tree walk at startup/reindex time, with in-memory longest-prefix lookup per document afterward — not a walk per file.
 

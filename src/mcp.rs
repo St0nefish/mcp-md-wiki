@@ -167,7 +167,7 @@ fn normalize_scope_path(raw: &str) -> Result<std::path::PathBuf, McpError> {
 /// all say the same thing. The deprecated `extend` is still accepted but is not
 /// advertised, so it is not listed here either.
 const FIELD_DEFINITION_KEYS: &str =
-    "`type`, `required`, `indexed`, `values`, `default`, `open`, `fields`";
+    "`type`, `required`, `indexed`, `values`, `default`, `open`, `fields`, `items`";
 
 /// A `set_field` definition as delivered by an MCP client.
 ///
@@ -402,21 +402,23 @@ fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::Schem
             MAX_FILTER_STR_LEN
         )));
     }
-    // `field` is a dot-path split into nested containers. Each segment becomes two
-    // levels of YAML nesting, so cap the depth well under the parser's recursion limit
-    // rather than let the round-trip check fail with a 500.
-    if params.field.split('.').count() > MAX_SCHEMA_PATH_SEGMENTS {
+    // `field` is a path (`a.b`, `a[]`, `a[].b`) into nested containers and list
+    // elements. Each step becomes two levels of YAML nesting, so cap the depth well
+    // under the parser's recursion limit rather than let the round-trip check fail
+    // with a 500.
+    let path = crate::schema::FieldPath::parse(&params.field);
+    if path.depth() > MAX_SCHEMA_PATH_SEGMENTS {
         return Err(invalid(format!(
-            "field path too deep: more than {MAX_SCHEMA_PATH_SEGMENTS} dot-separated segments"
+            "field path too deep: more than {MAX_SCHEMA_PATH_SEGMENTS} steps (each \
+             dot-separated name and each `[]` counts as one)"
         )));
     }
-    // An empty or whitespace-padded segment ("a..b", "a.", "a. b") would create a key no
-    // frontmatter field can match.
-    if params
-        .field
-        .split('.')
-        .any(|seg| seg.is_empty() || seg != seg.trim())
-    {
+    // An empty or whitespace-padded name ("a..b", "a.", "a. b", "[]") would create a
+    // key no frontmatter field can match.
+    if path.steps().iter().any(|step| match step {
+        crate::schema::PathStep::Field(name) => name.is_empty() || name != name.trim(),
+        crate::schema::PathStep::Items => false,
+    }) {
         return Err(invalid(format!(
             "invalid field path '{}': every dot-separated segment must be non-empty with no surrounding whitespace",
             params.field
@@ -584,15 +586,50 @@ fn insert_casualties(
 /// report it. Only what constrains a document is sent: `type` and `values`
 /// when set, `required`/`indexed` when true, `default` when there is one,
 /// `open: false` on an object that refuses undeclared keys (`true` is the
-/// default), and `declared_in` — the scope directory that last set it (`/` for
-/// the root).
+/// default), `items` — a list's element definition, in the same shape with its own
+/// `fields` — when declared (#346), and `declared_in` — the scope directory that
+/// last set it (`/` for the root). The field's own children are not included: each
+/// is reported as a field of its own.
 fn field_def_json(def: &crate::schema::FieldDef, origin: Option<&str>) -> serde_json::Value {
+    let mut entry = field_attributes_json(def);
+    if let Some(origin) = origin {
+        entry.insert(
+            "declared_in".into(),
+            serde_json::json!(crate::server::sanitize_facet_value(origin)),
+        );
+    }
+    serde_json::Value::Object(entry)
+}
+
+/// An element definition under `items`, for [`field_def_json`]: its attributes,
+/// its own `items`, and its child fields under `fields` (they have no entry of their
+/// own to be reported as).
+fn item_def_json(def: &crate::schema::FieldDef) -> serde_json::Value {
+    let mut entry = field_attributes_json(def);
+    let children: serde_json::Map<String, serde_json::Value> = def
+        .fields
+        .iter()
+        .take(MAX_REPORTED_FIELDS)
+        .map(|(name, child)| {
+            (
+                crate::server::sanitize_facet_value(name),
+                item_def_json(child),
+            )
+        })
+        .collect();
+    if !children.is_empty() {
+        entry.insert("fields".into(), serde_json::Value::Object(children));
+    }
+    serde_json::Value::Object(entry)
+}
+
+/// The attributes [`field_def_json`] and [`item_def_json`] share.
+fn field_attributes_json(
+    def: &crate::schema::FieldDef,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut entry = serde_json::Map::new();
     if let Some(ty) = def.ty {
-        entry.insert(
-            "type".into(),
-            serde_json::json!(format!("{ty:?}").to_lowercase()),
-        );
+        entry.insert("type".into(), serde_json::json!(ty.name()));
     }
     if def.required {
         entry.insert("required".into(), serde_json::json!(true));
@@ -616,13 +653,10 @@ fn field_def_json(def: &crate::schema::FieldDef, origin: Option<&str>) -> serde_
     if def.ty == Some(crate::schema::FieldType::Object) && !def.open {
         entry.insert("open".into(), serde_json::json!(false));
     }
-    if let Some(origin) = origin {
-        entry.insert(
-            "declared_in".into(),
-            serde_json::json!(crate::server::sanitize_facet_value(origin)),
-        );
+    if let Some(items) = &def.items {
+        entry.insert("items".into(), item_def_json(items));
     }
-    serde_json::Value::Object(entry)
+    entry
 }
 
 fn render_casualties(casualties: &[serde_json::Value]) -> String {
@@ -1504,8 +1538,9 @@ pub struct UpdateSchemaParams {
     #[schemars(extend("enum" = ["add_values", "remove_values", "set_field", "remove_field"]))]
     pub operation: String,
 
-    /// Field to change, as a dot-path (`planning.method`); `add_values` and
-    /// `set_field` create missing parents.
+    /// Field to change, as a dot-path (`planning.method`; `npcs[]` is a list's
+    /// element, `npcs[].name` a field of it); `add_values` and `set_field` create
+    /// missing parents.
     pub field: String,
 
     /// Values, for add_values/remove_values.
@@ -4322,22 +4357,13 @@ impl KbSearchServer {
             let key = crate::server::sanitize_facet_value(field);
             // Free text, timestamps and object containers have no vocabulary
             // worth listing.
-            if values_in_use
-                && def.values.is_none()
-                && !matches!(
-                    def.ty,
-                    Some(
-                        crate::schema::FieldType::Text
-                            | crate::schema::FieldType::Timestamp
-                            | crate::schema::FieldType::Object
-                    )
-                )
+            if values_in_use && def.values.is_none() && def.ty.is_none_or(|ty| ty.kind().vocabulary)
             {
                 open_fields.push((key.clone(), field.clone()));
             }
             reported.insert(
                 key,
-                field_def_json(def, schema.origin.get(field).map(String::as_str)),
+                field_def_json(def, schema.origin().get(field).map(String::as_str)),
             );
         }
 
@@ -4511,7 +4537,7 @@ impl KbSearchServer {
                 return None;
             }
             match schemas.resolve_from_disk(&rel_dir, None) {
-                Ok(resolved) => resolved.fields.get(edit.field()).cloned(),
+                Ok(resolved) => resolved.fields.lookup(edit.field()).cloned(),
                 // An ancestor's file no longer parses (it arrived through git): the
                 // server still enforces its last valid rules, so extend those rather
                 // than nothing, which would narrow the inherited set.
@@ -4520,7 +4546,7 @@ impl KbSearchServer {
                     schemas
                         .resolve_for(&parent.join("_"))
                         .fields
-                        .get(edit.field())
+                        .lookup(edit.field())
                         .cloned()
                 }
             }
@@ -4631,8 +4657,8 @@ impl KbSearchServer {
                 let field = edit.field();
                 let definition = resolved.as_ref().and_then(|r| {
                     r.fields
-                        .get(field)
-                        .map(|def| field_def_json(def, r.origin.get(field).map(String::as_str)))
+                        .lookup(field)
+                        .map(|def| field_def_json(def, def.declared_in.as_deref()))
                 });
                 let (would_invalidate, casualties_total, casualties_truncated) =
                     capped_casualties(&casualties);
@@ -7629,7 +7655,7 @@ mod tests {
 
         assert_eq!(resolved["type"], serde_json::json!("object"));
         for key in [
-            "type", "required", "indexed", "values", "default", "open", "fields",
+            "type", "required", "indexed", "values", "default", "open", "fields", "items",
         ] {
             let prop = &resolved["properties"][key];
             assert!(
@@ -7725,6 +7751,64 @@ mod tests {
             );
         }
         assert!(build_schema_edit(&update_params("remove_field", "planning.method")).is_ok());
+    }
+
+    #[test]
+    fn update_schema_field_paths_follow_the_list_item_grammar() {
+        // `[]` steps count toward the depth cap like names do (#346).
+        for ok in ["npcs[]", "npcs[].name", "a.b[][].c"] {
+            assert!(
+                build_schema_edit(&update_params("remove_field", ok)).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in ["[]", "a.[]", "a[]. b", "a[].", "a[]..b"] {
+            let err = build_schema_edit(&update_params("remove_field", bad)).unwrap_err();
+            assert!(err.message.contains("non-empty"), "{bad}: {}", err.message);
+        }
+        let deep = format!("{}[]", vec!["a"; MAX_SCHEMA_PATH_SEGMENTS].join("."));
+        let err = build_schema_edit(&update_params("remove_field", &deep)).unwrap_err();
+        assert!(err.message.contains("too deep"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn field_def_json_reports_items_only_when_declared() {
+        let resolved = crate::schema::ResolvedSchema::default().merged_with_for_test(
+            &serde_yaml_ng::from_str(
+                "fields:\n  npcs:\n    required: true\n    items:\n      type: object\n      \
+                 fields:\n        name:\n          type: text\n          required: true\n  \
+                 title:\n    type: text\n",
+            )
+            .unwrap(),
+            "/",
+        );
+        assert_eq!(
+            field_def_json(&resolved.fields["npcs"], Some("/")),
+            serde_json::json!({
+                "type": "list",
+                "required": true,
+                "items": {
+                    "type": "object",
+                    "fields": {"name": {"type": "text", "required": true}},
+                },
+                "declared_in": "/",
+            })
+        );
+        assert_eq!(
+            field_def_json(&resolved.fields["title"], Some("/")),
+            serde_json::json!({"type": "text", "declared_in": "/"})
+        );
+        // Every type is named as `FieldType::name` spells it.
+        for ty in crate::schema::FieldType::ALL {
+            let def = crate::schema::FieldDef {
+                ty: Some(ty),
+                ..Default::default()
+            };
+            assert_eq!(
+                field_def_json(&def, None)["type"],
+                serde_json::json!(ty.name())
+            );
+        }
     }
 
     #[test]
@@ -10917,7 +11001,7 @@ mod tests {
             serde_json::json!(false)
         );
         for key in [
-            "type", "required", "indexed", "values", "default", "open", "fields",
+            "type", "required", "indexed", "values", "default", "open", "fields", "items",
         ] {
             assert!(
                 !object_branch["properties"][key].is_null(),

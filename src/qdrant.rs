@@ -181,6 +181,12 @@ pub enum IndexKind {
 }
 
 impl IndexKind {
+    /// Whether a numeric range filter (`gte`/`lte`/`gt`/`lt`) works on a field of
+    /// this kind.
+    pub fn supports_range(self) -> bool {
+        matches!(self, IndexKind::Integer | IndexKind::Float)
+    }
+
     fn to_qdrant(self) -> FieldType {
         match self {
             IndexKind::Keyword => FieldType::Keyword,
@@ -633,7 +639,7 @@ pub fn lower_field_filters(
                 }
             }
             FieldFilter::Range { gte, lte, gt, lt } => {
-                if kind == IndexKind::Keyword || kind == IndexKind::Bool {
+                if !kind.supports_range() {
                     return Err(format!(
                         "filter '{field}': a numeric range (gte/lte/gt/lt) was requested but \
                          the field is indexed as {kind:?}; declare it `type: integer` or \

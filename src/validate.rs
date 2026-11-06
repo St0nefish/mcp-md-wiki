@@ -91,7 +91,7 @@ pub async fn validate_file(
 /// an error a caller reads, so they get the same control-character/length treatment as
 /// any other knowledge-base-controlled string reaching an agent.
 fn origin_suffix(schema: &ResolvedSchema, field: &str) -> (Option<String>, String) {
-    match schema.origin.get(field) {
+    match schema.origin().get(field) {
         Some(origin) => {
             let clean = crate::server::sanitize_facet_value(origin);
             let suffix = format!(" [declared in {clean}]");

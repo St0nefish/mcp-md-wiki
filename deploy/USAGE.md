@@ -159,13 +159,15 @@ fields:
     values: [$values, dinner, quick]   # inherited values, then these — see below
 ```
 
-Nested authoring (as above) and flat dot-paths (`planning.prep_minutes:`) are equivalent — nesting is sugar flattened at parse time.
+Nested authoring (as above) and flat dot-paths (`planning.prep_minutes:`) are equivalent — both name the same field of the resolved schema tree.
+
+A `list` field can describe its elements with `items:` (a scalar definition, or an `object` with its own `fields:`); `items` on a typeless field makes it a `list`, and `items` on any other type, or next to `fields:`, makes the file invalid. Paths use one grammar everywhere — `a.b` a child field, `a[]` a list's elements, `a[].b` a field of each element — so `npcs[].name:` as a key is the same field as `npcs: {items: {fields: {name: ...}}}`. Item definitions cascade like other fields and show up in `get_schema`, but are not yet enforced on documents, indexed, or filterable.
 
 **Types:** `text`, `integer`, `number`, `boolean`, `enum`, `list`, `date` (`YYYY-MM-DD`), `timestamp` (RFC 3339), `object`. Types are strictly enforced with no coercion (`prep_minutes: "45"` fails against `type: integer`). Undeclared fields are never type-checked and remain legal.
 
 A field definition can't declare both a scalar `type` and nested `fields:` — a field is either a value or a container, not both. `type: object` is the exception, since `object` inherently means "has nested fields." `update_schema` rejects this the same way a hand-edited `.schema.yaml` does.
 
-Declaring the same path twice in one file — once under a nested `fields:` and once as a flat dot-path key (`planning.method:` next to `planning: {fields: {method: ...}}`) — makes the file invalid (see [Invalid schema files](#invalid-schema-files)), because the two spellings are the same field and only one could win. `update_schema` addresses a nested field by its dot-path and edits it where it lives, nested or flat; `add_values`/`set_field` on a path whose parents don't exist yet create those parents as `type: object` fields.
+Declaring the same path twice in one file — once under a nested `fields:` and once as a flat dot-path key (`planning.method:` next to `planning: {fields: {method: ...}}`) — makes the file invalid (see [Invalid schema files](#invalid-schema-files)), because the two spellings are the same field and only one could win. `update_schema` addresses a nested field by its path (`planning.method`, `npcs[].name`) and edits it where it lives, nested or flat; `add_values`/`set_field` on a path whose parents don't exist yet create those parents as `type: object` fields (`type: list` before a `[]`).
 
 **`values:` without a `type:` is enforced leniently.** A field declaring `values:` *and* `type: enum` is checked strictly — any value outside the list fails, whatever its YAML type. A field declaring `values:` with **no** `type:` exempts non-string values from the check, so `status: 3` passes a `values: [active, draft]` list that `status: "retired"` would fail. That is deliberate: it preserves the behaviour of the pre-cascade global `frontmatter.allowed` map so existing deployments don't start failing, and it applies to any field authored that way — including in a `.schema.yaml`, not just the legacy `config.yaml` block. If you want a closed set actually enforced, declare `type: enum`.
 

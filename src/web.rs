@@ -1312,7 +1312,7 @@ async fn get_schema_handler(
         .take(MAX_SCHEMA_FIELDS)
         .map(|(field, def)| SchemaFieldEntry {
             field: field.clone(),
-            r#type: def.ty.map(|t| format!("{t:?}").to_lowercase()),
+            r#type: def.ty.map(|t| t.name().to_string()),
             required: def.required,
             indexed: def.indexed,
             values: def
@@ -1321,7 +1321,7 @@ async fn get_schema_handler(
                 .map(|v| v.iter().take(MAX_SCHEMA_VALUES).cloned().collect()),
             default: def.default.clone(),
             open: def.open,
-            declared_in: resolved.origin.get(field).cloned(),
+            declared_in: resolved.origin().get(field).cloned(),
         })
         .collect();
 
