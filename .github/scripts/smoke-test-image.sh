@@ -27,16 +27,23 @@
 # same on a plain workstation.
 #
 # Usage: smoke-test-image.sh <image ref>   (pulled by `docker run` if not present)
-# Needs: docker, jq. Everything is named per run and removed by a trap; several runner
-# containers share one daemon.
+# Needs: docker, jq. Everything is named ci-mcp-md-wiki-<job>-smoke-<purpose>-<run>-<attempt>
+# (stable, no random part), labelled ci.repo/ci.job/ci.run, and removed by a trap; several
+# runner containers share one daemon.
 set -euo pipefail
 shopt -s inherit_errexit
 
 image=${1:?usage: smoke-test-image.sh <image ref>}
-run_id="${GITHUB_RUN_ID:-local}-$$"
-net="mdw-smoke-${run_id}"
-qdrant_name="mdw-smoke-qdrant-${run_id}"
-app_name="mdw-smoke-app-${run_id}"
+job=$(printf '%s' "${GITHUB_JOB:-local}" | tr 'A-Z_' 'a-z-' | tr -cd 'a-z0-9-')
+run="${GITHUB_RUN_ID:-local}"
+suffix="${run}-${GITHUB_RUN_ATTEMPT:-1}"
+prefix="ci-mcp-md-wiki-${job}-smoke"
+net="${prefix}-net-${suffix}"
+qdrant_name="${prefix}-qdrant-${suffix}"
+app_name="${prefix}-app-${suffix}"
+probe_name=""
+probe_n=0
+ci_labels=(--label ci.repo=mcp-md-wiki --label "ci.job=${job}" --label "ci.run=${run}")
 token=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 body=$(mktemp)
 code=000
@@ -47,7 +54,7 @@ qdrant_image=${SMOKE_QDRANT_IMAGE:-$(docker compose -f docker-compose.yml config
 curl_image=${SMOKE_CURL_IMAGE:-curlimages/curl:8.11.1}
 
 cleanup() {
-  docker rm -f "$app_name" "$qdrant_name" >/dev/null 2>&1 || true
+  docker rm -f "$app_name" "$qdrant_name" ${probe_name:+"$probe_name"} >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
   rm -f "$body"
 }
@@ -64,18 +71,20 @@ fail() {
 
 [[ -n "$qdrant_image" ]] || fail "could not determine the Qdrant image (set SMOKE_QDRANT_IMAGE)"
 
-docker network create "$net" >/dev/null || fail "could not create docker network"
-docker run -d --name "$qdrant_name" --network "$net" "$qdrant_image" >/dev/null ||
+docker network create "${ci_labels[@]}" "$net" >/dev/null || fail "could not create docker network"
+docker run -d --name "$qdrant_name" "${ci_labels[@]}" --network "$net" "$qdrant_image" >/dev/null ||
   fail "could not start Qdrant (${qdrant_image})"
 
 # Runs curl on the private network. Prints the response body, then the status code on
 # its own last line ("000" when curl could not connect).
 probe() {
-  docker run --rm --network "$net" "$curl_image" -s --max-time 10 -w '\n%{http_code}' "$@" || true
+  docker run --rm --name "$probe_name" "${ci_labels[@]}" --network "$net" "$curl_image" -s --max-time 10 -w '\n%{http_code}' "$@" || true
 }
 # Runs a probe; leaves the body in $body (file) and the status in $code.
 request() {
   local out
+  probe_n=$((probe_n + 1))
+  probe_name="${prefix}-probe-${suffix}-${probe_n}"
   out=$(probe "$@")
   code=${out##*$'\n'}
   printf '%s' "${out%$'\n'*}" >"$body"
@@ -90,7 +99,7 @@ done
 [[ "$code" == "200" ]] || fail "Qdrant did not become ready within 60s (last status ${code})"
 
 # Port 9 (discard) refuses connections, so embeddings are unavailable but harmless.
-docker run -d --name "$app_name" --network "$net" \
+docker run -d --name "$app_name" "${ci_labels[@]}" --network "$net" \
   -e MCP_BEARER_TOKEN="$token" \
   -e QDRANT_URL="http://${qdrant_name}:6334" \
   -e EMBEDDING_BASE_URL="http://127.0.0.1:9/v1" \

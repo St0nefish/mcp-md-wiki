@@ -311,7 +311,9 @@ jobs:
               exit 1
             fi
             out="${dir}/mcp-md-wiki-linux-${arch}"
-            cid=$(docker create --platform "linux/${arch}" "${IMAGE}@${pdigest}")
+            cid=$(docker create --name "ci-mcp-md-wiki-${GITHUB_JOB}-extract-${arch}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --label ci.repo=mcp-md-wiki --label "ci.job=${GITHUB_JOB}" --label "ci.run=${GITHUB_RUN_ID}" \
+              --platform "linux/${arch}" "${IMAGE}@${pdigest}")
             docker cp "${cid}:/usr/local/bin/mcp-md-wiki" "$out"
             docker rm "$cid" >/dev/null
             docker image rm "${IMAGE}@${pdigest}" >/dev/null || true
