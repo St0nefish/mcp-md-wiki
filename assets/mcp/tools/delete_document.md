@@ -1,2 +1,2 @@
-Delete a document. Links to it from other documents are left as they are;
-those documents are returned as `referencing_paths` so you can fix them.
+Delete a document. Links to it stay as they are and those documents come back
+as `referencing_paths`, unless `unlink_inbound` turns them into plain text.

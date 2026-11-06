@@ -115,6 +115,30 @@ pub(crate) fn effective_dedup<E: QueryEmbedder, Q: RetrievalStore>(
     )
 }
 
+/// Upper bound on `write.related_limit` / `dedup.related_limit`.
+pub const MAX_RELATED_LIMIT: usize = 20;
+
+/// An existing document close to a newly created one, reported by the create-path
+/// dedup query so the writer can link to it and check it for conflicts (#356).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RelatedDocument {
+    pub path: String,
+    pub score: f32,
+}
+
+/// The create-path neighbour listing's effective `(limit, min_score)` for a
+/// document governed by `schema`: the schema file `dedup:` cascade where it sets a
+/// key, else the global `write.*` value (#356). A limit of `0` lists none.
+pub(crate) fn effective_related<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    schema: &schema::ResolvedSchema,
+) -> (usize, f32) {
+    (
+        schema.related_limit.unwrap_or(deps.related_limit),
+        schema.related_min_score.unwrap_or(deps.related_min_score),
+    )
+}
+
 /// Search options for the dedup gate.
 ///
 /// Deliberately pinned to dense-only rather than inheriting `search.hybrid`, so
@@ -123,9 +147,17 @@ pub(crate) fn effective_dedup<E: QueryEmbedder, Q: RetrievalStore>(
 /// cosine threshold like the 0.80 default the gate could never fire — and a
 /// cross-encoder relevance score is not a similarity at all, so reranking is
 /// also kept out of this path (see the `reranker: None` at the call site).
+#[cfg(test)]
 pub(crate) fn dedup_search_opts() -> crate::retrieval::SearchOptions {
+    dedup_search_opts_with_limit(1)
+}
+
+/// [`dedup_search_opts`] asking for the `limit` nearest chunks, one per document
+/// when more than one is wanted, so the extras are distinct neighbours (#356).
+/// The top hit is the same chunk `dedup_search_opts` returns.
+pub(crate) fn dedup_search_opts_with_limit(limit: usize) -> crate::retrieval::SearchOptions {
     crate::retrieval::SearchOptions {
-        limit: 1,
+        limit: limit.max(1) as u64,
         min_score: None,
         hybrid: false,
         // Unused in the dense-only path, which performs no RRF fusion.
@@ -141,7 +173,7 @@ pub(crate) fn dedup_search_opts() -> crate::retrieval::SearchOptions {
         // The dedup gate wants the single closest existing chunk, full stop — not
         // a diversified page of results (limit: 1 above makes a per-document cap
         // moot anyway, but this keeps intent explicit rather than accidental).
-        diversity_max_per_document: None,
+        diversity_max_per_document: (limit > 1).then_some(1),
     }
 }
 
@@ -232,17 +264,20 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     /// any rewritten referencing documents, and `commit_outcome.rebased_paths`
     /// (paths pulled in from OTHER commits during this write's own git
     /// fetch/rebase/push) — before they reach `queue.mark_paths` (#278).
-    /// `check_include_pattern` only checks `indexing.include`, never
-    /// `exclude`/`exclude_files`, so a write's own target can match `include`
-    /// (e.g. the default-excluded `README.md` against the default `**/*.md`)
-    /// and still not be reconcile-indexable; this filter is what keeps that
-    /// path out of the reindex queue the same way a reconcile would.
+    /// `check_include_pattern` applies the same predicate upfront and refuses a
+    /// write to an excluded target (#312); this filter still guards the paths
+    /// that gate never sees (rewritten referencing documents, rebase-pulled-in
+    /// paths).
     pub indexing: &'a crate::config::IndexingConfig,
     /// Mirrors `chunking.prepend_description` — the dedup query must be built on
     /// the same textual basis the indexer embeds.
     pub prepend_description: bool,
     pub dedup_enabled: bool,
     pub dedup_threshold: f32,
+    /// Global fallback for the create-path neighbour listing (#356); see
+    /// [`effective_related`].
+    pub related_limit: usize,
+    pub related_min_score: f32,
     pub git_url: Option<&'a str>,
     pub branch: &'a str,
     pub token: Option<&'a str>,
@@ -328,6 +363,11 @@ pub struct WriteRequest<'a> {
     /// DESTINATION's schema; the create-only dedup gate never runs. `change` must
     /// not be a create (reported as `WriteError::Internal`).
     pub dest_path: Option<&'a str>,
+    /// `Some` turns the move into an ARCHIVE (#357): `dest_path` is the archived
+    /// location (see [`archive_destination`]), the document gets `status: archived`
+    /// when its governing schema allows that, and the links pointing at it are
+    /// handled per this policy, all in the one move commit. Requires `dest_path`.
+    pub archive: Option<crate::config::ArchiveLinkPolicy>,
 }
 
 /// The two outcomes a write can land on. Both are the tool's happy path from a
@@ -373,6 +413,10 @@ pub struct WriteSuccess {
     /// caller with no access to server logs (the `warn!` #181 added) can still
     /// learn what it warned about and decide whether follow-up work is needed.
     pub referencing_paths: Vec<String>,
+    /// An archive write set `status: archived` on the moved document. `false` for
+    /// every other change, and for an archive whose governing schema declares no
+    /// `status` field allowing that value (the frontmatter is then left alone).
+    pub status_set: bool,
     /// The written document had other concurrent changes that were merged with
     /// this one (a three-way merge of a stale full replace, a relative edit
     /// applied over changes made since its `expected_version`, or a clean rebase
@@ -384,6 +428,12 @@ pub struct WriteSuccess {
     /// and when a merge during sync means the on-disk bytes are not known here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Existing documents close to a just-CREATED one, nearest first, from the
+    /// dedup query the create already ran (#356). Empty for every other change,
+    /// when dedup is off or bypassed for the path, or when nothing scores at least
+    /// the floor. Never contains the written path.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RelatedDocument>,
 }
 
 /// Every structured failure mode of the write pipeline. Callers map these onto
@@ -498,9 +548,11 @@ impl PathSafetyError {
 /// 1. Reject absolute paths.
 /// 2. Reject any `..` component.
 /// 3. Lexical `starts_with` check on the joined abs path.
-/// 4. Canonicalize the deepest *existing* ancestor of the target; verify it
-///    still `starts_with` the canonical data_root. This catches a symlinked
-///    ancestor directory that resolves to a location outside data_root.
+/// 4. Reject a `.git` component (any case) and any symlink among the existing
+///    components, leaf included ([`crate::ingest::inspect_kb_path`], the same
+///    check the indexer and the read path apply).
+/// 5. Canonicalize the deepest *existing* ancestor of the target; verify it
+///    still `starts_with` the canonical data_root (defense in depth behind 4).
 fn resolve_safe_write_path_detailed(
     data_root: &Path,
     rel_path: &str,
@@ -534,7 +586,49 @@ fn resolve_safe_write_path_detailed(
         ));
     }
 
-    // 4. Canonical-ancestor check: canonicalize data_root, then walk up from
+    // 4. No `.git` component, and no symlink anywhere along the existing part of
+    //    the path — the leaf included. Canonicalizing an ancestor (step 5) cannot
+    //    see a leaf symlink to a file inside the root (`x.md -> .git/config`,
+    //    `x.md -> state.db`), and writing through one lands in its target.
+    //    Independent of `indexing.include`: a widened include must not make a
+    //    `.git` directory writable. A directory leaf is allowed (directory moves
+    //    resolve their prefixes here); a FIFO, socket or device node is not.
+    match crate::ingest::inspect_kb_path(data_root, requested) {
+        Ok(
+            crate::ingest::KbEntry::Missing
+            | crate::ingest::KbEntry::File
+            | crate::ingest::KbEntry::Dir,
+        ) => {}
+        Ok(crate::ingest::KbEntry::Other) => {
+            return Err(PathSafetyError::Rejected(
+                "path is not a regular file or directory".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::GitDir) => {
+            return Err(PathSafetyError::Rejected(
+                "path names a reserved directory".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::Symlink) => {
+            return Err(PathSafetyError::Rejected(
+                "path must not be or pass through a symlink".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::NotRelative) => {
+            return Err(PathSafetyError::Rejected(
+                "path must be relative to the knowledge base root".to_string(),
+            ));
+        }
+        Err(crate::ingest::KbPathError::Io(e)) => {
+            return Err(PathSafetyError::Internal(format!(
+                "cannot inspect '{}': {}",
+                abs_path.display(),
+                e
+            )));
+        }
+    }
+
+    // 5. Canonical-ancestor check: canonicalize data_root, then walk up from
     //    abs_path to find the deepest ancestor that actually exists on disk,
     //    canonicalize it, and confirm it still sits under canonical data_root.
     let canonical_root = data_root.canonicalize().map_err(|e| {
@@ -632,6 +726,9 @@ fn safe_write_path<E: QueryEmbedder, Q: RetrievalStore>(
 /// existing caller's (necessarily exhaustive) match over `WriteError` keeps
 /// compiling unchanged — see `mcp.rs`'s and `web.rs`'s error-mapping functions.
 ///
+/// Also applies `indexing.exclude`/`exclude_files` (#312), so the gate answers
+/// "could this path ever be indexed" the same way a reconcile does.
+///
 /// `pub(crate)` (rather than folded entirely into `check_include_pattern`
 /// below) so `mcp.rs`'s `create_document` adapter can run this exact check —
 /// same message text — ahead of its own `exists()` pre-check, restoring the
@@ -639,10 +736,52 @@ fn safe_write_path<E: QueryEmbedder, Q: RetrievalStore>(
 /// check. See that call site's comment.
 pub(crate) fn check_include_pattern_against(
     include_patterns: &globset::GlobSet,
+    indexing: &crate::config::IndexingConfig,
     rel_path: &str,
 ) -> Result<(), WriteError> {
     let normalized = crate::retrieval::kb_root_relative(rel_path);
-    if include_patterns.is_match(normalized) {
+    if !include_patterns.is_match(normalized) {
+        return Err(WriteError::UnsafePath {
+            msg: format!(
+                "path '{}' does not match any indexable include pattern \
+                 (e.g. must be a markdown file under an included path)",
+                rel_path
+            ),
+        });
+    }
+    // Matching `include` is not enough: a reconcile also applies `exclude` and
+    // `exclude_files`, so a path they rule out would be committed and then never
+    // indexed (#312). Fails open on a glob-build error, like `partition_indexable`.
+    match crate::ingest::PathFilter::from_config(indexing) {
+        Ok(filter) if !filter.is_indexable(normalized) => Err(WriteError::UnsafePath {
+            msg: format!(
+                "path '{}' is excluded from indexing (it matches an exclusion rule), \
+                 so a document written there would never be searchable",
+                rel_path
+            ),
+        }),
+        Ok(_) => Ok(()),
+        Err(e) => {
+            error!(
+                "Failed to build indexing path filter, skipping the exclusion check for '{rel_path}': {e:#}"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The include-only half of [`check_include_pattern_against`], for a side of a
+/// write that is not held to the exclusion rules: the source of a move, the
+/// target of a delete, and the destination of a document that was already
+/// excluded from indexing at its source. A document sitting in an excluded directory must stay movable out of
+/// it and deletable (#312 refuses writes that would land in excluded paths, not
+/// cleanup of what is already there).
+fn check_include_only<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    rel_path: &str,
+) -> Result<(), WriteError> {
+    let normalized = crate::retrieval::kb_root_relative(rel_path);
+    if deps.retrieval.include_patterns.is_match(normalized) {
         return Ok(());
     }
     Err(WriteError::UnsafePath {
@@ -658,7 +797,7 @@ fn check_include_pattern<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     rel_path: &str,
 ) -> Result<(), WriteError> {
-    check_include_pattern_against(deps.retrieval.include_patterns, rel_path)
+    check_include_pattern_against(deps.retrieval.include_patterns, deps.indexing, rel_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -726,24 +865,28 @@ pub enum FrontmatterEdit {
 /// the frontmatter block at all, structurally, rather than by carefully
 /// avoiding it.
 ///
-/// Delimiter convention: `content` must begin with a `---` line (`\n`- or
-/// `\r\n`-terminated); the block ends at the next line that is exactly `---`
-/// (optionally `\r`-terminated), found by scanning line-by-line so a literal
-/// `---` inside a YAML value (e.g. a horizontal-rule in a `description`
-/// string) can never be mistaken for the closing delimiter. Returns `None`
-/// when `content` has no opening delimiter, or an opening delimiter with no
-/// matching close — both read as "no frontmatter block", the same as
-/// `gray_matter` treats them.
+/// Delimiter convention: gray_matter's, through the one predicate the indexer
+/// uses too (`heading::is_frontmatter_delimiter_line`: `---` with trailing
+/// whitespace — `\r`, spaces, tabs — trimmed). `content`'s first line must be
+/// such a delimiter and be `\n`-terminated; the block ends at the next line that
+/// is one, found by scanning line-by-line so a literal `---` inside a YAML value
+/// (e.g. a horizontal-rule in a `description` string) can never be mistaken for
+/// the closing delimiter. A stricter rule here would see no frontmatter in a
+/// document whose opening line is `--- `, while the parser still reads its
+/// fields, so a frontmatter patch would prepend a second block and leave the old
+/// one in the body. Returns `None` when `content` has no opening delimiter, or
+/// an opening delimiter with no matching close — both read as "no frontmatter
+/// block" (gray_matter parses no fields from an unclosed one).
 fn split_frontmatter_bytes(content: &str) -> Option<(&str, &str)> {
-    let after_open = content
-        .strip_prefix("---\r\n")
-        .or_else(|| content.strip_prefix("---\n"))?;
+    let (first, after_open) = content.split_once('\n')?;
+    if !crate::heading::is_frontmatter_delimiter_line(first) {
+        return None;
+    }
 
     let mut offset = 0usize;
     for line in after_open.split_inclusive('\n') {
         let trimmed = line.strip_suffix('\n').unwrap_or(line);
-        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
-        if trimmed == "---" {
+        if crate::heading::is_frontmatter_delimiter_line(trimmed) {
             let close_end = offset + line.len();
             let fm_len = (content.len() - after_open.len()) + close_end;
             return Some((&content[..fm_len], &content[fm_len..]));
@@ -891,7 +1034,7 @@ fn splice_frontmatter_block(
     let lines: Vec<&str> = old_block.split_inclusive('\n').collect();
     let (open, rest) = lines.split_first()?;
     let (close, inner) = rest.split_last()?;
-    if !close.trim_end_matches(['\r', '\n']).eq("---") {
+    if !crate::heading::is_frontmatter_delimiter_line(close.trim_end_matches('\n')) {
         return None;
     }
 
@@ -1457,20 +1600,35 @@ async fn validate_document<E: QueryEmbedder, Q: RetrievalStore>(
     Ok(validated)
 }
 
+/// Adapter that routes `embed_query` to the wrapped embedder's `embed_document`,
+/// so the dedup search embeds like with like against the indexed chunks.
+struct DocumentSideEmbedder<'a, E: QueryEmbedder>(&'a E);
+
+impl<E: QueryEmbedder> QueryEmbedder for DocumentSideEmbedder<'_, E> {
+    async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>> {
+        self.0.embed_document(q).await
+    }
+}
+
 /// The create-path dedup gate: refuse when an existing document is a near
 /// duplicate of `validated`. Runs before the lock — it embeds and queries
 /// Qdrant, which can take a while — and only for a create, whose content is fixed.
+///
+/// Returns the nearest other documents scoring at least the effective
+/// `related_min_score`, nearest first, taken from the same query (#356). Empty
+/// when dedup is off or bypassed, the limit is `0`, or the search fails.
 async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     rel_path: &str,
     validated: Option<&validate::ValidatedFile>,
     force_new: Option<bool>,
-) -> Result<(), WriteError> {
+) -> Result<Vec<RelatedDocument>, WriteError> {
     let schemas = crate::schema::load_shared(deps.schema_cache);
     let schema = schemas.resolve_for(Path::new(rel_path));
     let (dedup_enabled, dedup_threshold) = effective_dedup(deps, schema);
+    let (related_limit, related_min_score) = effective_related(deps, schema);
     if !dedup_enabled || matches!(force_new, Some(true)) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // The body already parsed during validation keeps the dedup query on exactly
     // the frontmatter-stripped basis the indexer embeds.
@@ -1485,12 +1643,15 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
             "Dedup gate skipped for '{}': no body text to compare",
             rel_path
         );
-        return Ok(());
+        return Ok(Vec::new());
     }
     // Detach the reranker: `dedup_threshold` is a cosine similarity, and a
     // cross-encoder relevance score is not comparable to it.
+    // Embed on the document side: the text is compared against indexed chunks, so it
+    // takes `embedding.document_prefix`, not the query prefix.
+    let document_side = DocumentSideEmbedder(deps.retrieval.embed_client);
     let dedup_deps = RetrievalDeps {
-        embed_client: deps.retrieval.embed_client,
+        embed_client: &document_side,
         qdrant: deps.retrieval.qdrant,
         collection: deps.retrieval.collection,
         data_path: deps.retrieval.data_path,
@@ -1501,20 +1662,24 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
         &dedup_deps,
         &query_text,
         &SearchFilters::default(),
-        &dedup_search_opts(),
+        &dedup_search_opts_with_limit(related_limit),
     )
     .await
     {
         Ok(results) => {
-            let top = results.into_iter().next().map(|r| {
-                let path = r
-                    .payload
-                    .get("file_path")
-                    .and_then(|v| v.as_str())
-                    .map(|p| crate::retrieval::relative_to_data(p, deps.canonical_data_path))
-                    .unwrap_or_default();
-                (path, r.score)
-            });
+            let hits: Vec<(String, f32)> = results
+                .into_iter()
+                .map(|r| {
+                    let path = r
+                        .payload
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .map(|p| crate::retrieval::relative_to_data(p, deps.canonical_data_path))
+                        .unwrap_or_default();
+                    (path, r.score)
+                })
+                .collect();
+            let top = hits.first().cloned();
             if let Some((path, score)) = top.as_ref() {
                 tracing::debug!(
                     "Dedup gate for '{}': nearest '{}' at dense cosine {:.4} (threshold {:.2})",
@@ -1531,6 +1696,12 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
                     threshold: dedup_threshold,
                 });
             }
+            return Ok(related_from_hits(
+                hits,
+                rel_path,
+                related_min_score,
+                related_limit,
+            ));
         }
         Err(e) => {
             warn!(
@@ -1539,7 +1710,35 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
             );
         }
     }
-    Ok(())
+    Ok(Vec::new())
+}
+
+/// The neighbours worth reporting from the dedup query's hits (path, dense cosine):
+/// scoring at least `min_score`, never `own_path`, each document once, nearest
+/// first, at most `limit` (#356).
+fn related_from_hits(
+    mut hits: Vec<(String, f32)>,
+    own_path: &str,
+    min_score: f32,
+    limit: usize,
+) -> Vec<RelatedDocument> {
+    let own = crate::retrieval::kb_root_relative(own_path);
+    hits.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut out: Vec<RelatedDocument> = Vec::new();
+    for (path, score) in hits {
+        if out.len() >= limit {
+            break;
+        }
+        if path.is_empty()
+            || score < min_score
+            || crate::retrieval::kb_root_relative(&path) == own
+            || out.iter().any(|r| r.path == path)
+        {
+            continue;
+        }
+        out.push(RelatedDocument { path, score });
+    }
+    out
 }
 
 /// Read a document, `None` when it does not exist.
@@ -1563,8 +1762,22 @@ async fn read_if_exists(abs_path: &Path) -> Result<Option<String>, WriteError> {
 /// caller moves on to `git add`.
 async fn write_and_flush(file: &mut tokio::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
+    #[cfg(test)]
+    if let Ok(written) = FAIL_WRITE_AFTER_BYTES.try_with(|n| *n) {
+        file.write_all(&bytes[..written.min(bytes.len())]).await?;
+        file.flush().await?;
+        return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+    }
     file.write_all(bytes).await?;
     file.flush().await
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only: inside this scope `write_and_flush` writes only this many bytes
+    /// and then fails the way ENOSPC part-way through would, leaving a partly
+    /// written file for the caller to clean up. A no-op outside tests.
+    static FAIL_WRITE_AFTER_BYTES: usize;
 }
 
 /// Run `write`, a document's one filesystem write, and when it fails undo what it
@@ -1637,6 +1850,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
         operation,
         expected_version,
         dest_path: _,
+        archive: _,
     } = req;
     let is_create = change.is_create();
 
@@ -1672,9 +1886,10 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     //    the lock: the gate's embedding call and Qdrant query are the one slow step
     //    deliberately kept outside it. Every other change is validated under the
     //    lock, against the content it actually computes there.
+    let mut related: Vec<RelatedDocument> = Vec::new();
     if let DocChange::Create(content) = change {
         let validated = validate_document(deps, rel_path, content).await?;
-        dedup_gate(deps, rel_path, validated.as_ref(), force_new).await?;
+        related = dedup_gate(deps, rel_path, validated.as_ref(), force_new).await?;
     }
 
     // 2. Validate the commit message BEFORE touching the filesystem.
@@ -1755,12 +1970,14 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
             // says what the caller asked for, so report it as it stands.
             if applied.content == current {
                 return Ok(WriteSuccess {
+                    related: related.clone(),
                     outcome: WriteOutcome::Synced,
                     sha: head.unwrap_or_default(),
                     rebased_paths: Vec::new(),
                     diff: String::new(),
                     rewritten_paths: Vec::new(),
                     referencing_paths: Vec::new(),
+                    status_set: false,
                     merged: applied.merged,
                     version: Some(document_version(current.as_bytes())),
                 });
@@ -1843,20 +2060,32 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                 };
             }
 
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            Err(git::CommitSyncError::PostCommit {
+                sha,
+                source,
+                rebased_paths,
+            }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure for '{}', commit {} stands \
                      uncorrected: {:#}",
                     rel_path, sha, source
                 );
-                mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
+                mark_dirty(
+                    deps.queue,
+                    deps.indexing,
+                    std::iter::once(PathBuf::from(rel_path))
+                        .chain(rebased_paths)
+                        .collect(),
+                );
                 return Ok(WriteSuccess {
+                    related: related.clone(),
                     outcome: WriteOutcome::CommittedPendingSync,
                     sha,
                     rebased_paths: Vec::new(),
                     diff: render_unified_diff(&old_content, &applied.content, rel_path),
                     rewritten_paths: Vec::new(),
                     referencing_paths: Vec::new(),
+                    status_set: false,
                     merged: applied.merged,
                     version: Some(document_version(applied.content.as_bytes())),
                 });
@@ -1896,12 +2125,14 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
             Some(document_version(applied.content.as_bytes()))
         };
         return Ok(WriteSuccess {
+            related: related.clone(),
             outcome: WriteOutcome::Synced,
             sha: commit_outcome.sha,
             diff: render_unified_diff(&old_content, &applied.content, rel_path),
             rebased_paths: commit_outcome.rebased_paths,
             rewritten_paths: Vec::new(),
             referencing_paths: Vec::new(),
+            status_set: false,
             merged: applied.merged || rebase_merged,
             version,
         });
@@ -1938,6 +2169,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
         operation,
         expected_version,
         dest_path,
+        archive,
     } = req;
     let dest_rel = dest_path.expect("write_document_move called with req.dest_path == None");
 
@@ -1954,7 +2186,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     //    particular before a configured validation.lint_command exec).
     check_not_schema_file(source_rel)?;
     check_not_schema_file(dest_rel)?;
-    check_include_pattern(deps, source_rel)?;
+    check_include_only(deps, source_rel)?;
     check_include_pattern(deps, dest_rel)?;
     safe_write_path(deps, source_rel)?;
     safe_write_path(deps, dest_rel)?;
@@ -1965,6 +2197,16 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     };
 
     validate_commit_message(message)?;
+
+    // An archive promises its inbound links are handled; without the reverse-link
+    // index it could not keep that promise, so it refuses instead of moving alone.
+    if archive.is_some() && deps.state.is_none() {
+        return Err(WriteError::Internal {
+            msg: "archiving needs the document index to find links to the document, and it is \
+                  unavailable right now"
+                .to_string(),
+        });
+    }
 
     let (git_lock, mut head) = lock_and_sync(deps).await;
     let data_path_str = data_path_of(deps);
@@ -1999,10 +2241,28 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
         //    moved document was authored against its OLD directory; each is
         //    re-relativized from `dest_rel` to its own target, a self-reference
         //    mapping to `dest_rel`.
-        let content_to_write =
+        let mut content_to_write =
             rewrite_outbound_links(&applied.content, source_rel, dest_rel, |resolved| {
                 (resolved == source_rel).then(|| dest_rel.to_string())
             });
+
+        // 6.5. An archive marks the document `status: archived` where the
+        //      DESTINATION's schema declares a `status` field that allows it;
+        //      otherwise the frontmatter is left exactly as it is.
+        let mut status_set = false;
+        if archive.is_some() && archive_status_allowed(deps, dest_rel) {
+            let set_status = [FrontmatterEdit::SetField {
+                field: "status".to_string(),
+                value: serde_json::json!(ARCHIVED_STATUS),
+            }];
+            match apply_frontmatter_patch(&content_to_write, &set_status) {
+                Ok(patched) => {
+                    content_to_write = patched;
+                    status_set = true;
+                }
+                Err(e) => warn!("Archiving '{}': leaving status alone: {}", source_rel, e),
+            }
+        }
 
         // 7. Validation against the DESTINATION's schema, not the source's.
         validate_document(deps, dest_rel, &content_to_write).await?;
@@ -2039,14 +2299,14 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                         }
                     }
                 })?;
-            write_and_flush(&mut file, content_to_write.as_bytes())
-                .await
-                .map_err(|e| {
-                    error!("Failed to write file '{}': {}", abs_dest.display(), e);
-                    WriteError::Io {
-                        msg: format!("Failed to write file: {}", e),
-                    }
-                })?;
+            // A partly written destination (ENOSPC, EIO) is removed again, as a
+            // create's is: left behind, every retry of the move would fail
+            // `AlreadyExists` and the reconcile would index the truncated copy. The
+            // source is only removed below, so it is still intact here.
+            write_or_undo(&abs_dest, None, async {
+                write_and_flush(&mut file, content_to_write.as_bytes()).await
+            })
+            .await?;
         }
 
         let abs_source = safe_write_path(deps, source_rel)?;
@@ -2075,101 +2335,63 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
         //    query, skips it; the links self-heal on each document's next reindex.
         let mut rewritten_paths: Vec<String> = Vec::new();
         if let Some(state) = deps.state {
-            match state.links_targeting(source_rel, "markdown").await {
-                Ok(referencing_paths) => {
-                    for ref_path in referencing_paths {
-                        // A self-reference was handled in `content_to_write`.
-                        if ref_path == source_rel {
-                            continue;
-                        }
-                        let abs_ref = match safe_write_path(deps, &ref_path) {
-                            Ok(p) => p,
-                            Err(_) => {
-                                warn!(
-                                    "Skipping link rewrite in '{}' while moving '{}' -> '{}': \
-                                     the path no longer resolves safely (stale document_links \
-                                     row?)",
-                                    ref_path, source_rel, dest_rel
-                                );
-                                continue;
-                            }
-                        };
-                        let body = match tokio::fs::read_to_string(&abs_ref).await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!(
-                                    "Skipping link rewrite in '{}' while moving '{}' -> '{}': \
-                                     failed to read it, likely a stale document_links row: {}",
-                                    ref_path, source_rel, dest_rel, e
-                                );
-                                continue;
-                            }
-                        };
-                        let occurrences: Vec<_> =
-                            crate::ingest::find_markdown_link_occurrences(&body, &ref_path)
-                                .into_iter()
-                                .filter(|o| o.resolved.as_str() == source_rel)
-                                .collect();
-                        if occurrences.is_empty() {
-                            continue;
-                        }
-                        let replacement = crate::ingest::relativize_md_path(&ref_path, dest_rel);
-                        let new_body = apply_link_replacements(&body, &occurrences, &replacement);
-                        if let Err(e) = tokio::fs::write(&abs_ref, new_body.as_bytes()).await {
-                            error!(
-                                "Failed to rewrite links into '{}' while moving '{}' -> '{}': \
-                                 {}. Undoing every filesystem change made for this move so far.",
-                                ref_path, source_rel, dest_rel, e
-                            );
-                            // Nothing has touched git yet: restore the tracked paths
-                            // from HEAD and delete the untracked destination.
-                            for done in &rewritten_paths {
-                                if let Err(e) =
-                                    git::restore_from_head(&git_lock, data_path_str, done).await
-                                {
-                                    error!(
-                                        "Rollback: failed to restore rewritten referencing \
-                                         document '{}': {:#}. This needs operator attention.",
-                                        done, e
-                                    );
-                                }
-                            }
-                            if let Err(e) =
-                                git::restore_from_head(&git_lock, data_path_str, source_rel).await
-                            {
-                                error!(
-                                    "Rollback: failed to restore source '{}': {:#}. This needs \
-                                     operator attention.",
-                                    source_rel, e
-                                );
-                            }
-                            if let Err(e) = tokio::fs::remove_file(&abs_dest).await {
-                                error!(
-                                    "Rollback: failed to remove destination '{}': {}. This \
-                                     needs operator attention.",
-                                    dest_rel, e
-                                );
-                            }
-                            return Err(WriteError::Io {
-                                msg: format!("Failed to rewrite links in '{}': {}", ref_path, e),
-                            });
-                        }
-                        rewritten_paths.push(ref_path);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Skipping incoming-link rewrite while moving '{}' -> '{}': the \
-                         reverse-link query failed: {:#}",
-                        source_rel, dest_rel, e
+            let action = match archive {
+                Some(crate::config::ArchiveLinkPolicy::Unlink) => InboundAction::Unlink,
+                _ => InboundAction::Repoint(dest_rel),
+            };
+            match rewrite_inbound_links(deps, state, source_rel, action, archive.is_some()).await {
+                Ok(paths) => rewritten_paths = paths,
+                Err(failure) => {
+                    error!(
+                        "Failed to rewrite links into '{}' while moving '{}' -> '{}': {}. \
+                         Undoing every filesystem change made for this move so far.",
+                        failure.path, source_rel, dest_rel, failure.msg
                     );
+                    // Nothing has touched git yet: restore the tracked paths
+                    // from HEAD and delete the untracked destination.
+                    for done in &failure.written {
+                        if let Err(e) = git::restore_from_head(&git_lock, data_path_str, done).await
+                        {
+                            error!(
+                                "Rollback: failed to restore rewritten referencing \
+                                 document '{}': {:#}. This needs operator attention.",
+                                done, e
+                            );
+                        }
+                    }
+                    if let Err(e) =
+                        git::restore_from_head(&git_lock, data_path_str, source_rel).await
+                    {
+                        error!(
+                            "Rollback: failed to restore source '{}': {:#}. This needs \
+                             operator attention.",
+                            source_rel, e
+                        );
+                    }
+                    if let Err(e) = tokio::fs::remove_file(&abs_dest).await {
+                        error!(
+                            "Rollback: failed to remove destination '{}': {}. This \
+                             needs operator attention.",
+                            dest_rel, e
+                        );
+                    }
+                    return Err(WriteError::Io {
+                        msg: format!(
+                            "Failed to rewrite links in '{}': {}",
+                            failure.path, failure.msg
+                        ),
+                    });
                 }
             }
         }
 
         let commit_message = build_commit_message(
             message,
-            &format!("docs: move {} to {}", source_rel, dest_rel),
+            &if archive.is_some() {
+                format!("docs: archive {} to {}", source_rel, dest_rel)
+            } else {
+                format!("docs: move {} to {}", source_rel, dest_rel)
+            },
             operation,
         );
 
@@ -2256,6 +2478,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
             Err(git::CommitSyncError::PostCommit {
                 sha,
                 source: source_err,
+                rebased_paths,
             }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure moving '{}' -> '{}', commit {} \
@@ -2268,15 +2491,18 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                     [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
                         .into_iter()
                         .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .chain(rebased_paths)
                         .collect(),
                 );
                 return Ok(WriteSuccess {
+                    related: Vec::new(),
                     outcome: WriteOutcome::CommittedPendingSync,
                     sha,
                     rebased_paths: Vec::new(),
                     diff: render_unified_diff(&current, &content_to_write, dest_rel),
                     rewritten_paths,
                     referencing_paths: Vec::new(),
+                    status_set,
                     merged: applied.merged,
                     version: Some(document_version(content_to_write.as_bytes())),
                 });
@@ -2312,18 +2538,248 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
         let rebase_merged = rebase_touched(&commit_outcome.rebased_paths, &commit_paths);
         let dest_merged = rebase_touched(&commit_outcome.rebased_paths, &[dest_rel]);
         return Ok(WriteSuccess {
+            related: Vec::new(),
             outcome: WriteOutcome::Synced,
             sha: commit_outcome.sha,
             diff: render_unified_diff(&current, &content_to_write, dest_rel),
             rebased_paths: commit_outcome.rebased_paths,
             rewritten_paths,
             referencing_paths: Vec::new(),
+            status_set,
             merged: applied.merged || rebase_merged,
             version: (!dest_merged).then(|| document_version(content_to_write.as_bytes())),
         });
     }
 
     Err(WriteError::EditedElsewhere)
+}
+
+// ---------------------------------------------------------------------------
+// Archive flow and inbound-link handling (#357)
+// ---------------------------------------------------------------------------
+
+/// The `status` value an archive sets.
+const ARCHIVED_STATUS: &str = "archived";
+
+/// Where an archive of `rel_path` lands: `<prefix>/<rel_path>`. `prefix` is
+/// `write.archive_prefix` (validated at config load; re-checked here). Refuses a
+/// document already under the prefix, so archiving twice cannot nest
+/// `_archive/_archive/...`.
+pub fn archive_destination(prefix: &str, rel_path: &str) -> Result<String, String> {
+    let prefix = crate::config::normalize_archive_prefix(prefix)
+        .map_err(|e| format!("write.archive_prefix {e}"))?;
+    let rel = rel_path.trim_start_matches('/');
+    if rel == prefix || rel.starts_with(&format!("{prefix}/")) {
+        return Err(format!(
+            "'{rel_path}' is already in the archive ('{prefix}/')"
+        ));
+    }
+    Ok(format!("{prefix}/{rel}"))
+}
+
+/// Whether the schema governing `dest_rel` declares a `status` field that can hold
+/// `archived`: a text or enum field, open or listing that value. A document under
+/// a schema without one keeps its frontmatter as it is.
+fn archive_status_allowed<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    dest_rel: &str,
+) -> bool {
+    let schemas = crate::schema::load_shared(deps.schema_cache);
+    let Some(def) = schemas
+        .resolve_for(Path::new(dest_rel))
+        .fields
+        .get("status")
+    else {
+        return false;
+    };
+    matches!(
+        def.ty,
+        None | Some(crate::schema::FieldType::Enum | crate::schema::FieldType::Text)
+    ) && def
+        .values
+        .as_ref()
+        .is_none_or(|v| v.iter().any(|x| x == ARCHIVED_STATUS))
+}
+
+/// What to do with a link that points at a document being moved or removed.
+#[derive(Clone, Copy)]
+enum InboundAction<'a> {
+    /// Point it at this (KB-relative) new location.
+    Repoint(&'a str),
+    /// Replace the whole link with its plain label.
+    Unlink,
+}
+
+/// A failed inbound rewrite: which document, why, and which documents had already
+/// been rewritten on disk (and so need restoring from HEAD).
+struct InboundFailure {
+    path: String,
+    msg: String,
+    written: Vec<String>,
+}
+
+/// Rewrite every other document that links to `source_rel`, in place on disk (the
+/// caller commits them together with its own change and rolls them back on
+/// failure). Each document is read now, under the caller's lock, so a concurrent
+/// change to it is carried along rather than overwritten. Returns the rewritten
+/// paths.
+///
+/// A failed reverse-link query is logged and skipped (the links then heal on each
+/// document's next reindex) unless `strict`, which an archive or an unlinking
+/// delete sets because it promises the links are handled.
+async fn rewrite_inbound_links<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    state: &StateDb,
+    source_rel: &str,
+    action: InboundAction<'_>,
+    strict: bool,
+) -> Result<Vec<String>, InboundFailure> {
+    let referencing_paths = match state.links_targeting(source_rel, "markdown").await {
+        Ok(paths) => paths,
+        Err(e) if strict => {
+            return Err(InboundFailure {
+                path: source_rel.to_string(),
+                msg: format!("the reverse-link query failed: {e:#}"),
+                written: Vec::new(),
+            });
+        }
+        Err(e) => {
+            warn!(
+                "Skipping incoming-link rewrite for '{}': the reverse-link query failed: {:#}",
+                source_rel, e
+            );
+            return Ok(Vec::new());
+        }
+    };
+    let mut written: Vec<String> = Vec::new();
+    for ref_path in referencing_paths {
+        // A self-reference is the moved document's own content, handled by its caller.
+        if ref_path == source_rel {
+            continue;
+        }
+        let abs_ref = match safe_write_path(deps, &ref_path) {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(
+                    "Skipping link rewrite in '{}' for '{}': the path no longer resolves \
+                     safely (stale document_links row?)",
+                    ref_path, source_rel
+                );
+                continue;
+            }
+        };
+        let body = match tokio::fs::read_to_string(&abs_ref).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    "Skipping link rewrite in '{}' for '{}': failed to read it, likely a \
+                     stale document_links row: {}",
+                    ref_path, source_rel, e
+                );
+                continue;
+            }
+        };
+        let occurrences: Vec<_> = crate::ingest::find_markdown_link_occurrences(&body, &ref_path)
+            .into_iter()
+            .filter(|o| o.resolved.as_str() == source_rel)
+            .collect();
+        if occurrences.is_empty() {
+            continue;
+        }
+        let new_body = match action {
+            InboundAction::Repoint(dest_rel) => {
+                let replacement = crate::ingest::relativize_md_path(&ref_path, dest_rel);
+                apply_link_replacements(&body, &occurrences, &replacement)
+            }
+            InboundAction::Unlink => unlink_occurrences(&body, &occurrences),
+        };
+        if new_body == body {
+            continue;
+        }
+        if let Err(e) = tokio::fs::write(&abs_ref, new_body.as_bytes()).await {
+            written.push(ref_path.clone());
+            return Err(InboundFailure {
+                path: ref_path,
+                msg: e.to_string(),
+                written,
+            });
+        }
+        written.push(ref_path);
+    }
+    Ok(written)
+}
+
+/// Replace each of `occurrences` (found in `body`) with its plain label: an inline
+/// `[label](target)` becomes `label`, a wiki `[[target]]` becomes `target` and
+/// `[[target|alias]]` becomes `alias`, an autolink `<target>` becomes `target`, and
+/// a reference definition line is dropped. Back-to-front, like every span rewrite.
+/// A reference-style link's use sites (`[text][ref]`) are left as written: only the
+/// definition holds the target.
+fn unlink_occurrences(body: &str, occurrences: &[crate::ingest::LinkOccurrence]) -> String {
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = occurrences
+        .iter()
+        .filter_map(|o| unlink_edit(body, o))
+        .collect();
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    let mut out = body.to_string();
+    for (range, text) in edits {
+        out.replace_range(range, &text);
+    }
+    out
+}
+
+/// The byte range one link construct occupies in `body`, and the plain text that
+/// replaces it, derived from the surroundings of the occurrence's target span.
+/// `None` for a construct this does not recognise (it is left alone).
+fn unlink_edit(
+    body: &str,
+    o: &crate::ingest::LinkOccurrence,
+) -> Option<(std::ops::Range<usize>, String)> {
+    let (start, end) = (o.span.start, o.span.end);
+    let before = &body[..start];
+    let after = &body[end..];
+    let line_end = after.find('\n').unwrap_or(after.len());
+
+    // Wiki `[[target]]` / `[[target|alias]]`.
+    if before.ends_with("[[") {
+        let close = after[..line_end].find("]]")?;
+        let alias = after[..close].strip_prefix('|').map(str::trim);
+        let text = match alias {
+            Some(a) if !a.is_empty() => a,
+            _ => o.raw.trim(),
+        };
+        return Some((start - 2..end + close + 2, text.to_string()));
+    }
+    // Autolink `<target>` (not the angle form of an inline target).
+    if before.ends_with('<') && !before.ends_with("(<") && after.starts_with('>') {
+        return Some((start - 1..end + 1, o.raw.trim().to_string()));
+    }
+    // Inline `[label](target "title")`.
+    if before.ends_with('(') && before[..before.len() - 1].ends_with(']') {
+        let label_close = before.len() - 2;
+        let line_start = before[..label_close].rfind('\n').map_or(0, |i| i + 1);
+        let open = line_start + before[line_start..label_close].rfind('[')?;
+        let paren = after[..line_end].find(')')?;
+        let label = before[open + 1..label_close].trim();
+        let text = if label.is_empty() {
+            o.raw.trim()
+        } else {
+            label
+        };
+        return Some((open..end + paren + 1, text.to_string()));
+    }
+    // Reference definition `[ref]: target` — a whole line.
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let prefix = before[line_start..].trim();
+    if prefix.starts_with('[') && prefix.ends_with("]:") {
+        let stop = if line_end < after.len() {
+            end + line_end + 1
+        } else {
+            end + line_end
+        };
+        return Some((line_start..stop, String::new()));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -2394,7 +2850,9 @@ fn rewrite_outbound_links(
     apply_link_replacements_each(content, &replacements)
 }
 
-/// Apply a PER-OCCURRENCE text replacement at each occurrence's own span,
+/// Apply a PER-OCCURRENCE text replacement at each occurrence's own path span
+/// (`LinkOccurrence::path_span` — the replacement is a bare path, so a
+/// `#fragment`, `"title"` suffix or wiki `|alias` after it stays as written),
 /// back-to-front by span start so an earlier edit's byte-length change can
 /// never invalidate a later span still waiting to be applied. Every
 /// occurrence must have come from scanning `body` itself (e.g.
@@ -2419,7 +2877,7 @@ fn apply_link_replacements_each(
 ) -> String {
     let mut spans: Vec<(std::ops::Range<usize>, &str)> = replacements
         .iter()
-        .map(|(o, r)| (o.span.clone(), r.as_str()))
+        .map(|(o, r)| (o.path_span.clone(), r.as_str()))
         .collect();
     // Sort back-to-front (descending by start) so replacing an earlier-in-text
     // span never shifts the byte offsets a later-in-iteration-but-earlier-in-text
@@ -2974,7 +3432,11 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                 return Err(BatchWriteError::PreCommitFailed { rolled_back });
             }
 
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            Err(git::CommitSyncError::PostCommit {
+                sha,
+                source,
+                rebased_paths,
+            }) => {
                 warn!(
                     "write_documents_batch: commit_and_sync post-commit (sync) failure, commit {} \
                      stands uncorrected for {} document(s): {:#}",
@@ -2985,7 +3447,11 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                 mark_dirty(
                     deps.queue,
                     deps.indexing,
-                    written.iter().map(|(p, _)| PathBuf::from(p)).collect(),
+                    written
+                        .iter()
+                        .map(|(p, _)| PathBuf::from(p))
+                        .chain(rebased_paths)
+                        .collect(),
                 );
                 return Ok(BatchWriteSuccess {
                     documents: documents(&[]),
@@ -3590,9 +4056,31 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // (old_rel, content as read) — the snapshot the under-lock check compares.
     let mut originals: Vec<(String, String)> = Vec::new();
 
+    // A document already excluded from indexing at its source (a `README.md`
+    // under the default `exclude_files`) only has to land inside `include`:
+    // holding it to `exclude` at the destination would refuse any directory
+    // that carries one. An indexable document keeps the full check, so a move
+    // cannot push it into a path a reconcile would never index. Fails open on a
+    // glob-build error, like `partition_indexable`.
+    let path_filter = match crate::ingest::PathFilter::from_config(deps.indexing) {
+        Ok(filter) => Some(filter),
+        Err(e) => {
+            error!(
+                "Failed to build indexing path filter, skipping the exclusion check for the directory move '{source_dir}' -> '{dest_dir}': {e:#}"
+            );
+            None
+        }
+    };
     for (old_rel, new_rel) in &moves {
-        check_include_pattern(deps, old_rel)?;
-        check_include_pattern(deps, new_rel)?;
+        check_include_only(deps, old_rel)?;
+        let excluded_at_source = path_filter
+            .as_ref()
+            .is_some_and(|f| !f.is_indexable(crate::retrieval::kb_root_relative(old_rel)));
+        if excluded_at_source {
+            check_include_only(deps, new_rel)?;
+        } else {
+            check_include_pattern(deps, new_rel)?;
+        }
         let abs_source_doc = safe_write_path(deps, old_rel)?;
         let abs_dest_doc = safe_write_path(deps, new_rel)?;
 
@@ -4206,6 +4694,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             Err(git::CommitSyncError::PostCommit {
                 sha,
                 source: source_err,
+                rebased_paths,
             }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure moving directory '{}' -> '{}', \
@@ -4223,6 +4712,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                         .iter()
                         .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
                         .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .chain(rebased_paths)
                         .collect(),
                 );
 
@@ -4292,10 +4782,34 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     message: Option<&str>,
     expected_version: Option<&str>,
 ) -> Result<WriteSuccess, WriteError> {
+    delete_document_with(deps, rel_path, message, expected_version, false).await
+}
+
+/// [`delete_document`], optionally with `unlink_inbound` (#357): every other
+/// document that links to `rel_path` has the link replaced with its plain label
+/// in the SAME commit (listed in `WriteSuccess::rewritten_paths`), so the delete
+/// leaves no dangling link. Those documents are read under the lock after the
+/// sync, so a concurrent change to one is carried along; if the remote moves
+/// under the commit the whole attempt is redone. Refused when the document index
+/// is unavailable, since the links could not be found.
+pub async fn delete_document_with<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    rel_path: &str,
+    message: Option<&str>,
+    expected_version: Option<&str>,
+    unlink_inbound: bool,
+) -> Result<WriteSuccess, WriteError> {
+    if unlink_inbound && deps.state.is_none() {
+        return Err(WriteError::Internal {
+            msg: "unlink_inbound needs the document index to find links to the document, and \
+                  it is unavailable right now"
+                .to_string(),
+        });
+    }
     // Schema-file guard, then include-pattern eligibility guard, then the early
     // path-safety check, ahead of everything else — see `write_document`.
     check_not_schema_file(rel_path)?;
-    check_include_pattern(deps, rel_path)?;
+    check_include_only(deps, rel_path)?;
     safe_write_path(deps, rel_path)?;
 
     // Validate the commit message BEFORE deleting anything: rejecting it after
@@ -4317,7 +4831,9 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     // the referencing document's own next reindex, same as any stale
     // `document_links` row. A read of the index, so it runs before the lock.
     let mut referencing_paths: Vec<String> = Vec::new();
-    if let Some(state) = deps.state {
+    // With `unlink_inbound` the links are rewritten below, so there is nothing to
+    // warn about.
+    if let Some(state) = deps.state.filter(|_| !unlink_inbound) {
         match state.links_targeting(rel_path, "markdown").await {
             Ok(inbound) if !inbound.is_empty() => {
                 warn!(
@@ -4367,6 +4883,38 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
             }
         })?;
 
+        // Unlink every document that linked to this one, in the same commit.
+        let mut rewritten_paths: Vec<String> = Vec::new();
+        if unlink_inbound && let Some(state) = deps.state {
+            match rewrite_inbound_links(deps, state, rel_path, InboundAction::Unlink, true).await {
+                Ok(paths) => rewritten_paths = paths,
+                Err(failure) => {
+                    error!(
+                        "Failed to unlink '{}' in '{}' while deleting it: {}. Restoring.",
+                        rel_path, failure.path, failure.msg
+                    );
+                    for done in failure.written.iter().map(String::as_str).chain([rel_path]) {
+                        if let Err(e) = git::restore_from_head(&git_lock, data_path_str, done).await
+                        {
+                            error!(
+                                "Rollback: failed to restore '{}': {:#}. This needs operator \
+                                 attention.",
+                                done, e
+                            );
+                        }
+                    }
+                    return Err(WriteError::Io {
+                        msg: format!(
+                            "Failed to rewrite links in '{}': {}",
+                            failure.path, failure.msg
+                        ),
+                    });
+                }
+            }
+        }
+        let mut commit_paths: Vec<&str> = vec![rel_path];
+        commit_paths.extend(rewritten_paths.iter().map(String::as_str));
+
         // `PreCommit`: HEAD never recorded the deletion — restore the file from
         // HEAD so the caller sees "nothing changed". `PostCommit`: the deletion is
         // a real local commit; leave it and report the sync as pending.
@@ -4379,7 +4927,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
             deps.branch,
             data_path_str,
             deps.token,
-            &[rel_path],
+            &commit_paths,
             &commit_message,
             deps.commit_author_name,
             deps.commit_author_email,
@@ -4393,6 +4941,15 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
                     "commit_and_sync pre-commit failure deleting '{}', restoring from HEAD: {:#}",
                     rel_path, source
                 );
+                for path in &rewritten_paths {
+                    if let Err(e) = git::restore_from_head(&git_lock, data_path_str, path).await {
+                        error!(
+                            "Rollback: failed to restore unlinked document '{}': {:#}. This \
+                             needs operator attention.",
+                            path, e
+                        );
+                    }
+                }
                 return match git::restore_from_head(&git_lock, data_path_str, rel_path).await {
                     Ok(()) => Err(WriteError::PreCommitFailed {
                         rolled_back: true,
@@ -4416,20 +4973,33 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
                 };
             }
 
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            Err(git::CommitSyncError::PostCommit {
+                sha,
+                source,
+                rebased_paths,
+            }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure deleting '{}', deletion commit \
                      {} stands uncorrected: {:#}",
                     rel_path, sha, source
                 );
-                mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
+                mark_dirty(
+                    deps.queue,
+                    deps.indexing,
+                    std::iter::once(PathBuf::from(rel_path))
+                        .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .chain(rebased_paths)
+                        .collect(),
+                );
                 return Ok(WriteSuccess {
+                    related: Vec::new(),
                     outcome: WriteOutcome::CommittedPendingSync,
                     sha,
                     rebased_paths: Vec::new(),
                     diff: render_unified_diff(&old_content, "", rel_path),
-                    rewritten_paths: Vec::new(),
+                    rewritten_paths,
                     referencing_paths,
+                    status_set: false,
                     merged: false,
                     version: None,
                 });
@@ -4453,18 +5023,24 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
             deps.queue,
             deps.indexing,
             std::iter::once(PathBuf::from(rel_path))
+                .chain(rewritten_paths.iter().map(PathBuf::from))
                 .chain(commit_outcome.rebased_paths.iter().cloned())
                 .collect(),
         );
 
+        // The deleted document is gone, so a rebase merge only matters for the
+        // documents this call unlinked.
+        let rebase_merged = rebase_touched(&commit_outcome.rebased_paths, &commit_paths[1..]);
         return Ok(WriteSuccess {
+            related: Vec::new(),
             outcome: WriteOutcome::Synced,
             sha: commit_outcome.sha,
             diff: render_unified_diff(&old_content, "", rel_path),
             rebased_paths: commit_outcome.rebased_paths,
-            rewritten_paths: Vec::new(),
+            rewritten_paths,
             referencing_paths,
-            merged: false,
+            status_set: false,
+            merged: rebase_merged,
             version: None,
         });
     }
@@ -4599,6 +5175,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn safe_write_path_rejects_a_leaf_symlink_to_an_in_root_file() {
+        // `x.md -> .git/config`: the canonical ancestor is inside the root, so only
+        // a leaf check stops the write landing in `.git/config`.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".git/config"), "[core]").unwrap();
+        std::fs::write(tmp.path().join("state.db"), "db").unwrap();
+        std::os::unix::fs::symlink(".git/config", tmp.path().join("x.md")).unwrap();
+        std::os::unix::fs::symlink("state.db", tmp.path().join("y.md")).unwrap();
+
+        for rel in ["x.md", "/x.md", "y.md"] {
+            let msg = resolve_safe_write_path(tmp.path(), rel).unwrap_err();
+            assert!(msg.contains("symlink"), "{rel}: {msg}");
+            assert!(!msg.contains("git"), "no git talk for MCP callers: {msg}");
+        }
+    }
+
+    #[test]
+    fn safe_write_path_rejects_a_leaf_symlink_to_an_outside_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), tmp.path().join("leak.md"))
+            .unwrap();
+        // A dangling one is refused too.
+        std::os::unix::fs::symlink("nowhere.md", tmp.path().join("dangling.md")).unwrap();
+
+        for rel in ["leak.md", "dangling.md"] {
+            let msg = resolve_safe_write_path(tmp.path(), rel).unwrap_err();
+            assert!(msg.contains("symlink"), "{rel}: {msg}");
+        }
+    }
+
+    #[test]
+    fn safe_write_path_rejects_a_symlinked_directory_inside_the_root() {
+        // `alias -> docs` stays inside the root canonically, but is still refused:
+        // no write goes through a link.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::os::unix::fs::symlink("docs", tmp.path().join("alias")).unwrap();
+
+        let msg = resolve_safe_write_path(tmp.path(), "alias/new.md").unwrap_err();
+        assert!(msg.contains("symlink"), "{msg}");
+        assert!(resolve_safe_write_path(tmp.path(), "docs/new.md").is_ok());
+    }
+
+    #[test]
+    fn safe_write_path_rejects_any_git_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        for rel in [
+            ".git/config",
+            "/.git/hooks/pre-commit",
+            "a/.GIT/x.md",
+            ".Git",
+        ] {
+            let msg = resolve_safe_write_path(tmp.path(), rel).unwrap_err();
+            assert!(msg.contains("reserved directory"), "{rel}: {msg}");
+            // Nothing git-related reaches an MCP caller.
+            assert!(!msg.to_ascii_lowercase().contains("git"), "{rel}: {msg}");
+        }
+        // Only an exact `.git` component, not a name that merely contains it.
+        assert!(resolve_safe_write_path(tmp.path(), "notes/.gitignore.md").is_ok());
+        assert!(resolve_safe_write_path(tmp.path(), "my.git/x.md").is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // build_commit_message / render_unified_diff — pure unit tests
     // -----------------------------------------------------------------------
@@ -4675,6 +5317,84 @@ mod tests {
         let (fm, body) = split_frontmatter_bytes(content).unwrap();
         assert_eq!(fm, "---\ndescription: a---b\n---\n");
         assert_eq!(body, "\nBody\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_accepts_trailing_whitespace_on_both_delimiters() {
+        // gray_matter's rule (`heading::is_frontmatter_delimiter_line`): the indexer
+        // reads these as frontmatter, so the writer must too.
+        let content = "--- \ntitle: X\n---\t\n\nBody\n";
+        let (fm, body) = split_frontmatter_bytes(content).unwrap();
+        assert_eq!(fm, "--- \ntitle: X\n---\t\n");
+        assert_eq!(body, "\nBody\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_crlf_with_trailing_space_delimiters() {
+        let content = "---  \r\ntitle: X\r\n--- \r\n\r\nBody\r\n";
+        let (fm, body) = split_frontmatter_bytes(content).unwrap();
+        assert_eq!(fm, "---  \r\ntitle: X\r\n--- \r\n");
+        assert_eq!(body, "\r\nBody\r\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_leading_whitespace_is_not_a_delimiter() {
+        assert!(split_frontmatter_bytes(" ---\ntitle: X\n---\nBody\n").is_none());
+        // A ` ---` line inside the block does not close it either.
+        let (fm, _) = split_frontmatter_bytes("---\na: |\n ---\n---\nBody\n").unwrap();
+        assert_eq!(fm, "---\na: |\n ---\n---\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_agrees_with_body_line_offset() {
+        // One delimiter rule for the writer and the indexer: the frontmatter block
+        // the writer sees spans exactly the lines the indexer skips (no blank lines
+        // after the block in these inputs, which `body_line_offset` also skips).
+        for content in [
+            "---\ntitle: X\n---\nBody\n",
+            "--- \ntitle: X\n--- \nBody\n",
+            "---\r\ntitle: X\r\n---\t\r\nBody\r\n",
+            "---\ntitle: X\n---",
+        ] {
+            let (fm, _) = split_frontmatter_bytes(content).unwrap();
+            assert_eq!(
+                fm.split_inclusive('\n').count(),
+                crate::heading::body_line_offset(content),
+                "{content:?}"
+            );
+        }
+    }
+
+    /// A delimiter with trailing whitespace used to read as "no frontmatter" here
+    /// while the parser still found the fields, so the patch prepended a second
+    /// block and the old one became body text.
+    #[test]
+    fn apply_frontmatter_patch_trailing_space_delimiters_yield_one_block() {
+        for old in [
+            "--- \ntitle: X\nstatus: draft\n---  \n\n# Body\n",
+            "--- \r\ntitle: X\r\nstatus: draft\r\n--- \r\n\r\n# Body\r\n",
+        ] {
+            let new = apply_frontmatter_patch(
+                old,
+                &[FrontmatterEdit::SetField {
+                    field: "status".into(),
+                    value: serde_json::json!("archived"),
+                }],
+            )
+            .unwrap();
+            let delimiters = new
+                .lines()
+                .filter(|l| crate::heading::is_frontmatter_delimiter_line(l))
+                .count();
+            assert_eq!(delimiters, 2, "exactly one frontmatter block: {new:?}");
+            assert_eq!(new.matches("title: X").count(), 1, "{new:?}");
+            assert!(new.contains("status: archived"), "{new:?}");
+            assert!(!new.contains("draft"), "{new:?}");
+            assert!(new.trim_end().ends_with("\n# Body"), "{new:?}");
+            let (fm, body) = validate::parse_frontmatter_raw(&new);
+            assert_eq!(fm.get("status"), Some(&serde_json::json!("archived")));
+            assert_eq!(body.trim(), "# Body");
+        }
     }
 
     #[test]
@@ -5141,6 +5861,8 @@ mod tests {
             batch_size: 32,
             request_timeout_secs: 60,
             batch_concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
         (embed, qdrant)
@@ -5244,6 +5966,8 @@ mod tests {
                 prepend_description: self.config.chunking.prepend_description,
                 dedup_enabled: self.config.write.dedup_enabled,
                 dedup_threshold: self.config.write.dedup_threshold,
+                related_limit: self.config.write.related_limit,
+                related_min_score: self.config.write.related_min_score,
                 git_url: self.config.source.git_url.as_deref(),
                 branch: &self.config.source.branch,
                 token: self.token.as_deref(),
@@ -5282,6 +6006,7 @@ mod tests {
             operation: "test",
             expected_version: None,
             dest_path: None,
+            archive: None,
         }
     }
 
@@ -5302,7 +6027,76 @@ mod tests {
             operation: "test",
             expected_version: Some(leak(document_version(old_content.as_bytes()))),
             dest_path: Some(dest_rel),
+            archive: None,
         }
+    }
+
+    #[test]
+    fn related_from_hits_applies_floor_limit_order_and_excludes_self() {
+        let hits = vec![
+            ("a.md".to_string(), 0.60),
+            ("docs/new.md".to_string(), 0.79),
+            ("b.md".to_string(), 0.75),
+            ("a.md".to_string(), 0.55),
+            ("c.md".to_string(), 0.40),
+            ("d.md".to_string(), 0.50),
+        ];
+        let got = related_from_hits(hits.clone(), "docs/new.md", 0.5, 5);
+        let paths: Vec<&str> = got.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["b.md", "a.md", "d.md"],
+            "ordered, floor applied, self gone"
+        );
+        assert_eq!(
+            got[1].score, 0.60,
+            "a document appears once, at its best score"
+        );
+
+        let capped = related_from_hits(hits.clone(), "docs/new.md", 0.5, 2);
+        assert_eq!(capped.len(), 2);
+        assert!(related_from_hits(hits.clone(), "docs/new.md", 0.5, 0).is_empty());
+        assert!(related_from_hits(hits, "docs/new.md", 0.9, 5).is_empty());
+        assert!(related_from_hits(Vec::new(), "x.md", 0.0, 5).is_empty());
+    }
+
+    #[test]
+    fn dedup_search_opts_with_limit_spreads_over_documents_only_when_listing() {
+        let one = dedup_search_opts_with_limit(1);
+        assert_eq!((one.limit, one.diversity_max_per_document), (1, None));
+        let zero = dedup_search_opts_with_limit(0);
+        assert_eq!(
+            zero.limit, 1,
+            "the gate itself always needs the nearest hit"
+        );
+        let many = dedup_search_opts_with_limit(5);
+        assert_eq!((many.limit, many.diversity_max_per_document), (5, Some(1)));
+        assert!(!many.hybrid, "still dense-only");
+    }
+
+    #[test]
+    fn effective_related_prefers_schema_override_per_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = (*crate::mcp::make_test_resolved_config(tmp.path())).clone();
+        config.write.related_limit = 5;
+        config.write.related_min_score = 0.5;
+        let harness = Harness::new(&tmp, Arc::new(config));
+        let deps = harness.deps();
+
+        assert_eq!(
+            effective_related(&deps, &schema::ResolvedSchema::default()),
+            (5, 0.5)
+        );
+        let tuned = schema::ResolvedSchema {
+            related_limit: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(effective_related(&deps, &tuned), (0, 0.5));
+        let floor = schema::ResolvedSchema {
+            related_min_score: Some(0.7),
+            ..Default::default()
+        };
+        assert_eq!(effective_related(&deps, &floor), (5, 0.7));
     }
 
     /// A schema `dedup:` key overrides the global `write.*` value per key; an unset
@@ -5397,6 +6191,53 @@ mod tests {
             document_version(b"hello\n"),
             "ce013625030ba8dba906f756967f9e9ca394464a"
         );
+    }
+
+    #[tokio::test]
+    async fn git_paths_and_symlinks_are_refused_by_every_write_even_with_a_widened_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let git_config = tmp.path().join(".git/config");
+        std::fs::write(&git_config, "[core]\n").unwrap();
+        std::os::unix::fs::symlink(".git/config", tmp.path().join("x.md")).unwrap();
+
+        let mut config = crate::mcp::make_test_resolved_config(tmp.path());
+        {
+            let c = Arc::get_mut(&mut config).unwrap();
+            c.write.dedup_enabled = false;
+            c.indexing.include = vec!["**/*".to_string()];
+            c.indexing.exclude = vec![];
+            c.indexing.exclude_files = vec![];
+        }
+        let mut harness = Harness::new(&tmp, config);
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/*").unwrap());
+        harness.include_patterns = builder.build().unwrap();
+
+        let content = "---\ntitle: T\ndescription: d\ntype: guide\ntags: [t]\n---\n# Body\n";
+        for (rel, create) in [
+            (".git/config", false),
+            (".git/new.md", true),
+            ("x.md", false),
+        ] {
+            let err = write_document(&harness.deps(), make_req(rel, content, create))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, WriteError::UnsafePath { .. }),
+                "{rel}: {err:?}"
+            );
+        }
+        let err = delete_document(&harness.deps(), "x.md", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WriteError::UnsafePath { .. }),
+            "delete: {err:?}"
+        );
+
+        assert_eq!(std::fs::read_to_string(&git_config).unwrap(), "[core]\n");
+        assert!(!tmp.path().join(".git/new.md").exists());
     }
 
     #[tokio::test]
@@ -5901,32 +6742,68 @@ mod tests {
         );
     }
 
-    /// #278 (own-target gap): a write's OWN target path — not just
-    /// `commit_outcome.rebased_paths` — must also be filtered through
-    /// `indexing.include`/`exclude`/`exclude_files` before it reaches
-    /// `queue.mark_paths`. `check_include_pattern` only checks `include`, so a
-    /// path that matches the default `**/*.md` include glob but is ALSO in the
-    /// default `exclude_files` (here, `README.md`) still passes eligibility
-    /// and commits successfully — but a full reconcile would never index it,
-    /// so it must never be marked dirty either.
+    /// #312: a path that matches `include` but also `exclude_files` (the default
+    /// `README.md`) is refused upfront for edit, create, move and delete, with
+    /// nothing committed and nothing marked dirty.
     #[tokio::test]
-    async fn write_document_does_not_mark_its_own_excluded_target_path_dirty() {
+    async fn write_document_refuses_a_path_the_indexing_config_excludes() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let head_before = head_sha(&work);
+        let harness = git_backed_harness(&work);
+
+        let expect_excluded = |r: Result<WriteSuccess, WriteError>| match r {
+            Err(WriteError::UnsafePath { msg }) => {
+                assert!(msg.contains("excluded from indexing"), "got: {msg}")
+            }
+            other => panic!("expected UnsafePath, got {other:?}"),
+        };
+
+        // Edit of the seeded README.md.
+        expect_excluded(
+            write_document(
+                &harness.deps(),
+                make_req("README.md", "# Test repo\n\nUpdated.\n", false),
+            )
+            .await,
+        );
+        // Create at another excluded filename.
+        expect_excluded(
+            write_document(&harness.deps(), make_req("docs/README.md", "# Hi\n", true)).await,
+        );
+        // Move to an excluded destination.
+        expect_excluded(
+            write_document(
+                &harness.deps(),
+                make_move_req("docs/a.md", "docs/README.md", "# A\n", "# A\n"),
+            )
+            .await,
+        );
+        // Delete of an excluded path is NOT refused by this gate: cleaning up a
+        // document already sitting in an excluded path must stay possible (it
+        // gets past eligibility and stops at the missing version).
+        assert!(matches!(
+            delete_document(&harness.deps(), "README.md", None, None).await,
+            Err(WriteError::VersionRequired)
+        ));
+
+        assert_eq!(head_sha(&work), head_before, "nothing is committed");
+        assert!(harness.reindex_queue.snapshot_paths().is_empty());
+    }
+
+    /// An ordinary document is unaffected by the exclusion gate (#312).
+    #[tokio::test]
+    async fn write_document_still_accepts_a_normal_indexable_path() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         let harness = git_backed_harness(&work);
-
-        // `create_bare_repo` already seeds a `README.md` at the repo root, so
-        // this is an edit, not a create.
-        let req = make_req("README.md", "# Test repo\n\nUpdated.\n", false);
-        let success = write_document(&harness.deps(), req).await.unwrap();
+        let success = write_document(
+            &harness.deps(),
+            make_req("docs/new.md", "# New\n\nBody.\n", true),
+        )
+        .await
+        .unwrap();
         assert_eq!(success.outcome, WriteOutcome::Synced);
-
-        let pending = harness.reindex_queue.snapshot_paths();
-        assert!(
-            pending.is_empty(),
-            "README.md is in the default exclude_files list and must not be marked \
-             dirty, even though it is its own write's target: {pending:?}"
-        );
     }
 
     #[tokio::test]
@@ -7360,6 +8237,47 @@ mod tests {
         );
     }
 
+    /// A move whose destination write fails part-way (ENOSPC, EIO) removes the
+    /// partly written destination again and leaves the source as it was, so a
+    /// retry does not fail `AlreadyExists` and the reconcile never indexes a
+    /// truncated copy.
+    #[tokio::test]
+    async fn move_whose_destination_write_fails_part_way_leaves_no_partial_destination() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        let original = "---\ntitle: T\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("docs/source.md"), original).unwrap();
+        git_commit_all(&work, "docs/source.md", "add docs/source.md");
+        let harness = git_backed_harness(&work);
+        let source_dir = work.path().join("docs");
+
+        let req = make_move_req("docs/source.md", "other/dest.md", original, original);
+        let err = FAIL_WRITE_AFTER_BYTES
+            .scope(5, write_document(&harness.deps(), req))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Io { .. }), "got {err:?}");
+        assert!(
+            !work.path().join("other/dest.md").exists(),
+            "the partly written destination must be removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_dir.join("source.md")).unwrap(),
+            original,
+            "the source must be untouched when the destination write fails"
+        );
+
+        // The retry is not blocked by a leftover destination.
+        let req = make_move_req("docs/source.md", "other/dest.md", original, original);
+        write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("other/dest.md")).unwrap(),
+            original
+        );
+        assert!(!work.path().join("docs/source.md").exists());
+    }
+
     #[tokio::test]
     async fn move_validates_against_the_destination_schema_not_the_sources() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8477,6 +9395,119 @@ mod tests {
         );
     }
 
+    /// Body text exercising every link syntax with a `#fragment` and, where the
+    /// syntax allows one, a `"title"` suffix or wiki alias; `{p}` is the path each
+    /// link spells (the wiki ones `{wiki}`). The reference label is the path's last
+    /// component, which a move keeps, so two bodies in one document never share one.
+    fn fragment_links_body(p: &str, wiki: &str) -> String {
+        let r = p.rsplit('/').next().unwrap();
+        format!(
+            "See [inline]({p}#install \"Title\"), [bare]({p}#top), [[{wiki}#Set up]], \
+             [[{wiki}#h|Alias]], <{p}#x> and [ref style][{r}].\n\n[{r}]: {p}#y \"Ref title\"\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn move_keeps_fragments_titles_and_aliases_on_outbound_links() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        std::fs::create_dir_all(work.path().join("shared")).unwrap();
+        std::fs::write(
+            work.path().join("shared/doc.md"),
+            "---\ntitle: Shared\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Shared\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "shared/doc.md", "add shared/doc.md");
+
+        let front = "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        let source_original = format!(
+            "{front}{}Self: [me](a.md#top \"Me\").\n",
+            fragment_links_body("../shared/doc.md", "../shared/doc")
+        );
+        std::fs::write(work.path().join("old/a.md"), &source_original).unwrap();
+        git_commit_all(&work, "old/a.md", "add old/a.md");
+
+        let harness = git_backed_harness(&work);
+        let req = make_move_req(
+            "old/a.md",
+            "new/deep/a.md",
+            &source_original,
+            &source_original,
+        );
+        write_document(&harness.deps(), req).await.unwrap();
+
+        let dest = std::fs::read_to_string(work.path().join("new/deep/a.md")).unwrap();
+        // The wiki links' bare `../shared/doc` gains `.md` exactly as it does
+        // without a fragment; only the path portion changes.
+        let expected = format!(
+            "{front}{}Self: [me](a.md#top \"Me\").\n",
+            fragment_links_body("../../shared/doc.md", "../../shared/doc.md")
+        );
+        assert_eq!(dest, expected);
+    }
+
+    #[tokio::test]
+    async fn same_directory_rename_keeps_the_fragment_on_a_self_link() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        let source_original = "---\ntitle: Rename Me\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nTop: [me](a.md#top \"Me\"), [[a#Intro|here]], <a.md#x>.\n";
+        std::fs::write(work.path().join("docs/a.md"), source_original).unwrap();
+        git_commit_all(&work, "docs/a.md", "add docs/a.md");
+
+        let harness = git_backed_harness(&work);
+        let req = make_move_req("docs/a.md", "docs/b.md", source_original, source_original);
+        write_document(&harness.deps(), req).await.unwrap();
+
+        let dest = std::fs::read_to_string(work.path().join("docs/b.md")).unwrap();
+        assert!(
+            dest.ends_with("\nTop: [me](b.md#top \"Me\"), [[b.md#Intro|here]], <b.md#x>.\n"),
+            "{dest}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_repoints_inbound_links_keeping_fragments_and_titles() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let front = "---\ntitle: Referencer\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        let referencing_original =
+            format!("{front}{}", fragment_links_body("old/loc.md", "old/loc"));
+        std::fs::write(work.path().join("referencing.md"), &referencing_original).unwrap();
+        git_commit_all(&work, "referencing.md", "add referencing.md");
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing.md",
+                "markdown",
+                &[("old/loc.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let req = make_move_req("old/loc.md", "new/loc.md", source_original, source_original);
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+
+        let after = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert_eq!(
+            after,
+            format!("{front}{}", fragment_links_body("new/loc.md", "new/loc.md"))
+        );
+    }
+
     #[tokio::test]
     async fn move_outbound_rewrite_skips_links_inside_fences_and_code_spans() {
         let bare = crate::git::tests::create_bare_repo("master");
@@ -9173,12 +10204,11 @@ mod tests {
         );
     }
 
-    /// A create whose target is taken by the time the batch writes it — here a
-    /// dangling symlink, which reads as missing but makes `create_new` fail —
-    /// fails the batch, and the rollback leaves that entry alone: only files
-    /// this batch created are removed.
+    /// A create onto a dangling symlink — which reads as missing — is refused
+    /// up front by the path check, before anything is written, and the link is
+    /// left alone.
     #[tokio::test]
-    async fn write_documents_batch_create_collision_does_not_remove_the_existing_entry() {
+    async fn write_documents_batch_create_onto_a_dangling_symlink_is_refused_and_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
         let link = tmp.path().join("docs/link.md");
@@ -9203,13 +10233,13 @@ mod tests {
         ];
         let err = write_documents_batch(&harness.deps(), &requests, None)
             .await
-            .expect_err("a create onto an existing entry must fail the batch");
+            .expect_err("a create onto a symlink must fail the batch");
         match err {
             BatchWriteError::Documents { failures } => {
                 assert_eq!(failures.len(), 1, "{failures:?}");
                 assert_eq!(failures[0].0, "docs/link.md");
                 assert!(
-                    matches!(failures[0].1, WriteError::AlreadyExists),
+                    matches!(failures[0].1, WriteError::UnsafePath { .. }),
                     "{:?}",
                     failures[0].1
                 );
@@ -9218,11 +10248,11 @@ mod tests {
         }
         assert!(
             std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()),
-            "the rollback must not remove an entry this batch did not create"
+            "the refused batch must not remove an entry it did not create"
         );
         assert!(
             !tmp.path().join("docs/first.md").exists(),
-            "the earlier create is rolled back"
+            "nothing is written when the pre-flight check fails"
         );
     }
 
@@ -9405,6 +10435,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn move_directory_carries_a_readme_excluded_from_indexing() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("readme-src")).unwrap();
+        let doc = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# A\n";
+        let readme = "---\ntitle: R\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# R\n";
+        std::fs::write(work.path().join("readme-src/a.md"), doc).unwrap();
+        std::fs::write(work.path().join("readme-src/README.md"), readme).unwrap();
+        git_commit_paths(
+            &work,
+            &["readme-src/a.md", "readme-src/README.md"],
+            "add readme-src",
+        );
+
+        let harness = git_backed_harness(&work);
+        let success = move_directory(&harness.deps(), "readme-src", "readme-dst", None)
+            .await
+            .unwrap();
+
+        assert_eq!(success.moved.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("readme-dst/README.md")).unwrap(),
+            readme
+        );
+        assert!(!work.path().join("readme-src").exists());
+    }
+
+    #[tokio::test]
+    async fn move_directory_refuses_an_indexable_document_landing_in_an_excluded_path() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("excl-src")).unwrap();
+        let doc = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# A\n";
+        std::fs::write(work.path().join("excl-src/a.md"), doc).unwrap();
+        git_commit_paths(&work, &["excl-src/a.md"], "add excl-src");
+
+        let harness = git_backed_harness(&work);
+        let err = move_directory(&harness.deps(), "excl-src", "node_modules/x", None)
+            .await
+            .unwrap_err();
+
+        match err {
+            DirectoryMoveError::UnsafePath { msg } => {
+                assert!(msg.contains("excluded from indexing"), "got: {msg}")
+            }
+            other => panic!("expected UnsafePath, got {other:?}"),
+        }
+        assert!(work.path().join("excl-src/a.md").exists());
+    }
+
+    #[tokio::test]
     async fn move_directory_preserves_a_link_between_two_documents_inside_the_moved_subtree() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
@@ -9521,6 +10602,76 @@ mod tests {
         assert_eq!(
             occurrences[0].resolved, "new4/a.md",
             "the outside document's link must resolve to the moved document's new location"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_directory_keeps_fragments_titles_and_aliases_on_every_rewritten_link() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("frag/sub")).unwrap();
+        std::fs::create_dir_all(work.path().join("shared")).unwrap();
+        let front = "---\ntitle: T\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        // `frag/a.md` links to a document moving with it and to one staying put.
+        let a = format!(
+            "{front}{}{}",
+            fragment_links_body("sub/b.md", "sub/b"),
+            fragment_links_body("../shared/s.md", "../shared/s")
+        );
+        let b = format!("{front}# B\n");
+        let s = format!("{front}# S\n");
+        let referencing = format!(
+            "{front}{}",
+            fragment_links_body("frag/sub/b.md", "frag/sub/b")
+        );
+        std::fs::write(work.path().join("frag/a.md"), &a).unwrap();
+        std::fs::write(work.path().join("frag/sub/b.md"), &b).unwrap();
+        std::fs::write(work.path().join("shared/s.md"), &s).unwrap();
+        std::fs::write(work.path().join("referencing5.md"), &referencing).unwrap();
+        git_commit_paths(
+            &work,
+            &[
+                "frag/a.md",
+                "frag/sub/b.md",
+                "shared/s.md",
+                "referencing5.md",
+            ],
+            "add frag",
+        );
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing5.md",
+                "markdown",
+                &[("frag/sub/b.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        move_directory(&harness.deps(), "frag", "moved5/deep", None)
+            .await
+            .unwrap();
+
+        let a_after = std::fs::read_to_string(work.path().join("moved5/deep/a.md")).unwrap();
+        assert_eq!(
+            a_after,
+            format!(
+                "{front}{}{}",
+                fragment_links_body("sub/b.md", "sub/b.md"),
+                fragment_links_body("../../shared/s.md", "../../shared/s.md")
+            )
+        );
+        let ref_after = std::fs::read_to_string(work.path().join("referencing5.md")).unwrap();
+        assert_eq!(
+            ref_after,
+            format!(
+                "{front}{}",
+                fragment_links_body("moved5/deep/sub/b.md", "moved5/deep/sub/b.md")
+            )
         );
     }
 
@@ -10438,5 +11589,426 @@ mod tests {
         // as the single-document move's equivalent test above.
         assert!(!tmp.path().join("new-dir-no-repo/a.md").exists());
         assert!(!sub.join("a.md").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Archive flow and unlinking inbound links (#357)
+    // -----------------------------------------------------------------------
+
+    const ARCHIVE_SOURCE: &str = "---\ntitle: Old Page\ndescription: d\ntype: guide\ntags: [t]\nstatus: active\n---\n\n# Body\n";
+    const ARCHIVE_REFERENCER: &str = "---\ntitle: Referencer\ndescription: d\ntype: guide\n\
+         tags: [t]\n---\n\nSee [the page](old/loc.md \"T\"), [[old/loc.md|Alias]] and \
+         [[old/loc.md]] or <old/loc.md>.\n";
+
+    fn archive_req<'a>(
+        source_rel: &'a str,
+        dest_rel: &'a str,
+        version_of: &str,
+        policy: crate::config::ArchiveLinkPolicy,
+    ) -> WriteRequest<'a> {
+        WriteRequest {
+            rel_path: source_rel,
+            change: DocChange::Keep,
+            message: None,
+            default_verb: "update",
+            force_new: None,
+            operation: "test (archive)",
+            expected_version: Some(leak(document_version(version_of.as_bytes()))),
+            dest_path: Some(dest_rel),
+            archive: Some(policy),
+        }
+    }
+
+    /// A work tree holding the archive source and one referencing document,
+    /// optionally under a root schema declaring `status`, with the reverse-link
+    /// index seeded; returns the harness and the HEAD before any write.
+    async fn archive_fixture(work: &tempfile::TempDir, status_schema: bool) -> (Harness, String) {
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        std::fs::write(work.path().join("old/loc.md"), ARCHIVE_SOURCE).unwrap();
+        git_commit_all(work, "old/loc.md", "add old/loc.md");
+        std::fs::write(work.path().join("referencing.md"), ARCHIVE_REFERENCER).unwrap();
+        git_commit_all(work, "referencing.md", "add referencing.md");
+        if status_schema {
+            std::fs::write(
+                work.path().join(crate::schema::SCHEMA_FILE_NAME),
+                "fields:\n  status:\n    type: enum\n    values: [active, archived]\n",
+            )
+            .unwrap();
+            git_commit_all(work, crate::schema::SCHEMA_FILE_NAME, "add schema");
+        }
+        let head_before = head_sha(work);
+        let harness = git_backed_harness_with_state_db(work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing.md",
+                "markdown",
+                &[("old/loc.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+        (harness, head_before)
+    }
+
+    fn commit_count_since(work: &tempfile::TempDir, base: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-list", "--count", &format!("{base}..HEAD")])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn archive_repoint_moves_sets_status_and_rewrites_links_in_one_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, head_before) = archive_fixture(&work, true).await;
+
+        let dest = archive_destination("_archive", "old/loc.md").unwrap();
+        assert_eq!(dest, "_archive/old/loc.md");
+        let req = archive_req(
+            "old/loc.md",
+            &dest,
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(success.status_set);
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+        assert!(!work.path().join("old/loc.md").exists());
+        let archived = std::fs::read_to_string(work.path().join(&dest)).unwrap();
+        assert!(archived.contains("status: archived"), "{archived}");
+        assert!(!archived.contains("status: active"), "{archived}");
+        assert!(archived.ends_with("# Body\n"));
+        assert_eq!(success.version, Some(document_version(archived.as_bytes())));
+
+        let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert!(
+            referencing.contains("[the page](_archive/old/loc.md \"T\")"),
+            "{referencing}"
+        );
+        assert!(
+            referencing.contains("[[_archive/old/loc.md|Alias]]"),
+            "{referencing}"
+        );
+        assert!(
+            referencing.contains("[[_archive/old/loc.md]]"),
+            "{referencing}"
+        );
+        assert!(
+            referencing.contains("<_archive/old/loc.md>"),
+            "{referencing}"
+        );
+        assert!(!referencing.contains("(old/loc.md"));
+
+        // The move, the status change and the rewritten links: one commit.
+        assert_eq!(commit_count_since(&work, &head_before), "1");
+        let show = std::process::Command::new("git")
+            .args(["show", "--name-only", "--format=%s", "HEAD"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        let show = String::from_utf8_lossy(&show.stdout);
+        assert!(show.contains("docs: archive old/loc.md to _archive/old/loc.md"));
+        assert!(show.contains("old/loc.md"));
+        assert!(show.contains("_archive/old/loc.md"));
+        assert!(show.contains("referencing.md"));
+        crate::reindex::test_support::assert_marked_dirty(
+            &harness.reindex_queue,
+            &["old/loc.md", "_archive/old/loc.md", "referencing.md"],
+        );
+    }
+
+    /// The archive's `status: archived` step goes through the frontmatter patch, so a
+    /// document whose delimiters carry trailing whitespace must still end up with one
+    /// frontmatter block, not a second one prepended above the old.
+    #[tokio::test]
+    async fn archive_status_patch_on_trailing_space_delimiters_keeps_one_block() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, _) = archive_fixture(&work, true).await;
+        let source = ARCHIVE_SOURCE
+            .replacen("---\n", "--- \n", 1)
+            .replace("active\n---\n", "active\n---  \n");
+        assert!(source.starts_with("--- \n") && source.contains("---  \n"));
+        std::fs::write(work.path().join("old/loc.md"), &source).unwrap();
+        git_commit_all(&work, "old/loc.md", "trailing-space delimiters");
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            &source,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert!(success.status_set);
+
+        let archived = std::fs::read_to_string(work.path().join("_archive/old/loc.md")).unwrap();
+        let delimiters = archived
+            .lines()
+            .filter(|l| crate::heading::is_frontmatter_delimiter_line(l))
+            .count();
+        assert_eq!(delimiters, 2, "{archived}");
+        assert_eq!(archived.matches("title: Old Page").count(), 1, "{archived}");
+        assert!(archived.contains("status: archived"), "{archived}");
+        assert!(!archived.contains("status: active"), "{archived}");
+        assert!(archived.ends_with("# Body\n"), "{archived}");
+    }
+
+    #[tokio::test]
+    async fn archive_repoint_keeps_fragments_titles_and_aliases() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, _) = archive_fixture(&work, true).await;
+        let front = "---\ntitle: Referencer\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        std::fs::write(
+            work.path().join("referencing.md"),
+            format!("{front}{}", fragment_links_body("old/loc.md", "old/loc")),
+        )
+        .unwrap();
+        git_commit_all(&work, "referencing.md", "fragment links");
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+
+        let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert_eq!(
+            referencing,
+            format!(
+                "{front}{}",
+                fragment_links_body("_archive/old/loc.md", "_archive/old/loc.md")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_unlink_replaces_links_with_plain_text_in_one_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, head_before) = archive_fixture(&work, true).await;
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Unlink,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert!(success.status_set);
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+        let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert!(
+            referencing.ends_with("\nSee the page, Alias and old/loc.md or old/loc.md.\n"),
+            "{referencing}"
+        );
+        assert!(!referencing.contains("]("));
+        assert!(!referencing.contains("[["));
+        assert_eq!(commit_count_since(&work, &head_before), "1");
+    }
+
+    #[tokio::test]
+    async fn archive_leaves_frontmatter_alone_when_the_schema_has_no_status_field() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, _) = archive_fixture(&work, false).await;
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert!(!success.status_set);
+        let archived = std::fs::read_to_string(work.path().join("_archive/old/loc.md")).unwrap();
+        assert_eq!(archived, ARCHIVE_SOURCE);
+    }
+
+    #[tokio::test]
+    async fn archive_with_a_stale_or_missing_expected_version_is_refused() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, head_before) = archive_fixture(&work, true).await;
+
+        let stale = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            "some older content\n",
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let err = write_document(&harness.deps(), stale).await.unwrap_err();
+        assert!(matches!(err, WriteError::EditedElsewhere), "{err:?}");
+
+        let mut missing = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        missing.expected_version = None;
+        let err = write_document(&harness.deps(), missing).await.unwrap_err();
+        assert!(matches!(err, WriteError::VersionRequired), "{err:?}");
+
+        assert!(work.path().join("old/loc.md").exists());
+        assert!(!work.path().join("_archive").exists());
+        assert_eq!(head_sha(&work), head_before);
+    }
+
+    #[tokio::test]
+    async fn archive_without_the_document_index_is_refused() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        std::fs::write(work.path().join("old/loc.md"), ARCHIVE_SOURCE).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+        let harness = git_backed_harness(&work);
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        assert!(matches!(err, WriteError::Internal { .. }), "{err:?}");
+        assert!(work.path().join("old/loc.md").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_with_unlink_inbound_rewrites_links_in_the_same_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, head_before) = archive_fixture(&work, false).await;
+
+        let success = delete_document_with(
+            &harness.deps(),
+            "old/loc.md",
+            None,
+            Some(leak(document_version(ARCHIVE_SOURCE.as_bytes()))),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+        assert!(success.referencing_paths.is_empty());
+        assert!(!work.path().join("old/loc.md").exists());
+        let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert!(
+            referencing.ends_with("\nSee the page, Alias and old/loc.md or old/loc.md.\n"),
+            "{referencing}"
+        );
+        assert_eq!(commit_count_since(&work, &head_before), "1");
+        crate::reindex::test_support::assert_marked_dirty(
+            &harness.reindex_queue,
+            &["old/loc.md", "referencing.md"],
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_without_unlink_inbound_leaves_links_and_reports_them() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, _) = archive_fixture(&work, false).await;
+
+        let success = delete_document(
+            &harness.deps(),
+            "old/loc.md",
+            None,
+            Some(leak(document_version(ARCHIVE_SOURCE.as_bytes()))),
+        )
+        .await
+        .unwrap();
+
+        assert!(success.rewritten_paths.is_empty());
+        assert_eq!(
+            success.referencing_paths,
+            vec!["referencing.md".to_string()]
+        );
+        let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert_eq!(referencing, ARCHIVE_REFERENCER);
+    }
+
+    #[tokio::test]
+    async fn delete_with_unlink_inbound_and_a_stale_version_is_refused() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, head_before) = archive_fixture(&work, false).await;
+
+        let err = delete_document_with(
+            &harness.deps(),
+            "old/loc.md",
+            None,
+            Some(leak(document_version(b"older"))),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, WriteError::EditedElsewhere), "{err:?}");
+        assert!(work.path().join("old/loc.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("referencing.md")).unwrap(),
+            ARCHIVE_REFERENCER
+        );
+        assert_eq!(head_sha(&work), head_before);
+    }
+
+    #[test]
+    fn unlink_occurrences_covers_every_link_syntax_and_skips_code() {
+        let body = "a [x](p.md \"t\") b [[p.md]] c [[p.md|al]] d <p.md> e `[c](p.md)` f\n\
+                    ```\n[f](p.md)\n```\n[r][ref]\n[ref]: p.md\nend\n";
+        let occ: Vec<_> = crate::ingest::find_markdown_link_occurrences(body, "q.md")
+            .into_iter()
+            .filter(|o| o.resolved == "p.md")
+            .collect();
+        let out = unlink_occurrences(body, &occ);
+        assert_eq!(
+            out,
+            "a x b p.md c al d p.md e `[c](p.md)` f\n```\n[f](p.md)\n```\n[r][ref]\nend\n"
+        );
+    }
+
+    #[test]
+    fn archive_destination_prefixes_and_refuses_the_archive_itself() {
+        assert_eq!(
+            archive_destination("/_archive/", "a/b.md").unwrap(),
+            "_archive/a/b.md"
+        );
+        assert_eq!(
+            archive_destination("old/stuff", "a.md").unwrap(),
+            "old/stuff/a.md"
+        );
+        assert!(archive_destination("_archive", "_archive/a.md").is_err());
+        assert!(archive_destination("../x", "a.md").is_err());
+        assert!(archive_destination("  ", "a.md").is_err());
+    }
+
+    #[tokio::test]
+    async fn document_side_embedder_routes_query_calls_to_embed_document() {
+        struct Split;
+        impl QueryEmbedder for Split {
+            async fn embed_query(&self, _q: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![1.0])
+            }
+            async fn embed_document(&self, _t: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![2.0])
+            }
+        }
+        let inner = Split;
+        let adapter = DocumentSideEmbedder(&inner);
+        assert_eq!(adapter.embed_query("x").await.unwrap(), vec![2.0]);
     }
 }

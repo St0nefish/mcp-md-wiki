@@ -9,17 +9,18 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "Copy deploy.env.example to deploy.env and configure it." >&2
   exit 1
 fi
+# shellcheck source=/dev/null
 source "$ENV_FILE"
 
 BINARY="mcp-md-wiki"
-CONTEXT_FLAG=""
-[[ -n "${DOCKER_CONTEXT:-}" ]] && CONTEXT_FLAG="--context $DOCKER_CONTEXT"
+# docker with the optional --context from deploy.env.
+docker_ctx() { docker ${DOCKER_CONTEXT:+--context "$DOCKER_CONTEXT"} "$@"; }
 
 echo "Pulling latest image..."
-docker $CONTEXT_FLAG compose -f "$COMPOSE_FILE" pull "$SERVICE"
+docker_ctx compose -f "$COMPOSE_FILE" pull "$SERVICE"
 
 echo "Restarting service..."
-docker $CONTEXT_FLAG compose -f "$COMPOSE_FILE" up -d "$SERVICE"
+docker_ctx compose -f "$COMPOSE_FILE" up -d "$SERVICE"
 
 if [[ "${1:-}" == "--reindex" ]]; then
   echo "Waiting for service to be healthy..."
@@ -35,7 +36,7 @@ if [[ "${1:-}" == "--reindex" ]]; then
   HEALTH_TIMEOUT=60
   elapsed=0
   while true; do
-    status=$(docker $CONTEXT_FLAG compose -f "$COMPOSE_FILE" ps --format json "$SERVICE" |
+    status=$(docker_ctx compose -f "$COMPOSE_FILE" ps --format json "$SERVICE" |
       jq -rs 'flatten | .[0].Health // empty')
     if [[ "$status" == "healthy" ]]; then
       echo "Service is healthy."
@@ -54,7 +55,7 @@ if [[ "${1:-}" == "--reindex" ]]; then
   done
 
   echo "Running full reindex..."
-  docker $CONTEXT_FLAG exec "$SERVICE" "$BINARY" index --full
+  docker_ctx exec "$SERVICE" "$BINARY" index --full
 fi
 
 echo "Done."

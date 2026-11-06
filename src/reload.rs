@@ -451,39 +451,79 @@ const DIFF_TABLE: &[DiffField] = &[
         }],
     },
     // ── embedding ────────────────────────────────────────────────────────────
-    // EmbedClient is built exactly once, at server startup, from a `&ResolvedEmbeddingConfig`
-    // snapshot — every field below is captured by value or baked into a
-    // `reqwest::Client` at that point (embed.rs EmbedClient::new).
+    // Two EmbedClients read these, with different lifetimes. The indexer builds a
+    // fresh one from the live config at the start of every run
+    // (ingest::index_paths_inner, from the snapshot the reindex worker loads per
+    // drained unit). The one behind search queries and the write dedup/related query
+    // is built once at server startup (server.rs run_server) and never rebuilt. Every
+    // field is captured by value or baked into a `reqwest::Client` at construction
+    // (embed.rs EmbedClient::new). `batch_size`/`batch_concurrency` only shape
+    // `EmbedClient::embed_texts`, which only the indexer calls; the query side embeds
+    // one text per request.
     DiffField {
         path: "embedding.batch_size",
         get: |c| Some(d(&c.embedding.batch_size)),
         consumers: &[ConsumerEntry {
-            effect: ReloadEffect::RestartRequired,
+            effect: ReloadEffect::Applied,
             setting: "embedding.batch_size",
-            note: "EmbedClient captures this by value at construction (embed.rs \
-                   EmbedClient::new); it is built once at server startup and never \
-                   rebuilt.",
+            note: "only the indexer batches (EmbedClient::embed_texts), and it builds a fresh \
+                   EmbedClient from the live config on every run (ingest::index_paths_inner), \
+                   so the next indexing run uses the new value.",
         }],
     },
     DiffField {
         path: "embedding.request_timeout_secs",
         get: |c| Some(d(&c.embedding.request_timeout_secs)),
-        consumers: &[ConsumerEntry {
-            effect: ReloadEffect::RestartRequired,
-            setting: "embedding.request_timeout_secs",
-            note: "baked into the reqwest::Client's timeout when EmbedClient is \
-                   constructed (embed.rs); a reqwest::Client's timeout cannot be changed \
-                   after the client is built.",
-        }],
+        consumers: &[
+            ConsumerEntry {
+                effect: ReloadEffect::Applied,
+                setting: "embedding.request_timeout_secs (indexing)",
+                note: "the indexer builds a fresh EmbedClient, and with it the timed \
+                       reqwest::Client, from the live config on every run \
+                       (ingest::index_paths_inner), so the next indexing run uses it.",
+            },
+            ConsumerEntry {
+                effect: ReloadEffect::RestartRequired,
+                setting: "embedding.request_timeout_secs (search queries / write dedup)",
+                note: "baked into the reqwest::Client of the EmbedClient built once at server \
+                       startup (server.rs run_server; embed.rs EmbedClient::new); a \
+                       reqwest::Client's timeout cannot be changed after it is built.",
+            },
+        ],
     },
     DiffField {
         path: "embedding.batch_concurrency",
         get: |c| Some(d(&c.embedding.batch_concurrency)),
         consumers: &[ConsumerEntry {
-            effect: ReloadEffect::RestartRequired,
+            effect: ReloadEffect::Applied,
             setting: "embedding.batch_concurrency",
-            note: "EmbedClient captures this by value at construction (embed.rs \
-                   EmbedClient::new).",
+            note: "only the indexer runs concurrent batches (EmbedClient::embed_texts), and it \
+                   builds a fresh EmbedClient from the live config on every run \
+                   (ingest::index_paths_inner), so the next indexing run uses the new value.",
+        }],
+    },
+    DiffField {
+        path: "embedding.query_prefix",
+        get: |c| Some(d(&c.embedding.query_prefix)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "embedding.query_prefix",
+            note: "EmbedClient captures this at construction (embed.rs \
+                   EmbedClient::new). reload_config keeps the running value in the \
+                   live config so it cannot drift from the client until restart.",
+        }],
+    },
+    DiffField {
+        path: "embedding.document_prefix",
+        get: |c| Some(d(&c.embedding.document_prefix)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "embedding.document_prefix",
+            note: "EmbedClient captures this at construction (embed.rs \
+                   EmbedClient::new) and ingest::indexing_fingerprint folds it in, so \
+                   after the restart the next reconcile re-embeds every file. \
+                   reload_config keeps the running value in the live config so the \
+                   fingerprint never gets ahead of the client.",
         }],
     },
     // ── validation ───────────────────────────────────────────────────────────
@@ -600,7 +640,9 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::RestartRequired,
             setting: "mcp.allowed_hosts",
             note: "baked into the StreamableHttpServerConfig when the MCP service is \
-                   built (server.rs mcp_transport_config, invoked once from run_server).",
+                   built (server.rs mcp_transport_config, invoked once from run_server), \
+                   and into the web UI's /api/* Host/Origin guard when the router is \
+                   assembled.",
         }],
     },
     DiffField {
@@ -935,6 +977,48 @@ const DIFF_TABLE: &[DiffField] = &[
         }],
     },
     DiffField {
+        path: "write.related_min_score",
+        get: |c| Some(d(&c.write.related_min_score)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.related_min_score",
+            note: "read fresh from the live config on every document create (write.rs \
+                   effective_related); the global fallback where no schema file `dedup:` \
+                   block overrides it (#356).",
+        }],
+    },
+    DiffField {
+        path: "write.related_limit",
+        get: |c| Some(d(&c.write.related_limit)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.related_limit",
+            note: "read fresh from the live config on every document create (write.rs \
+                   effective_related); the global fallback where no schema file `dedup:` \
+                   block overrides it (#356).",
+        }],
+    },
+    DiffField {
+        path: "write.archive_prefix",
+        get: |c| Some(d(&c.write.archive_prefix)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.archive_prefix",
+            note: "read fresh from the live config on every archive write_document call \
+                   (mcp.rs write_deps, write.rs archive_destination, #357).",
+        }],
+    },
+    DiffField {
+        path: "write.archive_links",
+        get: |c| Some(d(&c.write.archive_links)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "write.archive_links",
+            note: "read fresh from the live config on every archive write_document call; a \
+                   call's own archive_links overrides it (#357).",
+        }],
+    },
+    DiffField {
         path: "write.commit_author_name",
         get: |c| Some(d(&c.write.commit_author_name)),
         consumers: &[ConsumerEntry {
@@ -1150,6 +1234,17 @@ const DIFF_TABLE: &[DiffField] = &[
                    Run `mcp-md-wiki index --full` for a consistent corpus.",
         }],
     },
+    DiffField {
+        path: "ui.api_auth",
+        get: |c| Some(d(&c.ui.api_auth)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "ui.api_auth",
+            note: "whether the /api/* routes sit behind the bearer-auth layer is decided \
+                   once when the router is assembled (server.rs assemble_router); the \
+                   layer is never rebuilt.",
+        }],
+    },
 ];
 
 /// Compare every YAML-reloadable setting between `old` and `new`, recording each one
@@ -1211,9 +1306,15 @@ pub fn reload_config(
     shared: &SharedConfig,
     queue: &crate::reindex::ReindexQueue,
 ) -> anyhow::Result<ReloadReport> {
-    let new = Config::load(path)?;
+    let mut new = Config::load(path)?;
     let old = crate::config::load_shared_config(shared);
     let report = diff(&old, &new);
+    // The embedding prefixes are baked into the startup-built `EmbedClient`, and the
+    // document prefix is part of the indexing fingerprint. Keep the running values in
+    // the live config so a reload cannot stamp files with a prefix the client is not
+    // yet sending; the change is reported `restart_required` and lands on restart.
+    new.embedding.query_prefix = old.embedding.query_prefix.clone();
+    new.embedding.document_prefix = old.embedding.document_prefix.clone();
     crate::config::store_shared_config(shared, new);
     queue.mark_full();
     Ok(report)
@@ -1270,6 +1371,42 @@ mod tests {
         assert_eq!(report.applied[0].new, "false");
         assert!(report.restart_required.is_empty());
         assert!(report.reindex_required.is_empty());
+    }
+
+    /// The indexer builds its EmbedClient from the live config on every run, so the
+    /// batching knobs (indexer-only) apply on the next run; the request timeout also
+    /// sits in the startup-built query-side client, which needs a restart.
+    #[test]
+    fn embedding_batching_applies_to_the_next_run_and_the_timeout_splits_by_consumer() {
+        let old = base_config();
+        let mut new = base_config();
+        new.embedding.batch_size = old.embedding.batch_size + 1;
+        new.embedding.batch_concurrency = old.embedding.batch_concurrency + 1;
+        let report = diff(&old, &new);
+        let applied: Vec<&str> = report.applied.iter().map(|c| c.setting.as_str()).collect();
+        assert_eq!(
+            applied,
+            vec!["embedding.batch_size", "embedding.batch_concurrency"]
+        );
+        assert!(
+            report.restart_required.is_empty(),
+            "{:?}",
+            report.restart_required
+        );
+
+        let mut new = base_config();
+        new.embedding.request_timeout_secs = old.embedding.request_timeout_secs + 1;
+        let report = diff(&old, &new);
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(
+            report.applied[0].setting,
+            "embedding.request_timeout_secs (indexing)"
+        );
+        assert_eq!(report.restart_required.len(), 1);
+        assert_eq!(
+            report.restart_required[0].setting,
+            "embedding.request_timeout_secs (search queries / write dedup)"
+        );
     }
 
     #[test]
@@ -1350,6 +1487,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_embedding_prefix_reload_is_restart_required_and_not_applied_live() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "chunking:\n  max_chunk_size: 1000\n");
+        let running = Config::load(&path).unwrap();
+        assert_eq!(running.embedding.document_prefix, "");
+        let shared = crate::config::shared_config(std::sync::Arc::new(running));
+
+        write_config(
+            tmp.path(),
+            "chunking:\n  max_chunk_size: 1000\nembedding:\n  query_prefix: \"query: \"\n  document_prefix: \"passage: \"\n",
+        );
+        let queue = crate::reindex::ReindexQueue::new();
+        let report = reload_config(&path, &shared, &queue).unwrap();
+        let names: Vec<&str> = report
+            .restart_required
+            .iter()
+            .map(|c| c.setting.as_str())
+            .collect();
+        assert!(names.contains(&"embedding.query_prefix"), "{names:?}");
+        assert!(names.contains(&"embedding.document_prefix"), "{names:?}");
+
+        let live = crate::config::load_shared_config(&shared);
+        assert_eq!(live.embedding.query_prefix, "");
+        assert_eq!(live.embedding.document_prefix, "");
+
+        clear_required_env();
     }
 
     #[test]
@@ -1622,6 +1791,7 @@ mod tests {
         // `descriptions::TOOL_NAMES`.
         new.mcp.disabled_tools = vec![
             "get_document".to_string(),
+            "changes_since".to_string(),
             "write_document".to_string(),
             "delete_document".to_string(),
             "get_schema".to_string(),

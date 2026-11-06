@@ -243,8 +243,8 @@ embedding:
   # Number of texts to send per API request. Higher values are faster but
   # use more memory on the embedding server. Tune based on your model's
   # context window and available VRAM.
-  # RESTART REQUIRED: baked into the embedding client at startup — POST
-  # /admin/reload cannot change this on a running server.
+  # Only indexing batches, and each indexing run builds its embedding client
+  # from the live config, so POST /admin/reload applies this to the next run.
   batch_size: 32
 
   # Wall-clock timeout (seconds) for a single embedding HTTP request. A batch
@@ -252,8 +252,9 @@ embedding:
   # server, so this needs headroom above a typical API timeout — a request
   # that hangs past this becomes a retryable error instead of blocking
   # forever. Tuning knob, not a connection setting — no env var override.
-  # RESTART REQUIRED: baked into the embedding client's HTTP timeout at
-  # startup — POST /admin/reload cannot change this on a running server.
+  # POST /admin/reload applies this to the next indexing run (each run builds
+  # its embedding client from the live config). RESTART REQUIRED for search
+  # queries and write dedup: their client's HTTP timeout is baked in at startup.
   request_timeout_secs: 60
 
   # Max number of embedding batches sent concurrently during indexing. The
@@ -262,9 +263,24 @@ embedding:
   # 4 is a compromise that leaves headroom for a future GPU deployment with
   # more parallel slots. Tuning knob, not a connection setting — no env var
   # override.
-  # RESTART REQUIRED: baked into the embedding client at startup — POST
-  # /admin/reload cannot change this on a running server.
+  # Each indexing run builds its embedding client from the live config, so
+  # POST /admin/reload applies this to the next run.
   batch_concurrency: 4
+
+  # Text prepended to the text sent for embedding, for asymmetric models that
+  # expect different prefixes for queries and documents (e.g. nomic-embed:
+  # "search_query: " / "search_document: "; e5: "query: " / "passage: ").
+  # Empty (the default) sends the text unchanged. Match the model's own
+  # convention — a wrong prefix degrades retrieval.
+  # `query_prefix` applies to search queries. `document_prefix` applies to
+  # chunk text at index time and to the write dedup / related-documents query.
+  # Changing `document_prefix` re-embeds the whole corpus on the next
+  # reconcile (it is part of each file's fingerprint); changing only
+  # `query_prefix` needs no reindex.
+  # RESTART REQUIRED: POST /admin/reload cannot change either on a running
+  # server (the running values are kept).
+  query_prefix: ""
+  document_prefix: ""
 
 
 # ----------------------------------------------------------------------------
@@ -287,9 +303,11 @@ validation:
   # regardless of their frontmatter.
   enabled: true
 
-  # Strict mode. When true, files that fail validation are treated as hard
-  # errors (indexing aborts). When false, invalid files are skipped with a
-  # warning and indexing continues.
+  # Strict mode. When true, a file that fails validation is rejected: indexing
+  # continues without it, the version indexed before the failing edit stays
+  # served, and /status lists the rejection. When false, invalid files are
+  # skipped with a warning and indexing continues; a previously indexed version
+  # is removed from the index, as a full reindex would leave it.
   strict: false
 
   # External lint command run on each markdown file before indexing. Specified
@@ -514,12 +532,18 @@ mcp:
   # rebinding, and a bearer-authenticated server already refuses those requests
   # at auth. Worth setting mainly when allow_unauthenticated is true.
   #
+  # The same list also guards the web UI's /api/* routes (unauthenticated
+  # unless ui.api_auth is on), where it is worth setting in any deployment:
+  # a request whose Host is not listed gets 403, and a cross-origin POST/DELETE
+  # is accepted only from a listed host (or the request's own Host).
+  #
   # Behind a reverse proxy, list the PUBLIC hostname clients connect to — the
   # proxy forwards the original Host header, not the container's address.
   # Include a port only if clients send one.
   #
-  # RESTART REQUIRED: baked into the MCP transport when it is built at
-  # startup — POST /admin/reload cannot change this on a running server.
+  # RESTART REQUIRED: baked into the MCP transport and the web UI router when
+  # they are built at startup — POST /admin/reload cannot change this on a
+  # running server.
   # allowed_hosts:
   #   - "kb.example.com"
 
@@ -562,8 +586,8 @@ mcp:
   # MCP tool names to disable at the server level: hidden from tools/list,
   # tools/get returns nothing for them, and tools/call refuses them with the
   # same error as an unknown tool name. Valid names are search, get_document,
-  # write_document, delete_document, get_schema, update_schema — every entry
-  # must be one of these, with no duplicates, and the list may not name every
+  # write_document, delete_document, get_schema, update_schema, changes_since —
+  # every entry must be one of these, with no duplicates, and the list may not name every
   # tool (config load fails otherwise). The web UI's own /api/doc/* write
   # routes call write::write_document/delete_document directly rather than
   # going through MCP dispatch, so they are unaffected by this setting.
@@ -616,6 +640,30 @@ write:
   # 0.80 works well for most embedding models; lower it to 0.75–0.80 for
   # shorter or more domain-specific documents.
   dedup_threshold: 0.80
+
+  # Creating a document also returns up to `related_limit` existing documents
+  # (`related` in the result: path and score, nearest first) that score at least
+  # `related_min_score` against it, so the writer can link to them and check them
+  # for conflicts. They come from the same dense query as the duplicate check (no
+  # extra embedding call), never include the written path, and are omitted when
+  # dedup is disabled or bypassed (`force_new`) for that path. `related_limit: 0`
+  # turns the listing off; maximum 20. `related_min_score` range: 0.0–1.0.
+  # A .schema.yaml `dedup:` block can override either per subtree
+  # (`related_limit`, `related_min_score`).
+  related_min_score: 0.50
+  related_limit: 5
+
+  # `write_document` with `archive: true` moves a document to
+  # `<archive_prefix>/<its path>` in one commit, sets `status: archived` when the
+  # governing schema declares a `status` field that allows that value, and
+  # handles links that point at it per `archive_links`: `repoint` rewrites them
+  # to the archived location, `unlink` replaces each with its plain label. A call
+  # can override the policy with its own `archive_links`. The prefix is an
+  # ordinary indexed path (archived documents stay searchable; filter on
+  # `status`); do not exclude it in `indexing.exclude`, which would make the
+  # archive write refuse. Reloadable without a restart.
+  archive_prefix: "_archive"
+  archive_links: repoint
 
   # Git author identity used for commits made by the write tools (write_document,
   # delete_document). Setting these to a bot identity makes tool-authored commits
@@ -845,9 +893,20 @@ reranking:
 # ui — knowledge-base web UI tuning
 # ----------------------------------------------------------------------------
 # Pure YAML tuning knobs for the web UI served by this same binary (see
-# README.md's "Web UI" section). No secrets, no bootstrap wiring — everything
-# here is live-reloadable via POST /admin/reload.
+# README.md's "Web UI" section). No secrets, no bootstrap wiring. Everything
+# here is live-reloadable via POST /admin/reload except `api_auth`, which is
+# read once at startup.
 ui:
+
+  # Put the same authentication that guards /mcp (static bearer token and/or
+  # OAuth) in front of every /api/* route of the web UI. The static shell
+  # ("/" and /assets/*) stays open either way so a browser can load it.
+  # Off by default: the web UI is normally reached through an SSO proxy, and
+  # its routes are open. Note a browser calling /api/* then needs to send the
+  # credential itself.
+  # RESTART REQUIRED: the auth layer is built once at startup — POST
+  # /admin/reload cannot change this on a running server.
+  api_auth: false
 
   # Precomputed semantic (kNN) graph edges shown alongside markdown-link edges
   # in the web UI's graph view, in addition to the links already discovered

@@ -9,8 +9,8 @@ assignees: ""
 ## Where
 
 Which file and section (`README.md`, `deploy/USAGE.md`, `deploy/TROUBLESHOOTING.md`,
-`docs/ARCHITECTURE.md`, `deploy/config.example.yaml`, etc.), with a line number or
-heading if you have one.
+`docs/ARCHITECTURE.md`, `deploy/config.example.yaml`, etc.), with the heading (not a line
+number) if you have one.
 
 ## Problem
 

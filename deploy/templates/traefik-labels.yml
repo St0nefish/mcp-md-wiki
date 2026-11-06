@@ -7,7 +7,16 @@
 #   {{TRAEFIK_NETWORK}} — your Traefik Docker network (e.g. traefik)
 #
 # When using Traefik, remove the `ports:` mapping from the mcp-md-wiki service
-# since Traefik routes traffic directly via the Docker network.
+# since Traefik routes traffic directly via the Docker network. (If you keep it,
+# its loopback-only default does not affect the Traefik route.)
+#
+# !!! WARNING: WITHOUT AN AUTH MIDDLEWARE THE WEB UI WRITE API IS OPEN !!!
+# The router below sends the whole host to the server with no authentication
+# in front of it. /mcp, /status, /metrics and /admin/* carry their own bearer /
+# OAuth check, but the web UI (/, /api/*) does not unless ui.api_auth is on —
+# anyone who can reach {{HOSTNAME}} can then create, edit and delete every
+# document through POST/DELETE /api/doc. Either set ui.api_auth: true in
+# config.yaml or put a forward-auth middleware on the UI (example below).
 
 # Add to mcp-md-wiki service:
 labels:
@@ -16,6 +25,26 @@ labels:
   - "traefik.http.routers.mcp-md-wiki.entrypoints=websecure"
   - "traefik.http.routers.mcp-md-wiki.tls.certresolver={{RESOLVER}}"
   - "traefik.http.services.mcp-md-wiki.loadbalancer.server.port=8001"
+
+  # --- Optional: forward-auth (Authentik outpost style) on the web UI ---
+  # Uncomment to put the web UI behind an identity provider. The routes that
+  # authenticate themselves (MCP clients present a bearer/OAuth token, not a
+  # browser session, so a forward-auth redirect would break them) get their own
+  # higher-priority router without the middleware; everything else — the UI
+  # shell, /assets/* and /api/* — matches the main router above, which gets it.
+  # Replace {{AUTH_OUTPOST}} with your outpost URL, e.g.
+  # http://authentik-outpost:9000/outpost.goauthentik.io/auth/traefik
+  #
+  # - "traefik.http.middlewares.mcp-md-wiki-auth.forwardauth.address={{AUTH_OUTPOST}}"
+  # - "traefik.http.middlewares.mcp-md-wiki-auth.forwardauth.trustForwardHeader=true"
+  # - "traefik.http.middlewares.mcp-md-wiki-auth.forwardauth.authResponseHeaders=X-authentik-username,X-authentik-groups,X-authentik-email,X-authentik-name,X-authentik-uid"
+  # - "traefik.http.routers.mcp-md-wiki.middlewares=mcp-md-wiki-auth"
+  #
+  # - "traefik.http.routers.mcp-md-wiki-app-auth.rule=Host(`{{HOSTNAME}}`) && (PathPrefix(`/mcp`) || PathPrefix(`/.well-known/oauth-protected-resource`) || Path(`/health`) || PathPrefix(`/status`) || Path(`/metrics`) || PathPrefix(`/admin/`) || Path(`/hooks/reindex`))"
+  # - "traefik.http.routers.mcp-md-wiki-app-auth.priority=100"
+  # - "traefik.http.routers.mcp-md-wiki-app-auth.entrypoints=websecure"
+  # - "traefik.http.routers.mcp-md-wiki-app-auth.tls.certresolver={{RESOLVER}}"
+  # - "traefik.http.routers.mcp-md-wiki-app-auth.service=mcp-md-wiki"
 
 # Add to top-level networks:
 networks:

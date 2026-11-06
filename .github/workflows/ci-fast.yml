@@ -5,10 +5,11 @@ name: CI fast
 # armed for auto-merge, and only after `ci-fast` passed on the same head).
 #
 #   changes  did the PR touch a code path? (.github/scripts/code-paths.sh)
-#   lint     always: actionlint (pinned, checksum-verified), shellcheck of the CI
-#            scripts (.github/scripts, scripts)
-#   checks   checks.yml fast tier (fmt, clippy, cargo audit, cargo test), only when a
-#            code path changed — a docs-only or version-only PR still gets `ci-fast`
+#   lint     always: actionlint and zizmor (pinned, checksum-verified), shellcheck of the
+#            CI scripts (.github/scripts, scripts), deploy/deploy.sh and .githooks
+#   checks   checks.yml fast tier (fmt, clippy, cargo audit, cargo deny, cargo test),
+#            only when a code path changed — a docs-only or version-only PR still gets
+#            `ci-fast`
 #   ci-fast  the required check; never skipped, every needed job named explicitly
 #
 # Runs the PR's own copy of this file. The owner's same-repo PRs run the cargo checks on
@@ -35,7 +36,7 @@ jobs:
       code: ${{ steps.diff.outputs.code }}
     steps:
       # GitHub's test merge of the PR: first parent is master, so HEAD^1..HEAD is the PR.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 2
           persist-credentials: false
@@ -53,14 +54,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: shellcheck
         run: |
           shellcheck --version
-          git ls-files -z '.github/scripts/*.sh' 'scripts/*.sh' | xargs -0 shellcheck -x
+          git ls-files -z '.github/scripts/*.sh' 'scripts/*.sh' 'deploy/*.sh' '.githooks/*' | xargs -0 shellcheck -x
 
       - name: actionlint
         env:
@@ -75,6 +76,25 @@ jobs:
           tar -xzf "${tmp}/${archive}" -C "${tmp}" actionlint
           "${tmp}/actionlint" -version
           "${tmp}/actionlint"
+
+      # Workflow security lint (template injection, unpinned actions, persisted
+      # credentials, dangerous triggers). Policy and exceptions: .github/zizmor.yml and the
+      # `# zizmor: ignore[...]` comments beside the workflow lines they excuse. --offline
+      # keeps it deterministic (no GitHub API calls, so no rate limits or token needed);
+      # it skips the audits that compare a ref against the action's repository.
+      - name: zizmor
+        env:
+          ZIZMOR_VERSION: 1.32.0
+          ZIZMOR_SHA256: bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b
+        run: |
+          tmp=$(mktemp -d)
+          archive="zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o "${tmp}/${archive}" \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/${archive}"
+          echo "${ZIZMOR_SHA256}  ${tmp}/${archive}" | sha256sum -c -
+          tar -xzf "${tmp}/${archive}" -C "${tmp}" zizmor
+          "${tmp}/zizmor" --version
+          "${tmp}/zizmor" --offline --format=github .github/workflows
 
   checks:
     needs: [changes]

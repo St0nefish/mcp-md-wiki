@@ -92,7 +92,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
@@ -184,7 +184,7 @@ jobs:
           - arch: amd64
             runner: self-hosted
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
@@ -212,7 +212,7 @@ jobs:
       # A docker-container builder: the default docker driver can neither push by
       # digest nor export a registry cache.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           name: ci-mcp-md-wiki-${{ github.job }}-buildx-${{ github.run_id }}
 
@@ -231,7 +231,7 @@ jobs:
       # checked out working tree — the merge, in merge mode — not a fresh git fetch.
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -257,7 +257,7 @@ jobs:
           touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digests-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
@@ -279,7 +279,7 @@ jobs:
     steps:
       # The Qdrant pin the smoke test reads (docker-compose.yml) comes from the tree under
       # test; the smoke test script itself is master's copy.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
@@ -305,7 +305,7 @@ jobs:
           [[ "$got" == "$TREE" ]] || { echo "::error::checkout tree ${got}, expected ${TREE}"; exit 1; }
 
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-*

@@ -7,6 +7,7 @@
 # Code paths: anything compiled into, tested against, or building the binary or image —
 #   src/**  assets/**  migrations/**  Cargo.toml  Cargo.lock  rust-toolchain.toml
 #   Dockerfile  docker-compose.yml (the Qdrant pin CI and the smoke test run)
+#   deny.toml  (the cargo-deny policy the fast tier enforces)
 #   deploy/**  (deploy/config.example.yaml is read by a test through include_str!)
 #   .github/workflows/**  .github/scripts/**
 #
@@ -27,7 +28,7 @@ shopt -s inherit_errexit
 from=${1:?usage: code-paths.sh <from> <to>}
 to=${2:?usage: code-paths.sh <from> <to>}
 
-code_re='^(src/|assets/|migrations/|deploy/|\.github/workflows/|\.github/scripts/)|^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|Dockerfile|docker-compose\.yml)$'
+code_re='^(src/|assets/|migrations/|deploy/|\.github/workflows/|\.github/scripts/)|^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|Dockerfile|docker-compose\.yml)$'
 
 # Cargo.toml with the [package] table's `version` value blanked.
 normalize_manifest() {

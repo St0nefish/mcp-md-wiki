@@ -33,12 +33,13 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
 
-/// The six MCP tools this server exposes. Also the source of truth for which
+/// The seven MCP tools this server exposes. Also the source of truth for which
 /// `assets/mcp/tools/*.md` files must exist and which `tools/<tool>.md`
 /// extension files a KB may provide.
-pub const TOOL_NAMES: [&str; 6] = [
+pub const TOOL_NAMES: [&str; 7] = [
     "search",
     "get_document",
+    "changes_since",
     "write_document",
     "delete_document",
     "get_schema",
@@ -64,6 +65,7 @@ fn compiled_tool_base(tool: &str) -> Option<&'static str> {
     match tool {
         "search" => Some(include_str!("../assets/mcp/tools/search.md")),
         "get_document" => Some(include_str!("../assets/mcp/tools/get_document.md")),
+        "changes_since" => Some(include_str!("../assets/mcp/tools/changes_since.md")),
         "write_document" => Some(include_str!("../assets/mcp/tools/write_document.md")),
         "delete_document" => Some(include_str!("../assets/mcp/tools/delete_document.md")),
         "get_schema" => Some(include_str!("../assets/mcp/tools/get_schema.md")),

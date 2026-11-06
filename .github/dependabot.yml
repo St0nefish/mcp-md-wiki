@@ -1,0 +1,62 @@
+# Dependabot version updates: monthly, one grouped PR per ecosystem, no major bumps.
+#
+# Every Dependabot PR costs a manual arm (these PRs are not owner-authored, so
+# auto-merge.yml never arms them) and a ci-slow run, so the volume is kept to about
+# three PRs a month. Arming one is also the approval for ci-slow to run on it.
+#
+# Cargo major bumps are not proposed at all (a 0.x minor such as tower-http 0.6 -> 0.7
+# counts as one). A major is a migration, not a merge: it changes APIs and needs code
+# edits, which a bot PR cannot make, and grouping several into one PR only produces a
+# PR that cannot build. Do them by hand, one crate at a time, when there is a reason.
+# `cargo audit` and `cargo deny` in the lint job still fail CI on a vulnerable or
+# unsound version, whatever the bump policy.
+#
+# Not covered, deliberately:
+#   - the Qdrant image pin: it is repeated in docker-compose.yml and every
+#     deploy/templates/compose-*.yml (and read by CI from docker-compose.yml), and
+#     Dependabot only finds compose files by their standard names, so it would bump the
+#     root file alone and leave the templates behind. Move them together by hand, and
+#     check the pinned server against what qdrant-client 1.x speaks.
+#   - assets/ui/vendor/* (see assets/ui/vendor/README.md).
+#   - the tool versions pinned inside workflow `run:` steps (actionlint, zizmor,
+#     cargo-binstall, cargo-audit, cargo-deny).
+
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: "chore(deps)"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: "chore(docker)"
+    groups:
+      docker-base-images:
+        patterns: ["*"]

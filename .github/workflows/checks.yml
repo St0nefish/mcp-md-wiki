@@ -45,7 +45,7 @@ on:
         required: false
         default: ""
       fast:
-        description: "Run the fast tier: lint (fmt, clippy, audit) and unit tests"
+        description: "Run the fast tier: lint (fmt, clippy, audit, deny) and unit tests"
         type: boolean
         required: false
         default: true
@@ -82,7 +82,7 @@ jobs:
     steps:
       # Merge mode checks out the pinned master commit, so the merge script that runs
       # next is master's copy, not one the PR could have edited.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
@@ -135,25 +135,52 @@ jobs:
         # (opt-in) hook and CI (fix #196).
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Audit dependencies
+      # Both the bootstrap script (fetched at a commit, not `main`) and the cargo-binstall
+      # release it installs (BINSTALL_VERSION, read by the script) are pinned, as are the two
+      # tools below, so a run never picks up a moving target. Bump them together by hand
+      # (dependabot does not see these).
+      - name: Install cargo-binstall
+        env:
+          # Commit of tag v1.26.2 in cargo-bins/cargo-binstall.
+          BINSTALL_SCRIPT_COMMIT: 851112458b5f28a29e5bc14a690c3f283d9dcc6f
+          BINSTALL_VERSION: v1.26.2
         run: |
-          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          curl -L --proto '=https' --tlsv1.2 -sSf \
+            "https://raw.githubusercontent.com/cargo-bins/cargo-binstall/${BINSTALL_SCRIPT_COMMIT}/install-from-binstall-release.sh" | bash
+
+      - name: Install cargo-audit and cargo-deny
+        env:
+          CARGO_AUDIT_VERSION: 0.22.2
+          CARGO_DENY_VERSION: 0.20.2
+        run: |
           # --force when the binary is missing: on a persistent self-hosted runner,
           # cargo-binstall's install record (CARGO_HOME/.crates2.json) can survive the
           # binary itself, and it then reports "already installed" without one.
-          if command -v cargo-audit >/dev/null; then
-            cargo binstall cargo-audit --no-confirm
-          else
-            cargo binstall cargo-audit --no-confirm --force
-          fi
-          cargo audit
+          install_tool() {
+            local crate="$1" version="$2"
+            if command -v "$crate" >/dev/null; then
+              cargo binstall "${crate}@${version}" --no-confirm --locked
+            else
+              cargo binstall "${crate}@${version}" --no-confirm --locked --force
+            fi
+          }
+          install_tool cargo-audit "$CARGO_AUDIT_VERSION"
+          install_tool cargo-deny "$CARGO_DENY_VERSION"
+
+      - name: Audit dependencies
+        run: cargo audit
+
+      # Licenses, banned/duplicate crates and sources, plus the advisory check again with
+      # deny.toml's reasoned ignores. Configuration and policy: deny.toml.
+      - name: Check dependency policy
+        run: cargo deny check
 
   test:
     if: inputs.fast
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0
@@ -226,7 +253,7 @@ jobs:
     #     reporting "7 passed; 0 failed". It is required from that point on,
     #     not on the strength of local runs.
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.base-sha || inputs.ref }}
           fetch-depth: 0

@@ -72,7 +72,7 @@ jobs:
       dev_version: ${{ steps.version.outputs.version }}
       sha_tag: ${{ steps.version.outputs.sha_tag }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.sha || github.sha }}
           # dev-version.sh counts first-parent commits since the latest release tag.
@@ -185,7 +185,7 @@ jobs:
       SHA_TAG: ${{ needs.prepare.outputs.sha_tag }}
       DEV_VERSION: ${{ needs.prepare.outputs.dev_version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.commit }}
           sparse-checkout: .github/scripts
@@ -269,7 +269,7 @@ jobs:
       statuses: write
       actions: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.commit }}
           sparse-checkout: .github/scripts
@@ -324,7 +324,7 @@ jobs:
       contents: write # --delete-branch
       pull-requests: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.commit }}
           persist-credentials: false
