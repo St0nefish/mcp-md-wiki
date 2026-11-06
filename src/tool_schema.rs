@@ -729,6 +729,88 @@ mod tests {
     }
 
     #[test]
+    fn an_array_of_tagged_ops_with_a_recursive_definition_is_made_self_contained() {
+        // The shape schemars emits for `update_schema`'s `ops` (#348): an optional
+        // array of op objects whose tag is a `$ref`ed string enum and whose payload is
+        // a `$ref`ed, nullable, recursive definition (through both a map and a boxed
+        // child).
+        let mut schema = obj(json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "ops": {
+                    "type": ["array", "null"],
+                    "items": { "$ref": "#/$defs/Op" }
+                }
+            },
+            "$defs": {
+                "Op": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["operation", "field"],
+                    "properties": {
+                        "operation": {
+                            "$ref": "#/$defs/Operation",
+                            "description": "which"
+                        },
+                        "field": { "type": "string" },
+                        "definition": {
+                            "anyOf": [{ "$ref": "#/$defs/Def" }, { "type": "null" }]
+                        }
+                    }
+                },
+                "Operation": {
+                    "type": "string",
+                    "enum": ["add_values", "patch_field"]
+                },
+                "Def": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "removed": { "type": "boolean", "default": false },
+                        "fields": {
+                            "type": ["object", "null"],
+                            "additionalProperties": { "$ref": "#/$defs/Def" }
+                        },
+                        "items": {
+                            "anyOf": [{ "$ref": "#/$defs/Def" }, { "type": "null" }]
+                        }
+                    }
+                }
+            }
+        }));
+        make_self_contained(&mut schema);
+        compact(&mut schema);
+
+        let text = serde_json::to_string(&schema).unwrap();
+        for banned in ["$ref", "$defs", "definitions", ":true", "null"] {
+            assert!(!text.contains(banned), "'{banned}' survived: {text}");
+        }
+        let op = &schema["properties"]["ops"]["items"];
+        assert_eq!(schema["properties"]["ops"]["type"], json!("array"));
+        assert_eq!(op["additionalProperties"], json!(false));
+        // The tag is an inlined flat enum, its site description kept.
+        assert_eq!(
+            op["properties"]["operation"],
+            json!({
+                "type": "string",
+                "enum": ["add_values", "patch_field"],
+                "description": "which"
+            })
+        );
+        // The definition is expanded once, with its data `default: false` intact...
+        let def = &op["properties"]["definition"];
+        assert_eq!(def["additionalProperties"], json!(false));
+        assert_eq!(def["properties"]["removed"]["default"], json!(false));
+        // ...and both recursive occurrences are cut to stubs at the repeat.
+        assert_eq!(
+            def["properties"]["fields"]["additionalProperties"],
+            json!({ "type": "object" })
+        );
+        assert_eq!(def["properties"]["items"], json!({ "type": "object" }));
+    }
+
+    #[test]
     #[should_panic]
     fn an_unresolvable_ref_panics_in_debug() {
         let mut schema = obj(json!({

@@ -2,20 +2,26 @@
 //!
 //! `documents.frontmatter` stores the faithful JSON record; this module derives the
 //! `document_fields` inverted index from it. Nested objects flatten to dot-paths
-//! (`planning.prep_minutes`), so a filter never needs to know a document's shape.
+//! (`planning.prep_minutes`), and the objects of a list to `[]` paths
+//! (`npcs[].role`) keyed by element, so a filter never needs to know a document's
+//! shape (#349).
 //!
-//! The projection is rebuildable — see `StateDb::reproject_all_fields`. Changing the
-//! rules here requires no re-read of markdown and no re-embedding.
+//! The projection is schema-driven where the schema speaks: a declared field's
+//! [`crate::schema::FieldKind::numeric`] decides its `value_num`, and an undeclared
+//! one keeps the JSON-type guess ([`numeric_value`]). It is rebuildable — see
+//! `StateDb::reproject_all_fields` and `StateDb::ensure_projection_current`. Changing
+//! the rules here requires no re-read of markdown and no re-embedding; bump
+//! `state::PROJECTION_VERSION` so existing databases reproject on next open.
 
+use crate::schema::{
+    FieldDef, FieldType, MAX_FIELD_PATH_DEPTH, NumericValue, PayloadValue, ResolvedSchema,
+};
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::warn;
 
-/// How deep nested objects are flattened before giving up. Frontmatter this deep is
-/// almost certainly structured data that belongs in the document body, not a filter key.
-const MAX_FLATTEN_DEPTH: usize = 4;
-
-/// Upper bound on projection rows from a single document.
+/// Upper bound on projection rows from a single document. Checked inside every
+/// expansion, so it bounds the work and not just the output.
 const MAX_PROJECTED_ROWS: usize = 2_000;
 
 /// Fields with a dedicated column on `documents`. They are prose, not filter-shaped,
@@ -25,8 +31,15 @@ const PROMOTED_FIELDS: [&str; 2] = ["title", "description"];
 /// One row of the `document_fields` projection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldRow {
-    /// Dot-path field name, e.g. `planning.prep_minutes`.
+    /// Field path, e.g. `planning.prep_minutes`, or `npcs[].role` for a field of a
+    /// list's object elements.
     pub field: String,
+    /// Which element of the outermost list of objects on the path this row came
+    /// from (its 0-based position), so a correlated filter can require every
+    /// condition to hold within one element. `0` for a row outside any list of
+    /// objects; the scalars of a plain list (`tags`) all share their context's
+    /// element — they are told apart by `value_text`, which is also in the key.
+    pub elem: i64,
     /// Canonical text form, used for equality and any-of/all-of matching.
     pub value_text: String,
     /// Numeric form when the value is coercible, enabling range queries.
@@ -78,7 +91,8 @@ fn canonical_number(n: &serde_json::Number) -> String {
     }
 }
 
-/// Numeric form of a scalar, or `None` when it cannot participate in range queries.
+/// Numeric form of a scalar by its JSON type alone, or `None` when it cannot
+/// participate in range queries — the guess for a field no schema types.
 ///
 /// Booleans map to 1.0/0.0 so they are usable by both equality and range operators
 /// without needing a third column.
@@ -90,32 +104,124 @@ pub fn numeric_value(value: &Value) -> Option<f64> {
     }
 }
 
-fn leaf_row(field: &str, value: &Value) -> Option<FieldRow> {
-    canonical_text(value).map(|value_text| FieldRow {
-        field: field.to_string(),
-        value_text,
-        value_num: numeric_value(value),
+/// The instant a `date` (`YYYY-MM-DD`, read as midnight UTC) or an RFC 3339
+/// `timestamp` (normalized from its offset to UTC) names, or `None` for anything
+/// else. The one date parser: [`epoch_seconds`] (a date field's `value_num`, and a
+/// date-string range bound in a filter) and [`payload_datetime`] (the Qdrant
+/// payload's datetime text, #350) both read through it, so the metadata index and
+/// the Qdrant payload cannot place one value at two instants.
+pub(crate) fn parse_instant(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(ts.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .ok()
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|midnight| midnight.and_utc())
+}
+
+/// Seconds since the Unix epoch (UTC, fractional seconds kept) of a `date` or an
+/// RFC 3339 `timestamp` ([`parse_instant`]), or `None` for anything else. Behind a
+/// date field's `value_num` and a date-string range bound in a filter, so a stored
+/// date and a filter bound always land on the same axis (#349).
+pub(crate) fn epoch_seconds(text: &str) -> Option<f64> {
+    parse_instant(text)
+        .map(|ts| ts.timestamp() as f64 + f64::from(ts.timestamp_subsec_nanos()) / 1e9)
+}
+
+/// The RFC 3339 UTC text a `date` or `timestamp` value is written as in the Qdrant
+/// payload (#350): [`parse_instant`]'s instant with a `Z` offset, so a date-only
+/// `2024-01-02` becomes `2024-01-02T00:00:00Z` and `2024-01-02T10:00:00+02:00`
+/// becomes `2024-01-02T08:00:00Z`; fractional seconds are kept, to the microsecond
+/// (below). `None` when the text
+/// is not a date or timestamp — the caller then keeps it as written, and Qdrant's
+/// datetime index does not place it on the axis, the same way [`epoch_seconds`]
+/// leaves it without a `value_num`.
+///
+/// Rounded to the microsecond first — the most fractional digits Qdrant documents
+/// for a datetime, and the precision `qdrant::epoch_to_timestamp` rounds filter
+/// bounds to — so a nanosecond timestamp is written with at most six.
+pub(crate) fn payload_datetime(text: &str) -> Option<String> {
+    use chrono::SubsecRound;
+    parse_instant(text).map(|ts| {
+        ts.round_subsecs(6)
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
     })
 }
 
-/// Flatten a document's frontmatter into `document_fields` rows.
+/// The `value_num` a scalar of a declared type stores, per that type's
+/// [`NumericValue`]: a `text` or `enum` field holding a number stores none.
+pub(crate) fn declared_numeric(numeric: NumericValue, value: &Value) -> Option<f64> {
+    match numeric {
+        NumericValue::None => None,
+        NumericValue::Number => value.as_f64(),
+        NumericValue::Boolean => value.as_bool().map(|b| if b { 1.0 } else { 0.0 }),
+        NumericValue::Epoch => value.as_str().and_then(epoch_seconds),
+    }
+}
+
+/// A scalar's `value_num` under its schema node: the declared type's mapping when
+/// the node has a type, else the JSON-type guess.
+fn scalar_numeric(node: Option<&FieldDef>, value: &Value) -> Option<f64> {
+    match node.and_then(|n| n.ty) {
+        Some(ty) => declared_numeric(ty.kind().numeric, value),
+        None => numeric_value(value),
+    }
+}
+
+/// The schema node a list's elements are read under: its `items`, or — for a
+/// scalar type that also accepts a list of itself (`enum`, and any scalar type a
+/// non-strict document gives a list) — the node itself. `None` (guess) for an
+/// untyped node or a `list` without `items`. Also how the Qdrant payload decides
+/// which node coerces a list's elements (`ingest::frontmatter_payload`, #350), so
+/// the two read a list's elements under the same type.
+pub(crate) fn element_node(node: Option<&FieldDef>) -> Option<&FieldDef> {
+    let node = node?;
+    if let Some(items) = node.items.as_deref() {
+        return Some(items);
+    }
+    match node.ty {
+        None | Some(FieldType::List) | Some(FieldType::Object) => None,
+        Some(_) => Some(node),
+    }
+}
+
+/// Flatten a document's frontmatter into `document_fields` rows, reading types from
+/// `schema` (the one governing the document).
 ///
-/// - Nested objects become dot-paths, recursively, capped at [`MAX_FLATTEN_DEPTH`].
-///   The container key itself never gets a row — whole objects are not filterable.
+/// - Nested objects become dot-paths, recursively, down to [`MAX_FIELD_PATH_DEPTH`]
+///   path steps (each name and each `[]` is one, the same limit a schema may
+///   declare to). The container key itself never gets a row — whole objects are not
+///   filterable.
 /// - Arrays of scalars become one row per element sharing a field name, which is what
 ///   makes any-of and all-of matching on `tags` possible.
-/// - Arrays holding objects or arrays are skipped; they have no useful flat projection.
+/// - The objects of a list project under `list[]`: `npcs: [{role: x}]` gives an
+///   `npcs[].role` row, with [`FieldRow::elem`] its position in `npcs`. Lists nested
+///   inside an element (`npcs[].tags`, `npcs[].items[].name`) keep the element of the
+///   outermost list; a list's list elements project under `list[]` the same way.
+/// - A declared field's type decides its `value_num` ([`declared_numeric`]):
+///   numbers for `integer`/`number`, 1/0 for `boolean`, epoch seconds for
+///   `date`/`timestamp` ([`epoch_seconds`]), none for `text`/`enum`. A field no
+///   schema types keeps the JSON-type guess ([`numeric_value`]). The structure
+///   always follows the value, so an undeclared list of objects projects too.
 /// - `null` produces no row, so "absent" and "explicitly null" filter identically.
-pub fn flatten_frontmatter(frontmatter: &HashMap<String, Value>) -> Vec<FieldRow> {
+pub fn flatten_frontmatter(
+    frontmatter: &HashMap<String, Value>,
+    schema: &ResolvedSchema,
+) -> Vec<FieldRow> {
     let mut rows = Vec::new();
-    // Sorted for deterministic output — makes tests stable and diffs readable.
+    // Sorted for deterministic output — makes tests stable and diffs readable —
+    // with every top-level list holding objects or lists after the rest: such a
+    // list can expand into many rows, and the row cap must not let it starve the
+    // scalar fields (`type`, `tags`) that projected before #349 projected lists.
     let mut keys: Vec<&String> = frontmatter.keys().collect();
-    keys.sort();
+    keys.sort_by_key(|key| (holds_containers(&frontmatter[*key]), *key));
     for key in keys {
         if PROMOTED_FIELDS.contains(&key.as_str()) {
             continue;
         }
-        flatten_value(key, &frontmatter[key], 1, &mut rows);
+        let node = schema.fields.tree().get(key.as_str());
+        flatten_value(key, 1, &frontmatter[key], node, None, &mut rows);
         if rows.len() >= MAX_PROJECTED_ROWS {
             warn!(
                 rows = rows.len(),
@@ -128,23 +234,35 @@ pub fn flatten_frontmatter(frontmatter: &HashMap<String, Value>) -> Vec<FieldRow
     rows
 }
 
-fn flatten_value(path: &str, value: &Value, depth: usize, out: &mut Vec<FieldRow>) {
+/// Whether `value` is a list with an object or list among its elements.
+fn holds_containers(value: &Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| items.iter().any(|v| v.is_array() || v.is_object()))
+}
+
+/// Project `value` at `path` (`depth` path steps deep), read under `node`. `elem`
+/// is the element of the outermost list of objects already entered, if any.
+fn flatten_value(
+    path: &str,
+    depth: usize,
+    value: &Value,
+    node: Option<&FieldDef>,
+    elem: Option<i64>,
+    out: &mut Vec<FieldRow>,
+) {
     match value {
         Value::Null => {}
         Value::String(_) | Value::Number(_) | Value::Bool(_) => {
             if out.len() >= MAX_PROJECTED_ROWS {
                 return;
             }
-            if let Some(row) = leaf_row(path, value) {
-                out.push(row);
-            }
+            push_leaf(path, elem, value, node, out);
         }
         Value::Array(items) => {
-            if items.iter().any(|v| v.is_array() || v.is_object()) {
-                debug!(field = path, "skipping array with non-scalar elements");
-                return;
-            }
-            for item in items {
+            let items_node = element_node(node);
+            let mut too_deep = false;
+            for (i, item) in items.iter().enumerate() {
                 // The cap is checked here, inside the expansion, so the WORK is bounded
                 // and not just the result. Documents arriving via git bypass the MCP
                 // write tools' size cap, so a single huge array would otherwise be
@@ -152,16 +270,30 @@ fn flatten_value(path: &str, value: &Value, depth: usize, out: &mut Vec<FieldRow
                 if out.len() >= MAX_PROJECTED_ROWS {
                     return;
                 }
-                if let Some(row) = leaf_row(path, item) {
-                    out.push(row);
+                match item {
+                    Value::Array(_) | Value::Object(_) => {
+                        if depth >= MAX_FIELD_PATH_DEPTH {
+                            too_deep = true;
+                            continue;
+                        }
+                        let elem = elem.or(Some(i as i64));
+                        flatten_value(&format!("{path}[]"), depth + 1, item, items_node, elem, out);
+                    }
+                    scalar => push_leaf(path, elem, scalar, items_node, out),
                 }
+            }
+            if too_deep {
+                warn!(
+                    field = path,
+                    depth, "max flatten depth reached; deeper fields are not filterable"
+                );
             }
         }
         Value::Object(map) => {
             if out.len() >= MAX_PROJECTED_ROWS {
                 return;
             }
-            if depth >= MAX_FLATTEN_DEPTH {
+            if depth >= MAX_FIELD_PATH_DEPTH {
                 warn!(
                     field = path,
                     depth, "max flatten depth reached; deeper fields are not filterable"
@@ -171,15 +303,130 @@ fn flatten_value(path: &str, value: &Value, depth: usize, out: &mut Vec<FieldRow
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
             for key in keys {
-                // Per key, not merely once before the loop: MAX_FLATTEN_DEPTH bounds
-                // nesting depth but not key count, so a single very wide object would
+                // Per key, not merely once before the loop: the depth limit bounds
+                // nesting but not key count, so a single very wide object would
                 // otherwise be fully materialized before any outer check saw it.
                 if out.len() >= MAX_PROJECTED_ROWS {
                     return;
                 }
-                flatten_value(&format!("{path}.{key}"), &map[key], depth + 1, out);
+                let child = node.and_then(|n| n.fields.get(key.as_str()));
+                flatten_value(
+                    &format!("{path}.{key}"),
+                    depth + 1,
+                    &map[key],
+                    child,
+                    elem,
+                    out,
+                );
             }
         }
+    }
+}
+
+/// The frontmatter object a document's Qdrant payload carries under
+/// `qdrant::FRONTMATTER_KEY` (#350), read under `schema` (the one governing it).
+///
+/// The structure is the frontmatter's own — nested objects and lists stay nested, so
+/// Qdrant addresses `fm.planning.prep_minutes` and `fm.npcs[].role` natively — and
+/// every scalar a schema node types is coerced by that type's
+/// [`crate::schema::FieldKind::payload`]: `integer` writes an integer (an integral
+/// `3.0` as `3`), `number` its JSON number as written, `text`/`enum` a string (`canonical_text`),
+/// `date`/`timestamp` RFC 3339 UTC text ([`payload_datetime`]). A value its type
+/// cannot represent (validation would refuse it in strict mode) and every scalar no
+/// schema types are written as they are. A list's elements are read under the same
+/// node the metadata projection reads them under ([`element_node`]), an object's
+/// children under its `fields`, so the payload and `document_fields` agree on which
+/// type governs each value. Unlike the projection, nothing is capped or left out:
+/// the payload keeps the whole record, `title` and `description` included.
+pub fn payload_frontmatter(
+    frontmatter: &HashMap<String, Value>,
+    schema: &ResolvedSchema,
+) -> serde_json::Map<String, Value> {
+    frontmatter
+        .iter()
+        .map(|(key, value)| {
+            let node = schema.fields.tree().get(key.as_str());
+            (key.clone(), payload_value(value, node))
+        })
+        .collect()
+}
+
+/// `value` as [`payload_frontmatter`] writes it under schema node `node`.
+fn payload_value(value: &Value, node: Option<&FieldDef>) -> Value {
+    let Some(node) = node else {
+        return value.clone();
+    };
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, child)| {
+                    (
+                        key.clone(),
+                        payload_value(child, node.fields.get(key.as_str())),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(items) => {
+            let items_node = element_node(Some(node));
+            Value::Array(
+                items
+                    .iter()
+                    .map(|item| payload_value(item, items_node))
+                    .collect(),
+            )
+        }
+        Value::Null => Value::Null,
+        scalar => match node.ty {
+            Some(ty) => payload_scalar(ty.kind().payload, scalar),
+            None => scalar.clone(),
+        },
+    }
+}
+
+/// A scalar coerced per [`PayloadValue`]; one the coercion does not apply to is
+/// returned as it is.
+pub(crate) fn payload_scalar(coercion: PayloadValue, value: &Value) -> Value {
+    let coerced = match coercion {
+        PayloadValue::AsIs | PayloadValue::Bool => None,
+        PayloadValue::Text => canonical_text(value).map(Value::String),
+        PayloadValue::Integer => integral(value).map(Value::from),
+        // A JSON number stays as written: a float index holds integers too, and an
+        // `integer` declaration of the same path in another scope (whose integer
+        // index is the one the collection keeps, `SchemaCache::all_indexed_fields`)
+        // does not hold floats, so `3` must not become `3.0`.
+        PayloadValue::Float => None,
+        PayloadValue::Datetime => value.as_str().and_then(payload_datetime).map(Value::String),
+    };
+    coerced.unwrap_or_else(|| value.clone())
+}
+
+/// An integer-valued number as an `i64`: an integer, or an integral float within
+/// `i64`'s range (`3.0`), the same values `schema::accepts_integer` accepts short of
+/// a `u64` above `i64::MAX`, which stays as written.
+fn integral(value: &Value) -> Option<i64> {
+    if let Some(i) = value.as_i64() {
+        return Some(i);
+    }
+    let f = value.as_f64().filter(|_| value.as_u64().is_none())?;
+    (f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64)
+        .then_some(f as i64)
+}
+
+fn push_leaf(
+    path: &str,
+    elem: Option<i64>,
+    value: &Value,
+    node: Option<&FieldDef>,
+    out: &mut Vec<FieldRow>,
+) {
+    if let Some(value_text) = canonical_text(value) {
+        out.push(FieldRow {
+            field: path.to_string(),
+            elem: elem.unwrap_or(0),
+            value_text,
+            value_num: scalar_numeric(node, value),
+        });
     }
 }
 
@@ -197,6 +444,17 @@ mod tests {
 
     fn find<'a>(rows: &'a [FieldRow], field: &str) -> Vec<&'a FieldRow> {
         rows.iter().filter(|r| r.field == field).collect()
+    }
+
+    /// The projection with no schema: every field undeclared.
+    fn flatten_undeclared(frontmatter: &HashMap<String, Value>) -> Vec<FieldRow> {
+        flatten_frontmatter(frontmatter, &ResolvedSchema::default())
+    }
+
+    /// A schema from root `.schema.yaml` text.
+    fn schema(yaml: &str) -> ResolvedSchema {
+        let file = crate::schema::parse_schema_text(yaml).expect("valid schema");
+        ResolvedSchema::default().merged_with_for_test(&file, "/")
     }
 
     /// The real shape from lifestyle/kitchen/recipes/stir-fry.md — the document that
@@ -226,7 +484,7 @@ mod tests {
 
     #[test]
     fn promoted_fields_are_not_projected() {
-        let rows = flatten_frontmatter(&stir_fry());
+        let rows = flatten_undeclared(&stir_fry());
         assert!(find(&rows, "title").is_empty(), "title has its own column");
         assert!(
             find(&rows, "description").is_empty(),
@@ -236,7 +494,7 @@ mod tests {
 
     #[test]
     fn scalars_project_with_canonical_text() {
-        let rows = flatten_frontmatter(&stir_fry());
+        let rows = flatten_undeclared(&stir_fry());
         let ty = find(&rows, "type");
         assert_eq!(ty.len(), 1);
         assert_eq!(ty[0].value_text, "reference");
@@ -245,7 +503,7 @@ mod tests {
 
     #[test]
     fn arrays_produce_one_row_per_element() {
-        let rows = flatten_frontmatter(&stir_fry());
+        let rows = flatten_undeclared(&stir_fry());
         let tags = find(&rows, "tags");
         assert_eq!(tags.len(), 4, "one row per tag enables any-of/all-of");
         let values: Vec<&str> = tags.iter().map(|r| r.value_text.as_str()).collect();
@@ -255,7 +513,7 @@ mod tests {
 
     #[test]
     fn nested_objects_flatten_to_dot_paths() {
-        let rows = flatten_frontmatter(&stir_fry());
+        let rows = flatten_undeclared(&stir_fry());
         let prep = find(&rows, "planning.prep_minutes");
         assert_eq!(prep.len(), 1);
         assert_eq!(prep[0].value_text, "45");
@@ -264,7 +522,7 @@ mod tests {
 
     #[test]
     fn container_key_itself_gets_no_row() {
-        let rows = flatten_frontmatter(&stir_fry());
+        let rows = flatten_undeclared(&stir_fry());
         assert!(
             find(&rows, "planning").is_empty(),
             "whole objects are not filterable"
@@ -273,7 +531,7 @@ mod tests {
 
     #[test]
     fn booleans_project_to_text_and_number() {
-        let rows = flatten_frontmatter(&stir_fry());
+        let rows = flatten_undeclared(&stir_fry());
         let needs = find(&rows, "planning.needs_recipe");
         assert_eq!(needs.len(), 1);
         assert_eq!(needs[0].value_text, "false");
@@ -287,7 +545,7 @@ mod tests {
     #[test]
     fn filter_value_canonicalizes_to_stored_text() {
         // The property that makes {"planning.needs_recipe": false} match the stored row.
-        let rows = flatten_frontmatter(&stir_fry());
+        let rows = flatten_undeclared(&stir_fry());
         let stored = find(&rows, "planning.needs_recipe")[0].value_text.clone();
         assert_eq!(canonical_text(&json!(false)), Some(stored));
 
@@ -297,25 +555,157 @@ mod tests {
 
     #[test]
     fn nulls_produce_no_row() {
-        let rows = flatten_frontmatter(&fm(json!({ "status": null, "type": "guide" })));
+        let rows = flatten_undeclared(&fm(json!({ "status": null, "type": "guide" })));
         assert!(find(&rows, "status").is_empty());
         assert_eq!(find(&rows, "type").len(), 1);
     }
 
     #[test]
-    fn arrays_of_objects_are_skipped() {
-        let rows = flatten_frontmatter(&fm(json!({
+    fn arrays_of_objects_project_per_element_under_brackets() {
+        // #349: an undeclared list of objects projects too — the structure follows
+        // the value; only types come from the schema.
+        let rows = flatten_undeclared(&fm(json!({
             "steps": [{ "n": 1 }, { "n": 2 }],
             "type": "guide"
         })));
-        assert!(find(&rows, "steps").is_empty());
+        assert!(
+            find(&rows, "steps").is_empty(),
+            "the list itself has no row"
+        );
+        let n: Vec<(i64, &str)> = find(&rows, "steps[].n")
+            .iter()
+            .map(|r| (r.elem, r.value_text.as_str()))
+            .collect();
+        assert_eq!(n, vec![(0, "1"), (1, "2")]);
         assert_eq!(find(&rows, "type").len(), 1, "siblings still project");
+        assert_eq!(find(&rows, "type")[0].elem, 0);
+    }
+
+    #[test]
+    fn declared_list_of_objects_projects_with_elem_and_typed_value_num() {
+        let schema = schema(
+            "fields:\n  npcs:\n    type: list\n    items:\n      type: object\n      fields:\n        \
+             name:\n          type: text\n        level:\n          type: integer\n        \
+             code:\n          type: text\n        tags:\n          type: list\n",
+        );
+        let rows = flatten_frontmatter(
+            &fm(json!({
+                "npcs": [
+                    { "name": "Ada", "level": 3, "code": 7, "tags": ["a", "b", "a"] },
+                    { "name": "Bo", "level": 5, "code": 9, "tags": ["c"],
+                      "gear": [{ "kind": "sword" }] }
+                ]
+            })),
+            &schema,
+        );
+        let names: Vec<(i64, &str)> = find(&rows, "npcs[].name")
+            .iter()
+            .map(|r| (r.elem, r.value_text.as_str()))
+            .collect();
+        assert_eq!(names, vec![(0, "Ada"), (1, "Bo")]);
+        let levels: Vec<(i64, Option<f64>)> = find(&rows, "npcs[].level")
+            .iter()
+            .map(|r| (r.elem, r.value_num))
+            .collect();
+        assert_eq!(levels, vec![(0, Some(3.0)), (1, Some(5.0))]);
+        // Declared text holding a number: text, no value_num.
+        assert!(
+            find(&rows, "npcs[].code")
+                .iter()
+                .all(|r| r.value_num.is_none())
+        );
+        // A scalar list inside an element keeps the element's index.
+        let tags: Vec<(i64, &str)> = find(&rows, "npcs[].tags")
+            .iter()
+            .map(|r| (r.elem, r.value_text.as_str()))
+            .collect();
+        assert_eq!(tags, vec![(0, "a"), (0, "b"), (0, "a"), (1, "c")]);
+        // A nested list of objects keeps the OUTERMOST element.
+        let gear = find(&rows, "npcs[].gear[].kind");
+        assert_eq!(gear.len(), 1);
+        assert_eq!(gear[0].elem, 1);
+    }
+
+    #[test]
+    fn declared_text_holding_a_number_gets_no_value_num_but_undeclared_still_guesses() {
+        let schema = schema(
+            "fields:\n  code:\n    type: text\n  count:\n    type: integer\n  flag:\n    \
+             type: boolean\n  kind:\n    type: enum\n    values: [1, 2]\n",
+        );
+        let rows = flatten_frontmatter(
+            &fm(json!({ "code": 42, "count": 3, "flag": true, "kind": 1, "loose": 7 })),
+            &schema,
+        );
+        assert_eq!(find(&rows, "code")[0].value_text, "42");
+        assert_eq!(find(&rows, "code")[0].value_num, None, "declared text");
+        assert_eq!(find(&rows, "kind")[0].value_num, None, "declared enum");
+        assert_eq!(find(&rows, "count")[0].value_num, Some(3.0));
+        assert_eq!(find(&rows, "flag")[0].value_num, Some(1.0));
+        assert_eq!(
+            find(&rows, "loose")[0].value_num,
+            Some(7.0),
+            "an undeclared number still guesses"
+        );
+    }
+
+    #[test]
+    fn dates_and_timestamps_store_epoch_seconds_on_one_axis() {
+        let schema = schema("fields:\n  on:\n    type: date\n  at:\n    type: timestamp\n");
+        let rows = flatten_frontmatter(
+            &fm(json!({ "on": "2024-01-02", "at": "2024-01-02T01:00:00+02:00" })),
+            &schema,
+        );
+        let on = find(&rows, "on")[0].value_num.unwrap();
+        let at = find(&rows, "at")[0].value_num.unwrap();
+        assert_eq!(on, 1_704_153_600.0, "midnight UTC");
+        // 01:00 at +02:00 is 23:00 UTC the day before — before the date's midnight.
+        assert_eq!(at, 1_704_150_000.0);
+        assert!(at < on);
+        assert_eq!(
+            epoch_seconds("2024-01-01T00:00:00.5Z"),
+            Some(1_704_067_200.5)
+        );
+        assert_eq!(epoch_seconds("not a date"), None);
+        // An undeclared date-looking string stays text-only.
+        let rows = flatten_undeclared(&fm(json!({ "on": "2024-01-02" })));
+        assert_eq!(find(&rows, "on")[0].value_num, None);
+    }
+
+    #[test]
+    fn a_big_list_of_objects_cannot_starve_scalar_fields_of_the_row_cap() {
+        // `aaa` sorts first; its rows alone exceed the cap.
+        let big: Vec<Value> = (0..MAX_PROJECTED_ROWS + 100)
+            .map(|i| json!({ "n": i }))
+            .collect();
+        let rows = flatten_undeclared(&fm(json!({
+            "aaa": big,
+            "type": "guide",
+            "tags": ["a", "b"],
+            "planning": { "effort": "low" }
+        })));
+        assert!(rows.len() <= MAX_PROJECTED_ROWS);
+        assert_eq!(find(&rows, "type").len(), 1);
+        assert_eq!(find(&rows, "tags").len(), 2);
+        assert_eq!(find(&rows, "planning.effort").len(), 1);
+        assert!(
+            !find(&rows, "aaa[].n").is_empty(),
+            "the list gets what is left"
+        );
+    }
+
+    #[test]
+    fn a_depth_eight_object_now_projects() {
+        // The pre-#349 cap was 4 steps.
+        let rows = flatten_undeclared(&fm(json!({
+            "a": { "b": { "c": { "d": { "e": { "f": { "g": { "h": "deep" } } } } } } }
+        })));
+        assert_eq!(find(&rows, "a.b.c.d.e.f.g.h").len(), 1);
     }
 
     #[test]
     fn a_huge_array_is_bounded_during_expansion_not_after() {
         let many: Vec<Value> = (0..50_000).map(|i| json!(format!("t{i}"))).collect();
-        let rows = flatten_frontmatter(&fm(json!({ "tags": many })));
+        let rows = flatten_undeclared(&fm(json!({ "tags": many })));
 
         assert!(
             rows.len() <= MAX_PROJECTED_ROWS,
@@ -330,7 +720,7 @@ mod tests {
         for i in 0..50_000 {
             wide.insert(format!("k{i}"), json!(i));
         }
-        let rows = flatten_frontmatter(&fm(json!({ "custom": Value::Object(wide) })));
+        let rows = flatten_undeclared(&fm(json!({ "custom": Value::Object(wide) })));
 
         assert!(
             rows.len() <= MAX_PROJECTED_ROWS,
@@ -351,20 +741,45 @@ mod tests {
         assert_ne!(very_negative, canonical_text(&json!(-2.0e19f64)).unwrap());
     }
 
+    /// `{a0: {a1: ... {a<steps-1>: "leaf"}}}`: a leaf `steps` path steps deep.
+    fn nested(steps: usize) -> (HashMap<String, Value>, String) {
+        let mut value = json!("leaf");
+        for i in (1..steps).rev() {
+            value = json!({ format!("a{i}"): value });
+        }
+        let path = (0..steps)
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join(".");
+        (fm(json!({ "a0": value })), path)
+    }
+
     #[test]
-    fn flattening_stops_at_max_depth() {
-        let rows = flatten_frontmatter(&fm(json!({
-            "a": { "b": { "c": { "d": { "e": "too deep" } } } }
-        })));
+    fn flattening_stops_at_the_shared_max_depth() {
+        let (doc, path) = nested(MAX_FIELD_PATH_DEPTH);
+        assert_eq!(find(&flatten_undeclared(&doc), &path).len(), 1);
+        let (doc, path) = nested(MAX_FIELD_PATH_DEPTH + 1);
+        let rows = flatten_undeclared(&doc);
         assert!(
-            rows.iter().all(|r| r.field != "a.b.c.d.e"),
+            rows.iter().all(|r| r.field != path),
             "depth beyond the cap is not projected"
         );
+        // `[]` counts as a step too: `l`, `[]`, then the chain below `a0`.
+        let (doc, _) = nested(MAX_FIELD_PATH_DEPTH - 1);
+        let rows = flatten_undeclared(&fm(json!({ "l": [doc["a0"].clone()] })));
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly {MAX_FIELD_PATH_DEPTH} steps: {rows:?}"
+        );
+        let (doc, _) = nested(MAX_FIELD_PATH_DEPTH);
+        let rows = flatten_undeclared(&fm(json!({ "l": [doc["a0"].clone()] })));
+        assert!(rows.is_empty(), "one step too deep: {rows:?}");
     }
 
     #[test]
     fn floats_keep_numeric_form() {
-        let rows = flatten_frontmatter(&fm(json!({ "score": 1.5 })));
+        let rows = flatten_undeclared(&fm(json!({ "score": 1.5 })));
         let score = find(&rows, "score");
         assert_eq!(score[0].value_num, Some(1.5));
         assert_eq!(score[0].value_text, "1.5");
@@ -378,7 +793,7 @@ mod tests {
         assert_eq!(canonical_text(&json!(45.0)), canonical_text(&json!(45)));
         assert_eq!(canonical_text(&json!(45.0)).as_deref(), Some("45"));
 
-        let stored = flatten_frontmatter(&fm(json!({ "planning": { "prep_minutes": 45.0 } })));
+        let stored = flatten_undeclared(&fm(json!({ "planning": { "prep_minutes": 45.0 } })));
         assert_eq!(
             find(&stored, "planning.prep_minutes")[0].value_text,
             canonical_text(&json!(45)).unwrap()
@@ -422,9 +837,9 @@ mod tests {
     fn output_is_deterministic() {
         // HashMap iteration order must not leak into the projection, or every
         // reindex would look like a change.
-        let first = flatten_frontmatter(&stir_fry());
+        let first = flatten_undeclared(&stir_fry());
         for _ in 0..8 {
-            assert_eq!(flatten_frontmatter(&stir_fry()), first);
+            assert_eq!(flatten_undeclared(&stir_fry()), first);
         }
     }
 }

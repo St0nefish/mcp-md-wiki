@@ -90,17 +90,19 @@ pub fn plain_search_filters(
     r#type: Option<&str>,
     tags: Option<&[String]>,
 ) -> SearchFilters {
+    // Frontmatter keys live under `fm.` in the payload (#350).
+    let key = crate::qdrant::payload_key;
     let mut conditions = Vec::new();
     if let Some(d) = domain {
-        conditions.push(Condition::matches("domain", d.to_string()));
+        conditions.push(Condition::matches(key("domain"), d.to_string()));
     }
     if let Some(t) = r#type {
-        conditions.push(Condition::matches("type", t.to_string()));
+        conditions.push(Condition::matches(key("type"), t.to_string()));
     }
     if let Some(tags) = tags
         && !tags.is_empty()
     {
-        conditions.push(Condition::matches("tags", tags.to_vec()));
+        conditions.push(Condition::matches(key("tags"), tags.to_vec()));
     }
     SearchFilters { conditions }
 }
@@ -5416,6 +5418,26 @@ mod tests {
             .unwrap();
         assert!(!outcome_ok.offset_truncated);
         assert_eq!(outcome_ok.results.len(), 2);
+    }
+
+    #[test]
+    fn plain_search_filters_address_the_fm_namespace() {
+        // #350: the CLI's and web UI's domain/type/tags reach frontmatter under `fm`.
+        let tags = vec!["rust".to_string()];
+        let filters = plain_search_filters(Some("food"), Some("guide"), Some(&tags));
+        assert_eq!(
+            filters.conditions,
+            vec![
+                Condition::matches("fm.domain", "food".to_string()),
+                Condition::matches("fm.type", "guide".to_string()),
+                Condition::matches("fm.tags", tags.clone()),
+            ]
+        );
+        assert!(
+            plain_search_filters(None, None, Some(&[]))
+                .conditions
+                .is_empty()
+        );
     }
 
     #[tokio::test]

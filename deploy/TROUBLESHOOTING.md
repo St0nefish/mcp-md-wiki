@@ -412,6 +412,30 @@ rebuild succeeds, `schema_error` clears, and every document written or changed w
 the schema was refused is indexed. A server that would not start just needs starting
 again once the file is fixed.
 
+### Filtered search finds too little right after an upgrade
+
+The release that moved frontmatter under the payload's `fm` key (#350) re-embeds the
+whole corpus on its first reconcile. Until that finishes, points written by the older
+version keep their frontmatter at the top level, which no query-mode filter (nor the
+CLI/web `domain`/`type`/`tags` filters) reads any more, so filtered searches with a
+`query` miss those documents. Unfiltered search and searches without a `query`
+(SQLite) are unaffected, and `section`/`heading_prefix` results say "results may be
+incomplete" meanwhile. Result titles and `type`/`tags` still show for old-shape
+points: a payload with no `fm` key is read at its top level.
+
+**Fix:** none needed — watch `/status` (`phase`, `chunks_total`) until the run
+completes. A run that fails is retried with backoff and by the next periodic sweep.
+
+### `Payload index on '…' is … but the field now needs …; recreating it`
+
+A WARN from `ensure_collection`: a field's declared type changed (say `text` →
+`integer`), so its Qdrant payload index is deleted and recreated with the new kind.
+Filters on that field run unindexed — correct, slower — for the moment in between.
+`Dropping the payload index on '…'` (INFO) is the same reconcile removing an
+unprefixed index an older version created before frontmatter moved under `fm.`. A
+failure is logged at ERROR and recorded in `/status` under `payload_indexes`, keyed by
+payload key (`fm.<field>`), until a later startup or indexing run succeeds.
+
 ### Qdrant connection refused
 
 Qdrant isn't running or hasn't finished starting.
@@ -560,6 +584,7 @@ Indexing run complete discovered=42 indexed=5 skipped=36 invalid=0 empty=0 read_
 | `empty` | Files that produced no chunks (blank body after frontmatter) |
 | `read_errors` | Files that could not be read (permissions, encoding errors) |
 | `orphans_removed` | Qdrant points removed for files no longer on disk |
+| `refreshed` | Unchanged files revalidated under an edited schema, with metadata (and, when the edit shapes it, Qdrant payload) refreshed in place — no re-embedding |
 | `elapsed_secs` | Wall-clock time for the run |
 
 If a file you expected to be indexed shows up under `skipped`, its hash matches the last indexed version — it hasn't changed since the last run. If it shows under `invalid`, run `mcp-md-wiki validate` for details.

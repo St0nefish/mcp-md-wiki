@@ -119,31 +119,34 @@ frontmatter:
 
   # Fields that MUST be present in every file's frontmatter. Files missing
   # required fields are skipped during indexing (with a warning).
-  # `domain` is derived from the folder, never author-written, so listing it
-  # here has no effect.
+  # Derived fields (e.g. `domain`) come only from a root `.schema.yaml`'s
+  # `derived:` block, which also replaces this whole block — so with this
+  # block in effect nothing is derived, and `domain` is an ordinary field.
   # Example: [title, description, type, tags]
   required: []
 
-  # Frontmatter fields to store as Qdrant payload fields, enabling filtered
-  # search. These become keyword-indexed payload fields on each point.
-  # `domain` is not author-written frontmatter — it's derived automatically
-  # from each document's top-level folder — but it's still a normal field
-  # here for the purpose of getting a Qdrant payload index.
+  # Frontmatter fields to give a Qdrant payload index, enabling filtered
+  # search with a query. Every point carries the whole frontmatter under its
+  # `fm` payload key; each field listed here gets a keyword index on
+  # `fm.<field>` (shown under that name in /status), reconciled on every
+  # startup and indexing run.
+  # A field a root `.schema.yaml` derives (`derived:`, e.g. `domain` from the
+  # top-level folder) still needs an index to be filtered on in query mode;
+  # declare it `indexed: true` there, since that file replaces this block.
   # Example: [type, domain, tags, status]
   indexed_fields: []
 
   # Default values applied to frontmatter before validation. If a file is
   # missing a key listed here, the default is injected automatically.
-  # A default for `domain` is never applied: it is derived from the folder.
+  # (A default for a derived field is never applied — see `required` above
+  # for where derived fields come from.)
   # Example: { status: "active" }
   defaults: {}
 
   # Closed-set (enum) enforcement. Maps a frontmatter field to its exhaustive
   # list of allowed values. A file whose field value is NOT in the list fails
   # validation. Absent fields are not checked here — use `required` for that.
-  # Open-ended fields (e.g. tags) should be omitted from this map. `domain`
-  # is never author-set at all (it's derived from the folder), so it never
-  # belongs here either.
+  # Open-ended fields (e.g. tags) should be omitted from this map.
   allowed:
     type:
       - guide

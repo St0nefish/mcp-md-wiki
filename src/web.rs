@@ -717,9 +717,7 @@ fn to_api_result(r: &SearchResult, data_path: &Path) -> ApiSearchResult {
     ApiSearchResult {
         score: r.score,
         file_path: retrieval::relative_to_data(file_path_raw, data_path),
-        title: r
-            .payload
-            .get("title")
+        title: crate::qdrant::frontmatter_value(&r.payload, "title")
             .and_then(|v| v.as_str())
             .unwrap_or("(untitled)")
             .to_string(),
@@ -1312,7 +1310,7 @@ async fn get_schema_handler(
         .take(MAX_SCHEMA_FIELDS)
         .map(|(field, def)| SchemaFieldEntry {
             field: field.clone(),
-            r#type: def.ty.map(|t| format!("{t:?}").to_lowercase()),
+            r#type: def.ty.map(|t| t.name().to_string()),
             required: def.required,
             indexed: def.indexed,
             values: def
@@ -1321,7 +1319,7 @@ async fn get_schema_handler(
                 .map(|v| v.iter().take(MAX_SCHEMA_VALUES).cloned().collect()),
             default: def.default.clone(),
             open: def.open,
-            declared_in: resolved.origin.get(field).cloned(),
+            declared_in: resolved.origin().get(field).cloned(),
         })
         .collect();
 
@@ -2725,7 +2723,8 @@ mod tests {
             "file_path".to_string(),
             serde_json::json!("/data/food/a.md"),
         );
-        payload.insert("title".to_string(), serde_json::json!("A Doc"));
+        // Frontmatter under `fm`, as `ingest::upsert_pending` writes it (#350).
+        payload.insert("fm".to_string(), serde_json::json!({"title": "A Doc"}));
         payload.insert("text".to_string(), serde_json::json!("chunk text"));
         payload.insert("line_start".to_string(), serde_json::json!(1));
         payload.insert("line_end".to_string(), serde_json::json!(10));
@@ -3214,6 +3213,40 @@ mod tests {
         let (_, scoped) = get_json(&canonical, "/api/enumerate?path_prefix=other/").await;
         assert_eq!(scoped["total"], 1);
         assert_eq!(scoped["documents"][0]["file_path"], "other/c.md");
+    }
+
+    #[tokio::test]
+    async fn enumerate_applies_a_correlated_list_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let db = StateDb::new(&canonical.join("state.db")).await.unwrap();
+        for (path, npcs) in [
+            (
+                "split.md",
+                serde_json::json!([{ "role": "guard", "level": 1 }, { "role": "cook", "level": 5 }]),
+            ),
+            (
+                "same.md",
+                serde_json::json!([{ "role": "cook", "level": 2 }, { "role": "guard", "level": 5 }]),
+            ),
+        ] {
+            let fm: HashMap<String, serde_json::Value> =
+                [("npcs".to_string(), npcs)].into_iter().collect();
+            db.upsert_document_metadata(path, &fm, 100, path, 1)
+                .await
+                .unwrap();
+        }
+
+        // {"npcs[]": {"role": "guard", "level": {"gte": 3}}}
+        let (status, json) = get_json(
+            &canonical,
+            "/api/enumerate?filters=%7B%22npcs%5B%5D%22%3A%7B%22role%22%3A%22guard%22%2C\
+             %22level%22%3A%7B%22gte%22%3A3%7D%7D%7D",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["total"], 1, "{json}");
+        assert_eq!(json["documents"][0]["file_path"], "same.md");
     }
 
     #[tokio::test]

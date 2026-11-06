@@ -176,12 +176,18 @@ pub struct RunCounters {
     /// is the durable, per-path view that survives past this run's summary, because a
     /// rejected file's state row is never updated and so it resurfaces on every sweep.
     pub strict_rejected: u64,
+    /// Files whose bytes and chunking were unchanged but whose governing schema moved:
+    /// revalidated, with their metadata (and Qdrant payload, when it is shaped by what
+    /// changed) refreshed in place without re-embedding (#351,
+    /// `ingest::FileOutcome::Refresh`). Not counted in `indexed`.
+    #[serde(default)]
+    pub refreshed: u64,
 }
 
 impl RunCounters {
     /// Name/value pairs for the Prometheus encoder, so adding a counter above cannot
     /// silently fail to appear in `/metrics`.
-    pub fn as_pairs(&self) -> [(&'static str, u64); 9] {
+    pub fn as_pairs(&self) -> [(&'static str, u64); 10] {
         [
             ("discovered", self.discovered),
             ("indexed", self.indexed),
@@ -192,6 +198,7 @@ impl RunCounters {
             ("metadata_backfilled", self.metadata_backfilled),
             ("orphans_removed", self.orphans_removed),
             ("strict_rejected", self.strict_rejected),
+            ("refreshed", self.refreshed),
         ]
     }
 }
@@ -506,7 +513,9 @@ impl IndexStatus {
         });
     }
 
-    /// Record whether a Qdrant payload index is in place for `field`.
+    /// Record whether a Qdrant payload index is in place for `field` — the payload
+    /// key the index is on (`fm.tags` for a frontmatter field since #350; `mtime`,
+    /// `text`, `file_path` and the other built-ins unprefixed).
     pub fn record_payload_index(&self, field: &str, error: Option<String>) {
         self.with(|inner| {
             let state = match error {
@@ -1481,13 +1490,14 @@ mod tests {
             metadata_backfilled: 7,
             orphans_removed: 8,
             strict_rejected: 9,
+            refreshed: 10,
         };
         let pairs = c.as_pairs();
         // Every field is distinct and non-zero above, so a missing or duplicated entry
         // in as_pairs() shows up as a sum mismatch.
-        assert_eq!(pairs.iter().map(|(_, v)| v).sum::<u64>(), 45);
+        assert_eq!(pairs.iter().map(|(_, v)| v).sum::<u64>(), 55);
         let names: std::collections::BTreeSet<_> = pairs.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 10);
     }
 
     #[test]

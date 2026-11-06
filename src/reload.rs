@@ -349,7 +349,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "frontmatter.indexed_fields",
-            note: "index_paths re-ensures Qdrant payload indexes for \
+            note: "index_paths reconciles Qdrant payload indexes (on `fm.<field>`) for \
                    effective_indexed_fields on every run (ingest.rs), so a newly indexed \
                    field gets its payload index on the next run; existing documents' \
                    document_fields projection for that field backfills only when they are \

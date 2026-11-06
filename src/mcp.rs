@@ -39,8 +39,10 @@ use crate::{
 const MAX_QUERY_LEN: usize = 4096;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
-/// Deepest dot-path `update_schema` will nest; see `build_schema_edit`.
-const MAX_SCHEMA_PATH_SEGMENTS: usize = 16;
+/// Deepest dot-path `update_schema` will nest; see `build_schema_edit`. The same
+/// limit the metadata projection flattens to (#349), so every declarable field is
+/// filterable.
+const MAX_SCHEMA_PATH_SEGMENTS: usize = crate::schema::MAX_FIELD_PATH_DEPTH;
 const MAX_CONTENT_LEN: usize = write::MAX_CONTENT_LEN;
 /// Cap on the number of operations a single `write_document` `frontmatter_patch`
 /// call may carry — a document write should rarely need more than a handful of
@@ -166,8 +168,137 @@ fn normalize_scope_path(raw: &str) -> Result<std::path::PathBuf, McpError> {
 /// them: `schema::RawFieldDef`'s advertised properties, kept in one place so those errors
 /// all say the same thing. The deprecated `extend` is still accepted but is not
 /// advertised, so it is not listed here either.
-const FIELD_DEFINITION_KEYS: &str =
-    "`type`, `required`, `indexed`, `values`, `default`, `open`, `fields`";
+const FIELD_DEFINITION_KEYS: &str = "`type`, `required`, `indexed`, `values`, `default`, \
+     `open`, `fields`, `items`, `exclude_values`, `removed`";
+
+/// The keys of [`FIELD_DEFINITION_KEYS`] as names: what a `patch_field` op's
+/// `reinherit` may list (#348). A test keeps the two in step.
+const FIELD_DEFINITION_KEY_NAMES: &[&str] = &[
+    "type",
+    "required",
+    "indexed",
+    "values",
+    "default",
+    "open",
+    "fields",
+    "items",
+    "exclude_values",
+    "removed",
+];
+
+/// Most operations one `update_schema` call's `ops` may carry (#348). Each op is
+/// bounded on its own (`MAX_SCHEMA_VALUES`, `MAX_SCHEMA_DEFINITION_LEN`); this bounds
+/// the batch, and with it the work done under the git lock.
+const MAX_SCHEMA_OPS: usize = 50;
+
+// The operations `update_schema` performs (#348). A real enum, so `ops` advertises
+// (and a client's own validation enforces) the closed set.
+//
+// `//` rather than `///` throughout: schemars would serve a doc comment as the
+// type's description, and on the variants would turn them into a `oneOf` of described
+// `const` branches; without them it emits a flat string `enum`, and the caller-facing
+// sentence lives on `SchemaOpInput::operation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaOperation {
+    AddValues,
+    RemoveValues,
+    SetField,
+    RemoveField,
+    PatchField,
+}
+
+impl SchemaOperation {
+    fn name(self) -> &'static str {
+        match self {
+            SchemaOperation::AddValues => "add_values",
+            SchemaOperation::RemoveValues => "remove_values",
+            SchemaOperation::SetField => "set_field",
+            SchemaOperation::RemoveField => "remove_field",
+            SchemaOperation::PatchField => "patch_field",
+        }
+    }
+}
+
+// One entry of `update_schema`'s `ops` (#348). `//`, not `///`: a doc comment here
+// would be served as the entry's description.
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaOpInput {
+    /// add_values/remove_values: change the permitted values (removing an inherited
+    /// value excludes it here); set_field: declare or replace a definition;
+    /// patch_field: change only the keys given; remove_field: drop this
+    /// directory's declaration.
+    pub operation: SchemaOperation,
+
+    /// Field path (`planning.method`; `npcs[]` is a list's element, `npcs[].name` a
+    /// field of it); add_values, set_field and patch_field create missing parents.
+    pub field: String,
+
+    /// For add_values/remove_values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+
+    /// For set_field: the whole definition. For patch_field: only the keys to change
+    /// (`fields` merge per child); to make a key inherit again, name it in
+    /// `reinherit` (a literal `null` for the key also works).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<FieldPatchInput>,
+
+    /// For patch_field: definition keys to drop from this directory's declaration so
+    /// they inherit again (`required`, `values`, ...). A key may not also be set in
+    /// `definition`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reinherit: Option<Vec<String>>,
+}
+
+/// A field definition (or `patch_field` merge patch) as an `ops` entry delivers it:
+/// kept as the JSON object it arrived as, since a patch's `null`s mean "inherit
+/// again" and a [`crate::schema::RawFieldDef`] cannot hold them. Advertised as the
+/// same `RawFieldDef` object [`FieldDefinitionInput`] advertises, and, like it,
+/// also accepted as a JSON string containing that object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldPatchInput(pub serde_json::Map<String, serde_json::Value>);
+
+impl<'de> serde::Deserialize<'de> for FieldPatchInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde_json::Value;
+        let value = Value::deserialize(deserializer)?;
+        let object = match value {
+            Value::Object(map) => map,
+            Value::String(s) => match serde_json::from_str::<Value>(&s) {
+                Ok(Value::Object(map)) => map,
+                Ok(other) => return Err(serde::de::Error::custom(definition_shape_error(&other))),
+                Err(e) => {
+                    return Err(serde::de::Error::custom(format!(
+                        "field definition must be a JSON object with keys \
+                         {FIELD_DEFINITION_KEYS}. A JSON string containing that object \
+                         is also accepted, but this string is not valid JSON: {e}"
+                    )));
+                }
+            },
+            other => return Err(serde::de::Error::custom(definition_shape_error(&other))),
+        };
+        Ok(FieldPatchInput(object))
+    }
+}
+
+impl schemars::JsonSchema for FieldPatchInput {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        crate::schema::RawFieldDef::schema_name()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        crate::schema::RawFieldDef::schema_id()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        crate::schema::RawFieldDef::json_schema(generator)
+    }
+}
 
 /// A `set_field` definition as delivered by an MCP client.
 ///
@@ -352,77 +483,206 @@ impl schemars::JsonSchema for SearchFiltersInput {
     // implementation rationale leaks into the emitted schema, only the shape a
     // caller needs to construct a valid `filters` value. The prose lives once,
     // on the `filters` property (`SearchParams::filters`); the structure here
-    // carries none of its own.
+    // carries none of its own. The last branch is a correlated list filter's
+    // value (#349, a key ending in `[]`): sub-field names mapped to the same
+    // condition shapes, inlined rather than referenced so the schema stays
+    // `$ref`-free (`tool_schema`, #288). A range bound may be a date string.
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let scalar = serde_json::json!({ "type": ["string", "number", "boolean"] });
+        let bound = serde_json::json!({ "type": ["number", "string"] });
+        let condition = serde_json::json!({
+            "anyOf": [
+                scalar,
+                { "type": "array", "items": scalar },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "any_of": { "type": "array", "items": scalar },
+                        "all_of": { "type": "array", "items": scalar },
+                        "gte": bound,
+                        "lte": bound,
+                        "gt": bound,
+                        "lt": bound
+                    }
+                }
+            ]
+        });
+        let mut branches = condition["anyOf"].as_array().cloned().unwrap_or_default();
+        branches.push(serde_json::json!({
+            "type": "object",
+            "additionalProperties": condition
+        }));
         schemars::json_schema!({
             "type": "object",
-            "additionalProperties": {
-                "anyOf": [
-                    { "type": ["string", "number", "boolean"] },
-                    {
-                        "type": "array",
-                        "items": { "type": ["string", "number", "boolean"] }
-                    },
-                    {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "any_of": {
-                                "type": "array",
-                                "items": { "type": ["string", "number", "boolean"] }
-                            },
-                            "all_of": {
-                                "type": "array",
-                                "items": { "type": ["string", "number", "boolean"] }
-                            },
-                            "gte": { "type": "number" },
-                            "lte": { "type": "number" },
-                            "gt": { "type": "number" },
-                            "lt": { "type": "number" }
-                        }
-                    }
-                ]
-            }
+            "additionalProperties": { "anyOf": branches }
         })
     }
 }
 
-/// Turn tool parameters into a typed schema edit.
+/// The schema edits an `update_schema` call asks for, in order: its `ops`, or the
+/// deprecated flat `operation`/`field`/`values`/`definition` as a one-element batch
+/// (#348). The two forms are mutually exclusive.
+fn build_schema_edits(
+    params: &UpdateSchemaParams,
+) -> Result<Vec<crate::schema::SchemaEdit>, McpError> {
+    let invalid = |msg: String| McpError::invalid_params(msg, None);
+    let legacy = !params.operation.trim().is_empty()
+        || !params.field.is_empty()
+        || params.values.is_some()
+        || params.definition.is_some();
+    let Some(ops) = &params.ops else {
+        if !legacy {
+            return Err(invalid(
+                "update_schema needs `ops`: a list of {operation, field, values?, \
+                 definition?} objects"
+                    .into(),
+            ));
+        }
+        return build_schema_edit(params).map(|edit| vec![edit]);
+    };
+    if legacy {
+        return Err(invalid(
+            "pass either `ops` or the deprecated `operation`/`field`/`values`/`definition`, \
+             not both"
+                .into(),
+        ));
+    }
+    if ops.is_empty() {
+        return Err(invalid("`ops` must hold at least one operation".into()));
+    }
+    if ops.len() > MAX_SCHEMA_OPS {
+        return Err(invalid(format!(
+            "too many operations: {} (max {MAX_SCHEMA_OPS}); split the change across calls",
+            ops.len()
+        )));
+    }
+    ops.iter()
+        .enumerate()
+        .map(|(i, op)| {
+            build_schema_op(
+                op.operation.name(),
+                &op.field,
+                op.values.as_deref(),
+                op.definition.as_ref().map(|d| &d.0),
+                op.reinherit.as_deref(),
+            )
+            .map_err(|e| {
+                if ops.len() > 1 {
+                    invalid(format!("ops[{i}]: {}", e.message))
+                } else {
+                    e
+                }
+            })
+        })
+        .collect()
+}
+
+/// Turn the deprecated flat tool parameters into a typed schema edit.
 fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::SchemaEdit, McpError> {
+    // The flat `definition` is parsed as a whole field definition, which cannot hold
+    // a patch's `null`s, so `patch_field` exists only in `ops` (#348).
+    if params.operation.trim().eq_ignore_ascii_case("patch_field") {
+        return Err(McpError::invalid_params(
+            "patch_field is only available through `ops`".to_string(),
+            None,
+        ));
+    }
+    let definition = params
+        .definition
+        .as_ref()
+        .map(|d| match serde_json::to_value(&d.0) {
+            Ok(serde_json::Value::Object(map)) => Ok(map),
+            _ => Err(McpError::internal_error(
+                "could not re-read the field definition".to_string(),
+                None,
+            )),
+        })
+        .transpose()?;
+    build_schema_op(
+        &params.operation,
+        &params.field,
+        params.values.as_deref(),
+        definition.as_ref(),
+        None,
+    )
+}
+
+/// One operation's arguments, however they arrived, bounded and turned into a typed
+/// schema edit.
+fn build_schema_op(
+    operation: &str,
+    field: &str,
+    values: Option<&[String]>,
+    definition: Option<&serde_json::Map<String, serde_json::Value>>,
+    reinherit: Option<&[String]>,
+) -> Result<crate::schema::SchemaEdit, McpError> {
     use crate::schema::SchemaEdit;
     let invalid = |msg: String| McpError::invalid_params(msg, None);
+    let operation_name = operation.trim().to_ascii_lowercase();
+
+    // `reinherit` is the way to send a patch's "inherit again" without a JSON `null`,
+    // which the advertised (compacted, #288) definition schema cannot carry.
+    let reinherit = reinherit.unwrap_or_default();
+    if !reinherit.is_empty() {
+        if operation_name != "patch_field" {
+            return Err(invalid(format!(
+                "`reinherit` applies only to patch_field, not '{operation_name}'"
+            )));
+        }
+        if let Some(unknown) = reinherit
+            .iter()
+            .find(|k| !FIELD_DEFINITION_KEY_NAMES.contains(&k.as_str()))
+        {
+            return Err(invalid(format!(
+                "`reinherit` names unknown key '{unknown}': expected one of \
+                 {FIELD_DEFINITION_KEYS}"
+            )));
+        }
+        if let Some(both) = reinherit.iter().find(|k| {
+            definition
+                .and_then(|d| d.get(k.as_str()))
+                .is_some_and(|v| !v.is_null())
+        }) {
+            return Err(invalid(format!(
+                "'{both}' is both set in `definition` and listed in `reinherit`; pick one"
+            )));
+        }
+    }
 
     // A schema file is committed, pushed, and re-parsed on every cache build, so an
     // oversized one is a durable cost rather than a transient one. Bound the inputs
     // here, mirroring the content cap the document write tools enforce.
-    if params.field.len() > MAX_FILTER_STR_LEN {
+    if field.len() > MAX_FILTER_STR_LEN {
         return Err(invalid(format!(
             "field name too long: {} chars (max {})",
-            params.field.len(),
+            field.len(),
             MAX_FILTER_STR_LEN
         )));
     }
-    // `field` is a dot-path split into nested containers. Each segment becomes two
-    // levels of YAML nesting, so cap the depth well under the parser's recursion limit
-    // rather than let the round-trip check fail with a 500.
-    if params.field.split('.').count() > MAX_SCHEMA_PATH_SEGMENTS {
+    // `field` is a path (`a.b`, `a[]`, `a[].b`) into nested containers and list
+    // elements. Each step becomes two levels of YAML nesting, so cap the depth well
+    // under the parser's recursion limit rather than let the round-trip check fail
+    // with a 500.
+    let path = crate::schema::FieldPath::parse(field);
+    if path.depth() > MAX_SCHEMA_PATH_SEGMENTS {
         return Err(invalid(format!(
-            "field path too deep: more than {MAX_SCHEMA_PATH_SEGMENTS} dot-separated segments"
+            "field path too deep: more than {MAX_SCHEMA_PATH_SEGMENTS} steps (each \
+             dot-separated name and each `[]` counts as one)"
         )));
     }
-    // An empty or whitespace-padded segment ("a..b", "a.", "a. b") would create a key no
-    // frontmatter field can match.
-    if params
-        .field
-        .split('.')
-        .any(|seg| seg.is_empty() || seg != seg.trim())
-    {
+    // An empty or whitespace-padded name ("a..b", "a.", "a. b", "[]") would create a
+    // key no frontmatter field can match.
+    if path.steps().iter().any(|step| match step {
+        crate::schema::PathStep::Field(name) => name.is_empty() || name != name.trim(),
+        crate::schema::PathStep::Items => false,
+    }) {
         return Err(invalid(format!(
             "invalid field path '{}': every dot-separated segment must be non-empty with no surrounding whitespace",
-            params.field
+            field
         )));
     }
-    if let Some(values) = &params.values {
+    if let Some(values) = values {
         if values.len() > MAX_SCHEMA_VALUES {
             return Err(invalid(format!(
                 "too many values: {} (max {})",
@@ -438,12 +698,12 @@ fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::Schem
             )));
         }
     }
-    if let Some(definition) = &params.definition {
+    if let Some(definition) = definition {
         // Measured on the parsed-and-reserialized form rather than whatever bytes the
         // client happened to send: that's what actually gets committed to the schema
         // file (via `SchemaFile::to_yaml`), and it makes the cap apply identically
         // whether the definition arrived as an object or as the string fallback.
-        let size = serde_json::to_string(&definition.0)
+        let size = serde_json::to_string(definition)
             .map(|s| s.len())
             .unwrap_or(usize::MAX);
         if size > MAX_SCHEMA_DEFINITION_LEN {
@@ -455,46 +715,50 @@ fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::Schem
     }
 
     let values = || -> Result<Vec<String>, McpError> {
-        params
-            .values
-            .clone()
+        values
+            .map(<[String]>::to_vec)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                invalid(format!(
-                    "'{}' requires a non-empty values list",
-                    params.operation
-                ))
-            })
+            .ok_or_else(|| invalid(format!("'{operation}' requires a non-empty values list")))
     };
+    let field = field.to_string();
 
-    match params.operation.trim().to_ascii_lowercase().as_str() {
+    match operation_name.as_str() {
         "add_values" => Ok(SchemaEdit::AddValues {
-            field: params.field.clone(),
+            field,
             values: values()?,
         }),
         "remove_values" => Ok(SchemaEdit::RemoveValues {
-            field: params.field.clone(),
+            field,
             values: values()?,
         }),
         "set_field" => {
-            // Parsing already happened when the tool call's arguments were
-            // deserialized into `UpdateSchemaParams` (see `FieldDefinitionInput`), so
-            // there's nothing left to do here but unwrap it.
-            let definition = params
-                .definition
-                .clone()
-                .ok_or_else(|| invalid("'set_field' requires a definition".into()))?;
+            let definition =
+                definition.ok_or_else(|| invalid("'set_field' requires a definition".into()))?;
+            let definition = parse_field_definition(serde_json::Value::Object(definition.clone()))
+                .map_err(invalid)?;
             Ok(SchemaEdit::SetField {
-                field: params.field.clone(),
-                definition: Box::new(definition.0),
+                field,
+                definition: Box::new(definition),
             })
         }
-        "remove_field" => Ok(SchemaEdit::RemoveField {
-            field: params.field.clone(),
-        }),
+        "patch_field" => {
+            let mut patch = definition.cloned().unwrap_or_default();
+            for key in reinherit {
+                patch.insert(key.clone(), serde_json::Value::Null);
+            }
+            if patch.is_empty() {
+                return Err(invalid(
+                    "'patch_field' requires a definition holding the keys to change, or \
+                     `reinherit` naming keys to inherit again"
+                        .into(),
+                ));
+            }
+            Ok(SchemaEdit::PatchField { field, patch })
+        }
+        "remove_field" => Ok(SchemaEdit::RemoveField { field }),
         other => Err(invalid(format!(
             "unknown operation '{other}': expected add_values, remove_values, set_field, \
-             or remove_field"
+             remove_field, or patch_field"
         ))),
     }
 }
@@ -584,15 +848,50 @@ fn insert_casualties(
 /// report it. Only what constrains a document is sent: `type` and `values`
 /// when set, `required`/`indexed` when true, `default` when there is one,
 /// `open: false` on an object that refuses undeclared keys (`true` is the
-/// default), and `declared_in` — the scope directory that last set it (`/` for
-/// the root).
+/// default), `items` — a list's element definition, in the same shape with its own
+/// `fields` — when declared (#346), and `declared_in` — the scope directory that
+/// last set it (`/` for the root). The field's own children are not included: each
+/// is reported as a field of its own.
 fn field_def_json(def: &crate::schema::FieldDef, origin: Option<&str>) -> serde_json::Value {
+    let mut entry = field_attributes_json(def);
+    if let Some(origin) = origin {
+        entry.insert(
+            "declared_in".into(),
+            serde_json::json!(crate::server::sanitize_facet_value(origin)),
+        );
+    }
+    serde_json::Value::Object(entry)
+}
+
+/// An element definition under `items`, for [`field_def_json`]: its attributes,
+/// its own `items`, and its child fields under `fields` (they have no entry of their
+/// own to be reported as).
+fn item_def_json(def: &crate::schema::FieldDef) -> serde_json::Value {
+    let mut entry = field_attributes_json(def);
+    let children: serde_json::Map<String, serde_json::Value> = def
+        .fields
+        .iter()
+        .take(MAX_REPORTED_FIELDS)
+        .map(|(name, child)| {
+            (
+                crate::server::sanitize_facet_value(name),
+                item_def_json(child),
+            )
+        })
+        .collect();
+    if !children.is_empty() {
+        entry.insert("fields".into(), serde_json::Value::Object(children));
+    }
+    serde_json::Value::Object(entry)
+}
+
+/// The attributes [`field_def_json`] and [`item_def_json`] share.
+fn field_attributes_json(
+    def: &crate::schema::FieldDef,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut entry = serde_json::Map::new();
     if let Some(ty) = def.ty {
-        entry.insert(
-            "type".into(),
-            serde_json::json!(format!("{ty:?}").to_lowercase()),
-        );
+        entry.insert("type".into(), serde_json::json!(ty.name()));
     }
     if def.required {
         entry.insert("required".into(), serde_json::json!(true));
@@ -616,13 +915,10 @@ fn field_def_json(def: &crate::schema::FieldDef, origin: Option<&str>) -> serde_
     if def.ty == Some(crate::schema::FieldType::Object) && !def.open {
         entry.insert("open".into(), serde_json::json!(false));
     }
-    if let Some(origin) = origin {
-        entry.insert(
-            "declared_in".into(),
-            serde_json::json!(crate::server::sanitize_facet_value(origin)),
-        );
+    if let Some(items) = &def.items {
+        entry.insert("items".into(), item_def_json(items));
     }
-    serde_json::Value::Object(entry)
+    entry
 }
 
 fn render_casualties(casualties: &[serde_json::Value]) -> String {
@@ -663,6 +959,49 @@ fn capped_casualties(casualties: &[serde_json::Value]) -> (Vec<serde_json::Value
     (capped, total, total > MAX_REPORTED_CASUALTIES)
 }
 
+/// The one commit an `update_schema` call makes: `schema: <summary> in <scope>` for a
+/// single op, as before batching, and `schema: <n> changes in <scope>: <summaries>`
+/// for a batch (#348), the summaries cut short (on a char boundary) so a 50-op batch
+/// still makes a one-line subject of bounded length.
+fn schema_commit_message(summaries: &[String], scope: &str) -> String {
+    const MAX_SUMMARY_BYTES: usize = 400;
+    match summaries {
+        [one] => format!("schema: {one} in {scope}"),
+        many => {
+            let mut joined = many.join("; ");
+            if joined.len() > MAX_SUMMARY_BYTES {
+                let mut end = MAX_SUMMARY_BYTES;
+                while !joined.is_char_boundary(end) {
+                    end -= 1;
+                }
+                joined.truncate(end);
+                joined.push('…');
+            }
+            format!("schema: {} changes in {scope}: {joined}", many.len())
+        }
+    }
+}
+
+/// `update_schema`'s `warnings`: `schema::lint_raw` over the schema file as it will be
+/// written (#347), capped at [`MAX_REPORTED_CASUALTIES`] with a closing line counting
+/// the rest, so a file full of findings cannot balloon the result. Empty when the file
+/// is clean (the key is then omitted). Includes `schema::lint_cascade` against
+/// `inherited`, what the scope's ancestors resolve to (#348).
+fn schema_lint_warnings(
+    file: &crate::schema::SchemaFile,
+    is_root: bool,
+    inherited: &crate::schema::ResolvedSchema,
+) -> Vec<String> {
+    let mut warnings = crate::schema::lint_raw(file, is_root);
+    warnings.extend(crate::schema::lint_cascade(inherited, file));
+    if warnings.len() > MAX_REPORTED_CASUALTIES {
+        let rest = warnings.len() - MAX_REPORTED_CASUALTIES;
+        warnings.truncate(MAX_REPORTED_CASUALTIES);
+        warnings.push(format!("…and {rest} more"));
+    }
+    warnings
+}
+
 /// Cap `diff` (a `WriteSuccess`/`DirectoryMoveSuccess` unified diff) for
 /// `structured_content` — see [`MAX_STRUCTURED_DIFF_BYTES`]'s doc comment.
 /// Returns `(capped_diff, diff_truncated, diff_total_bytes)`, the same
@@ -696,12 +1035,99 @@ const MAX_LIST_FILTERS: usize = 20;
 /// unbounded number of bound SQL parameters.
 const MAX_FILTER_VALUES: usize = 500;
 
+/// The filter operator names, which are never a sub-field of a correlated filter.
+const FILTER_OPERATORS: [&str; 6] = ["any_of", "all_of", "gte", "lte", "gt", "lt"];
+
+/// Parse a correlated list filter (#349): `field` is `list[]` and `raw` an object
+/// whose keys are sub-fields of the list's elements (`role`, `stats.level`) and
+/// whose values are ordinary filter conditions, all of which must hold within one
+/// element. One level only: the list may not itself sit inside a list, and a
+/// condition may not be another correlated filter. At most [`MAX_LIST_FILTERS`]
+/// row tests (each `all_of` value counts as one), so one call cannot build an
+/// unbounded join.
+fn parse_elem_filter(
+    field: &str,
+    list: &str,
+    raw: &serde_json::Value,
+) -> Result<FieldFilter, String> {
+    let example = format!("{{\"{field}\": {{\"role\": \"guard\", \"level\": {{\"gte\": 3}}}}}}");
+    let Some(map) = raw.as_object() else {
+        return Err(format!(
+            "filter '{field}': a key ending in `[]` is a correlated list filter and takes an \
+             object of conditions on the list's sub-fields, e.g. {example}"
+        ));
+    };
+    let path = crate::schema::FieldPath::parse(list);
+    let plain = path
+        .steps()
+        .iter()
+        .all(|step| matches!(step, crate::schema::PathStep::Field(name) if !name.is_empty()));
+    if list.is_empty() || !plain {
+        return Err(format!(
+            "filter '{field}': a correlated list filter names a list outside any other list, \
+             e.g. `npcs[]` or `campaign.npcs[]`"
+        ));
+    }
+    if map.is_empty() {
+        return Err(format!(
+            "filter '{field}': give at least one sub-field condition, e.g. {example}"
+        ));
+    }
+    let mut conditions = Vec::with_capacity(map.len());
+    let mut row_tests = 0usize;
+    for (sub, value) in map {
+        if sub.is_empty() || sub.len() > MAX_FILTER_STR_LEN {
+            return Err(format!(
+                "filter '{field}': sub-field names must be 1-{MAX_FILTER_STR_LEN} characters"
+            ));
+        }
+        if FILTER_OPERATORS.contains(&sub.as_str()) {
+            return Err(format!(
+                "filter '{field}': '{sub}' is an operator, not a sub-field; a correlated list \
+                 filter maps sub-fields to conditions, e.g. {example}"
+            ));
+        }
+        if sub.ends_with("[]") {
+            return Err(format!(
+                "filter '{field}': correlated list filters do not nest ('{sub}'); name the inner \
+                 list's sub-fields as conditions, e.g. '{sub}.name', which match anywhere in \
+                 the same element"
+            ));
+        }
+        let full = format!("{field}.{sub}");
+        let condition = parse_field_filter(&full, value)?;
+        row_tests += match &condition {
+            FieldFilter::AllOf(values) => values.len(),
+            _ => 1,
+        };
+        conditions.push((full, condition));
+    }
+    if row_tests > MAX_LIST_FILTERS {
+        return Err(format!(
+            "filter '{field}': too many conditions ({row_tests}, max {MAX_LIST_FILTERS}; each \
+             all_of value counts as one)"
+        ));
+    }
+    conditions.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(FieldFilter::Elem(conditions))
+}
+
 /// Translate one JSON filter value into a typed [`FieldFilter`].
 ///
 /// Accepts a scalar for equality, an array for any-of, or an object carrying
-/// `any_of` / `all_of` / `gte` / `lte` / `gt` / `lt`.
-fn parse_field_filter(field: &str, raw: &serde_json::Value) -> Result<FieldFilter, String> {
+/// `any_of` / `all_of` / `gte` / `lte` / `gt` / `lt`. A range bound may be a number
+/// or a date/RFC 3339 timestamp string, compared as epoch seconds the way a date
+/// field's `value_num` is stored (#349). A `field` ending in `[]` is a correlated
+/// list filter ([`parse_elem_filter`]).
+pub(crate) fn parse_field_filter(
+    field: &str,
+    raw: &serde_json::Value,
+) -> Result<FieldFilter, String> {
     use serde_json::Value;
+
+    if let Some(list) = field.strip_suffix("[]") {
+        return parse_elem_filter(field, list, raw);
+    }
 
     // Scalar values go through the same canonicalization as the write path, so a JSON
     // `false` matches a stored boolean and `45` matches a stored integer. Also caps
@@ -752,14 +1178,18 @@ fn parse_field_filter(field: &str, raw: &serde_json::Value) -> Result<FieldFilte
                 match map.get(key) {
                     None | Some(Value::Null) => Ok(None),
                     Some(Value::Number(n)) => Ok(n.as_f64()),
+                    Some(Value::String(s)) if document_fields::epoch_seconds(s).is_some() => {
+                        Ok(document_fields::epoch_seconds(s))
+                    }
                     Some(other) => Err(format!(
-                        "filter '{}': '{}' must be a number, got {}",
+                        "filter '{}': '{}' must be a number, or a date (YYYY-MM-DD) or RFC 3339 \
+                         timestamp, got {}",
                         field, key, other
                     )),
                 }
             };
 
-            let known = ["any_of", "all_of", "gte", "lte", "gt", "lt"];
+            let known = FILTER_OPERATORS;
             if let Some(unknown) = map.keys().find(|k| !known.contains(&k.as_str())) {
                 return Err(format!(
                     "filter '{}': unknown operator '{}'; expected one of {}",
@@ -851,11 +1281,11 @@ fn capped_list(items: &[String]) -> String {
 }
 
 /// Filter keys that need no schema declaration: the promoted `title` and
-/// `description`, the fields ingest derives (`ingest::DERIVED_FIELDS`), and
-/// the configured indexed fields.
-fn builtin_filter_field(field: &str, config: &ResolvedConfig) -> bool {
+/// `description`, the fields ingest derives (the root schema's `derived:` block,
+/// #345), and the configured indexed fields.
+fn builtin_filter_field(field: &str, config: &ResolvedConfig, schemas: &SchemaCache) -> bool {
     matches!(field, "title" | "description")
-        || crate::ingest::DERIVED_FIELDS.contains(&field)
+        || schemas.root().is_derived(field)
         || config.effective_indexed_fields().iter().any(|f| f == field)
 }
 
@@ -1004,7 +1434,16 @@ fn build_query_conditions(
             .map(|f| (f.name, f.kind))
             .collect();
 
-    if let Some((field, _)) = filters.iter().find(|(f, _)| !indexed.contains_key(f)) {
+    // A correlated list filter (#350: a nested condition) is checked sub-field by
+    // sub-field: `npcs[].role` must be indexed like any other field.
+    let mut named: Vec<&String> = Vec::with_capacity(filters.len());
+    for (field, filter) in &filters {
+        match filter {
+            FieldFilter::Elem(subs) => named.extend(subs.iter().map(|(sub, _)| sub)),
+            _ => named.push(field),
+        }
+    }
+    if let Some(field) = named.into_iter().find(|f| !indexed.contains_key(*f)) {
         return Err(McpError::invalid_params(
             format!(
                 "filter '{field}' is not indexed for Qdrant queries; mark it `indexed: true` \
@@ -1469,6 +1908,12 @@ pub struct GetSchemaParams {
     /// counts, and other fields documents here use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values_in_use: Option<bool>,
+
+    /// Name each declaring directory once, in a top-level `declared_in` map of
+    /// directory to field names, instead of on every field.
+    // Opt-in (#348) so existing callers keep the per-field `declared_in` shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact: Option<bool>,
 }
 
 /// Parameters for `changes_since`.
@@ -1499,20 +1944,28 @@ pub struct UpdateSchemaParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
-    // A string with an advertised `enum`, not a Rust enum, so parsing stays
-    // as tolerant as `build_schema_edit` already is.
+    /// The changes, applied in order, all or nothing: if any fails, none is made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ops: Option<Vec<SchemaOpInput>>,
+
+    /// Deprecated: use `ops`. One operation.
+    // A string with an advertised `enum`, not a Rust enum, so parsing stays as
+    // tolerant as `build_schema_edit` already is. Empty means absent: the flat
+    // parameters are a one-release shim (#348) for a one-element `ops`, mutually
+    // exclusive with it.
+    #[serde(default)]
     #[schemars(extend("enum" = ["add_values", "remove_values", "set_field", "remove_field"]))]
     pub operation: String,
 
-    /// Field to change, as a dot-path (`planning.method`); `add_values` and
-    /// `set_field` create missing parents.
+    /// Deprecated: use `ops`.
+    #[serde(default)]
     pub field: String,
 
-    /// Values, for add_values/remove_values.
+    /// Deprecated: use `ops`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
 
-    /// Field definition for set_field; a JSON string also works.
+    /// Deprecated: use `ops`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<FieldDefinitionInput>,
 
@@ -1524,7 +1977,10 @@ pub struct UpdateSchemaParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force: Option<bool>,
 
-    /// Must be true to change the root schema.
+    /// Confirms a deliberate root schema change, where the knowledge base guards
+    /// root edits.
+    // Enforced only when the root schema sets `root_edit: {require_ack: true}`
+    // (#345); dry runs and `remove_values` never need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acknowledge_root_change: Option<bool>,
 }
@@ -1543,7 +1999,10 @@ pub struct SearchParams {
 
     /// Frontmatter criteria keyed by field (dot-paths for nested fields): a
     /// scalar means equals (`{"type": "guide"}`), an array any-of, an object
-    /// all-of or a numeric range (`{"planning.prep_minutes": {"lt": 30}}`).
+    /// all-of or a range (`{"planning.prep_minutes": {"lt": 30}}`; a date field's
+    /// bound may be `"2024-01-01"`). A list's object fields are `npcs[].role`; a
+    /// key ending in `[]` needs every condition in one element
+    /// (`{"npcs[]": {"role": "guard", "level": {"gte": 3}}}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<SearchFiltersInput>,
 
@@ -2897,6 +3356,16 @@ impl<'a> SearchCtx<'a> {
         &self.deps
     }
 
+    /// The fields ingest derives (the root schema's `derived:` block, #345), which
+    /// a document row leaves out of its `frontmatter` unless asked for by name.
+    fn derived_fields(&self) -> Vec<String> {
+        crate::schema::load_shared(self.schema_cache)
+            .root()
+            .derived_field_names()
+            .map(str::to_string)
+            .collect()
+    }
+
     /// The document metadata index, opened on first use.
     pub(crate) async fn state_db(&self) -> anyhow::Result<&StateDb> {
         self.state_db
@@ -2960,32 +3429,66 @@ impl<'a> SearchCtx<'a> {
         let declared = schemas.declared_field_paths();
         let path_needle = retrieval::normalize_path_needle(params.path_prefix.as_deref());
 
+        // A correlated list filter (#349) is checked condition by condition: each
+        // sub-field (`npcs[].role`) is a field of its own, refused the same ways.
+        let mut checks: Vec<(&String, &FieldFilter, Option<&String>)> = Vec::new();
         for (field, filter) in &filters {
+            match filter {
+                FieldFilter::Elem(conditions) => checks.extend(
+                    conditions
+                        .iter()
+                        .map(|(sub, condition)| (sub, condition, Some(field))),
+                ),
+                _ => checks.push((field, filter, None)),
+            }
+        }
+
+        for (field, filter, list) in checks {
             let known = declared.contains(field)
-                || builtin_filter_field(field, &config)
+                || (list.is_none() && builtin_filter_field(field, &config, &schemas))
                 || index.field_in_use(field).await.unwrap_or(true);
             if !known {
                 let mut names: std::collections::BTreeSet<String> = declared.clone();
-                names.extend(
-                    config
-                        .effective_indexed_fields()
-                        .into_iter()
-                        .chain(crate::ingest::DERIVED_FIELDS.iter().map(|f| f.to_string())),
-                );
+                if list.is_none() {
+                    names.extend(
+                        config
+                            .effective_indexed_fields()
+                            .into_iter()
+                            .chain(schemas.root().derived_field_names().map(str::to_string)),
+                    );
+                }
                 if let Ok(in_use) = index.fields_in_use(None, 500).await {
                     names.extend(in_use.into_iter().map(|(name, _)| name));
                 }
                 names.remove("file_path");
+                if let Some(list) = list {
+                    let prefix = format!("{list}.");
+                    names.retain(|name| name.starts_with(&prefix));
+                }
                 let names: Vec<String> = names
                     .iter()
                     .map(|n| crate::server::sanitize_facet_value(n))
                     .collect();
-                return Err(McpError::invalid_params(
-                    format!(
+                let message = match list {
+                    Some(list) => format!(
+                        "filter '{}': unknown sub-field '{}'; fields of {}: {}",
+                        crate::server::sanitize_facet_value(list),
+                        crate::server::sanitize_facet_value(field),
+                        crate::server::sanitize_facet_value(list),
+                        if names.is_empty() {
+                            "none".to_string()
+                        } else {
+                            capped_list(&names)
+                        }
+                    ),
+                    None => format!(
                         "unknown filter field '{}'; filterable fields: {}",
                         crate::server::sanitize_facet_value(field),
                         capped_list(&names)
                     ),
+                };
+                return Err(McpError::invalid_params(
+                    message,
                     Some(serde_json::json!({ "filterable_fields": capped_vec(&names) })),
                 ));
             }
@@ -2993,7 +3496,31 @@ impl<'a> SearchCtx<'a> {
             let (values, needs_every_value) = match filter {
                 FieldFilter::AnyOf(values) => (values, false),
                 FieldFilter::AllOf(values) => (values, true),
-                FieldFilter::Range { .. } => continue,
+                FieldFilter::Range { .. } => {
+                    // A range compares the stored number, which a declared type with
+                    // no numeric mapping (`text`, `enum`, …) never stores (#349).
+                    // Refused only when every scope that types the field gives it
+                    // such a type; an undeclared field passes as before.
+                    let types = schemas.declared_types(field);
+                    let numeric = |ty: &crate::schema::FieldType| {
+                        ty.kind().numeric != crate::schema::NumericValue::None
+                    };
+                    if !types.is_empty() && !types.iter().any(numeric) {
+                        let names: Vec<&str> = types.iter().map(|ty| ty.name()).collect();
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "filter '{}': a range needs a numeric field, but it is declared \
+                                 `{}`, which stores no number; match it by value, or declare \
+                                 it `integer` or `number` (update_schema) to range over it",
+                                crate::server::sanitize_facet_value(field),
+                                names.join("`/`")
+                            ),
+                            Some(serde_json::json!({ "field": field, "declared_type": names })),
+                        ));
+                    }
+                    continue;
+                }
+                FieldFilter::Elem(_) => continue,
             };
             let Some(allowed) = schemas.filter_closed_values(field, path_needle) else {
                 continue;
@@ -3333,6 +3860,7 @@ impl<'a> SearchCtx<'a> {
         let mut response = build_grouped_search_payload(
             &documents,
             params.fields.as_deref(),
+            &self.derived_fields(),
             path_prefix_truncated,
             offset_truncated,
         );
@@ -3484,6 +4012,7 @@ impl<'a> SearchCtx<'a> {
         // `total` always; `has_more` only when another page exists. A row
         // carries `mtime` only when the listing is ordered by it.
         let fields = params.fields.as_deref();
+        let derived = self.derived_fields();
         let with_mtime = query.order_by == crate::state::OrderBy::Mtime;
         let mut response = serde_json::json!({
             "total": result.total,
@@ -3492,7 +4021,7 @@ impl<'a> SearchCtx<'a> {
                 .documents
                 .iter()
                 .map(|d| {
-                    let mut row = document_row(d, fields);
+                    let mut row = document_row(d, fields, &derived);
                     if with_mtime {
                         row.insert("mtime".into(), serde_json::json!(d.mtime));
                     }
@@ -4287,15 +4816,20 @@ impl KbSearchServer {
 
         let values_only = params.values_only.unwrap_or(false);
         let values_in_use = params.values_in_use.unwrap_or(false);
+        let compact = params.compact.unwrap_or(false);
+        // `compact`: declaring directory -> the reported fields it declares.
+        let mut declared_in: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
         // (reported key, field path) of each open field `values_in_use` fills in.
         let mut open_fields: Vec<(String, String)> = Vec::new();
         let mut reported = serde_json::Map::new();
         let mut omitted = 0usize;
         for (field, def) in &schema.fields {
-            // A derived field (`domain`) can be declared — a deployment lists it in
-            // `indexed_fields` to filter on it — but ingest sets it from the folder and
-            // a write that authors it is refused, so it is never offered as one to write.
-            if crate::ingest::DERIVED_FIELDS.contains(&field.as_str()) {
+            // A derived field (the root schema's `derived:` block, #345) can be
+            // declared — a deployment lists it in `indexed_fields` to filter on it —
+            // but ingest sets it from the folder and a write that authors it is
+            // refused, so it is never offered as one to write.
+            if schema.is_derived(field) {
                 continue;
             }
             if let Some(wanted) = &params.fields
@@ -4322,23 +4856,22 @@ impl KbSearchServer {
             let key = crate::server::sanitize_facet_value(field);
             // Free text, timestamps and object containers have no vocabulary
             // worth listing.
-            if values_in_use
-                && def.values.is_none()
-                && !matches!(
-                    def.ty,
-                    Some(
-                        crate::schema::FieldType::Text
-                            | crate::schema::FieldType::Timestamp
-                            | crate::schema::FieldType::Object
-                    )
-                )
+            if values_in_use && def.values.is_none() && def.ty.is_none_or(|ty| ty.kind().vocabulary)
             {
                 open_fields.push((key.clone(), field.clone()));
             }
-            reported.insert(
-                key,
-                field_def_json(def, schema.origin.get(field).map(String::as_str)),
-            );
+            let origin = schema.origin().get(field).map(String::as_str);
+            if compact {
+                if let Some(origin) = origin {
+                    declared_in
+                        .entry(crate::server::sanitize_facet_value(origin))
+                        .or_default()
+                        .push(key.clone());
+                }
+                reported.insert(key, field_def_json(def, None));
+            } else {
+                reported.insert(key, field_def_json(def, origin));
+            }
         }
 
         // `values_in_use`: what documents under this path actually use, so a
@@ -4372,7 +4905,7 @@ impl KbSearchServer {
             // uses — not just absent from this one: a field a deeper scope declares
             // would otherwise be offered here as one nothing governs.
             let declared = schemas.declared_field_paths();
-            let excluded = declared.len() + crate::ingest::DERIVED_FIELDS.len();
+            let excluded = declared.len() + schema.derived.len();
             if let Ok(fields) = index
                 .fields_in_use(dir, (excluded + MAX_FILTER_OPTIONS_LISTED) as i64)
                 .await
@@ -4380,10 +4913,7 @@ impl KbSearchServer {
                 other_fields_in_use = fields
                     .into_iter()
                     .map(|(name, _)| name)
-                    .filter(|name| {
-                        !declared.contains(name)
-                            && !crate::ingest::DERIVED_FIELDS.contains(&name.as_str())
-                    })
+                    .filter(|name| !declared.contains(name) && !schema.is_derived(name))
                     .take(MAX_FILTER_OPTIONS_LISTED)
                     .map(|name| crate::server::sanitize_facet_value(&name))
                     .collect();
@@ -4398,6 +4928,9 @@ impl KbSearchServer {
             },
             "fields": reported,
         });
+        if !declared_in.is_empty() {
+            structured["declared_in"] = serde_json::json!(declared_in);
+        }
         if omitted > 0 {
             structured["omitted_fields"] = serde_json::json!(omitted);
         }
@@ -4445,7 +4978,7 @@ impl KbSearchServer {
         let invalid = |msg: String| McpError::invalid_params(msg, None);
 
         let requested = normalize_scope_path(params.path.as_deref().unwrap_or(""))?;
-        let edit = build_schema_edit(&params)?;
+        let edits = build_schema_edits(&params)?;
 
         // Read the shared cache for the pre-edit view (casualty check, raw file
         // lookup below). This does NOT need to be maximally fresh — worst case a
@@ -4478,25 +5011,28 @@ impl KbSearchServer {
             }
         };
 
-        // Root-scope mutations need an explicit opt-in (see `acknowledge_root_change`'s
-        // doc comment). `remove_values` is exempt — shrinking the root vocabulary is the
-        // policy-aligned direction, and the casualty check below already guards it — and
-        // `dry_run` is exempt everywhere, since it writes nothing. This must run before
-        // `file.apply()` below: the point is to refuse before any edit is computed or
-        // written, not merely before the commit.
+        // Root-scope mutations need an explicit opt-in when the root schema's
+        // `root_edit: {require_ack: true}` asks for one (#345; see
+        // `acknowledge_root_change`'s doc comment). `remove_values` is exempt —
+        // shrinking the root vocabulary is never the change the guard is for, and the
+        // casualty check below already guards it — and `dry_run` is exempt everywhere,
+        // since it writes nothing. This must run before `file.apply()` below: the
+        // point is to refuse before any edit is computed or written, not merely before
+        // the commit. Judged per op (#348): a batch needs the acknowledgement when any
+        // one of its ops would.
         let is_root = rel_dir.as_os_str().is_empty();
-        let is_gated_op = !matches!(edit, crate::schema::SchemaEdit::RemoveValues { .. });
+        let is_gated_op = edits
+            .iter()
+            .any(|edit| !matches!(edit, crate::schema::SchemaEdit::RemoveValues { .. }));
         let dry_run_requested = params.dry_run.unwrap_or(false);
         let acknowledged = params.acknowledge_root_change.unwrap_or(false);
-        if is_root && is_gated_op && !dry_run_requested && !acknowledged {
-            return Err(McpError::invalid_params(
-                "root schema changes are guarded: the root tag vocabulary is \
-                 identity-only by policy (see meta/schema-tag-policy.md in this \
-                 knowledge base). Pass acknowledge_root_change=true only if this change \
-                 is a deliberate design decision consistent with that policy."
-                    .to_string(),
-                None,
-            ));
+        if is_root
+            && is_gated_op
+            && !dry_run_requested
+            && !acknowledged
+            && let Some(policy) = schemas.root().root_edit.as_ref().filter(|p| p.require_ack)
+        {
+            return Err(McpError::invalid_params(root_edit_refusal(policy), None));
         }
 
         // What this scope's ancestors alone resolve the field to, so `add_values` in a
@@ -4505,34 +5041,53 @@ impl KbSearchServer {
         // under the lock below for the real edit, so a concurrent change to a parent
         // scope cannot leave the edit extending a stale inherited set. The root has no
         // ancestors: a root schema file replaces the config-derived root outright.
+        //
+        // The whole scope's inheritance, not one field's: a batch looks each op's
+        // field up in it (#348). The ancestors are not what a batch edits, so one
+        // resolution serves every op, and it also feeds the cascade lint.
         let scope = crate::schema::scope_label(&rel_dir);
-        let inherited_field = |schemas: &SchemaCache| -> Option<crate::schema::FieldDef> {
+        let inherited_schema = |schemas: &SchemaCache| -> crate::schema::ResolvedSchema {
             if rel_dir.as_os_str().is_empty() {
-                return None;
+                return crate::schema::ResolvedSchema::default();
             }
             match schemas.resolve_from_disk(&rel_dir, None) {
-                Ok(resolved) => resolved.fields.get(edit.field()).cloned(),
+                Ok(resolved) => resolved,
                 // An ancestor's file no longer parses (it arrived through git): the
                 // server still enforces its last valid rules, so extend those rather
                 // than nothing, which would narrow the inherited set.
                 Err(_) => {
                     let parent = rel_dir.parent().unwrap_or(std::path::Path::new(""));
-                    schemas
-                        .resolve_for(&parent.join("_"))
-                        .fields
-                        .get(edit.field())
-                        .cloned()
+                    schemas.resolve_for(&parent.join("_")).clone()
                 }
             }
+        };
+        // Every op, in order, against one in-memory file: the first failure fails the
+        // batch, and nothing has been written. Per-op summaries on success.
+        let apply_all = |file: &mut crate::schema::SchemaFile,
+                         inherited: &crate::schema::ResolvedSchema|
+         -> Result<Vec<String>, String> {
+            edits
+                .iter()
+                .enumerate()
+                .map(|(i, edit)| {
+                    file.apply_inheriting(edit, inherited.fields.lookup(edit.field()))
+                        .map_err(|e| {
+                            if edits.len() > 1 {
+                                format!("ops[{i}] ({} '{}'): {e}", edit.operation(), edit.field())
+                            } else {
+                                e
+                            }
+                        })
+                })
+                .collect()
         };
 
         // Whether the edit applies to the file as it is before the lock — only to
         // tell an edit that a concurrent change made inapplicable from one that never
         // applied, should it fail under the lock.
-        let applied_before_lock = schemas.raw_file_at(&rel_dir).is_ok_and(|(mut file, _)| {
-            file.apply_inheriting(&edit, inherited_field(&schemas).as_ref())
-                .is_ok()
-        });
+        let applied_before_lock = schemas
+            .raw_file_at(&rel_dir)
+            .is_ok_and(|(mut file, _)| apply_all(&mut file, &inherited_schema(&schemas)).is_ok());
 
         let dry_run = params.dry_run.unwrap_or(false);
         let force = params.force.unwrap_or(false);
@@ -4546,7 +5101,7 @@ impl KbSearchServer {
         // is now — two concurrent edits both land, neither overwriting the other.
         let (git_lock, mut head) = write::lock_and_sync(&deps).await;
         let mut attempt = 0;
-        let (summary, casualties) = loop {
+        let (summary, casualties, warnings) = loop {
             attempt += 1;
 
             // Read from disk, not the shared cache: the edit must apply to the file as
@@ -4563,9 +5118,20 @@ impl KbSearchServer {
                      parses."
                 ))
             })?;
-            let inherited = inherited_field(&schemas);
-            let summary = match file.apply_inheriting(&edit, inherited.as_ref()) {
-                Ok(summary) => summary,
+            // The root-edit guard again, on the root file as it is under the lock: the
+            // check above reads the shared cache, which a `root_edit:` block the sync
+            // just pulled in reaches only after the worker's next rebuild (#345).
+            if is_root
+                && is_gated_op
+                && !dry_run
+                && !acknowledged
+                && let Some(policy) = file.root_edit.as_ref().filter(|p| p.require_ack)
+            {
+                return Err(invalid(root_edit_refusal(policy)));
+            }
+            let inherited = inherited_schema(&schemas);
+            let summaries = match apply_all(&mut file, &inherited) {
+                Ok(summaries) => summaries,
                 Err(_) if applied_before_lock || attempt > 1 => {
                     return Err(invalid(format!(
                         "The schema for '{scope}' was edited by someone else; re-read it with \
@@ -4574,11 +5140,16 @@ impl KbSearchServer {
                 }
                 Err(e) => return Err(invalid(e)),
             };
+            let summary = summaries.join("; ");
 
             // A self-contradictory definition parses fine but would be refused by the
             // next schema rebuild (and stop the server from starting) — after this call
             // has already reported success. Catch it here, where the caller can act.
+            // Once per batch, on the file the whole batch produced.
             file.validate_self().map_err(invalid)?;
+            // Lint warnings (#347, #348) for the file as it will be written: reported,
+            // never a refusal.
+            let warnings = schema_lint_warnings(&file, is_root, &inherited);
 
             let yaml = file.to_yaml().map_err(invalid)?;
 
@@ -4628,22 +5199,46 @@ impl KbSearchServer {
                 // file format is the server's business, and `get_schema` serves the
                 // rest of the scope.
                 let resolved = schemas.resolve_from_disk(&rel_dir, Some(&file)).ok();
-                let field = edit.field();
-                let definition = resolved.as_ref().and_then(|r| {
-                    r.fields
-                        .get(field)
-                        .map(|def| field_def_json(def, r.origin.get(field).map(String::as_str)))
-                });
+                let definition_of = |field: &str| {
+                    resolved.as_ref().and_then(|r| {
+                        r.fields
+                            .lookup(field)
+                            .map(|def| field_def_json(def, def.declared_in.as_deref()))
+                    })
+                };
                 let (would_invalidate, casualties_total, casualties_truncated) =
                     capped_casualties(&casualties);
                 let mut response = serde_json::json!({
                     "dry_run": true,
                     "path": scope,
                     "summary": summary,
-                    "field": field,
                 });
-                if let Some(definition) = definition {
-                    response["definition"] = definition;
+                if let [edit] = edits.as_slice() {
+                    // One op (the deprecated flat parameters always are one): its
+                    // field and resolved definition at the top level, as before #348.
+                    response["field"] = serde_json::json!(edit.field());
+                    if let Some(definition) = definition_of(edit.field()) {
+                        response["definition"] = definition;
+                    }
+                } else {
+                    // A batch: each op's own summary, and each field as the whole
+                    // batch leaves it (a field edited twice shows its final state).
+                    let ops: Vec<serde_json::Value> = edits
+                        .iter()
+                        .zip(&summaries)
+                        .map(|(edit, summary)| {
+                            let mut op = serde_json::json!({
+                                "operation": edit.operation(),
+                                "field": edit.field(),
+                                "summary": summary,
+                            });
+                            if let Some(definition) = definition_of(edit.field()) {
+                                op["definition"] = definition;
+                            }
+                            op
+                        })
+                        .collect();
+                    response["ops"] = serde_json::Value::Array(ops);
                 }
                 insert_casualties(
                     &mut response,
@@ -4652,6 +5247,9 @@ impl KbSearchServer {
                     casualties_total,
                     casualties_truncated,
                 );
+                if !warnings.is_empty() {
+                    response["warnings"] = serde_json::json!(warnings);
+                }
                 return Ok(CallToolResult::structured(response));
             }
 
@@ -4662,7 +5260,7 @@ impl KbSearchServer {
             let replaced = on_disk_name
                 .filter(|name| *name != crate::schema::SCHEMA_FILE_NAME)
                 .map(|name| rel_dir.join(name).to_string_lossy().to_string());
-            let commit_message = format!("schema: {summary} in {scope}");
+            let commit_message = schema_commit_message(&summaries, &scope);
 
             // `write_raw_file` rolls itself back on a pre-commit failure and returns
             // `Err` (see its doc comment) — this `?` propagates that WITHOUT reaching
@@ -4680,7 +5278,7 @@ impl KbSearchServer {
                 )
                 .await?
             {
-                RawWrite::Committed => break (summary, casualties),
+                RawWrite::Committed => break (summary, casualties, warnings),
                 // Every conflict syncs, the last one included: the reset that dropped
                 // this commit went back to `head`, so this sync is what brings the
                 // clone onto whatever reached the remote since and marks those paths
@@ -4771,6 +5369,9 @@ impl KbSearchServer {
                  the previous rules stay enforced until it is fixed. {}",
                 refusal.model_facing()
             ));
+        }
+        if !warnings.is_empty() {
+            response["warnings"] = serde_json::json!(warnings);
         }
         Ok(CallToolResult::structured(response))
     }
@@ -5730,19 +6331,44 @@ pub(crate) fn round_score(score: f64) -> serde_json::Value {
 /// The longest search snippet, in characters, before it is cut with `…`.
 const SNIPPET_CHARS: usize = 800;
 
+/// `update_schema`'s refusal of an unacknowledged root edit under a root schema's
+/// `root_edit: {require_ack: true}` (#345). Names `policy_doc` only when the
+/// root schema sets one.
+fn root_edit_refusal(policy: &crate::schema::RootEditPolicy) -> String {
+    let mut msg = String::from(
+        "root schema changes are guarded: the root schema governs every document in \
+         this knowledge base.",
+    );
+    msg.push_str(
+        " Pass acknowledge_root_change=true only if this change is a deliberate design decision",
+    );
+    // `policy_doc` is bounded and free of control characters (`validate_self`).
+    match &policy.policy_doc {
+        Some(doc) => msg.push_str(&format!(
+            " consistent with the policy in {doc} (a document in this knowledge base)."
+        )),
+        None => msg.push('.'),
+    }
+    msg
+}
+
 /// A row's frontmatter as `search` reports it: without the keys already promoted
-/// to the row itself (`title`, `description`) or derived from the path
-/// (`domain`, unless the caller named it in `fields`). `None` when nothing is
-/// left.
+/// to the row itself (`title`, `description`) or derived from the path (the root
+/// schema's `derived:` fields, #345 — each kept only when the caller named it in
+/// `fields`), since the row's `file_path` already says what they hold. `None` when
+/// nothing is left.
 fn row_frontmatter(
     frontmatter: &serde_json::Value,
     fields: Option<&[String]>,
+    derived: &[String],
 ) -> Option<serde_json::Value> {
     let mut map = frontmatter.as_object()?.clone();
     map.remove("title");
     map.remove("description");
-    if !fields.is_some_and(|f| f.iter().any(|k| k == "domain")) {
-        map.remove("domain");
+    for name in derived {
+        if !fields.is_some_and(|f| f.contains(name)) {
+            map.remove(name);
+        }
     }
     (!map.is_empty()).then_some(serde_json::Value::Object(map))
 }
@@ -5752,6 +6378,7 @@ fn row_frontmatter(
 fn document_row(
     summary: &crate::state::DocumentSummary,
     fields: Option<&[String]>,
+    derived: &[String],
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut row = serde_json::Map::new();
     row.insert("file_path".into(), serde_json::json!(summary.file_path));
@@ -5761,7 +6388,7 @@ fn document_row(
     if let Some(description) = &summary.description {
         row.insert("description".into(), serde_json::json!(description));
     }
-    if let Some(frontmatter) = row_frontmatter(&summary.frontmatter, fields) {
+    if let Some(frontmatter) = row_frontmatter(&summary.frontmatter, fields, derived) {
         row.insert("frontmatter".into(), frontmatter);
     }
     row
@@ -5819,8 +6446,7 @@ fn build_chunk_search_payload(
         row.insert(
             "title".into(),
             serde_json::json!(
-                payload
-                    .get("title")
+                crate::qdrant::frontmatter_value(payload, "title")
                     .and_then(|v| v.as_str())
                     .unwrap_or("(untitled)")
             ),
@@ -5842,14 +6468,12 @@ fn build_chunk_search_payload(
             snippet.push('…');
         }
         row.insert("text".into(), serde_json::json!(snippet));
-        if let Some(t) = payload
-            .get("type")
+        if let Some(t) = crate::qdrant::frontmatter_value(payload, "type")
             .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
         {
             row.insert("type".into(), t.clone());
         }
-        if let Some(tags) = payload
-            .get("tags")
+        if let Some(tags) = crate::qdrant::frontmatter_value(payload, "tags")
             .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
         {
             row.insert("tags".into(), tags.clone());
@@ -5887,6 +6511,7 @@ fn build_chunk_search_payload(
 fn build_grouped_search_payload(
     documents: &[retrieval::GroupedDocument],
     fields: Option<&[String]>,
+    derived: &[String],
     path_prefix_truncated: bool,
     offset_truncated: bool,
 ) -> serde_json::Value {
@@ -5896,7 +6521,7 @@ fn build_grouped_search_payload(
         documents
             .iter()
             .map(|d| {
-                let mut row = document_row(&d.summary, fields);
+                let mut row = document_row(&d.summary, fields, derived);
                 row.insert("score".into(), round_score(f64::from(d.score)));
                 serde_json::Value::Object(row)
             })
@@ -7436,21 +8061,22 @@ mod tests {
         // `tags: Vec<String>` array filter always used; `domain`/`type` (formerly
         // single-value scalar matches) now go through that same shape too, since
         // `filters` no longer distinguishes "one value" from "any of these values".
+        // Keys are under the payload's `fm` namespace (#350).
         assert!(
             conditions.contains(&qdrant_client::qdrant::Condition::matches(
-                "domain",
+                "fm.domain",
                 vec!["sysadmin".to_string()]
             ))
         );
         assert!(
             conditions.contains(&qdrant_client::qdrant::Condition::matches(
-                "type",
+                "fm.type",
                 vec!["guide".to_string()]
             ))
         );
         assert!(
             conditions.contains(&qdrant_client::qdrant::Condition::matches(
-                "tags",
+                "fm.tags",
                 vec!["rust".to_string(), "rag".to_string()]
             ))
         );
@@ -7515,6 +8141,7 @@ mod tests {
 
     fn update_params(operation: &str, field: &str) -> UpdateSchemaParams {
         UpdateSchemaParams {
+            ops: None,
             path: None,
             operation: operation.into(),
             field: field.into(),
@@ -7629,7 +8256,16 @@ mod tests {
 
         assert_eq!(resolved["type"], serde_json::json!("object"));
         for key in [
-            "type", "required", "indexed", "values", "default", "open", "fields",
+            "type",
+            "required",
+            "indexed",
+            "values",
+            "default",
+            "open",
+            "fields",
+            "items",
+            "exclude_values",
+            "removed",
         ] {
             let prop = &resolved["properties"][key];
             assert!(
@@ -7725,6 +8361,64 @@ mod tests {
             );
         }
         assert!(build_schema_edit(&update_params("remove_field", "planning.method")).is_ok());
+    }
+
+    #[test]
+    fn update_schema_field_paths_follow_the_list_item_grammar() {
+        // `[]` steps count toward the depth cap like names do (#346).
+        for ok in ["npcs[]", "npcs[].name", "a.b[][].c"] {
+            assert!(
+                build_schema_edit(&update_params("remove_field", ok)).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in ["[]", "a.[]", "a[]. b", "a[].", "a[]..b"] {
+            let err = build_schema_edit(&update_params("remove_field", bad)).unwrap_err();
+            assert!(err.message.contains("non-empty"), "{bad}: {}", err.message);
+        }
+        let deep = format!("{}[]", vec!["a"; MAX_SCHEMA_PATH_SEGMENTS].join("."));
+        let err = build_schema_edit(&update_params("remove_field", &deep)).unwrap_err();
+        assert!(err.message.contains("too deep"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn field_def_json_reports_items_only_when_declared() {
+        let resolved = crate::schema::ResolvedSchema::default().merged_with_for_test(
+            &serde_yaml_ng::from_str(
+                "fields:\n  npcs:\n    required: true\n    items:\n      type: object\n      \
+                 fields:\n        name:\n          type: text\n          required: true\n  \
+                 title:\n    type: text\n",
+            )
+            .unwrap(),
+            "/",
+        );
+        assert_eq!(
+            field_def_json(&resolved.fields["npcs"], Some("/")),
+            serde_json::json!({
+                "type": "list",
+                "required": true,
+                "items": {
+                    "type": "object",
+                    "fields": {"name": {"type": "text", "required": true}},
+                },
+                "declared_in": "/",
+            })
+        );
+        assert_eq!(
+            field_def_json(&resolved.fields["title"], Some("/")),
+            serde_json::json!({"type": "text", "declared_in": "/"})
+        );
+        // Every type is named as `FieldType::name` spells it.
+        for ty in crate::schema::FieldType::ALL {
+            let def = crate::schema::FieldDef {
+                ty: Some(ty),
+                ..Default::default()
+            };
+            assert_eq!(
+                field_def_json(&def, None)["type"],
+                serde_json::json!(ty.name())
+            );
+        }
     }
 
     #[test]
@@ -8150,6 +8844,7 @@ mod tests {
 
         server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("/brand/new".into()),
                 operation: "add_values".into(),
                 field: "tags".into(),
@@ -8184,6 +8879,7 @@ mod tests {
 
         let err = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("big".into()),
                 operation: "add_values".into(),
                 field: "tags".into(),
@@ -8217,6 +8913,7 @@ mod tests {
 
         let err = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "add_values".into(),
                 field: "tags".into(),
@@ -8254,6 +8951,7 @@ mod tests {
 
         let err = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "add_values".into(),
                 field: "tags".into(),
@@ -8384,7 +9082,8 @@ mod tests {
         write_schema_file(
             &tmp,
             "",
-            "fields:\n  tags:\n    type: list\n  status:\n    type: enum\n    values: [active]\n",
+            "derived:\n  domain: {from: path_segment, index: 0}\n\
+             fields:\n  tags:\n    type: list\n  status:\n    type: enum\n    values: [active]\n",
         );
         let server = schema_tool_server(&tmp);
         seed_document(
@@ -8485,9 +9184,57 @@ mod tests {
 
     #[tokio::test]
     async fn get_schema_never_lists_a_derived_field() {
-        // A deployment that filters on `domain` lists it in `indexed_fields`, which
-        // declares it. Ingest still derives it from the folder and a write that
-        // authors it is refused, so it must not be offered as a field to fill in.
+        // A deployment that filters on a derived `domain` declares it `indexed`.
+        // Ingest still derives it from the folder and a write that authors it is
+        // refused, so it must not be offered as a field to fill in — anywhere below
+        // the root that derives it (#345).
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "derived:\n  domain: {from: path_segment, index: 0}\n\
+             fields:\n  domain:\n    indexed: true\n  status:\n    indexed: true\n",
+        );
+        write_schema_file(&tmp, "notes", "fields:\n  tags:\n    type: list\n");
+        let server = schema_tool_server(&tmp);
+
+        for path in [None, Some("notes".to_string())] {
+            let all = server
+                .get_schema(Parameters(GetSchemaParams {
+                    path: path.clone(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            let names: Vec<&str> = all["fields"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert!(!names.contains(&"domain"), "{path:?}: {all}");
+            assert!(names.contains(&"status"), "{path:?}: {all}");
+            assert!(all.get("omitted_fields").is_none(), "{all}");
+        }
+
+        let named = server
+            .get_schema(Parameters(GetSchemaParams {
+                fields: Some(vec!["domain".into()]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert!(named["fields"].as_object().unwrap().is_empty(), "{named}");
+    }
+
+    /// Without a `derived:` block (#345) `domain` is an ordinary field: listed
+    /// like any other declared one.
+    #[tokio::test]
+    async fn get_schema_lists_domain_when_nothing_derives_it() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = (*make_test_resolved_config(tmp.path())).clone();
         config.frontmatter.indexed_fields = vec!["domain".into(), "status".into()];
@@ -8505,19 +9252,7 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(names, vec!["status"], "{all}");
-        assert!(all.get("omitted_fields").is_none(), "{all}");
-
-        let named = server
-            .get_schema(Parameters(GetSchemaParams {
-                fields: Some(vec!["domain".into()]),
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .structured_content
-            .unwrap();
-        assert!(named["fields"].as_object().unwrap().is_empty(), "{named}");
+        assert_eq!(names, vec!["domain", "status"], "{all}");
     }
 
     #[tokio::test]
@@ -8566,7 +9301,8 @@ mod tests {
         write_schema_file(
             &tmp,
             "",
-            "fields:\n  status:\n    type: enum\n    values: [active]\n",
+            "derived:\n  domain: {from: path_segment, index: 0}\n\
+             fields:\n  status:\n    type: enum\n    values: [active]\n",
         );
         let server = schema_tool_server(&tmp);
         seed_document(&server, "notes/a.md", serde_json::json!({ "owner": "me" })).await;
@@ -8607,6 +9343,319 @@ mod tests {
             ok.structured_content.unwrap()["total"],
             serde_json::json!(1)
         );
+    }
+
+    #[tokio::test]
+    async fn search_correlated_list_filter_matches_within_one_element() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  npcs:\n    type: list\n    items:\n      type: object\n      fields:\n        \
+             role:\n          type: enum\n          values: [guard, cook]\n        level:\n          \
+             type: integer\n",
+        );
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "split.md",
+            serde_json::json!({ "npcs": [{ "role": "guard", "level": 1 }, { "role": "cook", "level": 5 }] }),
+        )
+        .await;
+        seed_document(
+            &server,
+            "same.md",
+            serde_json::json!({ "npcs": [{ "role": "cook", "level": 2 }, { "role": "guard", "level": 5 }] }),
+        )
+        .await;
+
+        let search = |filter: serde_json::Value, query: Option<&str>| {
+            let mut filters = serde_json::Map::new();
+            filters.insert("npcs[]".into(), filter);
+            server.search(Parameters(SearchParams {
+                query: query.map(str::to_string),
+                filters: Some(SearchFiltersInput(filters)),
+                ..Default::default()
+            }))
+        };
+
+        let found = search(
+            serde_json::json!({ "role": "guard", "level": { "gte": 3 } }),
+            None,
+        )
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+        assert_eq!(found["total"], serde_json::json!(1), "{found}");
+        assert_eq!(found["documents"][0]["file_path"], "same.md", "{found}");
+
+        // An unknown sub-field lists the list's fields, not every field.
+        let err = search(serde_json::json!({ "rank": "x" }), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains(
+                "filter 'npcs[]': unknown sub-field 'npcs[].rank'; fields of npcs[]: \
+                 npcs[].level, npcs[].role"
+            ),
+            "{}",
+            err.message
+        );
+        // A value outside the sub-field's closed set.
+        let err = search(serde_json::json!({ "role": "king" }), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains(
+                "filter 'npcs[].role': 'king' is not an allowed value; allowed: cook, guard"
+            ),
+            "{}",
+            err.message
+        );
+        // Query mode lowers one to a nested condition (#350) — but, like any field,
+        // only over sub-fields with a payload index; these are not `indexed`.
+        let mut filters = serde_json::Map::new();
+        filters.insert("npcs[]".into(), serde_json::json!({ "role": "guard" }));
+        let params = SearchParams {
+            query: Some("q".into()),
+            filters: Some(SearchFiltersInput(filters)),
+            ..Default::default()
+        };
+        let schemas = crate::schema::load_shared(&server.schema_cache);
+        let err = build_query_conditions(&params, &server.config(), &schemas).unwrap_err();
+        assert!(
+            err.message
+                .contains("filter 'npcs[].role' is not indexed for Qdrant queries"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn query_mode_lowers_correlated_and_date_filters_over_indexed_fields() {
+        use qdrant_client::qdrant::condition::ConditionOneOf;
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  published:\n    type: date\n    indexed: true\n  npcs:\n    type: list\n    \
+             items:\n      type: object\n      fields:\n        role:\n          type: enum\n          \
+             values: [guard, cook]\n          indexed: true\n        level:\n          type: \
+             integer\n          indexed: true\n",
+        );
+        let server = schema_tool_server(&tmp);
+        let schemas = crate::schema::load_shared(&server.schema_cache);
+        let lower = |field: &str, filter: serde_json::Value| {
+            let mut filters = serde_json::Map::new();
+            filters.insert(field.into(), filter);
+            let params = SearchParams {
+                query: Some("q".into()),
+                filters: Some(SearchFiltersInput(filters)),
+                ..Default::default()
+            };
+            build_query_conditions(&params, &server.config(), &schemas)
+        };
+
+        let nested = lower(
+            "npcs[]",
+            serde_json::json!({ "role": "guard", "level": { "gte": 3 } }),
+        )
+        .unwrap();
+        let Some(ConditionOneOf::Nested(n)) = &nested[0].condition_one_of else {
+            panic!("expected a nested condition: {nested:?}");
+        };
+        assert_eq!(n.key, "fm.npcs");
+        let keys: Vec<String> = n
+            .filter
+            .as_ref()
+            .unwrap()
+            .must
+            .iter()
+            .map(|c| match &c.condition_one_of {
+                Some(ConditionOneOf::Field(f)) => f.key.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(keys, vec!["level", "role"]);
+
+        let dated = lower("published", serde_json::json!({ "gte": "2024-01-01" })).unwrap();
+        let Some(ConditionOneOf::Field(f)) = &dated[0].condition_one_of else {
+            panic!("{dated:?}");
+        };
+        assert_eq!(f.key, "fm.published");
+        assert_eq!(
+            f.datetime_range.unwrap().gte.unwrap().seconds,
+            1_704_067_200,
+            "midnight UTC, as the metadata index's epoch seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_refuses_ranges_that_could_never_compare_a_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  published:\n    type: date\n    indexed: true\n  count:\n    \
+             type: integer\n    indexed: true\n  code:\n    type: text\n  npcs:\n    \
+             type: list\n    items:\n      type: object\n      fields:\n        name:\n          \
+             type: text\n",
+        );
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "a.md",
+            serde_json::json!({ "code": "7", "loose": 3, "published": "2024-02-01",
+                                "npcs": [{ "name": "Ada" }] }),
+        )
+        .await;
+        let search = |field: &str, filter: serde_json::Value, query: Option<&str>| {
+            let mut filters = serde_json::Map::new();
+            filters.insert(field.into(), filter);
+            server.search(Parameters(SearchParams {
+                query: query.map(str::to_string),
+                filters: Some(SearchFiltersInput(filters)),
+                ..Default::default()
+            }))
+        };
+
+        // Declared text: no stored number, so a range is refused, not empty.
+        for (field, filter) in [
+            ("code", serde_json::json!({ "gte": 3 })),
+            ("npcs[]", serde_json::json!({ "name": { "gte": 1 } })),
+        ] {
+            let err = search(field, filter, None).await.unwrap_err();
+            assert!(
+                err.message.contains("a range needs a numeric field")
+                    && err.message.contains("declared `text`")
+                    && err.message.contains("`integer` or `number`"),
+                "{field}: {}",
+                err.message
+            );
+        }
+        // Undeclared and date fields range as before when listing.
+        search("loose", serde_json::json!({ "gte": 1 }), None)
+            .await
+            .unwrap();
+        search(
+            "published",
+            serde_json::json!({ "gte": "2024-01-01" }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // With a query (#350) a date range lowers too, on the epoch-seconds axis the
+        // metadata index uses: a date field takes a date or a numeric (epoch) bound,
+        // and a date bound on a numeric field compares as its epoch seconds, exactly
+        // as the listing compares `value_num`.
+        let schemas = crate::schema::load_shared(&server.schema_cache);
+        for (field, filter) in [
+            ("published", serde_json::json!({ "gte": "2024-01-01" })),
+            ("published", serde_json::json!({ "gte": 1 })),
+            ("count", serde_json::json!({ "gte": "2024-01-01" })),
+        ] {
+            let mut filters = serde_json::Map::new();
+            filters.insert(field.into(), filter.clone());
+            let params = SearchParams {
+                query: Some("q".into()),
+                filters: Some(SearchFiltersInput(filters)),
+                ..Default::default()
+            };
+            let conditions = build_query_conditions(&params, &server.config(), &schemas)
+                .unwrap_or_else(|e| panic!("{field} {filter}: {}", e.message));
+            assert_eq!(conditions.len(), 1, "{field} {filter}");
+        }
+    }
+
+    #[test]
+    fn correlated_filters_parse_with_caps_and_one_level_only() {
+        let parsed = parse_field_filter(
+            "npcs[]",
+            &serde_json::json!({ "role": "guard", "level": { "gte": 3 } }),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            FieldFilter::Elem(vec![
+                (
+                    "npcs[].level".into(),
+                    FieldFilter::Range {
+                        gte: Some(3.0),
+                        lte: None,
+                        gt: None,
+                        lt: None
+                    }
+                ),
+                (
+                    "npcs[].role".into(),
+                    FieldFilter::AnyOf(vec!["guard".into()])
+                ),
+            ])
+        );
+        let refused =
+            |field: &str, raw: serde_json::Value| parse_field_filter(field, &raw).unwrap_err();
+        assert!(refused("npcs[]", serde_json::json!("guard")).contains("takes an object"));
+        assert!(refused("npcs[]", serde_json::json!({})).contains("at least one"));
+        assert!(
+            refused("a[].b[]", serde_json::json!({ "c": 1 })).contains("outside any other list")
+        );
+        assert!(refused("[]", serde_json::json!({ "c": 1 })).contains("outside any other list"));
+        let nested = refused("npcs[]", serde_json::json!({ "gear[]": { "x": 1 } }));
+        assert!(nested.contains("do not nest"), "{nested}");
+        assert!(
+            nested.contains("e.g. 'gear[].name'"),
+            "the hint names a path the vocabulary check accepts: {nested}"
+        );
+        assert!(
+            refused("npcs[]", serde_json::json!({ "any_of": ["x"] })).contains("is an operator")
+        );
+        let many: serde_json::Map<String, serde_json::Value> = (0..=MAX_LIST_FILTERS)
+            .map(|i| (format!("f{i}"), serde_json::json!(1)))
+            .collect();
+        assert!(refused("npcs[]", serde_json::Value::Object(many)).contains("too many conditions"));
+        let values: Vec<String> = (0..=MAX_LIST_FILTERS).map(|i| format!("v{i}")).collect();
+        assert!(
+            refused(
+                "npcs[]",
+                serde_json::json!({ "tags": { "all_of": values } })
+            )
+            .contains("too many conditions"),
+            "each all_of value is a row test"
+        );
+        // A sub-condition is any ordinary filter, its own caps included.
+        let long = "x".repeat(MAX_FILTER_STR_LEN + 1);
+        assert!(refused("npcs[]", serde_json::json!({ "role": long })).contains("too long"));
+    }
+
+    #[test]
+    fn range_bounds_accept_dates_and_timestamps_as_epoch_seconds() {
+        let parsed = parse_field_filter(
+            "on",
+            &serde_json::json!({ "gte": "2024-01-02", "lt": "2024-01-03T00:00:00+01:00" }),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            FieldFilter::Range {
+                gte: crate::document_fields::epoch_seconds("2024-01-02"),
+                lte: None,
+                gt: None,
+                lt: Some(1_704_236_400.0),
+            }
+        );
+        let err = parse_field_filter("on", &serde_json::json!({ "gte": "soon" })).unwrap_err();
+        assert!(err.contains("must be a number, or a date"), "{err}");
+    }
+
+    #[test]
+    fn schema_path_depth_and_projection_depth_are_one_limit() {
+        assert_eq!(
+            MAX_SCHEMA_PATH_SEGMENTS,
+            crate::schema::MAX_FIELD_PATH_DEPTH
+        );
+        assert_eq!(MAX_SCHEMA_PATH_SEGMENTS, 16);
     }
 
     #[tokio::test]
@@ -8816,6 +9865,7 @@ mod tests {
 
         let result = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "set_field".into(),
                 field: "status".into(),
@@ -8896,6 +9946,7 @@ mod tests {
 
         let result = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "set_field".into(),
                 field: "status".into(),
@@ -8939,6 +9990,7 @@ mod tests {
 
         let result = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "set_field".into(),
                 field: "status".into(),
@@ -8969,6 +10021,7 @@ mod tests {
 
         let err = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "set_field".into(),
                 field: "status".into(),
@@ -9011,6 +10064,7 @@ mod tests {
 
         server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "add_values".into(),
                 field: "status".into(),
@@ -9040,6 +10094,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_schema_reports_lint_warnings_without_refusing() {
+        // A default that fails its own type and a reserved payload name are lint
+        // warnings (#347): reported in `warnings`, dry run and real write alike, and
+        // the write still lands.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+        let set = |field: &str, def: serde_json::Value, dry_run: bool| UpdateSchemaParams {
+            ops: None,
+            path: Some("notes".into()),
+            definition: Some(definition(def)),
+            dry_run: Some(dry_run),
+            ..update_params("set_field", field)
+        };
+
+        let dry = server
+            .update_schema(Parameters(set(
+                "servings",
+                serde_json::json!({ "type": "integer", "default": "four" }),
+                true,
+            )))
+            .await
+            .unwrap();
+        let dry = single_representation(&dry);
+        assert_eq!(
+            dry["warnings"],
+            serde_json::json!([
+                "field 'servings': the default fails the field's own type (expected an \
+                 integer, got a string)"
+            ])
+        );
+
+        let real = server
+            .update_schema(Parameters(set(
+                "servings",
+                serde_json::json!({ "type": "integer", "default": "four" }),
+                false,
+            )))
+            .await
+            .expect("a lint warning never refuses a write");
+        let real = single_representation(&real);
+        assert_eq!(real["warnings"], dry["warnings"]);
+        assert!(
+            work.path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists()
+        );
+
+        // Warnings cover the whole file as written, not just the edited field.
+        let next = server
+            .update_schema(Parameters(set(
+                "text",
+                serde_json::json!({ "type": "text" }),
+                false,
+            )))
+            .await
+            .expect("a reserved name is a warning, not a refusal");
+        let next = single_representation(&next);
+        let warnings = next["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .as_str()
+                .unwrap()
+                .starts_with("field 'servings'")
+        );
+        assert!(warnings[1].as_str().unwrap().contains("reserved"));
+    }
+
+    #[tokio::test]
+    async fn update_schema_omits_warnings_for_a_clean_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
+                path: Some("notes".into()),
+                definition: Some(definition(
+                    serde_json::json!({ "type": "integer", "default": 4 }),
+                )),
+                dry_run: Some(true),
+                ..update_params("set_field", "servings")
+            }))
+            .await
+            .unwrap();
+        assert!(single_representation(&result).get("warnings").is_none());
+    }
+
+    #[tokio::test]
+    async fn update_schema_casualty_check_validates_list_elements() {
+        // The dry run's casualty pass shares the recursive validator (#347), so an
+        // element rule names the element that would break.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "notes/a.md",
+            serde_json::json!({ "title": "A", "npcs": [{ "name": "Bob" }, { "role": "foe" }] }),
+        )
+        .await;
+        seed_document(
+            &server,
+            "notes/b.md",
+            serde_json::json!({ "title": "B", "npcs": [{ "name": "Eve" }] }),
+        )
+        .await;
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
+                path: Some("notes".into()),
+                definition: Some(definition(serde_json::json!({
+                    "type": "list",
+                    "items": { "fields": { "name": { "type": "text", "required": true } } },
+                }))),
+                dry_run: Some(true),
+                ..update_params("set_field", "npcs")
+            }))
+            .await
+            .unwrap();
+        let structured = single_representation(&result);
+        let casualties = structured["would_invalidate"].as_array().unwrap();
+        assert_eq!(casualties.len(), 1, "{casualties:?}");
+        assert!(
+            casualties[0].to_string().contains("npcs[1].name"),
+            "{casualties:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn update_schema_dry_run_ignores_documents_a_deeper_scope_governs() {
         // A descendant scope that redefines the edited field shadows the parent, so its
         // documents are unaffected and must not be reported as casualties.
@@ -9059,6 +10244,7 @@ mod tests {
 
         let result = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "set_field".into(),
                 field: "status".into(),
@@ -9094,6 +10280,7 @@ mod tests {
         // The point of this test: force must not be blocked by the casualty check.
         server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "set_field".into(),
                 field: "status".into(),
@@ -9125,6 +10312,7 @@ mod tests {
 
         let err = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "set_field".into(),
                 field: "planning".into(),
@@ -9156,6 +10344,7 @@ mod tests {
 
         let err = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("../escape".into()),
                 operation: "add_values".into(),
                 field: "tags".into(),
@@ -9171,22 +10360,33 @@ mod tests {
         assert!(format!("{:?}", err).contains(".."));
     }
 
+    /// A root schema guarding root edits (#345), naming the owner KB's policy
+    /// document as its example.
+    const GUARDED_ROOT: &str =
+        "root_edit:\n  require_ack: true\n  policy_doc: meta/schema-tag-policy.md\n";
+
+    fn root_add_values(acknowledge: Option<bool>) -> UpdateSchemaParams {
+        UpdateSchemaParams {
+            ops: None,
+            path: None,
+            operation: "add_values".into(),
+            field: "tags".into(),
+            values: Some(vec!["x".into()]),
+            definition: None,
+            dry_run: None,
+            force: None,
+            acknowledge_root_change: acknowledge,
+        }
+    }
+
     #[tokio::test]
     async fn update_schema_root_add_values_refused_without_acknowledgment() {
         let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "", GUARDED_ROOT);
         let server = schema_tool_server(&tmp);
 
         let err = server
-            .update_schema(Parameters(UpdateSchemaParams {
-                path: None,
-                operation: "add_values".into(),
-                field: "tags".into(),
-                values: Some(vec!["x".into()]),
-                definition: None,
-                dry_run: None,
-                force: None,
-                acknowledge_root_change: None,
-            }))
+            .update_schema(Parameters(root_add_values(None)))
             .await
             .expect_err("root add_values must be refused without acknowledge_root_change");
 
@@ -9197,10 +10397,97 @@ mod tests {
         );
         assert!(msg.contains("meta/schema-tag-policy.md"), "got: {msg}");
         assert!(msg.contains("acknowledge_root_change"), "got: {msg}");
-        assert!(
-            !tmp.path().join(crate::schema::SCHEMA_FILE_NAME).exists(),
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap(),
+            GUARDED_ROOT,
             "a refused change must leave the filesystem untouched"
         );
+    }
+
+    /// `require_ack` with no `policy_doc`: still refused, and the refusal names no
+    /// document at all.
+    #[tokio::test]
+    async fn update_schema_root_guard_without_a_policy_doc_names_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "", "root_edit:\n  require_ack: true\n");
+        let server = schema_tool_server(&tmp);
+
+        let msg = format!(
+            "{:?}",
+            server
+                .update_schema(Parameters(root_add_values(None)))
+                .await
+                .expect_err("require_ack alone still guards")
+        );
+        assert!(
+            msg.contains("root schema changes are guarded"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("acknowledge_root_change"), "got: {msg}");
+        assert!(!msg.contains("policy in"), "got: {msg}");
+        assert!(!msg.contains(".md"), "got: {msg}");
+    }
+
+    /// No `root_edit` block (or `require_ack: false`): root edits need no
+    /// acknowledgement (#345).
+    #[tokio::test]
+    async fn update_schema_root_edits_are_unguarded_without_root_edit() {
+        for root in [None, Some("root_edit:\n  require_ack: false\n")] {
+            let bare = crate::git::tests::create_bare_repo("master");
+            let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+            if let Some(yaml) = root {
+                write_schema_file(&work, "", yaml);
+                git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
+            }
+            let (server, _config) = make_git_backed_server(&work);
+
+            server
+                .update_schema(Parameters(root_add_values(None)))
+                .await
+                .expect("an unguarded root edit needs no acknowledgement");
+            let yaml =
+                std::fs::read_to_string(work.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap();
+            let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(reparsed.fields["tags"].values, Some(vec!["x".to_string()]));
+        }
+    }
+
+    /// A `root_edit` block that is on disk but not yet in the shared cache (it arrived
+    /// through git, and the worker has not rebuilt the cache) still guards: the root
+    /// file read under the lock is checked too (#345).
+    #[tokio::test]
+    async fn update_schema_root_guard_applies_before_the_cache_sees_it() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+        assert!(
+            crate::schema::load_shared(&server.schema_cache)
+                .root()
+                .root_edit
+                .is_none()
+        );
+        write_schema_file(&work, "", GUARDED_ROOT);
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "guard root edits");
+
+        let msg = format!(
+            "{:?}",
+            server
+                .update_schema(Parameters(root_add_values(None)))
+                .await
+                .expect_err("the on-disk guard must refuse an unacknowledged root edit")
+        );
+        assert!(
+            msg.contains("root schema changes are guarded"),
+            "got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap(),
+            GUARDED_ROOT
+        );
+        server
+            .update_schema(Parameters(root_add_values(Some(true))))
+            .await
+            .expect("acknowledged, the same edit lands");
     }
 
     #[tokio::test]
@@ -9209,12 +10496,13 @@ mod tests {
         write_schema_file(
             &tmp,
             "",
-            "fields:\n  tags:\n    type: enum\n    values: [x]\n",
+            &format!("{GUARDED_ROOT}fields:\n  tags:\n    type: enum\n    values: [x]\n"),
         );
         let server = schema_tool_server(&tmp);
 
         let err = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: None,
                 operation: "set_field".into(),
                 field: "status".into(),
@@ -9230,6 +10518,7 @@ mod tests {
 
         let err = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: None,
                 operation: "remove_field".into(),
                 field: "tags".into(),
@@ -9244,14 +10533,23 @@ mod tests {
         assert!(format!("{:?}", err).contains("root schema changes are guarded"));
     }
 
+    /// Also pins that an `update_schema` rewrite of the root file keeps its
+    /// hand-edited root-only blocks (#345).
     #[tokio::test]
     async fn update_schema_root_add_values_allowed_with_acknowledgment() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        write_schema_file(
+            &work,
+            "",
+            &format!("{GUARDED_ROOT}derived:\n  domain: {{from: path_segment, index: 0}}\n"),
+        );
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
         let (server, _config) = make_git_backed_server(&work);
 
         server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: None,
                 operation: "add_values".into(),
                 field: "tags".into(),
@@ -9264,19 +10562,41 @@ mod tests {
             .await
             .expect("root add_values must succeed once acknowledged");
 
-        assert!(
-            work.path().join(crate::schema::SCHEMA_FILE_NAME).exists(),
+        let yaml =
+            std::fs::read_to_string(work.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap();
+        let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            reparsed.fields["tags"].values,
+            Some(vec!["identity".to_string()]),
             "the acknowledged change must actually be written"
+        );
+        assert_eq!(
+            reparsed.root_edit,
+            Some(crate::schema::RootEditPolicy {
+                require_ack: true,
+                policy_doc: Some("meta/schema-tag-policy.md".into()),
+            }),
+            "{yaml}"
+        );
+        assert_eq!(
+            reparsed.derived,
+            Some(std::collections::BTreeMap::from([(
+                "domain".to_string(),
+                crate::schema::DerivedField::path_segment(0),
+            )])),
+            "{yaml}"
         );
     }
 
     #[tokio::test]
     async fn update_schema_root_add_values_allowed_with_dry_run() {
         let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "", GUARDED_ROOT);
         let server = schema_tool_server(&tmp);
 
         let result = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: None,
                 operation: "add_values".into(),
                 field: "tags".into(),
@@ -9297,8 +10617,9 @@ mod tests {
             "the dry-run result must be exactly what the same edit against a non-root \
              scope would report — the root guard must not alter dry-run behavior"
         );
-        assert!(
-            !tmp.path().join(crate::schema::SCHEMA_FILE_NAME).exists(),
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap(),
+            GUARDED_ROOT,
             "a dry run must not touch the filesystem"
         );
     }
@@ -9310,13 +10631,14 @@ mod tests {
         write_schema_file(
             &work,
             "",
-            "fields:\n  tags:\n    type: enum\n    values: [x, y]\n",
+            &format!("{GUARDED_ROOT}fields:\n  tags:\n    type: enum\n    values: [x, y]\n"),
         );
         git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
         let (server, _config) = make_git_backed_server(&work);
 
         server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: None,
                 operation: "remove_values".into(),
                 field: "tags".into(),
@@ -9342,10 +10664,13 @@ mod tests {
         // the property the root guard must not regress: the gate is root-only.
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        write_schema_file(&work, "", GUARDED_ROOT);
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
         let (server, _config) = make_git_backed_server(&work);
 
         server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "add_values".into(),
                 field: "tags".into(),
@@ -9403,6 +10728,11 @@ mod tests {
     #[tokio::test]
     async fn search_enumerate_rows_omit_promoted_derived_and_default_fields() {
         let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "derived:\n  domain: {from: path_segment, index: 0}\n",
+        );
         let server = schema_tool_server(&tmp);
         seed_document(
             &server,
@@ -10916,14 +12246,91 @@ mod tests {
             object_branch["additionalProperties"],
             serde_json::json!(false)
         );
-        for key in [
-            "type", "required", "indexed", "values", "default", "open", "fields",
-        ] {
+        let keys = [
+            "type",
+            "required",
+            "indexed",
+            "values",
+            "default",
+            "open",
+            "fields",
+            "items",
+            "exclude_values",
+            "removed",
+        ];
+        for key in keys {
             assert!(
                 !object_branch["properties"][key].is_null(),
                 "definition schema is missing documented key '{key}': {object_branch}"
             );
         }
+
+        // `ops` (#348): an array of op objects whose `operation` is a flat string
+        // enum (not a `oneOf` of described consts) and whose `definition` is the same
+        // inlined, closed `RawFieldDef` object.
+        let ops = &tool.input_schema["properties"]["ops"];
+        assert_eq!(ops["type"], serde_json::json!("array"), "{ops}");
+        let op = &ops["items"];
+        assert_eq!(op["type"], serde_json::json!("object"), "{op}");
+        assert_eq!(op["additionalProperties"], serde_json::json!(false), "{op}");
+        assert_eq!(
+            op["required"],
+            serde_json::json!(["operation", "field"]),
+            "{op}"
+        );
+        assert_eq!(
+            op["properties"]["operation"]["enum"],
+            serde_json::json!([
+                "add_values",
+                "remove_values",
+                "set_field",
+                "remove_field",
+                "patch_field"
+            ]),
+            "{op}"
+        );
+        assert_eq!(op["properties"]["operation"]["type"], "string", "{op}");
+        assert!(op["properties"]["operation"].get("oneOf").is_none(), "{op}");
+        let op_definition = &op["properties"]["definition"];
+        assert_eq!(
+            op_definition["additionalProperties"],
+            serde_json::json!(false)
+        );
+        for key in keys {
+            assert!(
+                !op_definition["properties"][key].is_null(),
+                "an op's definition is missing '{key}': {op_definition}"
+            );
+        }
+        // `reinherit` is how a schema-enforcing client re-inherits a key: compaction
+        // strips the `null` arm of every definition property, so a literal `null` is
+        // not something such a client can send. It must survive as a string array.
+        let reinherit = &op["properties"]["reinherit"];
+        assert_eq!(reinherit["type"], serde_json::json!("array"), "{op}");
+        assert_eq!(
+            reinherit["items"]["type"],
+            serde_json::json!("string"),
+            "{op}"
+        );
+        assert!(reinherit["description"].is_string(), "{op}");
+        // The flat parameters are still advertised, marked deprecated.
+        for key in ["operation", "field", "values", "definition"] {
+            assert!(
+                tool.input_schema["properties"][key]["description"]
+                    .as_str()
+                    .is_some_and(|d| d.starts_with("Deprecated")),
+                "{key}: {}",
+                tool.input_schema["properties"][key]
+            );
+        }
+        assert!(
+            tool.input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .is_none_or(|r| r.is_empty()),
+            "no parameter is required any more: {}",
+            serde_json::Value::Object((*tool.input_schema).clone())
+        );
     }
 
     #[test]
@@ -14425,6 +15832,7 @@ mod tests {
         // Widen the rule through the tool an agent would actually use.
         server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "add_values".into(),
                 field: "status".into(),
@@ -14688,6 +16096,12 @@ mod tests {
     async fn write_document_refuses_an_authored_derived_field() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        write_schema_file(
+            &work,
+            "",
+            "derived:\n  domain: {from: path_segment, index: 0}\n",
+        );
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
         let (server, _config) = make_git_backed_server(&work);
 
         let err = server
@@ -14701,7 +16115,7 @@ mod tests {
             .unwrap_err();
         let text = format!("{err:?}");
         assert!(
-            text.contains("`domain` is set by the document's top-level folder"),
+            text.contains("`domain` is set from the document's folder"),
             "{text}"
         );
         assert!(!work.path().join("docs/fresh.md").exists());
@@ -16980,6 +18394,7 @@ mod tests {
 
         let result = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "add_values".into(),
                 field: "tags".into(),
@@ -17040,6 +18455,7 @@ mod tests {
 
         let result = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "add_values".into(),
                 field: "status".into(),
@@ -17078,6 +18494,7 @@ mod tests {
 
     fn add_values_params(path: &str, field: &str, values: &[&str]) -> UpdateSchemaParams {
         UpdateSchemaParams {
+            ops: None,
             path: Some(path.into()),
             operation: "add_values".into(),
             field: field.into(),
@@ -17161,6 +18578,7 @@ mod tests {
                 fields: None,
                 values_only: None,
                 values_in_use: None,
+                compact: None,
             }))
             .await
             .unwrap();
@@ -17336,6 +18754,7 @@ mod tests {
                 fields: Some(vec!["tags".into()]),
                 values_only: None,
                 values_in_use: None,
+                compact: None,
             }))
             .await
             .unwrap();
@@ -17395,6 +18814,7 @@ mod tests {
 
         let result = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "add_values".into(),
                 field: "status".into(),
@@ -17482,6 +18902,7 @@ mod tests {
 
         let result = server
             .update_schema(Parameters(UpdateSchemaParams {
+                ops: None,
                 path: Some("notes".into()),
                 operation: "add_values".into(),
                 field: "tags".into(),
@@ -17653,7 +19074,8 @@ mod tests {
     ) -> crate::qdrant::SearchResult {
         let mut payload = HashMap::new();
         payload.insert("file_path".to_string(), serde_json::json!(file_path));
-        payload.insert("title".to_string(), serde_json::json!(title));
+        // Frontmatter under `fm`, as `ingest::upsert_pending` writes it (#350).
+        payload.insert("fm".to_string(), serde_json::json!({ "title": title }));
         payload.insert("text".to_string(), serde_json::json!("some body text"));
         crate::qdrant::SearchResult {
             score,
@@ -17705,6 +19127,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["notes/a.md", "notes/b.md"]
         );
+        assert_eq!(
+            arr.iter()
+                .map(|e| e["title"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["A", "B"],
+            "the title is read from the payload's `fm` object (#350)"
+        );
+    }
+
+    #[test]
+    fn build_chunk_search_payload_reads_type_and_tags_from_fm() {
+        let mut result = payload_search_result("/data/notes/a.md", "A", 0.9);
+        result.payload.insert(
+            "fm".to_string(),
+            serde_json::json!({ "title": "A", "type": "guide", "tags": ["x"] }),
+        );
+        // A top-level key of the shape before #350 is not frontmatter any more.
+        result
+            .payload
+            .insert("type".to_string(), serde_json::json!("stale"));
+        let structured = chunk_payload(&[result], false, false, false);
+        let row = &structured["results"][0];
+        assert_eq!(row["type"], "guide");
+        assert_eq!(row["tags"], serde_json::json!(["x"]));
     }
 
     #[test]
@@ -17746,15 +19192,10 @@ mod tests {
         result
             .payload
             .insert("chunk_index".to_string(), serde_json::json!(3));
-        result
-            .payload
-            .insert("domain".to_string(), serde_json::json!("notes"));
-        result
-            .payload
-            .insert("tags".to_string(), serde_json::json!([]));
-        result
-            .payload
-            .insert("type".to_string(), serde_json::json!(""));
+        result.payload.insert(
+            "fm".to_string(),
+            serde_json::json!({ "title": "A", "domain": "notes", "tags": [], "type": "" }),
+        );
         for explain in [false, true] {
             let structured = chunk_payload(std::slice::from_ref(&result), explain, false, false);
             let text = structured.to_string();
@@ -17896,7 +19337,7 @@ mod tests {
             payload_grouped_document("notes/a.md", "A", 0.9),
             payload_grouped_document("notes/b.md", "B", 0.5),
         ];
-        let structured = build_grouped_search_payload(&documents, None, false, false);
+        let structured = build_grouped_search_payload(&documents, None, &[], false, false);
         let obj = structured.as_object().unwrap();
         assert!(
             !obj.contains_key("total"),
@@ -17919,7 +19360,7 @@ mod tests {
 
     #[test]
     fn build_grouped_search_payload_empty_reports_zero() {
-        let structured = build_grouped_search_payload(&[], None, false, false);
+        let structured = build_grouped_search_payload(&[], None, &[], false, false);
         assert_eq!(
             structured,
             serde_json::json!({"returned": 0, "documents": []})
@@ -17929,18 +19370,19 @@ mod tests {
     #[test]
     fn build_grouped_search_payload_truncation_flags_appear_only_when_set() {
         let documents = vec![payload_grouped_document("notes/a.md", "A", 0.9)];
-        let structured = build_grouped_search_payload(&documents, None, true, true);
+        let structured = build_grouped_search_payload(&documents, None, &[], true, true);
         assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
         assert_eq!(structured["offset_truncated"], serde_json::json!(true));
-        let plain = build_grouped_search_payload(&documents, None, false, false);
+        let plain = build_grouped_search_payload(&documents, None, &[], false, false);
         assert!(plain.get("path_prefix_truncated").is_none(), "{plain}");
         assert!(plain.get("offset_truncated").is_none(), "{plain}");
     }
 
     /// A document row's `frontmatter` drops what the row already promotes
-    /// (`title`, `description`) and what the path derives (`domain`), keeping
-    /// `domain` only when the caller asked for it by name; `mtime` is not on a
-    /// grouped row at all.
+    /// (`title`, `description`) and what the path derives (the root schema's
+    /// `derived:` fields, #345), keeping a derived field only when the caller asked
+    /// for it by name; `mtime` is not on a grouped row at all. A field nothing
+    /// derives stays.
     #[test]
     fn document_rows_drop_promoted_and_derived_frontmatter_keys() {
         let mut doc = payload_grouped_document("notes/a.md", "A", 0.9);
@@ -17948,20 +19390,28 @@ mod tests {
         doc.summary.frontmatter = serde_json::json!({
             "title": "A", "description": "About A", "domain": "notes", "tags": ["x"],
         });
+        let derived = vec!["domain".to_string()];
         let structured =
-            build_grouped_search_payload(std::slice::from_ref(&doc), None, false, false);
+            build_grouped_search_payload(std::slice::from_ref(&doc), None, &derived, false, false);
         let row = &structured["documents"][0];
         assert_eq!(row["frontmatter"], serde_json::json!({"tags": ["x"]}));
         assert_eq!(row["description"], "About A");
         assert!(row.get("mtime").is_none(), "{row}");
 
+        let not_derived =
+            build_grouped_search_payload(std::slice::from_ref(&doc), None, &[], false, false);
+        assert_eq!(
+            not_derived["documents"][0]["frontmatter"]["domain"], "notes",
+            "derivation off: domain is an authored field"
+        );
+
         let fields = vec!["domain".to_string()];
-        let asked = build_grouped_search_payload(&[doc], Some(&fields), false, false);
+        let asked = build_grouped_search_payload(&[doc], Some(&fields), &derived, false, false);
         assert_eq!(asked["documents"][0]["frontmatter"]["domain"], "notes");
 
         let mut bare = payload_grouped_document("notes/b.md", "B", 0.5);
         bare.summary.frontmatter = serde_json::json!({"title": "B"});
-        let structured = build_grouped_search_payload(&[bare], None, false, false);
+        let structured = build_grouped_search_payload(&[bare], None, &[], false, false);
         assert!(
             structured["documents"][0].get("frontmatter").is_none(),
             "an empty projection is omitted: {structured}"
@@ -18023,5 +19473,700 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -- batched update_schema ops and explicit cascade semantics (#348) --------
+
+    /// `update_schema` arguments as a client sends them, through the real
+    /// `Deserialize` (so `ops` entries are parsed exactly as on the wire).
+    fn schema_args(args: serde_json::Value) -> UpdateSchemaParams {
+        serde_json::from_value(args).expect("test fixture must be valid update_schema args")
+    }
+
+    fn commit_count(work: &tempfile::TempDir) -> usize {
+        let out = std::process::Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    fn head_subject(work: &tempfile::TempDir) -> String {
+        let out = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    const BATCH_ROOT: &str = "fields:
+  tags:
+    type: list
+    values: [a, b, c]
+  status:
+    type: enum
+    values: [draft, active]
+";
+
+    /// A git-backed server over a work tree whose root schema is `BATCH_ROOT`,
+    /// committed.
+    fn batch_server() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        KbSearchServer,
+        Arc<crate::config::ResolvedConfig>,
+    ) {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        write_schema_file(&work, "", BATCH_ROOT);
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
+        let (server, config) = make_git_backed_server(&work);
+        (bare, work, server, config)
+    }
+
+    fn notes_schema(work: &tempfile::TempDir) -> Option<crate::schema::SchemaFile> {
+        let path = work
+            .path()
+            .join("notes")
+            .join(crate::schema::SCHEMA_FILE_NAME);
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|yaml| serde_yaml_ng::from_str(&yaml).unwrap())
+    }
+
+    #[test]
+    fn ops_and_the_flat_parameters_are_mutually_exclusive_and_bounded() {
+        let msg =
+            |args: serde_json::Value| build_schema_edits(&schema_args(args)).unwrap_err().message;
+        assert!(msg(serde_json::json!({})).contains("needs `ops`"));
+        assert!(msg(serde_json::json!({"ops": []})).contains("at least one"));
+        let both = msg(serde_json::json!({
+            "operation": "add_values",
+            "field": "tags",
+            "values": ["x"],
+            "ops": [{"operation": "remove_field", "field": "tags"}]
+        }));
+        assert!(both.contains("not both"), "{both}");
+        // The flat `definition` cannot carry a patch's nulls, so the shim refuses it.
+        let legacy_patch = msg(serde_json::json!({
+            "operation": "patch_field",
+            "field": "tags",
+            "definition": {"required": true}
+        }));
+        assert!(
+            legacy_patch.contains("only available through `ops`"),
+            "{legacy_patch}"
+        );
+        let many: Vec<serde_json::Value> = (0..=MAX_SCHEMA_OPS)
+            .map(|i| serde_json::json!({"operation": "remove_field", "field": format!("f{i}")}))
+            .collect();
+        assert!(msg(serde_json::json!({"ops": many})).contains("too many operations"));
+        // Per-op bounds still apply, and name the offending op in a batch.
+        let bad = msg(serde_json::json!({"ops": [
+            {"operation": "remove_field", "field": "ok"},
+            {"operation": "add_values", "field": "tags", "values": []}
+        ]}));
+        assert!(bad.starts_with("ops[1]: "), "{bad}");
+        assert!(bad.contains("non-empty values list"), "{bad}");
+        let deep = vec!["a"; MAX_SCHEMA_PATH_SEGMENTS + 1].join(".");
+        assert!(
+            msg(serde_json::json!({"ops": [{"operation": "remove_field", "field": deep}]}))
+                .contains("too deep")
+        );
+        // `operation` is a closed enum, and an op takes no unknown keys.
+        for bad in [
+            serde_json::json!({"ops": [{"operation": "drop_table", "field": "x"}]}),
+            serde_json::json!({"ops": [{"operation": "remove_field", "field": "x", "valuez": []}]}),
+        ] {
+            assert!(serde_json::from_value::<UpdateSchemaParams>(bad).is_err());
+        }
+        // patch_field needs keys to change.
+        assert!(
+            msg(serde_json::json!({"ops": [{"operation": "patch_field", "field": "x", "definition": {}}]}))
+                .contains("requires a definition")
+        );
+    }
+
+    #[test]
+    fn a_patch_definition_keeps_its_nulls_and_also_arrives_as_a_string() {
+        let edits = build_schema_edits(&schema_args(serde_json::json!({"ops": [
+            {"operation": "patch_field", "field": "x", "definition": {"required": null, "indexed": true}},
+            {"operation": "patch_field", "field": "y", "definition": "{\"open\": null}"}
+        ]})))
+        .unwrap();
+        match &edits[0] {
+            crate::schema::SchemaEdit::PatchField { patch, .. } => {
+                assert_eq!(patch["required"], serde_json::Value::Null);
+                assert_eq!(patch["indexed"], serde_json::json!(true));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            &edits[1],
+            crate::schema::SchemaEdit::PatchField { patch, .. } if patch.contains_key("open")
+        ));
+        // set_field in an op still refuses an unknown key, naming it.
+        let err = build_schema_edits(&schema_args(serde_json::json!({"ops": [
+            {"operation": "set_field", "field": "x", "definition": {"typ": "text"}}
+        ]})))
+        .unwrap_err();
+        assert!(err.message.contains("typ"), "{}", err.message);
+    }
+
+    #[test]
+    fn reinherit_is_the_null_free_way_to_inherit_a_key_again() {
+        let edits = |args: serde_json::Value| build_schema_edits(&schema_args(args));
+        // `reinherit` lowers to exactly the patch a literal `null` gives, alone or
+        // next to keys being set.
+        let via_list = edits(serde_json::json!({"ops": [
+            {"operation": "patch_field", "field": "x", "reinherit": ["required"]},
+            {"operation": "patch_field", "field": "y", "definition": {"indexed": true},
+             "reinherit": ["values", "open"]}
+        ]}))
+        .unwrap();
+        let via_null = edits(serde_json::json!({"ops": [
+            {"operation": "patch_field", "field": "x", "definition": {"required": null}},
+            {"operation": "patch_field", "field": "y",
+             "definition": {"indexed": true, "values": null, "open": null}}
+        ]}))
+        .unwrap();
+        assert_eq!(format!("{via_list:?}"), format!("{via_null:?}"));
+
+        let msg = |args: serde_json::Value| edits(args).unwrap_err().message;
+        let not_patch = msg(serde_json::json!({"ops": [
+            {"operation": "set_field", "field": "x", "definition": {"type": "text"},
+             "reinherit": ["required"]}
+        ]}));
+        assert!(not_patch.contains("only to patch_field"), "{not_patch}");
+        let unknown = msg(serde_json::json!({"ops": [
+            {"operation": "patch_field", "field": "x", "reinherit": ["requird"]}
+        ]}));
+        assert!(
+            unknown.contains("requird") && unknown.contains(FIELD_DEFINITION_KEYS),
+            "{unknown}"
+        );
+        let both = msg(serde_json::json!({"ops": [
+            {"operation": "patch_field", "field": "x", "definition": {"required": true},
+             "reinherit": ["required"]}
+        ]}));
+        assert!(both.contains("both set"), "{both}");
+        // An empty list with no definition still has nothing to change.
+        assert!(
+            msg(serde_json::json!({"ops": [
+                {"operation": "patch_field", "field": "x", "reinherit": []}
+            ]}))
+            .contains("requires a definition")
+        );
+    }
+
+    #[test]
+    fn field_definition_key_names_match_the_listed_keys() {
+        let listed: Vec<&str> = FIELD_DEFINITION_KEYS
+            .split(',')
+            .map(|k| k.trim().trim_matches('`'))
+            .collect();
+        assert_eq!(listed, FIELD_DEFINITION_KEY_NAMES);
+    }
+
+    #[tokio::test]
+    async fn reinherit_through_the_tool_drops_the_local_key() {
+        let (_bare, work, server, _config) = batch_server();
+        write_schema_file(
+            &work,
+            "notes",
+            "fields:\n  status:\n    required: true\n    indexed: true\n",
+        );
+        git_commit_all(
+            &work,
+            &format!("notes/{}", crate::schema::SCHEMA_FILE_NAME),
+            "notes schema",
+        );
+        server
+            .update_schema(Parameters(schema_args(serde_json::json!({
+                "path": "notes",
+                "ops": [{"operation": "patch_field", "field": "status",
+                         "reinherit": ["required"]}]
+            }))))
+            .await
+            .unwrap();
+        assert_eq!(
+            notes_schema(&work).unwrap().fields["status"],
+            crate::schema::RawFieldDef {
+                indexed: Some(true),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_ops_land_as_one_commit() {
+        let (_bare, work, server, _config) = batch_server();
+        let before = commit_count(&work);
+
+        let result = server
+            .update_schema(Parameters(schema_args(serde_json::json!({
+                "path": "notes",
+                "ops": [
+                    {"operation": "add_values", "field": "tags", "values": ["d"]},
+                    {"operation": "remove_values", "field": "status", "values": ["draft"]},
+                    {"operation": "set_field", "field": "rating", "definition": {"type": "integer"}},
+                    {"operation": "patch_field", "field": "rating", "definition": {"indexed": true}}
+                ]
+            }))))
+            .await
+            .expect("the batch lands");
+        let structured = single_representation(&result);
+        assert_eq!(structured["path"], "notes/");
+        let summary = structured["summary"].as_str().unwrap();
+        assert!(summary.contains("added to 'tags': d"), "{summary}");
+        assert!(summary.contains("patched 'rating'"), "{summary}");
+
+        assert_eq!(
+            commit_count(&work),
+            before + 1,
+            "one commit for the whole batch"
+        );
+        let subject = head_subject(&work);
+        assert!(
+            subject.starts_with("schema: 4 changes in notes/: added to 'tags'"),
+            "{subject}"
+        );
+        let file = notes_schema(&work).unwrap();
+        assert_eq!(
+            file.fields["tags"].values,
+            Some(vec!["$values".into(), "d".into()])
+        );
+        assert_eq!(
+            file.fields["status"].exclude_values,
+            Some(vec!["draft".into()])
+        );
+        assert_eq!(
+            file.fields["rating"].ty,
+            Some(crate::schema::FieldType::Integer)
+        );
+        assert_eq!(file.fields["rating"].indexed, Some(true));
+    }
+
+    #[tokio::test]
+    async fn update_schema_ops_are_all_or_nothing() {
+        let (_bare, work, server, _config) = batch_server();
+        let head_before = head_sha(&work);
+
+        let err = server
+            .update_schema(Parameters(schema_args(serde_json::json!({
+                "path": "notes",
+                "ops": [
+                    {"operation": "add_values", "field": "tags", "values": ["d"]},
+                    {"operation": "set_field", "field": "rating", "definition": {"type": "integer"}},
+                    {"operation": "remove_field", "field": "never_declared"}
+                ]
+            }))))
+            .await
+            .expect_err("the last op fails, so the batch does");
+        assert!(
+            err.message
+                .starts_with("ops[2] (remove_field 'never_declared'): "),
+            "{}",
+            err.message
+        );
+        assert_eq!(head_sha(&work), head_before, "nothing committed");
+        assert!(notes_schema(&work).is_none(), "nothing written");
+        assert_eq!(git_status(&work), "", "the work tree is clean");
+
+        // A batch that validates op by op but leaves a self-contradictory file is
+        // refused as a whole too: `validate_self` runs once, on the result.
+        let err = server
+            .update_schema(Parameters(schema_args(serde_json::json!({
+                "path": "notes",
+                "ops": [
+                    {"operation": "set_field", "field": "planning", "definition": {"type": "text"}},
+                    {"operation": "patch_field", "field": "planning", "definition": {"fields": {"x": {"type": "text"}}}}
+                ]
+            }))))
+            .await
+            .expect_err("a value with nested fields is refused");
+        assert!(err.message.contains("nested fields"), "{}", err.message);
+        assert_eq!(head_sha(&work), head_before);
+        assert!(notes_schema(&work).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_flat_parameters_act_exactly_like_a_one_op_batch() {
+        for dry_run in [true, false] {
+            let mut results = Vec::new();
+            let mut files = Vec::new();
+            for args in [
+                serde_json::json!({
+                    "path": "notes",
+                    "operation": "set_field",
+                    "field": "status",
+                    "definition": {"type": "enum", "values": ["x"], "required": true},
+                    "dry_run": dry_run,
+                }),
+                serde_json::json!({
+                    "path": "notes",
+                    "ops": [{
+                        "operation": "set_field",
+                        "field": "status",
+                        "definition": {"type": "enum", "values": ["x"], "required": true}
+                    }],
+                    "dry_run": dry_run,
+                }),
+            ] {
+                let (_bare, work, server, _config) = batch_server();
+                let result = server
+                    .update_schema(Parameters(schema_args(args)))
+                    .await
+                    .unwrap();
+                results.push(single_representation(&result));
+                files.push((
+                    notes_schema(&work).map(|f| f.to_yaml().unwrap()),
+                    head_subject(&work),
+                ));
+            }
+            assert_eq!(results[0], results[1], "dry_run={dry_run}");
+            assert_eq!(files[0], files[1], "dry_run={dry_run}");
+            if dry_run {
+                assert_eq!(results[0]["field"], "status");
+                assert!(results[0].get("ops").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_dry_run_reports_each_op_and_the_combined_casualties() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "", BATCH_ROOT);
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "notes/a.md",
+            serde_json::json!({"title": "A", "status": "draft"}),
+        )
+        .await;
+
+        let result = server
+            .update_schema(Parameters(schema_args(serde_json::json!({
+                "path": "notes",
+                "dry_run": true,
+                "ops": [
+                    {"operation": "remove_values", "field": "status", "values": ["draft"]},
+                    {"operation": "set_field", "field": "rating", "definition": {"required": true}},
+                    {"operation": "add_values", "field": "status", "values": ["paused"]}
+                ]
+            }))))
+            .await
+            .unwrap();
+        let structured = single_representation(&result);
+        assert_eq!(structured["dry_run"], true);
+        assert!(structured.get("field").is_none(), "{structured}");
+        let ops = structured["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0]["operation"], "remove_values");
+        assert!(
+            ops[0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("now excluded here")
+        );
+        // Each field as the whole batch leaves it.
+        assert_eq!(
+            ops[0]["definition"]["values"],
+            serde_json::json!(["active", "paused"])
+        );
+        assert_eq!(ops[1]["definition"]["required"], true);
+        // One casualty pass over the batch's result: the document fails both the
+        // excluded value and the new required field, and is reported once.
+        let casualties = structured["would_invalidate"].as_array().unwrap();
+        assert_eq!(casualties.len(), 1, "{casualties:?}");
+        assert_eq!(casualties[0]["error_count"], 2, "{casualties:?}");
+        assert!(
+            !tmp.path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_root_guard_is_judged_per_op_in_a_batch() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        write_schema_file(
+            &work,
+            "",
+            &format!("{GUARDED_ROOT}fields:\n  tags:\n    values: [a, b, c]\n"),
+        );
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
+        let (server, _config) = make_git_backed_server(&work);
+        let root_values = || {
+            let yaml =
+                std::fs::read_to_string(work.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap();
+            serde_yaml_ng::from_str::<crate::schema::SchemaFile>(&yaml)
+                .unwrap()
+                .fields["tags"]
+                .values
+                .clone()
+        };
+        let ops = serde_json::json!([
+            {"operation": "remove_values", "field": "tags", "values": ["a"]},
+            {"operation": "add_values", "field": "tags", "values": ["z"]}
+        ]);
+
+        let err = server
+            .update_schema(Parameters(schema_args(serde_json::json!({"ops": ops}))))
+            .await
+            .expect_err("one gated op guards the whole batch");
+        assert!(
+            err.message.contains("root schema changes are guarded"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            root_values(),
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
+
+        // A dry run of it is not guarded.
+        server
+            .update_schema(Parameters(schema_args(
+                serde_json::json!({"ops": ops, "dry_run": true}),
+            )))
+            .await
+            .expect("a dry run is exempt");
+
+        // A batch of only exempt ops needs no acknowledgement.
+        server
+            .update_schema(Parameters(schema_args(serde_json::json!({"ops": [
+                {"operation": "remove_values", "field": "tags", "values": ["c"]},
+                {"operation": "remove_values", "field": "tags", "values": ["b"]}
+            ]}))))
+            .await
+            .expect("remove_values is exempt");
+        assert_eq!(root_values(), Some(vec!["a".into()]));
+
+        server
+            .update_schema(Parameters(schema_args(serde_json::json!({
+                "ops": ops,
+                "acknowledge_root_change": true
+            }))))
+            .await
+            .expect("acknowledged");
+        assert_eq!(root_values(), Some(vec!["z".into()]));
+    }
+
+    #[tokio::test]
+    async fn remove_values_on_an_inherited_value_excludes_it_and_add_values_undoes_it() {
+        let (_bare, work, server, _config) = batch_server();
+
+        server
+            .update_schema(Parameters(UpdateSchemaParams {
+                operation: "remove_values".into(),
+                ..add_values_params("notes", "tags", &["a"])
+            }))
+            .await
+            .expect("an inherited value is excluded rather than refused");
+        let file = notes_schema(&work).unwrap();
+        assert_eq!(file.fields["tags"].exclude_values, Some(vec!["a".into()]));
+        assert_eq!(file.fields["tags"].values, None);
+        let got = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("notes".into()),
+                fields: Some(vec!["tags".into()]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            got.structured_content.unwrap()["fields"]["tags"]["values"],
+            serde_json::json!(["b", "c"])
+        );
+
+        let result = server
+            .update_schema(Parameters(add_values_params("notes", "tags", &["a"])))
+            .await
+            .expect("adding the excluded value back");
+        assert_eq!(
+            single_representation(&result)["summary"],
+            "added to 'tags': a"
+        );
+        let file = notes_schema(&work).unwrap();
+        assert!(!file.fields.contains_key("tags"), "{:?}", file.fields);
+    }
+
+    #[tokio::test]
+    async fn patch_field_through_the_tool_minimizes_and_reports_cross_kind_changes() {
+        let (_bare, work, server, _config) = batch_server();
+        write_schema_file(
+            &work,
+            "notes",
+            "fields:\n  status:\n    required: true\n    indexed: true\n",
+        );
+        git_commit_all(
+            &work,
+            &format!("notes/{}", crate::schema::SCHEMA_FILE_NAME),
+            "notes schema",
+        );
+
+        // `null` re-inherits `required`; `type: enum` is what the root says already.
+        let result = server
+            .update_schema(Parameters(schema_args(serde_json::json!({
+                "path": "notes",
+                "ops": [{"operation": "patch_field", "field": "status",
+                         "definition": {"required": null, "type": "enum"}}]
+            }))))
+            .await
+            .unwrap();
+        assert_eq!(
+            single_representation(&result)["summary"],
+            "patched 'status'"
+        );
+        let file = notes_schema(&work).unwrap();
+        assert_eq!(
+            file.fields["status"],
+            crate::schema::RawFieldDef {
+                indexed: Some(true),
+                ..Default::default()
+            }
+        );
+
+        // A same-kind change warns about nothing; a cross-kind one lands with a
+        // warning.
+        let same = server
+            .update_schema(Parameters(schema_args(serde_json::json!({
+                "path": "notes",
+                "ops": [{"operation": "patch_field", "field": "status",
+                         "definition": {"type": "text"}}]
+            }))))
+            .await
+            .unwrap();
+        assert!(single_representation(&same).get("warnings").is_none());
+        let cross = server
+            .update_schema(Parameters(schema_args(serde_json::json!({
+                "path": "notes",
+                "ops": [{"operation": "patch_field", "field": "tags",
+                         "definition": {"type": "text"}}]
+            }))))
+            .await
+            .expect("a cross-kind change is a warning, not a refusal");
+        let warnings = single_representation(&cross)["warnings"].clone();
+        assert!(
+            warnings[0]
+                .as_str()
+                .is_some_and(|w| w.contains("'list'") && w.contains("'text'")),
+            "{warnings}"
+        );
+        assert_eq!(
+            notes_schema(&work).unwrap().fields["tags"].ty,
+            Some(crate::schema::FieldType::Text)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_field_disappears_from_get_schema_below_the_scope() {
+        let (_bare, work, server, _config) = batch_server();
+        server
+            .update_schema(Parameters(schema_args(serde_json::json!({
+                "path": "notes",
+                "ops": [{"operation": "set_field", "field": "status",
+                         "definition": {"removed": true}}]
+            }))))
+            .await
+            .unwrap();
+        assert!(notes_schema(&work).unwrap().fields["status"].removed);
+        for path in ["notes", "notes/deeper"] {
+            let got = server
+                .get_schema(Parameters(GetSchemaParams {
+                    path: Some(path.into()),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+            let fields = got.structured_content.unwrap()["fields"].clone();
+            assert!(fields.get("status").is_none(), "{path}: {fields}");
+            assert!(fields.get("tags").is_some(), "{path}: {fields}");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_batches_both_land() {
+        let h = concurrent_harness();
+        let schema_rel = format!("docs/{}", crate::schema::SCHEMA_FILE_NAME);
+        peer_push(
+            h.peer.path(),
+            &schema_rel,
+            "fields:\n  status:\n    type: enum\n    values: [active]\n",
+        );
+        let batch = |value: &str, field: &str| {
+            schema_args(serde_json::json!({
+                "path": "docs",
+                "ops": [
+                    {"operation": "add_values", "field": "status", "values": [value]},
+                    {"operation": "set_field", "field": field, "definition": {"type": "text"}}
+                ]
+            }))
+        };
+        let other = h.server.clone();
+        let theirs = batch("gamma", "theirs");
+        with_hook_once(
+            crate::git::HookPoint::BeforeLock,
+            move || async move {
+                other
+                    .update_schema(Parameters(theirs))
+                    .await
+                    .expect("the concurrent batch lands");
+            },
+            h.server.update_schema(Parameters(batch("beta", "ours"))),
+        )
+        .await
+        .expect("the batch applies to the schema as it is under the lock");
+
+        let written = std::fs::read_to_string(h.work.path().join(&schema_rel)).unwrap();
+        for expected in ["active", "beta", "gamma", "theirs", "ours"] {
+            assert!(written.contains(expected), "{expected}: {written}");
+        }
+        assert_eq!(rev(h.work.path(), "HEAD"), rev(h._bare.path(), "master"));
+    }
+
+    #[tokio::test]
+    async fn get_schema_compact_names_each_declaring_directory_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  title:\n    required: true\n  a:\n    type: text\n",
+        );
+        write_schema_file(&tmp, "food", "fields:\n  prep:\n    type: integer\n");
+        let server = schema_tool_server(&tmp);
+        let get = |compact: Option<bool>| {
+            server.get_schema(Parameters(GetSchemaParams {
+                path: Some("food".into()),
+                compact,
+                ..Default::default()
+            }))
+        };
+
+        let full = get(None).await.unwrap().structured_content.unwrap();
+        assert_eq!(full["fields"]["prep"]["declared_in"], "food/");
+        assert!(full.get("declared_in").is_none());
+
+        let compact = get(Some(true)).await.unwrap().structured_content.unwrap();
+        assert_eq!(
+            compact["declared_in"],
+            serde_json::json!({"/": ["a", "title"], "food/": ["prep"]})
+        );
+        assert_eq!(
+            compact["fields"],
+            serde_json::json!({
+                "a": {"type": "text"},
+                "prep": {"type": "integer"},
+                "title": {"required": true}
+            })
+        );
     }
 }

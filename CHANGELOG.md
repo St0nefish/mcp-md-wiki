@@ -14,6 +14,276 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+### FULL RE-EMBED on the first reconcile after upgrading: typed, namespaced Qdrant payload (#350)
+
+**Coordinate the release with the owner.** This release changes what every Qdrant
+point carries, and bumps `ingest::CHUNKER_VERSION` (2 → 3) to rewrite them: every
+file's chunking fingerprint goes stale, so **the first reconcile after the new
+version starts (startup, the periodic sweep, or `/admin/reload`) re-chunks and
+re-embeds the whole corpus** — one embedding call per chunk of every document,
+with the time and embedding-endpoint cost of a full `index --full` (but without
+dropping the collection). No operator step is needed to start it. While it runs:
+
+- points still in the old shape match **no** frontmatter filter (query-mode
+  `filters`, and the CLI/web `domain`/`type`/`tags` filters, now address `fm.*`
+  keys), so filtered search results are **incomplete until the re-embed finishes**;
+  unfiltered search, `get_document` and enumeration mode (`search` without a
+  `query`, which reads SQLite) are unaffected. The sticky `stale_chunking` latch
+  behind `IndexStatus::is_bulk_indexing` is set by the reconcile scan and stays set
+  through retries until a run completes, so `section` and `heading_prefix` results
+  carry the "results may be incomplete" note for the whole transition;
+- result titles, `type` and `tags` still render for old-shape points: a payload
+  with no `fm` key is read at its top level (`qdrant::frontmatter_value`);
+- `/status` shows the run's progress (`chunks_total`, `phase`).
+
+Rolling back to an older binary afterwards would face the opposite mismatch and
+re-embed again (its `CHUNKER_VERSION` differs too).
+
+- **Payload shape.** Frontmatter moves from the top level of each point's payload
+  into one `fm` object, with its own structure (`fm.planning.prep_minutes`,
+  `fm.npcs[].role`); `title` and `description` live there too. The built-in keys —
+  `file_path`, `mtime`, `chunk_index`, `text`, `text_body_offset`, `line_start`,
+  `line_end`, `path_ancestors`, the heading/section keys — stay at the top level, so
+  a frontmatter key can no longer collide with one.
+- **Typed values.** A declared field's value is written as its type: `integer` as an
+  integer (an integral `3.0`, which validation accepts, as `3`, so it matches an
+  integer filter), `number` as the number written, `text`/`enum` as a string, `boolean` as is,
+  `date`/`timestamp` as RFC 3339 UTC text (`2024-01-02` → `2024-01-02T00:00:00Z`,
+  offsets normalized to `Z`). Undeclared fields are written as they are. Dates are
+  parsed by the same function as the metadata index's epoch seconds, so both search
+  modes place a date at the same instant.
+- **Datetime indexes and ranges with a query.** `date`/`timestamp` fields declared
+  `indexed` get a Qdrant datetime index (was keyword), and a range on them works
+  with a `query` (`{"published": {"gte": "2024-01-01"}}`, date-only bounds at
+  midnight UTC, compared at microsecond precision), lifting #349's refusal. Equality
+  on such a field matches the instant (enumeration mode compares the text as
+  written, so a timestamp spelled with another offset for the same instant matches
+  only in query mode).
+- **Correlated list filters with a query.** `{"npcs[]": {...}}` runs as a Qdrant
+  nested filter, every condition within one element, lifting #349's refusal. List
+  sub-fields declared `indexed: true` (`npcs[].role`) get payload indexes
+  (`fm.npcs[].role`), which a query-mode filter on them — plain or correlated —
+  needs; a `list` with typed `items` is indexed as the item type.
+- **Payload indexes are reconciled on every startup and indexing run.** One whose
+  kind no longer matches the declared type is deleted and recreated, a missing one is
+  created, and the unprefixed index an older version left on a declared field's name
+  (`tags`) is dropped — no more "delete the payload index and reindex" after a type
+  change. **`/status` and `/metrics` now name indexes by payload key**: `fm.tags`,
+  `fm.planning.prep_minutes` (`file_path`, `mtime`, `path_ancestors`, `text` and the
+  heading keys unchanged); update dashboards or alerts on
+  `kb_payload_index_ok{field=...}`.
+- A schema `type` change that writes values differently (`text` → `integer`) now
+  refreshes the payload in place through #351's path (no re-embed); one that does
+  not (`text` → `enum`) changes nothing in Qdrant.
+- The reserved-name lint for top-level schema fields (`file_path`, `text`, …, `fm`)
+  stays, reworded: frontmatter no longer collides with those keys, but a `file_path`
+  filter always means the document's path.
+
+### Breaking: `domain` derivation and the root-edit guard are opt-in (#345)
+
+**Upgrade action required right after deploying.** Two policies that were
+hard-coded for one knowledge base now come from two new root-only blocks in the root
+`.schema.yaml`, and both are **absent by default**: no `derived:` block means no
+field is derived (`domain` included), and no `root_edit:` block means `update_schema`
+edits to the root need no acknowledgement. A knowledge base that relies on either
+must add, to its root `.schema.yaml`, **as soon as the new version is running —
+never before**: an older binary rejects the unknown `derived:`/`root_edit:` keys,
+so a commit that lands first makes the running old server refuse the schema
+rebuild (and fail to start if it restarts). Commit:
+
+```yaml
+derived:
+  domain: { from: path_segment, index: 0 }
+root_edit:
+  require_ack: true
+  policy_doc: meta/schema-tag-policy.md   # the owner KB's policy document
+```
+
+Until the blocks are committed, `domain` derivation and the root-edit guard
+**silently stop**. The gap is harmless to the existing index — without a `derived:`
+block every fingerprint is unchanged, so nothing is reindexed — but a document
+written or reindexed in the gap is stored without `domain` (or with whatever it
+authors) until the block lands and reprocesses it, and root schema edits go through
+unacknowledged meanwhile. Keep the gap short. A deployment with no root
+`.schema.yaml` (rules only in `config.yaml`'s `frontmatter` block) derives
+nothing; add a root schema file to keep deriving.
+
+- **`derived:`** maps a field name to `{from: path_segment, index: n}`: the
+  document's `n`-th directory (0 = the top-level folder; the file name never counts),
+  so other corpora can derive other fields (`campaign: {from: path_segment, index:
+  1}`) or none. A document with no such directory gets no value. Everything that
+  used to be special-cased for `domain` now follows the configured names: the value
+  is written to the Qdrant payload and the metadata index, overriding an authored
+  one; a write that authors a derived field is refused (`rule: "derived"`, now
+  worded "`<field>` is set from the document's folder; remove it from the
+  frontmatter"); a schema `required`/`default` on it is ignored; `get_schema` never
+  lists it; `search` accepts it as a filter and leaves it out of a row's
+  `frontmatter` unless named in `fields`. Invalid entries (another `from`, an `index`
+  over 32, a name that is not a plain top-level field name of up to 64 characters,
+  a reserved name such as `file_path` or `title`, more than 16 fields, a field named
+  twice) make the file invalid.
+- **`root_edit:`** `{require_ack: true}` refuses a root `add_values`/`set_field`/
+  `remove_field` without `acknowledge_root_change: true` (`dry_run` and
+  `remove_values` stay exempt). The refusal names `policy_doc` only when set and no
+  longer carries this KB's wording ("tag vocabulary is identity-only").
+- Both blocks take effect only in the root schema and are inherited by every
+  directory; in any other schema file they are ignored with a lint warning.
+  `update_schema` cannot write them but preserves them when it rewrites the root
+  file.
+- **Reindex:** `derived` is part of the schema fingerprint (only when non-empty, so
+  every existing schema hashes exactly as before and the upgrade alone reindexes
+  nothing). Adding the `derived:` block above therefore changes every document's
+  fingerprint, and the next reconcile reprocesses the whole corpus, as does any
+  later change to the block — since #351 (below) by refreshing each document's
+  metadata and Qdrant payload in place, not by re-chunking or re-embedding it.
+  Adding, changing or removing `root_edit:` reindexes nothing.
+- The server instructions still say nothing about derived fields; the write-time
+  refusal is what tells a model.
+
+### Explicit cascade semantics and batched `update_schema` ops (#348)
+
+**Deploy order:** the new schema keys `removed` and `exclude_values` (like `items`
+from #346) are unknown to older servers, whose schema files are
+`deny_unknown_fields`: an older server refuses the whole schema over one. Deploy
+this version before any `.schema.yaml` uses them, and if you roll back afterwards,
+take them out of the knowledge base first — otherwise the older server refuses the
+schema rebuild and fails to start.
+
+- **`removed: true`** in a directory's schema deletes an inherited field, with
+  everything nested under it, from that directory and every directory below it; a
+  deeper directory may declare it again from scratch. It works at any depth
+  (`planning.effort`, `npcs[]`). A removing declaration may carry no other key (the
+  file is invalid otherwise).
+- **`exclude_values: [...]`** takes inherited values out of a field's set in that
+  directory: applied after the declaration's own `values` (and its `$values`
+  splice), so a value in both is excluded. `$`-prefixed entries make the file
+  invalid.
+- **Same-kind type changes.** A directory may retype an inherited field within one
+  kind (`text`/`enum`/`date`/`timestamp`; `integer`/`number`); a change to another
+  kind (scalar ↔ `list`/`object`, `list` ↔ `object`, to or from `boolean`) is now a
+  **lint warning**, not yet an error — logged and returned in `update_schema`'s
+  `warnings`, never a refusal. Also warned: `removed: true` on a field nothing above
+  declares, `exclude_values` naming a value the field does not have there (or on a
+  field with no value set — such a declaration also declares no field), a value in
+  both `values` and `exclude_values`, and `values`/`exclude_values` that no longer
+  permit the default the field inherits (documents omitting it would be given an
+  invalid value).
+- **`update_schema` takes `ops`**: a list of `{operation, field, values?,
+  definition?}` applied in order and **atomically** — validated once on the result
+  and written as **one commit**, or not at all if any op fails (the error names it:
+  `ops[2] (remove_field 'x'): …`); at most 50 per call. `operation` is a closed enum
+  (`add_values`, `remove_values`, `set_field`, `patch_field`, `remove_field`). The
+  root-edit guard applies when any op in the batch needs it. A multi-op `dry_run`
+  returns `ops: [{operation, field, summary, definition?}]` and one combined
+  `would_invalidate`; a single op keeps the old `field`/`definition` shape.
+- **Deprecated:** the flat `operation`/`field`/`values`/`definition` parameters.
+  They still work for this release, as a one-op batch with the same result and
+  response shape, and will be removed in the next; passing them together with `ops`
+  is refused. The new `patch_field` is only available through `ops` (the flat
+  `definition` cannot carry its `null`s). No parameter is marked required in the
+  advertised schema any more.
+- `add_values`, `remove_values` and `patch_field` on a field the directory itself
+  removes (`removed: true`) are refused; re-declare it with `set_field` first.
+- **`patch_field`** changes only the keys it is given (nested `fields` merge per
+  child, `items` likewise; any other key replaces), `null` for a key drops the
+  directory's own setting so it is inherited again — or, for a client that enforces
+  the advertised schema (which carries no `null` arms), the op's `reinherit` array
+  names those keys (`"reinherit": ["required"]`) — and the written declaration is
+  minimized against the inherited one — attributes equal to what it inherits are
+  not written, and a declaration left saying nothing is removed.
+- **`remove_values` of an inherited value** now writes `exclude_values` in the
+  directory instead of failing with "not declared in this scope" / "has no value
+  list"; `add_values` of an excluded value drops the exclusion.
+- **`get_schema` `compact: true`** (opt-in; the default output is unchanged) names
+  each declaring directory once, in a top-level `declared_in` map of directory →
+  field names, instead of on every field.
+- **Reindex:** none on upgrade. The new keys change the schema fingerprint only
+  through what they remove or exclude, and only for the directories that use them,
+  so a knowledge base that does not use them hashes exactly as before.
+
+### Schema edits no longer re-embed (#351)
+
+- A schema edit used to re-chunk and re-embed every document it governs, although
+  chunk text does not depend on the schema. Now a document whose bytes and chunking
+  settings are unchanged is **revalidated** (an invalid one is still dropped from the
+  index in non-strict mode, and a strict-mode rejection still keeps its last good
+  version), its metadata index row and links are rewritten, and — only when the
+  edit changed what goes into its Qdrant payload, i.e. a field `default` or the root
+  `derived:` block — its payload is updated **in place** (with #350, one write
+  replacing the `fm` object, which drops a key the edit removed; chunk text, line
+  ranges and heading keys are untouched). No embedding call, no point upsert.
+- **Exception:** with `chunking.prepend_description` on (the default), a document's
+  `description` is prepended to every chunk's embedded text, and a schema `default`
+  for `description` can change it. A document whose prepended description a schema
+  edit changes (the default added, changed or removed while the document has no
+  `description` of its own) is still re-chunked and re-embedded; one with its own
+  `description` is not. A document with no stored metadata row is re-embedded too.
+- New `indexed_files.payload_hash` column (added automatically) tracks the
+  payload-shaping part of the schema next to `schema_hash`, which keeps its meaning.
+  `/status`, `/metrics` and the run summary gain a `refreshed` count.
+- A schema edit no longer lights the "results may be incomplete" note on `section`
+  and `heading_prefix` results: the chunks those come from are unchanged.
+- **Reindex:** the new column forces nothing by itself — existing rows get an
+  empty `payload_hash`, read as "current" while `schema_hash` matches. **This
+  release re-embeds the whole corpus anyway**, because #350 bumps
+  `CHUNKER_VERSION` (see the top of this section); that re-embed writes every row's
+  `payload_hash`, so later schema edits refresh payloads in place without
+  re-embedding.
+- Since #350 (same release) the frontmatter is one `fm` payload key, which the
+  refresh sets as a whole, so a frontmatter key named like a heading/section payload
+  key (`section_key`, …) no longer meets the chunk's own key in either mode.
+
+### Schema-driven metadata projection and correlated list filters (#349)
+
+- **First start after upgrading rebuilds `document_fields` automatically.** The
+  table gains an `elem` column in its primary key, which SQLite cannot add in place,
+  so opening an older database drops the table; the server (and every `index` run)
+  then reprojects every document from the stored `documents.frontmatter` before
+  serving or indexing. **Reproject only: no markdown is re-read, nothing is
+  embedded, and Qdrant is not touched.** The projection version is kept in SQLite's
+  `PRAGMA user_version` and recorded only once a reproject completes with no
+  failed document, so an interrupted one simply reruns. A future change to the
+  projection rules bumps `state::PROJECTION_VERSION` and is caught up the same way.
+  `reproject-fields` now reads each document under its governing schema (it builds
+  the schema tree, refusing to run on an invalid schema file like `validate`).
+  Run against an old database first, a CLI command that does not reproject
+  (`status`, `lint`, `validate`) still rebuilds the table on open, leaving the
+  projection empty — enumeration filters match nothing, `/status` breakdowns are
+  blank — until the next `serve`, `index` or `reproject-fields`. An automatic
+  reproject that fails is retried once per process, then left to the next start
+  or a `reproject-fields`.
+- Date and timestamp ranges work with a `query` too (#350, same release). A range
+  on a field every scope declares `text`, `enum`, `list` of non-numbers or `object`
+  is refused in both modes, naming the type, instead of silently matching nothing.
+- **Lists of objects are filterable.** `npcs: [{role: guard, level: 3}]` projects
+  as `npcs[].role`/`npcs[].level` rows keyed by element, in enumeration mode
+  (`search` without `query`, `/api/enumerate`): `{"npcs[].role": "guard"}` matches
+  any element, and the new **correlated list filter**
+  `{"npcs[]": {"role": "guard", "level": {"gte": 3}}}` requires every condition to
+  hold within **one** element. Its conditions are any ordinary filter form (one
+  level only, at most 20 row tests, each `all_of` value counting as one). With a
+  `query` it runs as a Qdrant nested filter (#350, same release). Unknown
+  sub-fields and values outside a sub-field's closed set are refused with the
+  options listed, like any other filter. Previously a list holding objects was
+  skipped entirely.
+- **Projection depth is 16 path steps** (was 4), the same limit `update_schema`
+  allows a schema to declare, so a declared field is always filterable. Deeper
+  values are still skipped with a warning; the 2000-row cap per document stays.
+- **Behavior change: a declared field's type now decides its `value_num`.** A field
+  declared `text` or `enum` that holds a number (`code: 42`) no longer gets a
+  numeric value, so a range filter (`gte`/`lte`/…) on it now matches nothing;
+  equality is unchanged. `integer`/`number` store the number, `boolean` 1/0, and an
+  undeclared field keeps the old JSON-type guess. Declare the field `integer` or
+  `number` if range filters on it are wanted.
+- **Dates are comparable.** `date` and `timestamp` fields store seconds since the
+  Unix epoch (UTC; a date is its midnight UTC, a timestamp is normalized from its
+  offset), and a range bound may be given as a date or RFC 3339 timestamp string:
+  `{"published": {"gte": "2024-01-01"}}` — in query mode too, on a datetime index
+  (#350).
+- `/status` and `/metrics` field breakdowns leave out `[]` fields; `get_schema`'s
+  `other_fields_in_use` lists an undeclared `npcs[].x` like any other undeclared
+  field and no longer lists a declared one.
+
 ### Security
 
 - **Symlinks and `.git` paths are refused on write and read, and skipped by
@@ -67,6 +337,77 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   the UI write API is open, and carries a commented-out forward-auth (Authentik
   outpost) example applied to the UI router only, with `/mcp` and the other
   self-authenticating routes on a separate router.
+
+### Added
+
+- **Schema list element definitions (`items`) and one path grammar** (#346). A
+  `.schema.yaml` field (and `update_schema`'s `set_field` `definition`) accepts
+  `items:`, the definition of each element of a list — a scalar, or an `object` with
+  its own `fields:`; a typeless field with `items` is a `list`. Field paths, as
+  schema keys and as `update_schema`'s `field`, follow one grammar: `a.b`, `a[]` (a
+  list's elements), `a[].b` (a field of each element); `[]` steps count toward the
+  16-step depth cap. Item definitions cascade per attribute like any other field and
+  are shown by `get_schema` under the list field's `items`, and are enforced on every
+  element (#347, under Changed), but are **not indexed or filterable yet**. Internally the resolved schema is now
+  a tree with per-attribute provenance and one per-type table (`FieldKind`) shared by
+  validation, Qdrant index kinds, range-filter support and type names; for every
+  schema that does not use `items` the result is unchanged, including its
+  fingerprint, so **upgrading triggers no revalidation and no reindex** (a golden test
+  pins the fingerprint). Two narrow edge cases now read differently: a schema key
+  ending in `[]` (`tags[]:`) or containing `[].` used to declare a literal field of
+  that name and now addresses list elements (a `tags[]:` key alone also declares
+  `tags` as a `list`), and `items:` is a new key, so a schema file that
+  uses it is rejected as invalid by an older binary — roll back only after removing
+  it.
+- **Schema lint warnings** (#347). A schema definition that loads but is probably a
+  mistake is now reported, never refused: a `default` that fails the field's own
+  `type` or `values`, `values` on an `object` or `boolean` field, and a top-level
+  field named like a key the search index writes itself (`file_path`, `mtime`,
+  `chunk_index`, `text`, `text_body_offset`, `line_start`, `line_end`,
+  `path_ancestors`, the `heading_*`/`section_*` keys, and `fm`, reserved for the
+  frontmatter namespace), and any `default` under a list's `items` (defaults are
+  never applied to list elements, so it does nothing). The server logs each one at
+  `warn`, naming the scope: every finding once at startup and in `mcp-md-wiki
+  validate`, and afterwards only findings a schema rebuild newly introduces (indexing
+  runs never log them). `update_schema` returns them in a new `warnings` array (dry
+  run included; omitted when empty; capped at 20). Nothing that loaded before stops
+  loading.
+
+### Changed
+
+- **Frontmatter validation now walks nested and list structure** (#347). Behavior
+  changes, applying to writes, `update_schema`'s casualty check, `validate` and
+  index-time validation alike:
+  - **Stricter:** a list's elements are checked against its `items` (type, `values`,
+    and an object element's own `required`/`open`/children), with errors at indexed
+    paths such as `npcs[2].name`; `open: false` is enforced on every object at any
+    depth, inside list elements included (and on an `open: false` field with no
+    declared type whose value is an object). A `null` list element is now a
+    `type_mismatch` against a typed `items`. A document accepted before can now be
+    refused on its next write.
+  - **Looser:** a required nested field is required only when its parent is present.
+    With `planning.effort` required, a document with no `planning` (or
+    `planning: null`) used to fail and now passes; `planning: {}` still fails.
+    Required top-level fields are unaffected. A nested `default` still creates its
+    parent object, so in a scope that defaults one child of `planning`, `planning`'s
+    other required children still apply to every document. A closed object no
+    longer rejects a key that only a deeper declared path passes through (`a` closed
+    with `a.b.c` declared now accepts `a: {b: {c: …}}`).
+  - **Looser:** `type: integer` accepts a whole number written as a decimal (`3.0`);
+    `3.5` is still refused.
+  - Defaults are never applied inside list elements.
+  - A document's schema errors are capped at 100; past that, one final
+    `rule: "too_many_errors"` entry (field `<more>`) counts the rest.
+
+  **Upgrade:** the schema fingerprint is unchanged, so upgrading re-validates and
+  re-embeds nothing. Existing documents are not re-checked against the stricter
+  rules until they are next reindexed — a git push that touches them, a change to
+  their governing schema, `index --full`, or a future chunker-version bump. **With
+  the default `validation.strict: false`, a document that now fails (a bad list
+  element, say) is purged from the index at that point and stays out of search until
+  it is fixed**; with `validation.strict: true` the index keeps its last good version
+  and lists it as rejected. Run `mcp-md-wiki validate` after upgrading to find such
+  documents ahead of time.
 
 ### Fixed
 

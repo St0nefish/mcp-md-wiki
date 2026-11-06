@@ -253,6 +253,10 @@ pub const ENUMERATION_SENTENCE: &str = "Without `query`, every match is listed i
 /// Never names a granularity that isn't enabled. `hybrid` is `search.hybrid`:
 /// the `query` text says the query is matched literally as well as
 /// semantically only when the sparse arm actually runs (#309).
+///
+/// `filters` is not among them: since #350 every filter form — date bounds and
+/// correlated list filters included — works with and without a query, so its
+/// `SearchParams::filters` doc comment is right on every server.
 pub fn search_property_descriptions(
     effective: &[Granularity],
     hybrid: bool,

@@ -30,6 +30,39 @@ pub enum FieldFilter {
         gt: Option<f64>,
         lt: Option<f64>,
     },
+    /// A correlated list filter (#349), the parsed form of
+    /// `{"npcs[]": {"role": "guard", "level": {"gte": 3}}}`: every condition must be
+    /// satisfied by the rows of ONE element of the list (one `document_fields.elem`),
+    /// not merely somewhere in the document. Each entry is the projected field path
+    /// of a sub-field (`npcs[].role`) and its condition, any of the other forms —
+    /// never another `Elem`. Query mode lowers it to one Qdrant nested condition on
+    /// the list (`qdrant::lower_field_filters`, #350).
+    Elem(Vec<(String, FieldFilter)>),
+}
+
+/// The version of the rules that turn stored frontmatter into `document_fields`
+/// rows (`document_fields::flatten_frontmatter`) and of that table's shape. Kept in
+/// SQLite's `PRAGMA user_version`; when the stored value differs,
+/// [`StateDb::ensure_projection_current`] reprojects every document from
+/// `documents.frontmatter` — no markdown read, no embedding, no Qdrant write — and
+/// only then records this value. Bump it whenever the projection rules change.
+///
+/// `1`: schema-driven projection with list-of-object rows keyed by `elem` (#349).
+/// Every database written before has `user_version` 0.
+pub const PROJECTION_VERSION: i64 = 1;
+
+/// What [`StateDb::reproject_all_fields`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReprojectReport {
+    /// Documents whose projection was rebuilt.
+    pub reprojected: u64,
+    /// Documents whose stored frontmatter is not a JSON object, left without rows.
+    /// Reprojecting again cannot change that; reindexing the file does.
+    pub unparseable: usize,
+    /// Documents a database error kept from being reprojected. Non-zero means the
+    /// projection is incomplete, so [`StateDb::ensure_projection_current`] does not
+    /// record [`PROJECTION_VERSION`].
+    pub failed: usize,
 }
 
 /// Ordering for a document listing. An allowlist rather than a free string, because
@@ -276,9 +309,18 @@ pub struct IndexedFile {
     pub content_hash: String,
     pub chunk_count: i64,
     pub indexed_at: String,
-    /// Fingerprint of the schema this file was last validated against. Empty for rows
-    /// written before schema tracking existed, which forces one revalidation pass.
+    /// Fingerprint of the schema this file was last validated and projected against
+    /// (`ResolvedSchema::fingerprint`). Empty for rows written before schema tracking
+    /// existed, which forces one revalidation pass. A mismatch alone never re-embeds
+    /// (#351): it revalidates and refreshes the metadata, see `payload_hash`.
     pub schema_hash: String,
+    /// Fingerprint of the schema inputs that shape this file's Qdrant payload
+    /// frontmatter (`ingest::payload_hash_for`, over `ResolvedSchema::payload_fingerprint`)
+    /// as of the last index or refresh (#351). `''` means unknown — every row written
+    /// before this column existed — and is treated as current while `schema_hash`
+    /// matches, so upgrading writes nothing to Qdrant; once `schema_hash` moves, an
+    /// unknown value counts as changed and the payload is refreshed in place.
+    pub payload_hash: String,
     /// Fingerprint of the chunking configuration (`ingest::chunking_fingerprint`: every
     /// `chunking.*` setting that shapes chunk text or payload, plus
     /// `ingest::CHUNKER_VERSION`) this file was last chunked and embedded under. Empty
@@ -299,6 +341,20 @@ pub struct IndexedFile {
     pub size: i64,
 }
 
+/// Every column of one `indexed_files` row that [`StateDb::upsert_record`] writes —
+/// a struct rather than more positional arguments on [`StateDb::upsert`].
+#[derive(Debug, Clone, Copy)]
+pub struct IndexedFileRecord<'a> {
+    pub file_path: &'a str,
+    pub content_hash: &'a str,
+    pub chunk_count: i64,
+    pub schema_hash: &'a str,
+    pub payload_hash: &'a str,
+    pub chunking_fingerprint: &'a str,
+    pub mtime: i64,
+    pub size: i64,
+}
+
 /// One row from [`StateDb::scan_indexed_files`]: an `indexed_files` row plus the
 /// `documents.content_hash` for the same path, if a metadata row exists at all.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -306,6 +362,8 @@ pub struct ScanRow {
     pub file_path: String,
     pub content_hash: String,
     pub schema_hash: String,
+    /// `indexed_files.payload_hash` (#351); see [`IndexedFile::payload_hash`].
+    pub payload_hash: String,
     pub chunking_fingerprint: String,
     pub mtime: i64,
     pub size: i64,
@@ -322,10 +380,43 @@ enum ReprojectOutcome {
     Done,
     /// The row disappeared mid-run; nothing to do.
     Gone,
-    /// Left as-is, with a logged reason.
-    Skipped,
-    /// Placeholder before the first attempt; counted as skipped if it survives.
+    /// Stored frontmatter is not a JSON object; left as-is, with a logged reason.
+    Unparseable,
+    /// A database error; left as-is, with a logged reason.
+    Failed,
+    /// Placeholder before the first attempt; counted as failed if it survives.
     Retry,
+}
+
+/// Replace `file_path`'s `document_fields` rows with `frontmatter`'s projection
+/// under `schema`, inside the caller's transaction.
+async fn write_projection(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    file_path: &str,
+    frontmatter: &HashMap<String, Value>,
+    schema: &crate::schema::ResolvedSchema,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM document_fields WHERE file_path = ?")
+        .bind(file_path)
+        .execute(&mut **tx)
+        .await?;
+
+    for row in document_fields::flatten_frontmatter(frontmatter, schema) {
+        // INSERT OR IGNORE: a document may legitimately repeat a value within one
+        // array (duplicate tags), which collides on the primary key.
+        sqlx::query(
+            "INSERT OR IGNORE INTO document_fields (file_path, field, elem, value_text, value_num)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(file_path)
+        .bind(&row.field)
+        .bind(row.elem)
+        .bind(&row.value_text)
+        .bind(row.value_num)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Whether an error is SQLite reporting the database as busy or locked.
@@ -397,8 +488,98 @@ async fn add_column_if_missing(
     }
 }
 
+/// Whether an existing `document_fields` table has the current shape (`elem` in its
+/// primary key, #349); `None` when there is no such table yet.
+async fn document_fields_current_shape(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<Option<bool>, sqlx::Error> {
+    let columns: Vec<(String, i64)> =
+        sqlx::query_as("SELECT name, pk FROM pragma_table_info('document_fields')")
+            .fetch_all(&mut *conn)
+            .await?;
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        columns.iter().any(|(name, pk)| name == "elem" && *pk > 0),
+    ))
+}
+
+/// Drop a `document_fields` table of an older shape, and reset `PRAGMA
+/// user_version` to 0 in the same transaction so the next
+/// [`StateDb::ensure_projection_current`] reprojects into the recreated table
+/// whatever version was recorded. Returns whether it dropped one.
+///
+/// Checked once outside a transaction (the common, current case costs one pragma
+/// read) and again under `BEGIN IMMEDIATE`, so two processes opening an old
+/// database at once rebuild it once and neither fails.
+async fn rebuild_document_fields_if_old_shape(pool: &SqlitePool) -> Result<bool> {
+    let mut conn = pool.acquire().await?;
+    if document_fields_current_shape(&mut conn).await? != Some(false) {
+        return Ok(false);
+    }
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let rebuilt = async {
+        if document_fields_current_shape(&mut conn).await? != Some(false) {
+            return Ok::<bool, sqlx::Error>(false);
+        }
+        sqlx::query("DROP TABLE document_fields")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("PRAGMA user_version = 0")
+            .execute(&mut *conn)
+            .await?;
+        Ok(true)
+    }
+    .await;
+    match rebuilt {
+        Ok(rebuilt) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            if rebuilt {
+                tracing::info!(
+                    "document_fields had an older shape; dropped it to be rebuilt from \
+                     stored frontmatter (no re-embedding)"
+                );
+            }
+            Ok(rebuilt)
+        }
+        Err(e) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(e).context("Failed to rebuild the document_fields table")
+        }
+    }
+}
+
 pub struct StateDb {
     pool: SqlitePool,
+    /// As opened; keys [`REPROJECT_FAILURES`].
+    db_path: std::path::PathBuf,
+}
+
+/// How many automatic reprojects (`ensure_projection_current` without `force`)
+/// have failed in this process, per database path. After
+/// [`MAX_AUTOMATIC_REPROJECT_ATTEMPTS`] failures the automatic check stops
+/// retrying until the process restarts, so a persistent failure is not re-run (and
+/// re-logged) at the start of every index run; `reproject-fields` still forces one.
+static REPROJECT_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The first attempt plus one retry.
+const MAX_AUTOMATIC_REPROJECT_ATTEMPTS: usize = 2;
+
+/// How many times [`StateDb::new`] tries to open and set up the database when it
+/// keeps finding it busy — with a backoff of 10 ms per attempt (capped at 200 ms),
+/// a few seconds in all.
+const MAX_OPEN_ATTEMPTS: u32 = 25;
+
+/// Whether SQLite reported the database busy or locked anywhere in `e`'s chain.
+fn is_busy_in_chain(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .is_some_and(is_busy_or_locked)
+    })
 }
 
 impl StateDb {
@@ -414,6 +595,35 @@ impl StateDb {
             // leaving orphaned projection rows behind on every delete.
             .foreign_keys(true);
 
+        // Opening is retried as a whole on SQLITE_BUSY. `busy_timeout` makes SQLite
+        // wait for a lock, but not in every case: switching a rollback-journal file
+        // to WAL (the `journal_mode` pragma each new connection runs) needs an
+        // exclusive lock and fails at once while another process holds any lock on
+        // the file, and an autocommit DDL statement (`CREATE TABLE IF NOT EXISTS`,
+        // the shape rebuild's `DROP`) that read the schema before another
+        // connection changed it cannot upgrade its snapshot — retrying the same
+        // statement can never succeed, a fresh attempt does. Several processes
+        // opening one database at once (serve plus a CLI command, typically on the
+        // first start after an upgrade, when the shape rebuild also runs) hit both.
+        // Every setup step is idempotent, so a fresh pool and a rerun from the top
+        // is always safe.
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match Self::open_and_migrate(options.clone(), db_path).await {
+                Ok(db) => return Ok(db),
+                Err(e) if attempt < MAX_OPEN_ATTEMPTS && is_busy_in_chain(&e) => {
+                    debug!(attempt, "state DB busy while opening; retrying: {e:#}");
+                    let backoff = (10 * u64::from(attempt)).min(200);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// One attempt at [`Self::new`]: connect, then create or upgrade every table.
+    async fn open_and_migrate(options: SqliteConnectOptions, db_path: &Path) -> Result<Self> {
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
@@ -441,6 +651,20 @@ impl StateDb {
             &pool,
             "indexed_files",
             "schema_hash",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
+
+        // Payload-shape fingerprint (#351, `ingest::payload_hash_for`). Unlike the
+        // columns above, '' here does NOT force anything: it means "unknown", which
+        // ingest treats as current while `schema_hash` still matches, so adding the
+        // column re-embeds nothing by itself (the release that added it re-embeds
+        // anyway, through #350's `CHUNKER_VERSION` bump), and a later schema edit
+        // refreshes the payload in place rather than re-embedding.
+        add_column_if_missing(
+            &pool,
+            "indexed_files",
+            "payload_hash",
             "TEXT NOT NULL DEFAULT ''",
         )
         .await?;
@@ -530,13 +754,21 @@ impl StateDb {
             .await?;
         }
 
+        // `elem` (#349) is the element of the outermost list of objects a row came
+        // from (`document_fields::FieldRow::elem`), part of the key so two elements
+        // carrying the same value both keep a row. A table from before it existed
+        // cannot be ALTERed into this key, so `rebuild_document_fields_if_old_shape`
+        // drops it first; the projection is derived data, rebuilt from
+        // `documents.frontmatter` by `ensure_projection_current`.
+        rebuild_document_fields_if_old_shape(&pool).await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS document_fields (
                 file_path  TEXT NOT NULL REFERENCES documents(file_path) ON DELETE CASCADE,
                 field      TEXT NOT NULL,
+                elem       INTEGER NOT NULL DEFAULT 0,
                 value_text TEXT NOT NULL,
                 value_num  REAL,
-                PRIMARY KEY (file_path, field, value_text)
+                PRIMARY KEY (file_path, field, elem, value_text)
             )",
         )
         .execute(&pool)
@@ -544,7 +776,9 @@ impl StateDb {
 
         // The composite primary key is file_path-first, which does not serve the
         // "which documents have field = value" lookup that filtering actually performs.
-        // These secondary indexes are load-bearing, not an optimization.
+        // These secondary indexes are load-bearing, not an optimization. A correlated
+        // list filter's per-element lookup (`file_path`, `field`, `elem`) is a prefix
+        // of the primary key and needs no index of its own.
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_document_fields_field_text
              ON document_fields(field, value_text)",
@@ -593,7 +827,10 @@ impl StateDb {
         .execute(&pool)
         .await?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            db_path: db_path.to_path_buf(),
+        })
     }
 
     /// Raw pool access so tests can assert on rows this API does not expose.
@@ -605,7 +842,7 @@ impl StateDb {
     #[cfg(test)]
     pub async fn get(&self, file_path: &str) -> Result<Option<IndexedFile>> {
         let row = sqlx::query_as::<_, IndexedFile>(
-            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, chunking_fingerprint, mtime, size
+            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, payload_hash, chunking_fingerprint, mtime, size
              FROM indexed_files WHERE file_path = ?",
         )
         .bind(file_path)
@@ -615,6 +852,10 @@ impl StateDb {
         Ok(row)
     }
 
+    /// Write a whole `indexed_files` row with an unknown (`''`) `payload_hash` — see
+    /// [`IndexedFile::payload_hash`]. Test-only shorthand: ingest writes rows through
+    /// [`Self::upsert_record`], which records the payload hash too.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         &self,
@@ -626,19 +867,63 @@ impl StateDb {
         mtime: i64,
         size: i64,
     ) -> Result<()> {
+        self.upsert_record(&IndexedFileRecord {
+            file_path,
+            content_hash,
+            chunk_count,
+            schema_hash,
+            payload_hash: "",
+            chunking_fingerprint,
+            mtime,
+            size,
+        })
+        .await
+    }
+
+    /// Write a whole `indexed_files` row (`INSERT OR REPLACE`, `indexed_at` now).
+    pub async fn upsert_record(&self, record: &IndexedFileRecord<'_>) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO indexed_files
                 (file_path, content_hash, chunk_count, indexed_at, schema_hash,
-                 chunking_fingerprint, mtime, size)
-             VALUES (?, ?, ?, datetime('now'), ?, ?, ?, ?)",
+                 payload_hash, chunking_fingerprint, mtime, size)
+             VALUES (?, ?, ?, datetime('now'), ?, ?, ?, ?, ?)",
         )
-        .bind(file_path)
-        .bind(content_hash)
-        .bind(chunk_count)
+        .bind(record.file_path)
+        .bind(record.content_hash)
+        .bind(record.chunk_count)
+        .bind(record.schema_hash)
+        .bind(record.payload_hash)
+        .bind(record.chunking_fingerprint)
+        .bind(record.mtime)
+        .bind(record.size)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Record that an already-indexed file was revalidated and its metadata (and, when
+    /// its payload hash moved, its Qdrant payload) refreshed under a new schema without
+    /// re-chunking or re-embedding it (#351): only `schema_hash`, `payload_hash` and the
+    /// stat baseline change. `content_hash`, `chunk_count`, `chunking_fingerprint` and
+    /// `indexed_at` describe the chunks still in Qdrant, which this does not touch.
+    pub async fn update_schema_hashes(
+        &self,
+        file_path: &str,
+        schema_hash: &str,
+        payload_hash: &str,
+        mtime: i64,
+        size: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE indexed_files SET schema_hash = ?, payload_hash = ?, mtime = ?, size = ?
+             WHERE file_path = ?",
+        )
         .bind(schema_hash)
-        .bind(chunking_fingerprint)
+        .bind(payload_hash)
         .bind(mtime)
         .bind(size)
+        .bind(file_path)
         .execute(&self.pool)
         .await?;
 
@@ -677,7 +962,7 @@ impl StateDb {
 
     pub async fn list_all(&self) -> Result<Vec<IndexedFile>> {
         let rows = sqlx::query_as::<_, IndexedFile>(
-            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, chunking_fingerprint, mtime, size
+            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, payload_hash, chunking_fingerprint, mtime, size
              FROM indexed_files ORDER BY file_path",
         )
         .fetch_all(&self.pool)
@@ -707,7 +992,7 @@ impl StateDb {
     /// query per row.
     pub async fn fetch_indexed_files_page(&self, limit: i64, offset: i64) -> Result<Vec<ScanRow>> {
         let rows: Vec<ScanRow> = sqlx::query_as(
-            "SELECT i.file_path, i.content_hash, i.schema_hash, i.chunking_fingerprint, i.mtime, i.size, \
+            "SELECT i.file_path, i.content_hash, i.schema_hash, i.payload_hash, i.chunking_fingerprint, i.mtime, i.size, \
                     i.chunk_count, d.content_hash AS doc_hash \
              FROM indexed_files i LEFT JOIN documents d ON d.file_path = i.file_path \
              ORDER BY i.file_path LIMIT ? OFFSET ?",
@@ -731,7 +1016,7 @@ impl StateDb {
                 continue;
             }
             let mut builder = QueryBuilder::<Sqlite>::new(
-                "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, chunking_fingerprint, mtime, size \
+                "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, payload_hash, chunking_fingerprint, mtime, size \
                  FROM indexed_files WHERE file_path IN (",
             );
             let mut separated = builder.separated(", ");
@@ -828,14 +1113,39 @@ impl StateDb {
         Ok(row.0)
     }
 
-    /// Replace a document's metadata row and its full field projection.
-    ///
-    /// Runs as a single transaction: the projection is deleted and rebuilt rather than
-    /// merged, so a field removed from frontmatter does not leave a stale row behind.
+    /// [`Self::upsert_document_metadata_with`] under an empty schema — every field
+    /// undeclared, so `value_num` follows the JSON type. For tests that are not about
+    /// the schema-driven projection.
+    #[cfg(test)]
     pub async fn upsert_document_metadata(
         &self,
         file_path: &str,
         frontmatter: &HashMap<String, Value>,
+        mtime: i64,
+        content_hash: &str,
+        chunk_count: i64,
+    ) -> Result<()> {
+        self.upsert_document_metadata_with(
+            file_path,
+            frontmatter,
+            &crate::schema::ResolvedSchema::default(),
+            mtime,
+            content_hash,
+            chunk_count,
+        )
+        .await
+    }
+
+    /// Replace a document's metadata row and its full field projection, the latter
+    /// read under `schema` — the one governing `file_path` (#349).
+    ///
+    /// Runs as a single transaction: the projection is deleted and rebuilt rather than
+    /// merged, so a field removed from frontmatter does not leave a stale row behind.
+    pub async fn upsert_document_metadata_with(
+        &self,
+        file_path: &str,
+        frontmatter: &HashMap<String, Value>,
+        schema: &crate::schema::ResolvedSchema,
         mtime: i64,
         content_hash: &str,
         chunk_count: i64,
@@ -870,28 +1180,112 @@ impl StateDb {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("DELETE FROM document_fields WHERE file_path = ?")
-            .bind(file_path)
-            .execute(&mut *tx)
-            .await?;
-
-        for row in document_fields::flatten_frontmatter(frontmatter) {
-            // INSERT OR IGNORE: a document may legitimately repeat a value within an
-            // array (duplicate tags), which collides on the primary key.
-            sqlx::query(
-                "INSERT OR IGNORE INTO document_fields (file_path, field, value_text, value_num)
-                 VALUES (?, ?, ?, ?)",
-            )
-            .bind(file_path)
-            .bind(&row.field)
-            .bind(&row.value_text)
-            .bind(row.value_num)
-            .execute(&mut *tx)
-            .await?;
-        }
+        write_projection(&mut tx, file_path, frontmatter, schema).await?;
 
         tx.commit().await?;
         Ok(())
+    }
+
+    /// The projection version recorded in `PRAGMA user_version`.
+    pub async fn projection_version(&self) -> Result<i64> {
+        let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(version)
+    }
+
+    /// Bring `document_fields` up to [`PROJECTION_VERSION`]: when the recorded
+    /// version differs (an upgrade, or a table [`StateDb::new`] just rebuilt from an
+    /// older shape, which resets it to 0) — or `force` is set, as `reproject-fields`
+    /// does — reproject every document from its stored frontmatter under `schemas`.
+    /// No markdown is read, nothing is embedded, Qdrant is untouched.
+    ///
+    /// The version is written only after a reproject in which no document failed,
+    /// so a crash or error part-way leaves it as it was and the next call starts
+    /// over — though an automatic check retries a failed reproject only once per
+    /// process ([`MAX_AUTOMATIC_REPROJECT_ATTEMPTS`]) and then returns `None`
+    /// without trying until a restart or a forced run, so a persistent failure is
+    /// not repeated on every index run. Returns `None` when the projection was
+    /// already current (one pragma
+    /// read), else what the reproject did. Callers run it right after opening the
+    /// database and before serving or indexing, so an upgraded database is never
+    /// queried with an empty projection.
+    pub async fn ensure_projection_current(
+        &self,
+        schemas: &crate::schema::SchemaCache,
+        force: bool,
+    ) -> Result<Option<ReprojectReport>> {
+        let stored = self.projection_version().await?;
+        if stored == PROJECTION_VERSION && !force {
+            return Ok(None);
+        }
+        let failures = || {
+            REPROJECT_FAILURES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if !force
+            && failures().get(&self.db_path).copied().unwrap_or(0)
+                >= MAX_AUTOMATIC_REPROJECT_ATTEMPTS
+        {
+            debug!("automatic reprojection already failed in this process; not retrying");
+            return Ok(None);
+        }
+        tracing::info!(
+            stored,
+            current = PROJECTION_VERSION,
+            "reprojecting document fields from stored frontmatter (no re-embedding)"
+        );
+        let outcome = async {
+            let report = self.reproject_all_fields(schemas).await?;
+            if report.failed > 0 {
+                anyhow::bail!(
+                    "{} document(s) could not be reprojected; the projection version stays at \
+                     {stored}, so a later start (or `reproject-fields`) retries",
+                    report.failed
+                );
+            }
+            sqlx::query(&format!("PRAGMA user_version = {PROJECTION_VERSION}"))
+                .execute(&self.pool)
+                .await?;
+            Ok(report)
+        }
+        .await;
+        match outcome {
+            Ok(report) => {
+                failures().remove(&self.db_path);
+                Ok(Some(report))
+            }
+            Err(e) => {
+                *failures().entry(self.db_path.clone()).or_default() += 1;
+                Err(e)
+            }
+        }
+    }
+
+    /// A document's stored `documents.frontmatter`, or `None` when it has no metadata
+    /// row (or the stored JSON is not an object).
+    ///
+    /// Ingest writes the same frontmatter (derived fields included) to this row and to
+    /// every chunk's Qdrant payload, so its `description` is what chunking prepended.
+    /// A payload refresh (#351) reads it before rewriting the row, to know whether the
+    /// prepended description changed; with no row it takes the full path.
+    pub async fn document_frontmatter(
+        &self,
+        file_path: &str,
+    ) -> Result<Option<serde_json::Map<String, Value>>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT frontmatter FROM documents WHERE file_path = ?")
+                .bind(file_path)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((json,)) = row else {
+            return Ok(None);
+        };
+        Ok(match serde_json::from_str::<Value>(&json) {
+            Ok(Value::Object(map)) => Some(map),
+            _ => None,
+        })
     }
 
     /// Remove a document's metadata. Projection rows cascade via the foreign key;
@@ -1144,9 +1538,13 @@ impl StateDb {
     /// Rebuild `document_fields` for every document from the stored frontmatter JSON.
     ///
     /// The escape hatch for when the projection rules change: no markdown is re-read,
-    /// nothing is re-embedded, and Qdrant is untouched. Returns the number of documents
-    /// reprojected.
-    pub async fn reproject_all_fields(&self) -> Result<u64> {
+    /// nothing is re-embedded, and Qdrant is untouched. Each document is read under
+    /// the schema `schemas` resolves for its path (#349). Run automatically by
+    /// [`Self::ensure_projection_current`] when [`PROJECTION_VERSION`] moves.
+    pub async fn reproject_all_fields(
+        &self,
+        schemas: &crate::schema::SchemaCache,
+    ) -> Result<ReprojectReport> {
         // Only the PATHS are snapshotted. Each document's frontmatter is re-read inside
         // the same transaction that rewrites its projection, so a concurrent reindex
         // can never be reverted: either it lands first and we reproject its new value,
@@ -1158,16 +1556,16 @@ impl StateDb {
                 .fetch_all(&self.pool)
                 .await?;
 
-        let mut reprojected = 0u64;
-        let mut skipped = 0usize;
+        let mut report = ReprojectReport::default();
 
         const MAX_ATTEMPTS: usize = 5;
 
         for (file_path,) in paths {
             let mut outcome = ReprojectOutcome::Retry;
+            let schema = schemas.resolve_for(Path::new(&file_path));
 
             for attempt in 1..=MAX_ATTEMPTS {
-                match self.reproject_one(&file_path).await {
+                match self.reproject_one(&file_path, schema).await {
                     Ok(result) => {
                         outcome = result;
                         break;
@@ -1182,28 +1580,34 @@ impl StateDb {
                     }
                     Err(e) => {
                         warn!(file = %file_path, "skipping reprojection: {e:#}");
-                        outcome = ReprojectOutcome::Skipped;
+                        outcome = ReprojectOutcome::Failed;
                         break;
                     }
                 }
             }
 
             match outcome {
-                ReprojectOutcome::Done => reprojected += 1,
+                ReprojectOutcome::Done => report.reprojected += 1,
                 ReprojectOutcome::Gone => {}
-                ReprojectOutcome::Skipped | ReprojectOutcome::Retry => skipped += 1,
+                ReprojectOutcome::Unparseable => report.unparseable += 1,
+                ReprojectOutcome::Failed | ReprojectOutcome::Retry => report.failed += 1,
             }
         }
 
+        let skipped = report.unparseable + report.failed;
         if skipped > 0 {
             warn!("{skipped} document(s) skipped during reprojection; see logs above");
         }
 
-        Ok(reprojected)
+        Ok(report)
     }
 
     /// Reproject one document, re-reading its frontmatter inside the write transaction.
-    async fn reproject_one(&self, file_path: &str) -> Result<ReprojectOutcome, sqlx::Error> {
+    async fn reproject_one(
+        &self,
+        file_path: &str,
+        schema: &crate::schema::ResolvedSchema,
+    ) -> Result<ReprojectOutcome, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
         let row: Option<(String,)> =
@@ -1221,26 +1625,10 @@ impl StateDb {
         let Ok(frontmatter) = serde_json::from_str::<HashMap<String, Value>>(&frontmatter_json)
         else {
             warn!(file = %file_path, "stored frontmatter is unparseable; leaving it alone");
-            return Ok(ReprojectOutcome::Skipped);
+            return Ok(ReprojectOutcome::Unparseable);
         };
 
-        sqlx::query("DELETE FROM document_fields WHERE file_path = ?")
-            .bind(file_path)
-            .execute(&mut *tx)
-            .await?;
-
-        for row in document_fields::flatten_frontmatter(&frontmatter) {
-            sqlx::query(
-                "INSERT OR IGNORE INTO document_fields (file_path, field, value_text, value_num)
-                 VALUES (?, ?, ?, ?)",
-            )
-            .bind(file_path)
-            .bind(&row.field)
-            .bind(&row.value_text)
-            .bind(row.value_num)
-            .execute(&mut *tx)
-            .await?;
-        }
+        write_projection(&mut tx, file_path, &frontmatter, schema).await?;
 
         tx.commit().await?;
         Ok(ReprojectOutcome::Done)
@@ -1295,9 +1683,9 @@ impl StateDb {
                         }
                         builder.push(")");
                     }
-                    FieldFilter::Range { .. } => {
-                        // Prose columns have no numeric ordering; an unsatisfiable
-                        // clause is more honest than ignoring the filter.
+                    FieldFilter::Range { .. } | FieldFilter::Elem(_) => {
+                        // Prose columns have no numeric ordering and no elements; an
+                        // unsatisfiable clause is more honest than ignoring the filter.
                         builder.push(" AND 0 = 1");
                     }
                 }
@@ -1363,6 +1751,7 @@ impl StateDb {
                     }
                     builder.push(")");
                 }
+                FieldFilter::Elem(conditions) => push_elem_filter(builder, conditions),
             }
         }
     }
@@ -1389,6 +1778,10 @@ impl StateDb {
     ///   takes. A scoped schema can declare twenty fields that apply to one folder;
     ///   ordering by value count floats all of them above `type` and `status`, and the
     ///   fields that describe the whole knowledge base fall off the end of `limit`.
+    ///
+    /// Fields of a list's elements (`npcs[].role`, #349) are left out: a per-value
+    /// document count of one sub-field says little about a list of records, and
+    /// would crowd out the document-level fields `/status` is for.
     pub async fn breakdown_fields(
         &self,
         max_distinct: i64,
@@ -1398,7 +1791,8 @@ impl StateDb {
         let limit = limit.max(0);
         let rows: Vec<(String, i64, i64)> = sqlx::query_as(
             "SELECT field, COUNT(DISTINCT value_text) AS n, COUNT(DISTINCT file_path) AS docs \
-             FROM document_fields GROUP BY field HAVING n <= ? \
+             FROM document_fields WHERE instr(field, '[]') = 0 \
+             GROUP BY field HAVING n <= ? \
              ORDER BY docs DESC, n DESC, field ASC LIMIT ?",
         )
         .bind(max_distinct)
@@ -1520,6 +1914,100 @@ impl StateDb {
 
         Ok(rows)
     }
+}
+
+/// One row-level test inside a correlated list filter: a single `document_fields`
+/// row of the element must satisfy it.
+enum ElemAtom<'a> {
+    In(&'a [String]),
+    Eq(&'a String),
+    Range([(&'static str, Option<f64>); 4]),
+}
+
+/// Append a [`FieldFilter::Elem`] clause (#349). Each sub-condition becomes one or
+/// more row tests (an `all_of` needs one row per value, as it does outside a list);
+/// the first test is an `EXISTS` over the document's rows, and every further test an
+/// `EXISTS` correlated to that row's `elem`, so all of them hold within ONE element:
+///
+/// ```sql
+/// EXISTS (SELECT 1 FROM document_fields e0
+///         WHERE e0.file_path = d.file_path AND e0.field = 'npcs[].role' AND ...
+///           AND EXISTS (SELECT 1 FROM document_fields e1
+///                       WHERE e1.file_path = e0.file_path AND e1.elem = e0.elem
+///                         AND e1.field = 'npcs[].level' AND ...))
+/// ```
+///
+/// An empty condition list, an empty set, or a nested `Elem` (none of which the
+/// tool parser lets through) is unsatisfiable rather than dropped.
+fn push_elem_filter(builder: &mut QueryBuilder<'_, Sqlite>, conditions: &[(String, FieldFilter)]) {
+    let mut atoms: Vec<(&String, ElemAtom<'_>)> = Vec::new();
+    for (field, filter) in conditions {
+        match filter {
+            FieldFilter::AnyOf(values) if !values.is_empty() => {
+                atoms.push((field, ElemAtom::In(values)));
+            }
+            FieldFilter::AllOf(values) if !values.is_empty() => {
+                atoms.extend(values.iter().map(|v| (field, ElemAtom::Eq(v))));
+            }
+            FieldFilter::Range { gte, lte, gt, lt } => atoms.push((
+                field,
+                ElemAtom::Range([(">=", *gte), ("<=", *lte), (">", *gt), ("<", *lt)]),
+            )),
+            FieldFilter::AnyOf(_) | FieldFilter::AllOf(_) | FieldFilter::Elem(_) => {
+                builder.push(" AND 0 = 1");
+                return;
+            }
+        }
+    }
+    let Some(((first_field, first), rest)) = atoms.split_first() else {
+        builder.push(" AND 0 = 1");
+        return;
+    };
+
+    fn push_atom(builder: &mut QueryBuilder<'_, Sqlite>, alias: &str, atom: &ElemAtom<'_>) {
+        match atom {
+            ElemAtom::In(values) => {
+                builder.push(format!(" AND {alias}.value_text IN ("));
+                let mut separated = builder.separated(", ");
+                for value in values.iter() {
+                    separated.push_bind(value.clone());
+                }
+                builder.push(")");
+            }
+            ElemAtom::Eq(value) => {
+                builder.push(format!(" AND {alias}.value_text = "));
+                builder.push_bind((*value).clone());
+            }
+            ElemAtom::Range(bounds) => {
+                builder.push(format!(" AND {alias}.value_num IS NOT NULL"));
+                for (op, bound) in bounds {
+                    if let Some(value) = bound {
+                        builder.push(format!(" AND {alias}.value_num {op} "));
+                        builder.push_bind(*value);
+                    }
+                }
+            }
+        }
+    }
+
+    builder.push(
+        " AND EXISTS (SELECT 1 FROM document_fields e0 \
+         WHERE e0.file_path = d.file_path AND e0.field = ",
+    );
+    builder.push_bind((*first_field).clone());
+    push_atom(builder, "e0", first);
+    for (i, (field, atom)) in rest.iter().enumerate() {
+        let alias = format!("e{}", i + 1);
+        builder.push(format!(
+            " AND EXISTS (SELECT 1 FROM document_fields {alias} \
+             WHERE {alias}.file_path = e0.file_path AND {alias}.elem = e0.elem \
+             AND {alias}.field = "
+        ));
+        builder.push_bind((*field).clone());
+        push_atom(builder, &alias, atom);
+        builder.push(")");
+    }
+    builder.push(")");
 }
 
 /// The `documents` column backing a promoted field, if it is one.
@@ -1839,6 +2327,248 @@ impl DocumentIndex for StateDb {
     }
 }
 
+/// The shared fixture of the SQLite/Qdrant filter parity checks (#350): one typed
+/// schema, documents exercising every declared kind (an integral float under
+/// `integer`, timestamps at several offsets and with fractional seconds, a list of
+/// objects whose elements split the conditions of a correlated filter), and a
+/// matrix of `search` filters with the documents each must find. The offline half
+/// (`state::tests`, evaluating the lowered conditions against the production
+/// payload) runs in the fast tier; the live half
+/// (`qdrant::tests::sqlite_and_qdrant_filters_agree_on_the_typed_fixture`) seeds a
+/// real Qdrant through the same builders in the `qdrant-integration` tier.
+#[cfg(test)]
+pub(crate) mod filter_parity {
+    use super::*;
+    use crate::schema::SchemaCache;
+    use std::path::Path;
+
+    /// The root schema: every field `indexed`, so query mode accepts each filter.
+    pub const SCHEMA_YAML: &str = "fields:
+  type:
+    type: enum
+    values: [guide, recipe, reference]
+    indexed: true
+  tags:
+    type: list
+    indexed: true
+    items:
+      type: text
+  count:
+    type: integer
+    indexed: true
+  rating:
+    type: number
+    indexed: true
+  tested:
+    type: boolean
+    indexed: true
+  published:
+    type: date
+    indexed: true
+  seen:
+    type: timestamp
+    indexed: true
+  npcs:
+    type: list
+    items:
+      type: object
+      fields:
+        role:
+          type: enum
+          values: [guard, cook]
+          indexed: true
+        level:
+          type: integer
+          indexed: true
+";
+
+    /// The documents, by path.
+    pub fn docs() -> Vec<(&'static str, HashMap<String, Value>)> {
+        let doc = |v: Value| -> HashMap<String, Value> {
+            v.as_object().unwrap().clone().into_iter().collect()
+        };
+        vec![
+            (
+                "a.md",
+                doc(serde_json::json!({
+                    "title": "A", "type": "guide", "tags": ["x", "y"], "count": 3,
+                    "rating": 4.5, "tested": true, "published": "2024-01-02",
+                    "seen": "2024-01-02T10:00:00+02:00",
+                    "npcs": [{"role": "guard", "level": 1}, {"role": "cook", "level": 5}]
+                })),
+            ),
+            (
+                "b.md",
+                doc(serde_json::json!({
+                    "title": "B", "type": "recipe", "tags": ["y"], "count": 3.0,
+                    "rating": 2.0, "tested": false, "published": "2024-01-03",
+                    "seen": "2024-01-01T23:30:00-01:00",
+                    "npcs": [{"role": "cook", "level": 2}, {"role": "guard", "level": 5}]
+                })),
+            ),
+            (
+                "c.md",
+                doc(serde_json::json!({
+                    "title": "C", "type": "reference", "tags": ["z"], "count": 7,
+                    "rating": 3.25, "tested": true, "published": "2023-12-31",
+                    "seen": "2024-01-02T00:00:00.5Z", "npcs": []
+                })),
+            ),
+            (
+                "d.md",
+                doc(serde_json::json!({ "title": "D", "type": "guide", "count": 12 })),
+            ),
+        ]
+    }
+
+    /// `(filter key, filter JSON, documents it must find)`, in `search`'s `filters`
+    /// syntax — parsed by the production parser (`mcp::parse_field_filter`).
+    pub fn cases() -> Vec<(&'static str, Value, Vec<&'static str>)> {
+        use serde_json::json;
+        vec![
+            ("type", json!("guide"), vec!["a.md", "d.md"]),
+            ("type", json!(["recipe", "reference"]), vec!["b.md", "c.md"]),
+            ("tags", json!({"all_of": ["x", "y"]}), vec!["a.md"]),
+            ("tags", json!(["y", "z"]), vec!["a.md", "b.md", "c.md"]),
+            // `3.0` is written as the integer 3 in the payload.
+            ("count", json!(3), vec!["a.md", "b.md"]),
+            ("count", json!({"gte": 5}), vec!["c.md", "d.md"]),
+            ("rating", json!({"gte": 3}), vec!["a.md", "c.md"]),
+            ("rating", json!({"lt": 2.5}), vec!["b.md"]),
+            ("tested", json!(true), vec!["a.md", "c.md"]),
+            ("tested", json!(false), vec!["b.md"]),
+            ("published", json!("2024-01-02"), vec!["a.md"]),
+            (
+                "published",
+                json!({"gte": "2024-01-02"}),
+                vec!["a.md", "b.md"],
+            ),
+            (
+                "published",
+                json!({"lte": "2024-01-02"}),
+                vec!["a.md", "c.md"],
+            ),
+            // a: 08:00Z, b: 00:30Z, c: 00:00:00.5Z — all on 2024-01-02 in UTC.
+            (
+                "seen",
+                json!({"gte": "2024-01-02"}),
+                vec!["a.md", "b.md", "c.md"],
+            ),
+            (
+                "seen",
+                json!({"lt": "2024-01-02T08:00:00Z"}),
+                vec!["b.md", "c.md"],
+            ),
+            (
+                "seen",
+                json!({"lte": "2024-01-02T10:00:00+02:00"}),
+                vec!["a.md", "b.md", "c.md"],
+            ),
+            (
+                "seen",
+                json!({"gt": "2024-01-02T00:00:00.5Z"}),
+                vec!["a.md", "b.md"],
+            ),
+            (
+                "seen",
+                json!({"gte": "2024-01-02T00:00:00.5Z"}),
+                vec!["a.md", "b.md", "c.md"],
+            ),
+            // Correlated: both conditions within one element. a's guard is level 1.
+            (
+                "npcs[]",
+                json!({"role": "guard", "level": {"gte": 3}}),
+                vec!["b.md"],
+            ),
+            (
+                "npcs[]",
+                json!({"role": "guard", "level": {"lte": 1}}),
+                vec!["a.md"],
+            ),
+            (
+                "npcs[]",
+                json!({"role": "cook", "level": {"lte": 2}}),
+                vec!["b.md"],
+            ),
+            // Uncorrelated: any element.
+            ("npcs[].role", json!("guard"), vec!["a.md", "b.md"]),
+            ("npcs[].level", json!({"gte": 5}), vec!["a.md", "b.md"]),
+        ]
+    }
+
+    /// The schema cache built from [`SCHEMA_YAML`] at the root of `root`.
+    pub fn schemas(root: &Path) -> SchemaCache {
+        std::fs::write(root.join(crate::schema::SCHEMA_FILE_NAME), SCHEMA_YAML).unwrap();
+        SchemaCache::build_for_test(root, &crate::config::FrontmatterConfig::default())
+    }
+
+    /// Every indexed field's kind, as `mcp::build_query_conditions` passes it.
+    pub fn indexed(schemas: &SchemaCache) -> HashMap<String, crate::qdrant::IndexKind> {
+        schemas
+            .all_indexed_fields()
+            .into_iter()
+            .map(|f| (f.name, f.kind))
+            .collect()
+    }
+
+    /// A state DB at `db_path` holding every document's production projection.
+    pub async fn seed_db(db_path: &Path, schemas: &SchemaCache) -> StateDb {
+        let db = StateDb::new(db_path).await.unwrap();
+        for (path, fm) in docs() {
+            db.upsert_document_metadata_with(
+                path,
+                &fm,
+                schemas.resolve_for(Path::new(path)),
+                100,
+                "h",
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        db
+    }
+
+    /// The frontmatter part of `path`'s production Qdrant payload.
+    pub fn payload(
+        path: &str,
+        fm: &HashMap<String, Value>,
+        schemas: &SchemaCache,
+    ) -> HashMap<String, Value> {
+        crate::ingest::frontmatter_payload(
+            fm,
+            path,
+            &Default::default(),
+            schemas.resolve_for(Path::new(path)),
+        )
+    }
+
+    /// `(field, filter)` parsed as `search` parses it.
+    pub fn parse(field: &str, raw: &Value) -> Vec<(String, FieldFilter)> {
+        vec![(
+            field.to_string(),
+            crate::mcp::parse_field_filter(field, raw).unwrap(),
+        )]
+    }
+
+    /// The paths the metadata index (enumeration mode) finds for `filters`, sorted.
+    pub async fn sqlite_paths(db: &StateDb, filters: Vec<(String, FieldFilter)>) -> Vec<String> {
+        let mut paths: Vec<String> = db
+            .query_documents(&DocumentQuery {
+                filters,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .documents
+            .into_iter()
+            .map(|d| d.file_path)
+            .collect();
+        paths.sort();
+        paths
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2105,6 +2835,129 @@ mod tests {
         let page = db.fetch_indexed_files_page(10, 0).await.unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].chunking_fingerprint, "");
+    }
+
+    #[tokio::test]
+    async fn upgrading_a_pre_payload_hash_db_adds_only_that_column() {
+        // #351: the shape of the release before `payload_hash` — every other column
+        // present with real values. They must survive untouched, and the new column
+        // must read back '' ("unknown"), which ingest treats as current while
+        // `schema_hash` matches, so the upgrade re-embeds and rewrites nothing.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pre-payload-hash.db");
+        let options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", path.to_str().unwrap()))
+                .unwrap()
+                .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE indexed_files (
+                file_path            TEXT PRIMARY KEY,
+                content_hash         TEXT NOT NULL,
+                chunk_count          INTEGER NOT NULL,
+                indexed_at           TEXT NOT NULL DEFAULT (datetime('now')),
+                schema_hash          TEXT NOT NULL DEFAULT '',
+                chunking_fingerprint TEXT NOT NULL DEFAULT '',
+                mtime                INTEGER NOT NULL DEFAULT 0,
+                size                 INTEGER NOT NULL DEFAULT -1
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO indexed_files
+                (file_path, content_hash, chunk_count, indexed_at, schema_hash,
+                 chunking_fingerprint, mtime, size)
+             VALUES ('a.md', 'hash-a', 4, 'then', 'schema-fp', 'chunk-fp', 123, 45)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = StateDb::new(&path).await.expect("upgrade must not fail");
+        let row = db.get("a.md").await.unwrap().unwrap();
+        assert_eq!(row.content_hash, "hash-a");
+        assert_eq!(row.chunk_count, 4);
+        assert_eq!(row.indexed_at, "then");
+        assert_eq!(row.schema_hash, "schema-fp");
+        assert_eq!(row.chunking_fingerprint, "chunk-fp");
+        assert_eq!((row.mtime, row.size), (123, 45));
+        assert_eq!(
+            row.payload_hash, "",
+            "a pre-existing row's payload hash is unknown"
+        );
+
+        let page = db.fetch_indexed_files_page(10, 0).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].payload_hash, "");
+        assert_eq!(page[0].schema_hash, "schema-fp");
+        let many = db.get_many(&["a.md".to_string()]).await.unwrap();
+        assert_eq!(many["a.md"].payload_hash, "");
+    }
+
+    #[tokio::test]
+    async fn upsert_record_and_update_schema_hashes_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::new(&dir.path().join("s.db")).await.unwrap();
+        db.upsert_record(&IndexedFileRecord {
+            file_path: "a.md",
+            content_hash: "h",
+            chunk_count: 3,
+            schema_hash: "s1",
+            payload_hash: "p1",
+            chunking_fingerprint: "c",
+            mtime: 1,
+            size: 2,
+        })
+        .await
+        .unwrap();
+        let row = db.get("a.md").await.unwrap().unwrap();
+        assert_eq!(
+            (row.schema_hash.as_str(), row.payload_hash.as_str()),
+            ("s1", "p1")
+        );
+        let indexed_at = row.indexed_at.clone();
+
+        db.update_schema_hashes("a.md", "s2", "p2", 5, 6)
+            .await
+            .unwrap();
+        let row = db.get("a.md").await.unwrap().unwrap();
+        assert_eq!(row.schema_hash, "s2");
+        assert_eq!(row.payload_hash, "p2");
+        assert_eq!((row.mtime, row.size), (5, 6));
+        // What describes the chunks still in Qdrant is untouched.
+        assert_eq!(row.content_hash, "h");
+        assert_eq!(row.chunk_count, 3);
+        assert_eq!(row.chunking_fingerprint, "c");
+        assert_eq!(row.indexed_at, indexed_at);
+
+        // The positional `upsert` writes an unknown payload hash.
+        db.upsert("a.md", "h", 3, "s3", "c", 1, 2).await.unwrap();
+        assert_eq!(db.get("a.md").await.unwrap().unwrap().payload_hash, "");
+    }
+
+    #[tokio::test]
+    async fn document_frontmatter_reads_the_stored_object() {
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::new(&dir.path().join("s.db")).await.unwrap();
+        assert_eq!(db.document_frontmatter("a.md").await.unwrap(), None);
+        let mut fm = HashMap::new();
+        fm.insert("title".to_string(), serde_json::json!("A"));
+        fm.insert("planning".to_string(), serde_json::json!({"effort": "low"}));
+        db.upsert_document_metadata("a.md", &fm, 0, "h", 1)
+            .await
+            .unwrap();
+        let stored = db.document_frontmatter("a.md").await.unwrap().unwrap();
+        assert_eq!(
+            Value::Object(stored),
+            serde_json::json!({"title": "A", "planning": {"effort": "low"}})
+        );
     }
 
     #[tokio::test]
@@ -2577,9 +3430,9 @@ mod tests {
             .unwrap();
         assert!(field_rows(&db, "r.md").await.is_empty());
 
-        let count = db.reproject_all_fields().await.unwrap();
+        let report = db.reproject_all_fields(&no_schemas()).await.unwrap();
 
-        assert_eq!(count, 1);
+        assert_eq!(report.reprojected, 1);
         let rows = field_rows(&db, "r.md").await;
         assert!(rows.contains(&("planning.prep_minutes".into(), "45".into(), Some(45.0))));
     }
@@ -2599,8 +3452,428 @@ mod tests {
             .await
             .unwrap();
 
-        // Collides on the (file_path, field, value_text) primary key; must not error.
+        // Collides on the (file_path, field, elem, value_text) primary key; must not
+        // error.
         assert_eq!(field_rows(&db, "d.md").await.len(), 2);
+    }
+
+    // -- schema-driven projection, correlated filters, versioning (#349) -----
+
+    fn no_schemas() -> crate::schema::SchemaCache {
+        crate::schema::SchemaCache::from_config_only(&Default::default())
+    }
+
+    /// A schema cache whose root `.schema.yaml` is `yaml`.
+    fn schemas_from(yaml: &str) -> (crate::schema::SchemaCache, TempDir) {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".schema.yaml"), yaml).unwrap();
+        let cache = crate::schema::SchemaCache::build_for_test(dir.path(), &Default::default());
+        (cache, dir)
+    }
+
+    fn fm_of(value: Value) -> HashMap<String, Value> {
+        match value {
+            Value::Object(map) => map.into_iter().collect(),
+            _ => panic!("frontmatter fixture must be an object"),
+        }
+    }
+
+    fn query_with(filters: Vec<(&str, FieldFilter)>) -> DocumentQuery {
+        DocumentQuery {
+            filters: filters
+                .into_iter()
+                .map(|(f, filter)| (f.to_string(), filter))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn any(value: &str) -> FieldFilter {
+        FieldFilter::AnyOf(vec![value.to_string()])
+    }
+
+    fn at_least(n: f64) -> FieldFilter {
+        FieldFilter::Range {
+            gte: Some(n),
+            lte: None,
+            gt: None,
+            lt: None,
+        }
+    }
+
+    /// `split.md`: role guard on element 0, level 5 on element 1 — the two conditions
+    /// hold in the document, never in one element. `same.md`: both on element 1.
+    async fn npc_db() -> (StateDb, TempDir) {
+        let (db, dir) = test_db().await;
+        let split = fm_of(serde_json::json!({
+            "npcs": [{ "role": "guard", "level": 1 }, { "role": "cook", "level": 5 }]
+        }));
+        let same = fm_of(serde_json::json!({
+            "npcs": [{ "role": "cook", "level": 2 }, { "role": "guard", "level": 5 }]
+        }));
+        db.upsert_document_metadata("split.md", &split, 1, "h", 1)
+            .await
+            .unwrap();
+        db.upsert_document_metadata("same.md", &same, 1, "h", 1)
+            .await
+            .unwrap();
+        (db, dir)
+    }
+
+    #[tokio::test]
+    async fn a_correlated_filter_needs_every_condition_in_one_element() {
+        let (db, _dir) = npc_db().await;
+        let correlated = query_with(vec![(
+            "npcs[]",
+            FieldFilter::Elem(vec![
+                ("npcs[].level".into(), at_least(3.0)),
+                ("npcs[].role".into(), any("guard")),
+            ]),
+        )]);
+        let result = db.query_documents(&correlated).await.unwrap();
+        assert_eq!(paths(&result), vec!["same.md"]);
+
+        // The same two conditions uncorrelated match both documents.
+        let uncorrelated = query_with(vec![
+            ("npcs[].level", at_least(3.0)),
+            ("npcs[].role", any("guard")),
+        ]);
+        let result = db.query_documents(&uncorrelated).await.unwrap();
+        assert_eq!(paths(&result), vec!["same.md", "split.md"]);
+
+        // A single correlated condition is just a filter on the sub-field.
+        let one = query_with(vec![(
+            "npcs[]",
+            FieldFilter::Elem(vec![("npcs[].role".into(), any("cook"))]),
+        )]);
+        assert_eq!(db.query_documents(&one).await.unwrap().total, 2);
+
+        // all_of inside an element: both values on one element's list.
+        let tagged = fm_of(serde_json::json!({
+            "npcs": [{ "tags": ["a"] }, { "tags": ["b"] }]
+        }));
+        db.upsert_document_metadata("tags.md", &tagged, 1, "h", 1)
+            .await
+            .unwrap();
+        let all_of = query_with(vec![(
+            "npcs[]",
+            FieldFilter::Elem(vec![(
+                "npcs[].tags".into(),
+                FieldFilter::AllOf(vec!["a".into(), "b".into()]),
+            )]),
+        )]);
+        assert_eq!(db.query_documents(&all_of).await.unwrap().total, 0);
+        let plain_all_of = query_with(vec![(
+            "npcs[].tags",
+            FieldFilter::AllOf(vec!["a".into(), "b".into()]),
+        )]);
+        assert_eq!(
+            paths(&db.query_documents(&plain_all_of).await.unwrap()),
+            vec!["tags.md"]
+        );
+
+        // Unsatisfiable shapes stay unsatisfiable.
+        for bad in [
+            FieldFilter::Elem(vec![]),
+            FieldFilter::Elem(vec![("npcs[].role".into(), FieldFilter::AnyOf(vec![]))]),
+        ] {
+            let q = query_with(vec![("npcs[]", bad)]);
+            assert_eq!(db.query_documents(&q).await.unwrap().total, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn date_range_filters_order_dates_and_timestamps_on_one_axis() {
+        let (schemas, _schema_dir) =
+            schemas_from("fields:\n  on:\n    type: date\n  at:\n    type: timestamp\n");
+        let (db, _dir) = test_db().await;
+        for (path, on, at) in [
+            ("a.md", "2024-01-01", "2024-01-01T12:00:00Z"),
+            ("b.md", "2024-02-01", "2024-01-02T01:00:00+02:00"),
+            ("c.md", "2023-12-31", "2024-01-02T00:30:00Z"),
+        ] {
+            db.upsert_document_metadata_with(
+                path,
+                &fm_of(serde_json::json!({ "on": on, "at": at })),
+                schemas.resolve_for(Path::new(path)),
+                1,
+                "h",
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        let jan_2 = crate::document_fields::epoch_seconds("2024-01-02").unwrap();
+        let on_or_after = query_with(vec![("on", at_least(jan_2))]);
+        assert_eq!(
+            paths(&db.query_documents(&on_or_after).await.unwrap()),
+            vec!["b.md"]
+        );
+        // b's 01:00+02:00 is 23:00 UTC on Jan 1, before Jan 2's midnight; c's is after.
+        let at_or_after = query_with(vec![("at", at_least(jan_2))]);
+        assert_eq!(
+            paths(&db.query_documents(&at_or_after).await.unwrap()),
+            vec!["c.md"]
+        );
+    }
+
+    async fn columns_of_document_fields(db: &StateDb) -> Vec<(String, i64)> {
+        sqlx::query_as("SELECT name, pk FROM pragma_table_info('document_fields') ORDER BY cid")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// A database as written before #349: `document_fields` without `elem`.
+    async fn old_shape_db(dir: &TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("old.db");
+        let pool = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", path.display()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Left in the default rollback journal mode, as a database some other
+        // tool created: the first `StateDb::new` converts it to WAL, which is the
+        // hardest case for concurrent openers.
+        for statement in [
+            "CREATE TABLE documents (
+                file_path TEXT PRIMARY KEY, title TEXT, description TEXT,
+                frontmatter TEXT NOT NULL, mtime INTEGER NOT NULL,
+                content_hash TEXT NOT NULL, chunk_count INTEGER NOT NULL,
+                indexed_at TEXT NOT NULL DEFAULT (datetime('now')))",
+            "CREATE TABLE document_fields (
+                file_path TEXT NOT NULL REFERENCES documents(file_path) ON DELETE CASCADE,
+                field TEXT NOT NULL, value_text TEXT NOT NULL, value_num REAL,
+                PRIMARY KEY (file_path, field, value_text))",
+            "CREATE INDEX idx_document_fields_field_text ON document_fields(field, value_text)",
+            "INSERT INTO documents (file_path, frontmatter, mtime, content_hash, chunk_count)
+             VALUES ('n.md', '{\"npcs\": [{\"role\": \"guard\"}], \"type\": \"guide\"}', 1, 'h', 1)",
+            "INSERT INTO document_fields VALUES ('n.md', 'type', 'guide', NULL)",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+        path
+    }
+
+    #[tokio::test]
+    async fn an_old_shaped_field_table_is_rebuilt_and_reprojected() {
+        let dir = TempDir::new().unwrap();
+        let path = old_shape_db(&dir).await;
+
+        let db = StateDb::new(&path).await.unwrap();
+        let columns = columns_of_document_fields(&db).await;
+        assert!(
+            columns.iter().any(|(name, pk)| name == "elem" && *pk > 0),
+            "elem is part of the key: {columns:?}"
+        );
+        assert!(field_rows(&db, "n.md").await.is_empty(), "old rows dropped");
+        assert_eq!(
+            db.projection_version().await.unwrap(),
+            0,
+            "reproject needed"
+        );
+
+        let report = db
+            .ensure_projection_current(&no_schemas(), false)
+            .await
+            .unwrap()
+            .expect("a reproject ran");
+        assert_eq!(report.reprojected, 1);
+        assert_eq!(db.projection_version().await.unwrap(), PROJECTION_VERSION);
+        let rows = field_rows(&db, "n.md").await;
+        assert!(
+            rows.contains(&("npcs[].role".into(), "guard".into(), None)),
+            "{rows:?}"
+        );
+        assert!(rows.contains(&("type".into(), "guide".into(), None)));
+
+        // Current now: reopening rebuilds nothing, and the check is a no-op.
+        drop(db);
+        let db = StateDb::new(&path).await.unwrap();
+        assert!(!field_rows(&db, "n.md").await.is_empty());
+        assert_eq!(
+            db.ensure_projection_current(&no_schemas(), false)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_opens_of_an_old_shaped_db_all_succeed() {
+        // Each open is what a separate process (serve, a CLI command) does against
+        // the same file; repeated with fresh databases because the race is timing
+        // dependent.
+        const OPENERS: usize = 8;
+        const ROUNDS: usize = 20;
+        for round in 0..ROUNDS {
+            let dir = TempDir::new().unwrap();
+            let path = old_shape_db(&dir).await;
+            let opens = (0..OPENERS).map(|_| {
+                let path = path.clone();
+                tokio::spawn(async move { StateDb::new(&path).await })
+            });
+            for (i, open) in futures::future::join_all(opens)
+                .await
+                .into_iter()
+                .enumerate()
+            {
+                let db = open
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("round {round}, opener {i}: {e:#}"));
+                let columns = columns_of_document_fields(&db).await;
+                assert!(
+                    columns.iter().any(|(name, pk)| name == "elem" && *pk > 0),
+                    "round {round}, opener {i}: {columns:?}"
+                );
+                assert_eq!(db.projection_version().await.unwrap(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_projection_version_change_reprojects_without_touching_anything_else() {
+        let (db, _dir) = test_db().await;
+        // A fresh database records the version on its first check.
+        assert!(
+            db.ensure_projection_current(&no_schemas(), false)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        db.upsert_document_metadata("r.md", &recipe_frontmatter(), 1, "h", 1)
+            .await
+            .unwrap();
+        db.upsert("r.md", "h", 1, "schema", "chunking", 0, 10)
+            .await
+            .unwrap();
+
+        // An older version on disk, and a projection that no longer matches.
+        sqlx::query("PRAGMA user_version = 0")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM document_fields")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let report = db
+            .ensure_projection_current(&no_schemas(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.reprojected, 1);
+        assert!(!field_rows(&db, "r.md").await.is_empty());
+        assert_eq!(db.projection_version().await.unwrap(), PROJECTION_VERSION);
+        // Reads only the state DB: the indexed_files bookkeeping is untouched.
+        let row = db.get("r.md").await.unwrap().unwrap();
+        assert_eq!(row.content_hash, "h");
+        assert_eq!(row.schema_hash, "schema");
+    }
+
+    #[tokio::test]
+    async fn a_failed_reproject_does_not_advance_the_projection_version() {
+        let (db, _dir) = test_db().await;
+        db.upsert_document_metadata("r.md", &recipe_frontmatter(), 1, "h", 1)
+            .await
+            .unwrap();
+        // Every projection write fails, as a full disk or a crash mid-run would.
+        sqlx::query(
+            "CREATE TRIGGER refuse BEFORE INSERT ON document_fields \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert!(
+            db.ensure_projection_current(&no_schemas(), false)
+                .await
+                .is_err()
+        );
+        assert_eq!(db.projection_version().await.unwrap(), 0);
+
+        sqlx::query("DROP TRIGGER refuse")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.ensure_projection_current(&no_schemas(), false)
+            .await
+            .unwrap()
+            .expect("the retry reprojects");
+        assert_eq!(db.projection_version().await.unwrap(), PROJECTION_VERSION);
+    }
+
+    #[tokio::test]
+    async fn a_persistently_failing_reproject_is_retried_once_per_process() {
+        let (db, _dir) = test_db().await;
+        db.upsert_document_metadata("r.md", &recipe_frontmatter(), 1, "h", 1)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse BEFORE INSERT ON document_fields \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let schemas = no_schemas();
+        assert!(db.ensure_projection_current(&schemas, false).await.is_err());
+        assert!(
+            db.ensure_projection_current(&schemas, false).await.is_err(),
+            "one retry"
+        );
+        assert_eq!(
+            db.ensure_projection_current(&schemas, false).await.unwrap(),
+            None,
+            "then no more attempts in this process"
+        );
+        assert_eq!(db.projection_version().await.unwrap(), 0);
+        // A forced run still tries, and a success clears the count.
+        assert!(db.ensure_projection_current(&schemas, true).await.is_err());
+        sqlx::query("DROP TRIGGER refuse")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.ensure_projection_current(&schemas, true).await.unwrap();
+        assert_eq!(db.projection_version().await.unwrap(), PROJECTION_VERSION);
+    }
+
+    #[tokio::test]
+    async fn reproject_reads_each_document_under_its_schema() {
+        let (schemas, _schema_dir) = schemas_from("fields:\n  code:\n    type: text\n");
+        let (db, _dir) = test_db().await;
+        db.upsert_document_metadata("c.md", &fm_of(serde_json::json!({ "code": 42 })), 1, "h", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            field_rows(&db, "c.md").await,
+            vec![("code".into(), "42".into(), Some(42.0))],
+            "undeclared: guessed"
+        );
+        db.ensure_projection_current(&schemas, true).await.unwrap();
+        assert_eq!(
+            field_rows(&db, "c.md").await,
+            vec![("code".into(), "42".into(), None)],
+            "declared text: no value_num"
+        );
+    }
+
+    #[tokio::test]
+    async fn breakdown_fields_leave_out_list_element_fields() {
+        let (db, _dir) = npc_db().await;
+        let fields = db.breakdown_fields(50, 50).await.unwrap();
+        assert!(
+            fields.iter().all(|(name, _)| !name.contains("[]")),
+            "{fields:?}"
+        );
+        // Still filterable and still in use for the vocabulary check.
+        assert!(db.field_in_use("npcs[].role").await.unwrap());
     }
 
     // -- listing / query builder --------------------------------------------
@@ -2846,14 +4119,46 @@ mod tests {
         (db, dir)
     }
 
-    /// Navigate a dot-path into a JSON object the same way Qdrant addresses a
-    /// nested payload field natively.
-    fn payload_at<'a>(payload: &'a Value, key: &str) -> Option<&'a Value> {
-        let mut cur = payload;
+    /// The values at payload key `key` — a dot-path where a `name[]` segment steps
+    /// into every element of that array (`fm.npcs[].role`) — the way Qdrant
+    /// addresses a nested payload field natively. A key that reaches nothing gives
+    /// no values.
+    fn payload_at<'a>(payload: &'a Value, key: &str) -> Vec<&'a Value> {
+        let mut current: Vec<&Value> = vec![payload];
         for part in key.split('.') {
-            cur = cur.as_object()?.get(part)?;
+            let (name, elements) = match part.strip_suffix("[]") {
+                Some(name) => (name, true),
+                None => (part, false),
+            };
+            current = current
+                .into_iter()
+                .filter_map(|v| v.as_object()?.get(name))
+                .flat_map(|v| match (elements, v) {
+                    (true, Value::Array(items)) => items.iter().collect::<Vec<_>>(),
+                    (true, _) => Vec::new(),
+                    (false, v) => vec![v],
+                })
+                .collect();
         }
-        Some(cur)
+        current
+    }
+
+    /// Whether a datetime payload value is inside a `DatetimeRange`, at the
+    /// microsecond precision the bounds are rounded to (`qdrant::epoch_to_timestamp`).
+    fn qdrant_datetime_range_matches(
+        val: &Value,
+        range: &qdrant_client::qdrant::DatetimeRange,
+    ) -> bool {
+        let Some(epoch) = val.as_str().and_then(crate::document_fields::epoch_seconds) else {
+            return false;
+        };
+        let at = qdrant::epoch_to_timestamp(epoch);
+        let at = (at.seconds, at.nanos);
+        let bound = |t: &Option<qdrant_client::qdrant::Timestamp>| t.map(|t| (t.seconds, t.nanos));
+        bound(&range.gte).is_none_or(|b| at >= b)
+            && bound(&range.lte).is_none_or(|b| at <= b)
+            && bound(&range.gt).is_none_or(|b| at > b)
+            && bound(&range.lt).is_none_or(|b| at < b)
     }
 
     fn qdrant_range_matches(val: &Value, range: &qdrant_client::qdrant::Range) -> bool {
@@ -2918,37 +4223,89 @@ mod tests {
             .expect("every lowered condition sets one variant")
         {
             ConditionOneOf::Field(fc) => {
-                let Some(val) = payload_at(payload, &fc.key) else {
-                    return false;
-                };
-                if let Some(range) = &fc.range {
-                    qdrant_range_matches(val, range)
-                } else if let Some(m) = &fc.r#match {
-                    qdrant_match_matches(val, m)
-                } else {
-                    panic!(
-                        "equivalence test's evaluator only models match/range field \
-                         conditions"
-                    )
-                }
+                // Every value at the key is a candidate: Qdrant matches an array (or
+                // a `[]` projection) when any element does.
+                let values = payload_at(payload, &fc.key);
+                let candidates: Vec<&Value> = values
+                    .iter()
+                    .flat_map(|v| match v {
+                        Value::Array(items) => items.iter().collect::<Vec<_>>(),
+                        other => vec![*other],
+                    })
+                    .collect();
+                candidates.into_iter().any(|val| {
+                    if let Some(range) = &fc.range {
+                        qdrant_range_matches(val, range)
+                    } else if let Some(range) = &fc.datetime_range {
+                        qdrant_datetime_range_matches(val, range)
+                    } else if let Some(m) = &fc.r#match {
+                        qdrant_match_matches(val, m)
+                    } else {
+                        panic!(
+                            "equivalence test's evaluator only models match/range/datetime \
+                             field conditions: {fc:?}"
+                        )
+                    }
+                })
+            }
+            ConditionOneOf::IsNull(n) => payload_at(payload, &n.key)
+                .first()
+                .is_none_or(|v| v.is_null()),
+            ConditionOneOf::Nested(n) => {
+                // Every condition of the nested filter must hold within ONE element of
+                // the array at the key (Qdrant's nested object filter).
+                let filter = n.filter.as_ref().expect("a nested condition has a filter");
+                assert!(
+                    filter.should.is_empty()
+                        && filter.must_not.is_empty()
+                        && filter.min_should.is_none(),
+                    "unexpected nested Filter shape from lower_field_filters: {filter:?}"
+                );
+                payload_at(payload, &n.key)
+                    .into_iter()
+                    .filter_map(|v| v.as_array())
+                    .flatten()
+                    .any(|element| {
+                        filter
+                            .must
+                            .iter()
+                            .all(|c| qdrant_condition_matches(c, element))
+                    })
             }
             ConditionOneOf::Filter(f) => {
-                // The only `Filter` shape `lower_field_filters` produces is a bare
-                // `should` OR (multi-value boolean equality) — must/must_not/
-                // min_should here would mean this evaluator is out of date.
-                assert!(
-                    f.must.is_empty() && f.must_not.is_empty() && f.min_should.is_none(),
-                    "unexpected Filter shape from lower_field_filters: {f:?}"
-                );
-                f.should
-                    .iter()
-                    .any(|c| qdrant_condition_matches(c, payload))
+                // `lower_field_filters` produces a bare `should` OR (multi-value
+                // boolean or datetime equality) and `unsatisfiable`'s must + must_not
+                // pair; anything else means this evaluator is out of date.
+                assert!(f.min_should.is_none(), "unexpected Filter shape: {f:?}");
+                (f.should.is_empty()
+                    || f.should
+                        .iter()
+                        .any(|c| qdrant_condition_matches(c, payload)))
+                    && f.must.iter().all(|c| qdrant_condition_matches(c, payload))
+                    && !f
+                        .must_not
+                        .iter()
+                        .any(|c| qdrant_condition_matches(c, payload))
             }
             other => panic!(
                 "equivalence test's evaluator does not model condition variant {other:?} — \
                  lower_field_filters should not be producing this shape"
             ),
         }
+    }
+
+    /// The frontmatter part of the Qdrant payload production writes for `fm` under
+    /// `schema` (`ingest::frontmatter_payload`, #350), as one JSON object.
+    fn production_payload(
+        path: &str,
+        fm: &HashMap<String, Value>,
+        schema: &crate::schema::ResolvedSchema,
+    ) -> Value {
+        Value::Object(
+            crate::ingest::frontmatter_payload(fm, path, &Default::default(), schema)
+                .into_iter()
+                .collect(),
+        )
     }
 
     /// Seed [`equivalence_db`], run `filters` through both the real
@@ -2981,8 +4338,9 @@ mod tests {
             .expect("query mode should accept this filter");
         let mut qdrant_paths: Vec<&str> = equivalence_docs()
             .into_iter()
-            .filter(|(_, fm)| {
-                let payload = Value::Object(fm.clone().into_iter().collect());
+            .filter(|(path, fm)| {
+                let payload =
+                    production_payload(path, fm, &crate::schema::ResolvedSchema::default());
                 conditions
                     .iter()
                     .all(|c| qdrant_condition_matches(c, &payload))
@@ -3001,6 +4359,89 @@ mod tests {
         assert_eq!(
             qdrant_paths, expected_sorted,
             "query mode (Qdrant conditions) produced a different document set than expected"
+        );
+    }
+
+    /// #350: every case of the shared typed fixture (`filter_parity`) finds the same
+    /// documents through the metadata index (enumeration mode) and through the
+    /// lowered Qdrant conditions evaluated offline against the payload production
+    /// writes — `fm.` keys, kind coercion, datetime ranges and nested conditions
+    /// included. `qdrant::tests::sqlite_and_qdrant_filters_agree_on_the_typed_fixture`
+    /// runs the same matrix against a live Qdrant.
+    #[tokio::test]
+    async fn typed_fixture_filters_agree_offline_across_both_modes() {
+        let dir = TempDir::new().unwrap();
+        let schemas = filter_parity::schemas(dir.path());
+        let db = filter_parity::seed_db(&dir.path().join("state.db"), &schemas).await;
+        let indexed = filter_parity::indexed(&schemas);
+
+        for (field, raw, expected) in filter_parity::cases() {
+            let filters = filter_parity::parse(field, &raw);
+            let sql = filter_parity::sqlite_paths(&db, filters.clone()).await;
+            assert_eq!(sql, expected, "enumeration mode: {field} {raw}");
+
+            let conditions = qdrant::lower_field_filters(&filters, &indexed)
+                .unwrap_or_else(|e| panic!("query mode refused {field} {raw}: {e}"));
+            let mut offline: Vec<String> = filter_parity::docs()
+                .into_iter()
+                .filter(|(path, fm)| {
+                    let payload = Value::Object(
+                        filter_parity::payload(path, fm, &schemas)
+                            .into_iter()
+                            .collect(),
+                    );
+                    conditions
+                        .iter()
+                        .all(|c| qdrant_condition_matches(c, &payload))
+                })
+                .map(|(path, _)| path.to_string())
+                .collect();
+            offline.sort();
+            assert_eq!(offline, expected, "query mode (offline): {field} {raw}");
+        }
+    }
+
+    /// The one documented divergence of the typed fixture (#350): equality on a
+    /// timestamp compares the instant in query mode (the payload holds RFC 3339 UTC
+    /// text) but the text as written in enumeration mode (`value_text`), so the same
+    /// instant spelled with another offset matches only with a query. Pinned so a
+    /// change to either side is deliberate.
+    #[tokio::test]
+    async fn timestamp_equality_matches_the_instant_only_in_query_mode() {
+        let dir = TempDir::new().unwrap();
+        let schemas = filter_parity::schemas(dir.path());
+        let db = filter_parity::seed_db(&dir.path().join("state.db"), &schemas).await;
+        let indexed = filter_parity::indexed(&schemas);
+        // a.md's `seen` is written `2024-01-02T10:00:00+02:00`.
+        let filters = filter_parity::parse("seen", &serde_json::json!("2024-01-02T08:00:00Z"));
+
+        assert!(
+            filter_parity::sqlite_paths(&db, filters.clone())
+                .await
+                .is_empty()
+        );
+        let conditions = qdrant::lower_field_filters(&filters, &indexed).unwrap();
+        let matched: Vec<&str> = filter_parity::docs()
+            .into_iter()
+            .filter(|(path, fm)| {
+                let payload = Value::Object(
+                    filter_parity::payload(path, fm, &schemas)
+                        .into_iter()
+                        .collect(),
+                );
+                conditions
+                    .iter()
+                    .all(|c| qdrant_condition_matches(c, &payload))
+            })
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(matched, vec!["a.md"]);
+        // Spelled as written, both modes agree.
+        let as_written =
+            filter_parity::parse("seen", &serde_json::json!("2024-01-02T10:00:00+02:00"));
+        assert_eq!(
+            filter_parity::sqlite_paths(&db, as_written).await,
+            vec!["a.md".to_string()]
         );
     }
 
@@ -3733,7 +5174,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.reproject_all_fields().await.unwrap();
+        db.reproject_all_fields(&no_schemas()).await.unwrap();
 
         let rows = field_rows(&db, "r.md").await;
         assert!(
@@ -3760,12 +5201,17 @@ mod tests {
             .await
             .unwrap();
 
-        let count = db
-            .reproject_all_fields()
+        let report = db
+            .reproject_all_fields(&no_schemas())
             .await
             .expect("one bad row must not fail the whole repair run");
 
-        assert_eq!(count, 1, "the healthy document was still reprojected");
+        assert_eq!(
+            report.reprojected, 1,
+            "the healthy document was still reprojected"
+        );
+        assert_eq!(report.unparseable, 1);
+        assert_eq!(report.failed, 0);
         assert!(!field_rows(&db, "zz-later.md").await.is_empty());
     }
 
