@@ -1,0 +1,69 @@
+# cargo-deny configuration (`cargo deny check`; run in CI by checks.yml, `lint` job).
+#
+# Policy: a hard failure is reserved for things the project can act on (a vulnerability,
+# a license outside the allow-list, a registry or source it did not vet). Informational
+# findings that are upstream-driven (unmaintained or unsound transitive crates, duplicate
+# versions) are warnings, so a dependency graph this project does not control does not
+# turn the required `ci-fast` check red.
+
+[graph]
+# Judge every feature, so an optional dependency is not silently skipped.
+all-features = true
+
+[advisories]
+# RustSec advisory database; fetched fresh on every run.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Judge unmaintained and unsound advisories on the whole graph, not just direct
+# dependencies, so nothing is hidden by scope. cargo-deny has no "warn" level for an
+# advisory, so the findings this project cannot act on yet are `ignore`d below, each with
+# its reason; an ignore that no longer matches anything is itself reported, which is the
+# prompt to delete it. Vulnerabilities (not listed) always fail the check.
+unmaintained = "all"
+unsound = "all"
+# A yanked crate (chacha20, spin at the time of writing) is a warning: the lockfile pins
+# a version its author withdrew, usually fixed by the next upstream bump.
+yanked = "warn"
+ignore = [
+  # Unmaintained, no replacement reachable from this crate:
+  { id = "RUSTSEC-2025-0012", reason = "backoff is unmaintained; transitive via async-openai, which owns the retry layer" },
+  { id = "RUSTSEC-2024-0384", reason = "instant is unmaintained; transitive via backoff (async-openai)" },
+  { id = "RUSTSEC-2026-0441", reason = "pin-utils is unmaintained; transitive via hyper" },
+  { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained; transitive via serde_yaml_ng (a direct dependency, so a YAML-crate swap would clear it)" },
+  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained; transitive via tonic 0.12 (qdrant-client)" },
+]
+
+[licenses]
+# This crate is AGPL-3.0-or-later (Cargo.toml). Everything below is permissive or
+# copyleft-compatible with it, and every entry is present in the tree today (`cargo deny
+# list`). A new license appearing in a dependency fails the check and is reviewed by hand.
+allow = [
+  "0BSD",
+  "AGPL-3.0-or-later",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0", # webpki-roots (CA bundle data)
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+# Floor for a license detected from a LICENSE file rather than declared in the manifest.
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions are upstream-driven (qdrant-client / tonic / rustls pull a second
+# generation of axum, hashbrown, rand, thiserror, ...) and not actionable here.
+multiple-versions = "warn"
+wildcards = "deny"
+# `path` dependencies are not wildcards.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,57 @@
+# Dependabot version updates, weekly and grouped to keep the PR volume low.
+#
+# These PRs are not owner-authored, so auto-merge.yml never arms them (only
+# `St0nefish`'s PRs are). That is intended: the owner reads the grouped PR and arms it by
+# hand, which is also the approval for ci-slow to run on it.
+#
+# Not covered, deliberately:
+#   - the Qdrant image pin: it is repeated in docker-compose.yml and every
+#     deploy/templates/compose-*.yml (and read by CI from docker-compose.yml), and
+#     Dependabot only finds compose files by their standard names, so it would bump the
+#     root file alone and leave the templates behind. Move them together by hand, and
+#     check the pinned server against what qdrant-client 1.x speaks.
+#   - assets/ui/vendor/* (see assets/ui/vendor/README.md).
+#   - the tool versions pinned inside workflow `run:` steps (actionlint, zizmor,
+#     cargo-binstall, cargo-audit, cargo-deny).
+
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # Minor and patch bumps land together in one PR. A major bump (qdrant-client,
+      # rmcp, sqlx, ...) is its own PR so its breakage is attributable.
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "chore(docker)"
+    groups:
+      docker-base-images:
+        patterns: ["*"]

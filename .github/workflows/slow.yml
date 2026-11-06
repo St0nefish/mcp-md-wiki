@@ -63,7 +63,7 @@ jobs:
           echo "::error::slow.yml runs only from master (this run: ${GITHUB_REF})."
           exit 1
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5 # zizmor: ignore[artipacked] read-only token; merge-tree.sh fetches, and nothing uploads the workspace
         with:
           fetch-depth: 0
 

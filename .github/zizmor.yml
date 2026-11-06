@@ -1,0 +1,21 @@
+# zizmor configuration (https://docs.zizmor.sh/configuration/), read by the `zizmor` step
+# in ci-fast.yml's `lint` job. Per-site exceptions live next to the code as
+# `# zizmor: ignore[rule]` comments with their reason; this file only holds the
+# repo-wide policy.
+
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # This repository pins actions by version tag, and Dependabot (github-actions
+        # ecosystem, .github/dependabot.yml) keeps the tags current. Pinning every action
+        # to a commit hash is a stricter option that has not been adopted; until it is, a
+        # tag (or, for dtolnay/rust-toolchain, its documented `@master`) is the accepted
+        # form, and an action with no ref at all still fails.
+        "*": ref-pin
+
+  self-repository:
+    # Flags `uses: ./.github/workflows/x.yml` and suggests the `$/` shorthand. The
+    # `./` form works everywhere and is what every workflow here uses, so the suggestion
+    # is not taken.
+    disable: true
