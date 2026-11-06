@@ -6991,7 +6991,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Phase 3 feature tests: mtime filter + explain
+    // mtime filter and `explain` tests
     // ------------------------------------------------------------------
 
     #[tokio::test]

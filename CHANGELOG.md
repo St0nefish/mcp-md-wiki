@@ -77,6 +77,68 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   wiki-style, reference-definition and autolink syntax. Links without a fragment or
   title are rewritten exactly as before. Links already rewritten by an earlier move
   are not repaired.
+- **A timed-out git command no longer keeps running.** A fetch, push or other git
+  subprocess that hit the 120-second limit was abandoned but left running after the
+  git lock was released, so it could overwrite `FETCH_HEAD` or hold
+  `.git/index.lock` against the next write or webhook. It is now killed and reaped
+  before the lock is released (`git::run_bounded`). A rebase that times out during a
+  write's sync is also aborted, instead of leaving the clone mid-rebase until the
+  next restart.
+- **Webhooks and `POST /admin/sync` pull again after a failed push.** When a write's
+  push failed (the remote unreachable, say) the commit stayed local; once the remote
+  moved on, every pull's fast-forward failed until some write happened to run, so
+  remote pushes were neither pulled nor indexed. A pull that cannot fast-forward now
+  rebases the unpushed commits onto the remote (one that conflicts is saved under
+  `refs/mcp-md-wiki/unsynced/<sha>` and the clone reset to the remote tip), the same
+  sync a write runs first. The commits are still pushed by the next write.
+- **Files a write's rebase pulled in are indexed when its push then fails.** The
+  changes other commits brought in during a write's rebase were marked for
+  reindexing only when the push succeeded; after a failed push they waited for the
+  periodic reconcile. `CommitSyncError::PostCommit` now carries them and every write
+  path marks them dirty.
+- **An interrupted clone is reported at startup.** A `.git` left by a clone that
+  was killed part-way was accepted as a repository, and every later fetch and
+  rebase failed. Startup now refuses a `.git` that git cannot open, or one with no
+  commit while the remote branch has commits, with an error naming the data
+  directory. Nothing is deleted: move the directory aside and restart to clone
+  again. An empty repository whose remote is empty (or unreachable) still starts.
+- **A document that becomes empty or invalid stops being served.** An indexed
+  document edited down to frontmatter only (no chunks), or one that fails
+  validation with `validation.strict: false`, kept its old chunks, metadata row and
+  links in the index indefinitely, and the reconcile re-read it on every sweep;
+  only `index --full` dropped it. Both are now purged like a deleted file. An empty
+  document keeps a zero-chunk state row, so the reconcile skips it until it
+  changes; an invalid one keeps none, so the next sweep re-validates it. A
+  failing, timed-out or unrunnable `validation.lint_command` (or a validator
+  error) describes the tooling rather than the document, so it purges nothing: a
+  lint outage cannot empty the index. A strict-mode rejection is unchanged: the
+  last good version stays served and
+  `/status` lists the rejection. No reindex needed: an affected document's state
+  row never matched its content, so the first reconcile after upgrading cleans it
+  up.
+- **A frontmatter patch no longer duplicates the frontmatter.** A document whose
+  `---` delimiter line had trailing whitespace was read as having no frontmatter
+  by the write path (the indexer's parser accepts it), so `frontmatter_patch`, and
+  the `status: archived` step of `archive`, prepended a second block and left the
+  old one in the body. Both now share one delimiter rule
+  (`heading::is_frontmatter_delimiter_line`). Documents already affected are not
+  repaired.
+- **A failed move leaves no partial destination.** A single-document move whose
+  destination write failed part-way (a full disk, say) left the truncated file
+  behind, so every retry failed with "already exists" and the reconcile indexed the
+  truncated copy. The partial destination is removed again, as a create's is; the
+  source is untouched.
+- **`index --full` clears the link graph.** `StateDb::clear` emptied
+  `indexed_files` and the metadata index but not `document_links`, so a document
+  removed while no reconcile ran kept appearing as a `links_in` source after a full
+  reindex. All index tables are cleared now; run `index --full` once to drop
+  phantom links already there.
+- **Reload reports the embedding batching settings as applied.**
+  `embedding.batch_size` and `embedding.batch_concurrency` were reported as
+  `restart_required`, but only indexing uses them and each indexing run builds its
+  embedding client from the live config, so they apply to the next run.
+  `embedding.request_timeout_secs` is reported twice: `applied` for indexing,
+  `restart_required` for the search and write-dedup client built at startup.
 
 ## [0.2.2] - 2026-11-03
 

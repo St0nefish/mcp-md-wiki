@@ -309,6 +309,10 @@ pub struct ScanRow {
     pub chunking_fingerprint: String,
     pub mtime: i64,
     pub size: i64,
+    /// `indexed_files.chunk_count`. Zero marks a file recorded as present but not
+    /// indexable (a document with no chunks — see `ingest::index_paths_generic`'s
+    /// handling of `FileOutcome::Empty`), which has no `documents` row on purpose.
+    pub chunk_count: i64,
     /// `documents.content_hash` for this path, or `None` if no metadata row exists yet.
     pub doc_hash: Option<String>,
 }
@@ -704,7 +708,7 @@ impl StateDb {
     pub async fn fetch_indexed_files_page(&self, limit: i64, offset: i64) -> Result<Vec<ScanRow>> {
         let rows: Vec<ScanRow> = sqlx::query_as(
             "SELECT i.file_path, i.content_hash, i.schema_hash, i.chunking_fingerprint, i.mtime, i.size, \
-                    d.content_hash AS doc_hash \
+                    i.chunk_count, d.content_hash AS doc_hash \
              FROM indexed_files i LEFT JOIN documents d ON d.file_path = i.file_path \
              ORDER BY i.file_path LIMIT ? OFFSET ?",
         )
@@ -769,20 +773,32 @@ impl StateDb {
         Ok(out)
     }
 
+    /// Empty every index table: `indexed_files`, the metadata index (`documents`,
+    /// `document_fields`) and the link graph (`document_links`), in one transaction.
+    ///
+    /// A full reindex clears `indexed_files` before orphan detection reads it, so
+    /// orphans are never computed on a full run — anything left here for a file that is
+    /// gone is a phantom row no future run can detect, because detection is driven off
+    /// `indexed_files`. That holds for `document_links` as much as for `documents`:
+    /// it has no foreign key to `documents` (a link target need not be indexed), so
+    /// nothing cascades into it, and a removed document's outgoing rows would keep
+    /// surfacing as `links_in` sources forever. Every surviving file's links are
+    /// rebuilt by the run that follows. `document_fields` would cascade from
+    /// `documents`, but is cleared explicitly so the result does not depend on the
+    /// connection's `foreign_keys` pragma.
     pub async fn clear(&self) -> Result<()> {
-        sqlx::query("DELETE FROM indexed_files")
-            .execute(&self.pool)
-            .await?;
-
-        // Also clear the metadata index. A full reindex clears `indexed_files` before
-        // orphan detection reads it, so orphans are never computed on a full run —
-        // leaving any document whose file is gone as a phantom row that no future run
-        // can ever detect, because detection is driven off `indexed_files`.
-        // document_fields cascades.
-        sqlx::query("DELETE FROM documents")
-            .execute(&self.pool)
-            .await?;
-
+        let mut tx = self.pool.begin().await?;
+        for table in [
+            "indexed_files",
+            "document_fields",
+            "documents",
+            "document_links",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table}"))
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3671,6 +3687,32 @@ mod tests {
             "metadata must not survive a full-reindex clear"
         );
         assert!(field_rows(&db, "gone.md").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_also_wipes_document_links_so_no_phantom_links_in_survives() {
+        // `document_links` has no foreign key to `documents`, so nothing cascades into
+        // it. A file deleted while no reconcile ran, then `index --full`, must not keep
+        // showing up as a `links_in` source of the document it linked to.
+        let (db, _dir) = test_db().await;
+        db.upsert("gone.md", "h", 1, "", "", 0, 0).await.unwrap();
+        db.replace_links("gone.md", "markdown", &[("kept.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("gone.md", "semantic", &[("kept.md".to_string(), Some(0.9))])
+            .await
+            .unwrap();
+
+        db.clear().await.unwrap();
+
+        assert!(db.all_links().await.unwrap().is_empty());
+        assert!(
+            db.links_targeting("kept.md", "markdown")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a cleared index must not report a phantom inbound link"
+        );
     }
 
     #[tokio::test]

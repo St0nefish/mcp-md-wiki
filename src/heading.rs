@@ -82,6 +82,13 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 /// The frontmatter delimiter gray_matter's `Matter::<YAML>::new()` uses.
 const FRONTMATTER_DELIMITER: &str = "---";
 
+/// Whether `line` (without its `\n`) opens or closes a frontmatter block by
+/// gray_matter 0.2's rule: the line with trailing whitespace trimmed (a `\r`, a
+/// stray space or tab) is exactly `---`. Leading whitespace is not trimmed.
+pub fn is_frontmatter_delimiter_line(line: &str) -> bool {
+    line.trim_end() == FRONTMATTER_DELIMITER
+}
+
 /// Number of raw-file lines that precede the body `validate::
 /// parse_frontmatter_raw` returns for `content`. Add it to a body-relative line
 /// to get the line in the raw file, which is how `get_document` counts.
@@ -102,10 +109,11 @@ const FRONTMATTER_DELIMITER: &str = "---";
 /// 3. Empty lines at the start of what remains are stripped. Whitespace-only
 ///    lines are not.
 ///
-/// This is not `write::split_frontmatter_bytes`. That function is deliberately
-/// stricter (an exact `---` with no trailing spaces, and an unclosed block is
-/// "no frontmatter"), and it must stay byte-exact for writes. What matters here
-/// is matching the parser that produced the body being chunked. The tests pin
+/// Rule 2's delimiter test is [`is_frontmatter_delimiter_line`], which
+/// `write::split_frontmatter_bytes` shares, so the writer and the indexer always
+/// agree on where a frontmatter block starts and ends. The writer differs only
+/// where it must stay byte-exact: it treats an unclosed block as "no
+/// frontmatter" (gray_matter parses no fields from one either). The tests pin
 /// the invariant `content.lines().skip(offset)` joined by `"\n"` == body across
 /// every variant.
 pub fn body_line_offset(content: &str) -> usize {
@@ -113,11 +121,8 @@ pub fn body_line_offset(content: &str) -> usize {
         return 0;
     }
     let frontmatter_lines = match content.split_once('\n') {
-        Some((first, rest)) if first.trim_end() == FRONTMATTER_DELIMITER => {
-            match rest
-                .lines()
-                .position(|l| l.trim_end() == FRONTMATTER_DELIMITER)
-            {
+        Some((first, rest)) if is_frontmatter_delimiter_line(first) => {
+            match rest.lines().position(is_frontmatter_delimiter_line) {
                 // Opening line + the lines before the close + the close itself.
                 Some(close) => close + 2,
                 // Unclosed: gray_matter keeps everything after the opening line.

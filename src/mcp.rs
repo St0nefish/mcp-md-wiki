@@ -4000,7 +4000,8 @@ impl KbSearchServer {
                 };
             }
 
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            // `rebased_paths` needs no handling: `mark_full` below covers every path.
+            Err(git::CommitSyncError::PostCommit { sha, source, .. }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure writing schema '{}', commit {} \
                      stands uncorrected: {:#}",

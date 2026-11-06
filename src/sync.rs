@@ -1,6 +1,7 @@
 //! On-demand sync of the knowledge-base clone from its remote: `git fetch` + ff-only
-//! merge + diff of exactly what the pull brought in, then the include/exclude filter and
-//! marking the survivors dirty on the reindex queue.
+//! merge (falling back to rebasing unpushed local commits when the clone has
+//! diverged) + diff of exactly what the pull brought in, then the include/exclude
+//! filter and marking the survivors dirty on the reindex queue.
 //!
 //! One implementation behind three entry points — the push webhook
 //! (`webhook::handle_webhook`), `POST /admin/sync` (`server.rs`) and the `git-pull` CLI
@@ -9,16 +10,18 @@
 //! rev-parse -> diff sequence: per-command locking would let a write land between the
 //! fetch and the merge, or between the merge and the diff and attribute that write's
 //! files to this pull. The fetch and merge run inline here rather than in `git.rs`;
-//! they are covered by that guard being alive, not by a signature.
+//! they are covered by that guard being alive, not by a signature. The diverged-clone
+//! fallback (`git::integrate_fetch_head`) takes the same guard by reference.
 
 use std::path::PathBuf;
 
-use tokio::process::Command;
-use tokio::time::timeout;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::ResolvedConfig;
-use crate::git::{GIT_TIMEOUT, authenticated_url, redact_url};
+use crate::git::{
+    GIT_TIMEOUT, Integrated, authenticated_url, git_command, integrate_fetch_head, redact_url,
+    run_bounded,
+};
 use crate::reindex::ReindexQueue;
 
 /// Why a sync failed. `message` is a short fixed string safe to return to a webhook
@@ -85,6 +88,15 @@ pub struct SyncOutcome {
 /// Fetch the configured branch and fast-forward the clone to it, returning the paths
 /// the pull changed. Does not touch the reindex queue.
 ///
+/// When the clone cannot fast-forward because it holds local commits the remote
+/// lacks (a push that failed after its commit landed), this falls back to
+/// `git::integrate_fetch_head`, the same rebase (or, on a genuine conflict,
+/// park-and-reset) a write's pre-write sync applies, under the one guard this
+/// function already holds. The local commits are not pushed here; the next write
+/// pushes them. `changed` is still the diff between HEAD before the fetch and HEAD
+/// after, so it holds what the remote brought in (plus, after a conflict reset,
+/// the parked commits' paths, which changed on disk too).
+///
 /// `git_token` is injected into the fetch URL per call (never persisted in the clone's
 /// remote config), so a clone made before a token existed still pulls.
 pub async fn pull_clone(
@@ -133,9 +145,8 @@ pub async fn pull_clone(
         redact_url(&fetch_url)
     );
 
-    let fetch = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
+    let fetch = run_bounded(
+        git_command()
             .args([
                 "-c",
                 &format!("safe.directory={}", data_path),
@@ -144,8 +155,7 @@ pub async fn pull_clone(
                 &fetch_url,
                 branch,
             ])
-            .current_dir(data_path)
-            .output(),
+            .current_dir(data_path),
     )
     .await;
     match fetch {
@@ -173,9 +183,8 @@ pub async fn pull_clone(
         }
     }
 
-    let merge = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
+    let merge = run_bounded(
+        git_command()
             .args([
                 "-c",
                 &format!("safe.directory={}", data_path),
@@ -183,8 +192,7 @@ pub async fn pull_clone(
                 "--ff-only",
                 "FETCH_HEAD",
             ])
-            .current_dir(data_path)
-            .output(),
+            .current_dir(data_path),
     )
     .await;
     match merge {
@@ -198,9 +206,49 @@ pub async fn pull_clone(
         }
         Ok(Ok(o)) if o.status.success() => info!("Git merge (ff-only) succeeded"),
         Ok(Ok(o)) => {
+            // No fast-forward: most often the clone holds a commit a failed push
+            // left unpushed while the remote moved on. Reconcile it the way the
+            // next write would (`git::sync_to_remote`), under this same guard,
+            // rather than leaving every pull failing until a write happens.
             let stderr = redact_url(&String::from_utf8_lossy(&o.stderr));
-            error!("Git merge failed: {}", stderr);
-            return Err(git_err("Git merge failed", stderr.trim().to_string()));
+            info!(
+                "Git merge (ff-only) failed; rebasing local commits onto the remote: {}",
+                stderr.trim()
+            );
+            match integrate_fetch_head(
+                &git_lock,
+                data_path,
+                &config.write.commit_author_name,
+                &config.write.commit_author_email,
+            )
+            .await
+            {
+                Integrated::FastForwarded => info!("Git merge (ff-only) succeeded on retry"),
+                Integrated::Rebased => info!(
+                    "Rebased unpushed local commits onto the remote; they are pushed with \
+                     the next write"
+                ),
+                Integrated::ResetToRemote => warn!(
+                    "Unpushed local commits conflicted with the remote; the clone was reset \
+                     to the remote tip with them saved under a recovery ref"
+                ),
+                Integrated::RebaseFailed(e) => {
+                    let detail = redact_url(&format!("{e:#}"));
+                    error!("Git merge failed and the rebase fallback failed too: {detail}");
+                    return Err(git_err(
+                        "Git merge failed",
+                        format!("{}; rebase fallback: {detail}", stderr.trim()),
+                    ));
+                }
+                Integrated::ResetFailed(e) => {
+                    let detail = redact_url(&format!("{e:#}"));
+                    error!("Git merge failed and resetting to the remote tip failed: {detail}");
+                    return Err(git_err(
+                        "Git merge failed",
+                        format!("{}; reset to the remote tip: {detail}", stderr.trim()),
+                    ));
+                }
+            }
         }
     }
 
@@ -383,6 +431,72 @@ mod tests {
             queue.snapshot_paths(),
             std::collections::HashSet::from([PathBuf::from("b.md")])
         );
+    }
+
+    /// A clone holding a commit a failed push left unpushed, while the remote
+    /// moved on, cannot fast-forward. The pull rebases the local commit onto the
+    /// remote instead of failing, and reports only what the remote brought in.
+    #[tokio::test]
+    async fn a_diverged_clone_is_rebased_onto_the_remote() {
+        let (remote, clone, config) = fixture();
+        std::fs::write(clone.path().join("local.md"), "# Local\n").unwrap();
+        git(clone.path(), &["add", "-A"]);
+        git(clone.path(), &["commit", "-q", "-m", "unpushed"]);
+        std::fs::write(remote.path().join("remote.md"), "# Remote\n").unwrap();
+        git(remote.path(), &["add", "-A"]);
+        git(remote.path(), &["commit", "-q", "-m", "remote"]);
+
+        let out = pull_clone(&config, None).await.unwrap();
+        assert_ne!(out.old_head, out.new_head);
+        assert_eq!(out.changed, vec![PathBuf::from("remote.md")]);
+        assert!(clone.path().join("local.md").is_file());
+        assert!(clone.path().join("remote.md").is_file());
+
+        // The local commit now sits on top of the remote tip, so the next pull
+        // fast-forwards (here: has nothing to do) and the next write pushes it.
+        let log = StdCommand::new("git")
+            .args(["log", "--format=%s"])
+            .current_dir(clone.path())
+            .output()
+            .unwrap();
+        let subjects: Vec<String> = String::from_utf8_lossy(&log.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(subjects, ["unpushed", "remote", "init"]);
+        assert!(!clone.path().join(".git/rebase-merge").exists());
+
+        let again = pull_clone(&config, None).await.unwrap();
+        assert_eq!(again.old_head, again.new_head);
+        assert!(again.changed.is_empty());
+    }
+
+    /// A local commit that conflicts with the remote is parked under a recovery
+    /// ref and the clone reset to the remote tip, as a write's pre-write sync does.
+    #[tokio::test]
+    async fn a_diverged_clone_that_conflicts_is_reset_to_the_remote() {
+        let (remote, clone, config) = fixture();
+        std::fs::write(clone.path().join("a.md"), "# A local\n").unwrap();
+        git(clone.path(), &["commit", "-q", "-am", "unpushed"]);
+        std::fs::write(remote.path().join("a.md"), "# A remote\n").unwrap();
+        git(remote.path(), &["commit", "-q", "-am", "remote"]);
+
+        let out = pull_clone(&config, None).await.unwrap();
+        assert_eq!(out.changed, vec![PathBuf::from("a.md")]);
+        assert_eq!(
+            std::fs::read_to_string(clone.path().join("a.md")).unwrap(),
+            "# A remote\n"
+        );
+        let refs = StdCommand::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/mcp-md-wiki/unsynced",
+            ])
+            .current_dir(clone.path())
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&refs.stdout).trim().is_empty());
     }
 
     #[tokio::test]

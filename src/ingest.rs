@@ -55,7 +55,8 @@ fn shift_chunks_to_file_lines(chunks: &mut [chunk::Chunk], content: &str) {
 /// gets a state row, every later reconcile hits it again. So a bug triggered by one
 /// document's shape is contained to that document here instead. The caller reports
 /// it as [`FileOutcome::Invalid`], the same per-file "could not index this" outcome a
-/// validation failure gets: counted, skipped, and retried by the next reconcile.
+/// validation failure gets: counted, purged from the index, and retried by the next
+/// reconcile.
 ///
 /// `AssertUnwindSafe` is sound: the closure only borrows immutable inputs and builds
 /// a fresh `Vec`, so nothing observable is left half-updated by an unwind.
@@ -907,6 +908,16 @@ struct PendingFile {
     chunking_fingerprint: String,
 }
 
+/// An empty document's state-row baseline, held until its old index entries are
+/// purged (see `FileOutcome::Empty`).
+struct EmptiedFile {
+    file_path: String,
+    hash: String,
+    mtime: i64,
+    size: i64,
+    schema_hash: String,
+}
+
 /// Result of processing a single discovered file.
 enum FileOutcome {
     /// Unchanged since the last run. Carries the content hash so `index_paths` can tell
@@ -921,8 +932,29 @@ enum FileOutcome {
         mtime: i64,
         size: i64,
     },
+    /// The document itself failed validation (non-strict mode) or chunking.
+    /// `validation.strict: false` documents an invalid file as skipped, which is what
+    /// a `--full` run does with it, so `index_paths_generic` purges whatever an
+    /// earlier version of it left in the index (points, metadata, links, state row)
+    /// rather than keep serving that version. No state row is written, so the next
+    /// reconcile re-validates it.
     Invalid,
-    Empty,
+    /// The validation tooling failed (the engine errored, or a `lint_command` failed,
+    /// timed out or could not run) in non-strict mode. That says nothing about the
+    /// document's own content, so the
+    /// index is left exactly as it is, as before the purge-on-invalid fix: a transient
+    /// tooling failure must not take an indexed document out of search. No state row
+    /// is written, so the next reconcile retries.
+    ValidatorError,
+    /// Valid, but chunking produced nothing (frontmatter only, say). Treated like a
+    /// delete — its old points, metadata and links are purged — but recorded in
+    /// `indexed_files` with `chunk_count` 0 and the stat/hash baseline below, so the
+    /// reconcile does not re-read it on every sweep. Carries what that row needs.
+    Empty {
+        hash: String,
+        mtime: i64,
+        size: i64,
+    },
     Ready(PendingFile),
     /// A `validation.strict` rejection: the content-level validation errors branch
     /// (`Ok((result, None))`) or the validation-engine error branch (`Err(e)`), when
@@ -1054,7 +1086,7 @@ async fn process_file(
 
                 if chunks.is_empty() {
                     warn!("No chunks produced for: {}", file_path);
-                    return Ok(FileOutcome::Empty);
+                    return Ok(FileOutcome::Empty { hash, mtime, size });
                 }
 
                 debug!("  {} chunks from: {}", chunks.len(), file_path);
@@ -1091,6 +1123,17 @@ async fn process_file(
                     return Ok(FileOutcome::Rejected { reason });
                 }
 
+                // A failing, timed-out or unrunnable `lint_command` is reported as a
+                // validation error too, but it describes the tooling, not the
+                // document: an outage must not purge every indexed file it touches.
+                if result
+                    .field_errors
+                    .iter()
+                    .any(|fe| matches!(fe.rule.as_str(), "lint" | "io"))
+                {
+                    return Ok(FileOutcome::ValidatorError);
+                }
+
                 Ok(FileOutcome::Invalid)
             }
             Err(e) => {
@@ -1108,7 +1151,7 @@ async fn process_file(
                     return Ok(FileOutcome::Rejected { reason });
                 }
 
-                Ok(FileOutcome::Invalid)
+                Ok(FileOutcome::ValidatorError)
             }
         }
     } else {
@@ -1132,7 +1175,7 @@ async fn process_file(
         };
         if chunks.is_empty() {
             warn!("No chunks produced for: {}", file_path);
-            return Ok(FileOutcome::Empty);
+            return Ok(FileOutcome::Empty { hash, mtime, size });
         }
 
         Ok(FileOutcome::Ready(PendingFile {
@@ -1775,12 +1818,16 @@ async fn flush_pending_batch<E: EmbedStore, Q: VectorStore + NeighborStore>(
 
 /// Remove orphaned files (deleted from disk, or now excluded by the indexing path
 /// filter — #266 — but still in the index).
+///
+/// Returns the paths whose metadata and state rows were both removed; a path whose
+/// bookkeeping failed is left out (it stays detectable and is retried next run).
 async fn remove_orphans<Q: VectorStore>(
     orphaned: &[String],
     store: &Q,
     state: &StateDb,
     collection: &str,
-) -> Result<()> {
+) -> Result<HashSet<String>> {
+    let mut removed = HashSet::with_capacity(orphaned.len());
     let orphan_refs: Vec<&str> = orphaned.iter().map(|s| s.as_str()).collect();
     store
         .delete_by_files(collection, &orphan_refs)
@@ -1819,8 +1866,9 @@ async fn remove_orphans<Q: VectorStore>(
         // no future sweep able to clear it. `record_strict_rejection` is a no-op if
         // this path was never rejected.
         crate::status::INDEX_STATUS.record_strict_rejection(file_path, None);
+        removed.insert(file_path.clone());
     }
-    Ok(())
+    Ok(removed)
 }
 
 /// The frontmatter key [`with_derived_domain`] sets from a document's
@@ -2992,7 +3040,7 @@ const SCAN_PAGE_SIZE: i64 = 1000;
 /// makes `INDEX_STATUS.is_bulk_indexing()` true from that moment — and keeps
 /// it true past this function returning, through however long the indexing
 /// run that follows (and any retry of it) takes, until [`scan_and_index`]
-/// confirms nothing stale remains (#286; round-6 review L1).
+/// confirms nothing stale remains (#286).
 ///
 /// An invalid schema file anywhere in the tree fails the scan before any
 /// row is read (see [`build_run_schemas`]).
@@ -3128,8 +3176,10 @@ pub async fn scan_for_dirty(
             }
 
             // Reason 3: metadata staleness. Unchanged content, but the metadata index
-            // disagrees with (or lacks) it.
-            if row.doc_hash.as_deref() != Some(row.content_hash.as_str()) {
+            // disagrees with (or lacks) it. A zero-chunk row is a document that
+            // produced no chunks (`FileOutcome::Empty`): it has no metadata row on
+            // purpose, so a missing one is not staleness.
+            if row.chunk_count > 0 && row.doc_hash.as_deref() != Some(row.content_hash.as_str()) {
                 dirty.insert(PathBuf::from(&row.file_path));
             }
         }
@@ -3198,8 +3248,11 @@ pub async fn scan_for_dirty(
 /// does not exist on disk, or exists but is now excluded by `indexing.include`/
 /// `exclude`/`exclude_files` (#266; scoped runs only, and never when the path filter
 /// cannot be trusted — see [`PathFilter::for_exclusion_purge`]), its points and rows
-/// are purged. This exactly mirrors
-/// [`FileOutcome`] — see [`process_file`].
+/// are purged. A file still on disk that no longer produces an indexable document —
+/// invalid under non-strict validation, or empty of chunks — is purged the same way
+/// (an empty one keeps a zero-chunk state row); a strict-mode rejection is not, and
+/// keeps its last good version. This exactly mirrors [`FileOutcome`] — see
+/// [`process_file`].
 ///
 /// `force = true` bypasses the skip-if-unchanged check and, before touching any path,
 /// drops and recreates the Qdrant collection and clears the state DB — this is
@@ -3540,6 +3593,10 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     let mut pending: Vec<PendingFile> = Vec::new();
     let mut backfill_queue: Vec<(String, PathBuf)> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
+    // Present on disk but no longer producing an indexable document: purged like
+    // `missing`, but not counted as orphans (see `FileOutcome::Invalid`/`Empty`).
+    let mut unindexable: Vec<String> = Vec::new();
+    let mut emptied: Vec<EmptiedFile> = Vec::new();
     let mut skipped = 0usize;
     let mut invalid = 0usize;
     let mut empty = 0usize;
@@ -3640,8 +3697,11 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
             FileOutcome::Skipped { hash, mtime, size } => {
                 skipped += 1;
                 // Unchanged content, but the metadata index may still be missing or
-                // stale for this file — queue it for a cheap parse-only backfill.
-                if document_hashes.get(rel_key) != Some(&hash) {
+                // stale for this file — queue it for a cheap parse-only backfill. Not
+                // for a zero-chunk row (an empty document, see `FileOutcome::Empty`):
+                // it has no metadata row on purpose.
+                let recorded_empty = state_map.get(rel_key).is_some_and(|e| e.chunk_count == 0);
+                if !recorded_empty && document_hashes.get(rel_key) != Some(&hash) {
                     backfill_queue.push((rel_key.clone(), abs_path.clone()));
                 }
 
@@ -3665,8 +3725,33 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
                     );
                 }
             }
-            FileOutcome::Invalid => invalid += 1,
-            FileOutcome::Empty => empty += 1,
+            FileOutcome::Invalid => {
+                invalid += 1;
+                // Not indexable any more: drop what an earlier version left behind,
+                // the way a `--full` run (which never indexes it) would. Only when
+                // there is something to drop, so an invalid file that was never
+                // indexed costs no purge on every sweep. See `FileOutcome::Invalid`.
+                if state_map.contains_key(rel_key) || document_hashes.contains_key(rel_key) {
+                    unindexable.push(rel_key.clone());
+                }
+            }
+            FileOutcome::ValidatorError => {
+                // Counted with the invalid files for the run summary, but the index is
+                // left alone: see `FileOutcome::ValidatorError`.
+                invalid += 1;
+            }
+            FileOutcome::Empty { hash, mtime, size } => {
+                empty += 1;
+                // A valid document, whatever an earlier strict-mode rejection said.
+                INDEX_STATUS.record_strict_rejection(rel_key, None);
+                emptied.push(EmptiedFile {
+                    file_path: rel_key.clone(),
+                    hash,
+                    mtime,
+                    size,
+                    schema_hash: schema_hash.clone(),
+                });
+            }
             FileOutcome::Rejected { reason } => {
                 rejected += 1;
                 // Persistent, per-path — see `FileOutcome::Rejected`'s doc comment and
@@ -3742,6 +3827,44 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         INDEX_STATUS.set_phase(Phase::RemovingOrphans);
         info!("Removing {} missing file(s) from index", missing.len());
         remove_orphans(&missing, store, &state, collection).await?;
+    }
+
+    // ── Purge files that no longer produce an indexable document ─────────────
+    //
+    // An invalid (non-strict) or empty document is what a `--full` run leaves out of
+    // the index entirely, so an incremental run must not keep serving its previous
+    // version either: its points, metadata row, field projection and outgoing links
+    // go, exactly as for a deleted file. An empty one then gets a zero-chunk state row
+    // so the reconcile's stat pre-filter can skip it until it changes.
+    unindexable.extend(emptied.iter().map(|e| e.file_path.clone()));
+    if !unindexable.is_empty() {
+        INDEX_STATUS.set_phase(Phase::RemovingOrphans);
+        info!(
+            "Purging {} file(s) that no longer produce an indexable document",
+            unindexable.len()
+        );
+        let purged = remove_orphans(&unindexable, store, &state, collection).await?;
+        for e in emptied.iter().filter(|e| purged.contains(&e.file_path)) {
+            if let Err(err) = state
+                .upsert(
+                    &e.file_path,
+                    &e.hash,
+                    0,
+                    &e.schema_hash,
+                    &chunking_fp,
+                    e.mtime,
+                    e.size,
+                )
+                .await
+            {
+                // No row means the next reconcile re-reads it and tries again.
+                warn!(
+                    file = %e.file_path,
+                    "Failed to record empty document in state DB (non-fatal, retried next scan): {:#}",
+                    err
+                );
+            }
+        }
     }
 
     // ── Summary ──────────────────────────────────────────────────────────────
@@ -3892,7 +4015,7 @@ pub async fn scan_and_index(config: &ResolvedConfig, force: bool, trigger: Trigg
         let (_data_path, all_paths) = discover_relative(config).await?;
         let result = index_paths(config, &all_paths, true, trigger).await;
         // A full reindex re-chunks every file under the current settings, so no
-        // file can be stale afterward (#286 round-6 L1): see
+        // file can be stale afterward (#286): see
         // `status::IndexStatus::clear_stale_chunking`.
         if result.is_ok() {
             INDEX_STATUS.clear_stale_chunking();
@@ -3934,7 +4057,7 @@ pub async fn scan_and_index(config: &ResolvedConfig, force: bool, trigger: Trigg
     // The scan's guard is what `mark_rechunk` (inside `scan_for_dirty`) uses to
     // set `IndexStatus`'s sticky "stale chunking remains" latch — see that
     // method's doc comment for why it deliberately outlives this guard rather
-    // than clearing when it drops (#286 round-6 L1: that used to leave the note
+    // than clearing when it drops (#286: that used to leave the note
     // dark during retry backoff, a permanent give-up, and the wait for the next
     // reconcile). Two independent confirmations clear it below: this scan
     // itself finding nothing to re-chunk, and — separately — the run that
@@ -4589,6 +4712,174 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    async fn run_generic(config: &ResolvedConfig, paths: &[PathBuf], embeddings: usize) {
+        let embedder = MockEmbedClient::ok(vec![vec![1.0, 2.0, 3.0]; embeddings]);
+        let store = TrackingMockVectorStore::all_ok();
+        let result = index_paths_generic(
+            config,
+            paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+    }
+
+    /// A document that loses its body (frontmatter only) yields no chunks. It must be
+    /// purged like a deleted file — points, metadata and outgoing links — instead of
+    /// serving the old body forever, and recorded with a zero-chunk state row so the
+    /// reconcile stops re-reading it.
+    #[tokio::test]
+    async fn index_paths_generic_purges_a_document_that_became_empty_and_records_it() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+        let path = dir.path().join("a.md");
+        let paths = vec![PathBuf::from("a.md")];
+
+        std::fs::write(&path, "---\ntitle: A\n---\n# A\n\nSee [B](b.md).\n").unwrap();
+        run_generic(&config, &paths, 1).await;
+        let state = open_scan_test_db(&config).await;
+        assert_eq!(state.document_count().await.unwrap(), 1);
+        assert_eq!(state.all_links().await.unwrap().len(), 1);
+
+        std::fs::write(&path, "---\ntitle: A\n---\n").unwrap();
+        let embedder = MockEmbedClient::ok(vec![]);
+        let store = TrackingMockVectorStore::all_ok();
+        index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *store.delete_by_files_calls.lock().unwrap(),
+            vec![vec!["a.md".to_string()]],
+            "the emptied document's old points must be deleted"
+        );
+        assert_eq!(state.document_count().await.unwrap(), 0);
+        assert!(state.all_links().await.unwrap().is_empty());
+        let row = state.get("a.md").await.unwrap().expect("a zero-chunk row");
+        assert_eq!(row.chunk_count, 0);
+
+        // The reconcile's stat pre-filter now skips it, and a run over it again (a
+        // webhook marking it, say) neither purges again nor backfills metadata.
+        let dirty = scan_for_dirty(&config, &INDEX_STATUS.begin_reconcile_scan())
+            .await
+            .unwrap();
+        assert!(
+            dirty.is_empty(),
+            "an unchanged empty document is not dirty: {dirty:?}"
+        );
+        let store = TrackingMockVectorStore::all_ok();
+        index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &MockEmbedClient::ok(vec![]),
+            &store,
+        )
+        .await
+        .unwrap();
+        assert!(store.delete_by_files_calls.lock().unwrap().is_empty());
+        assert_eq!(state.document_count().await.unwrap(), 0);
+
+        // Filling the body back in indexes it again.
+        std::fs::write(&path, "---\ntitle: A\n---\n# A\n\nBack.\n").unwrap();
+        run_generic(&config, &paths, 1).await;
+        assert_eq!(state.document_count().await.unwrap(), 1);
+        assert_eq!(state.get("a.md").await.unwrap().unwrap().chunk_count, 1);
+    }
+
+    /// With `validation.strict: false` an invalid file is skipped, so an indexed
+    /// document that turns invalid must lose its old index entries (what a `--full`
+    /// run would leave), and keep no state row, so the next reconcile re-validates it.
+    #[tokio::test]
+    async fn index_paths_generic_purges_a_document_that_became_invalid_in_non_strict_mode() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+        config.validation = crate::config::ValidationConfig {
+            enabled: true,
+            strict: false,
+            ..Default::default()
+        };
+        config.frontmatter = crate::config::FrontmatterConfig {
+            required: vec!["title".into()],
+            ..Default::default()
+        };
+        let path = dir.path().join("a.md");
+        let paths = vec![PathBuf::from("a.md")];
+
+        std::fs::write(&path, "---\ntitle: A\n---\n# A\n\nSee [B](b.md).\n").unwrap();
+        run_generic(&config, &paths, 1).await;
+        let state = open_scan_test_db(&config).await;
+        assert_eq!(state.document_count().await.unwrap(), 1);
+
+        std::fs::write(&path, "---\n---\n# A\n\nSee [B](b.md).\n").unwrap();
+        let store = TrackingMockVectorStore::all_ok();
+        index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &MockEmbedClient::ok(vec![]),
+            &store,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *store.delete_by_files_calls.lock().unwrap(),
+            vec![vec!["a.md".to_string()]]
+        );
+        assert_eq!(state.document_count().await.unwrap(), 0);
+        assert!(state.all_links().await.unwrap().is_empty());
+        assert!(
+            state.get("a.md").await.unwrap().is_none(),
+            "no state row, so the next reconcile re-validates it"
+        );
+    }
+
+    /// An invalid file that was never indexed has nothing to purge, so it costs no
+    /// Qdrant delete on every sweep.
+    #[tokio::test]
+    async fn index_paths_generic_never_indexed_invalid_file_triggers_no_purge() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+        config.validation = crate::config::ValidationConfig {
+            enabled: true,
+            strict: false,
+            ..Default::default()
+        };
+        config.frontmatter = crate::config::FrontmatterConfig {
+            required: vec!["title".into()],
+            ..Default::default()
+        };
+        std::fs::write(dir.path().join("a.md"), "---\n---\n# A\n").unwrap();
+        let store = TrackingMockVectorStore::all_ok();
+        index_paths_generic(
+            &config,
+            &[PathBuf::from("a.md")],
+            false,
+            std::time::Instant::now(),
+            &MockEmbedClient::ok(vec![]),
+            &store,
+        )
+        .await
+        .unwrap();
+        assert!(store.delete_by_files_calls.lock().unwrap().is_empty());
     }
 
     /// Re-indexing a file whose links changed must REPLACE the prior edge set, not
@@ -6138,7 +6429,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_for_dirty_under_an_invalid_schema_never_marks_rechunk() {
-        // #286 round-6 L1: the scan aborts on the schema build, before any row's
+        // #286: the scan aborts on the schema build, before any row's
         // chunking fingerprint is compared, so a stale file cannot raise the
         // "results may be incomplete" note while nothing can be re-chunked.
         let dir = TempDir::new().unwrap();
@@ -7299,7 +7590,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(outcome, FileOutcome::Empty));
+        assert!(matches!(outcome, FileOutcome::Empty { .. }));
     }
 
     #[tokio::test]
@@ -7373,6 +7664,41 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(outcome, FileOutcome::Invalid));
+    }
+
+    /// A failing `lint_command` is reported as a validation error, but it describes
+    /// the tooling (a missing binary after a deploy, a timeout), not the document, so
+    /// non-strict mode must not treat it as an invalid document to purge.
+    #[tokio::test]
+    async fn process_file_lint_failure_in_non_strict_mode_is_validator_error_not_invalid() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\n---\n# Hello\nBody.";
+        std::fs::write(&path, content).unwrap();
+
+        let config = {
+            let mut c = config_no_validation();
+            c.validation.enabled = true;
+            c.validation.strict = false;
+            c.validation.lint_command = Some(vec!["false".into()]);
+            c
+        };
+
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config,
+            &ResolvedSchema::from_config(&config.frontmatter),
+            "",
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, FileOutcome::ValidatorError));
     }
 
     /// #156: a strict-mode validation failure used to propagate as `Err`, which
@@ -7639,7 +7965,8 @@ mod tests {
         match outcome {
             FileOutcome::Skipped { .. } => "Skipped",
             FileOutcome::Invalid => "Invalid",
-            FileOutcome::Empty => "Empty",
+            FileOutcome::ValidatorError => "ValidatorError",
+            FileOutcome::Empty { .. } => "Empty",
             FileOutcome::Ready(_) => "Ready",
             FileOutcome::Rejected { .. } => "Rejected",
         }

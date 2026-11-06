@@ -865,24 +865,28 @@ pub enum FrontmatterEdit {
 /// the frontmatter block at all, structurally, rather than by carefully
 /// avoiding it.
 ///
-/// Delimiter convention: `content` must begin with a `---` line (`\n`- or
-/// `\r\n`-terminated); the block ends at the next line that is exactly `---`
-/// (optionally `\r`-terminated), found by scanning line-by-line so a literal
-/// `---` inside a YAML value (e.g. a horizontal-rule in a `description`
-/// string) can never be mistaken for the closing delimiter. Returns `None`
-/// when `content` has no opening delimiter, or an opening delimiter with no
-/// matching close — both read as "no frontmatter block", the same as
-/// `gray_matter` treats them.
+/// Delimiter convention: gray_matter's, through the one predicate the indexer
+/// uses too (`heading::is_frontmatter_delimiter_line`: `---` with trailing
+/// whitespace — `\r`, spaces, tabs — trimmed). `content`'s first line must be
+/// such a delimiter and be `\n`-terminated; the block ends at the next line that
+/// is one, found by scanning line-by-line so a literal `---` inside a YAML value
+/// (e.g. a horizontal-rule in a `description` string) can never be mistaken for
+/// the closing delimiter. A stricter rule here would see no frontmatter in a
+/// document whose opening line is `--- `, while the parser still reads its
+/// fields, so a frontmatter patch would prepend a second block and leave the old
+/// one in the body. Returns `None` when `content` has no opening delimiter, or
+/// an opening delimiter with no matching close — both read as "no frontmatter
+/// block" (gray_matter parses no fields from an unclosed one).
 fn split_frontmatter_bytes(content: &str) -> Option<(&str, &str)> {
-    let after_open = content
-        .strip_prefix("---\r\n")
-        .or_else(|| content.strip_prefix("---\n"))?;
+    let (first, after_open) = content.split_once('\n')?;
+    if !crate::heading::is_frontmatter_delimiter_line(first) {
+        return None;
+    }
 
     let mut offset = 0usize;
     for line in after_open.split_inclusive('\n') {
         let trimmed = line.strip_suffix('\n').unwrap_or(line);
-        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
-        if trimmed == "---" {
+        if crate::heading::is_frontmatter_delimiter_line(trimmed) {
             let close_end = offset + line.len();
             let fm_len = (content.len() - after_open.len()) + close_end;
             return Some((&content[..fm_len], &content[fm_len..]));
@@ -1030,7 +1034,7 @@ fn splice_frontmatter_block(
     let lines: Vec<&str> = old_block.split_inclusive('\n').collect();
     let (open, rest) = lines.split_first()?;
     let (close, inner) = rest.split_last()?;
-    if !close.trim_end_matches(['\r', '\n']).eq("---") {
+    if !crate::heading::is_frontmatter_delimiter_line(close.trim_end_matches('\n')) {
         return None;
     }
 
@@ -1758,8 +1762,22 @@ async fn read_if_exists(abs_path: &Path) -> Result<Option<String>, WriteError> {
 /// caller moves on to `git add`.
 async fn write_and_flush(file: &mut tokio::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
+    #[cfg(test)]
+    if let Ok(written) = FAIL_WRITE_AFTER_BYTES.try_with(|n| *n) {
+        file.write_all(&bytes[..written.min(bytes.len())]).await?;
+        file.flush().await?;
+        return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+    }
     file.write_all(bytes).await?;
     file.flush().await
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only: inside this scope `write_and_flush` writes only this many bytes
+    /// and then fails the way ENOSPC part-way through would, leaving a partly
+    /// written file for the caller to clean up. A no-op outside tests.
+    static FAIL_WRITE_AFTER_BYTES: usize;
 }
 
 /// Run `write`, a document's one filesystem write, and when it fails undo what it
@@ -2042,13 +2060,23 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                 };
             }
 
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            Err(git::CommitSyncError::PostCommit {
+                sha,
+                source,
+                rebased_paths,
+            }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure for '{}', commit {} stands \
                      uncorrected: {:#}",
                     rel_path, sha, source
                 );
-                mark_dirty(deps.queue, deps.indexing, vec![PathBuf::from(rel_path)]);
+                mark_dirty(
+                    deps.queue,
+                    deps.indexing,
+                    std::iter::once(PathBuf::from(rel_path))
+                        .chain(rebased_paths)
+                        .collect(),
+                );
                 return Ok(WriteSuccess {
                     related: related.clone(),
                     outcome: WriteOutcome::CommittedPendingSync,
@@ -2271,14 +2299,14 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                         }
                     }
                 })?;
-            write_and_flush(&mut file, content_to_write.as_bytes())
-                .await
-                .map_err(|e| {
-                    error!("Failed to write file '{}': {}", abs_dest.display(), e);
-                    WriteError::Io {
-                        msg: format!("Failed to write file: {}", e),
-                    }
-                })?;
+            // A partly written destination (ENOSPC, EIO) is removed again, as a
+            // create's is: left behind, every retry of the move would fail
+            // `AlreadyExists` and the reconcile would index the truncated copy. The
+            // source is only removed below, so it is still intact here.
+            write_or_undo(&abs_dest, None, async {
+                write_and_flush(&mut file, content_to_write.as_bytes()).await
+            })
+            .await?;
         }
 
         let abs_source = safe_write_path(deps, source_rel)?;
@@ -2450,6 +2478,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
             Err(git::CommitSyncError::PostCommit {
                 sha,
                 source: source_err,
+                rebased_paths,
             }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure moving '{}' -> '{}', commit {} \
@@ -2462,6 +2491,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                     [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
                         .into_iter()
                         .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .chain(rebased_paths)
                         .collect(),
                 );
                 return Ok(WriteSuccess {
@@ -3402,7 +3432,11 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                 return Err(BatchWriteError::PreCommitFailed { rolled_back });
             }
 
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            Err(git::CommitSyncError::PostCommit {
+                sha,
+                source,
+                rebased_paths,
+            }) => {
                 warn!(
                     "write_documents_batch: commit_and_sync post-commit (sync) failure, commit {} \
                      stands uncorrected for {} document(s): {:#}",
@@ -3413,7 +3447,11 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                 mark_dirty(
                     deps.queue,
                     deps.indexing,
-                    written.iter().map(|(p, _)| PathBuf::from(p)).collect(),
+                    written
+                        .iter()
+                        .map(|(p, _)| PathBuf::from(p))
+                        .chain(rebased_paths)
+                        .collect(),
                 );
                 return Ok(BatchWriteSuccess {
                     documents: documents(&[]),
@@ -4656,6 +4694,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             Err(git::CommitSyncError::PostCommit {
                 sha,
                 source: source_err,
+                rebased_paths,
             }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure moving directory '{}' -> '{}', \
@@ -4673,6 +4712,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                         .iter()
                         .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
                         .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .chain(rebased_paths)
                         .collect(),
                 );
 
@@ -4933,7 +4973,11 @@ pub async fn delete_document_with<E: QueryEmbedder, Q: RetrievalStore>(
                 };
             }
 
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            Err(git::CommitSyncError::PostCommit {
+                sha,
+                source,
+                rebased_paths,
+            }) => {
                 warn!(
                     "commit_and_sync post-commit (sync) failure deleting '{}', deletion commit \
                      {} stands uncorrected: {:#}",
@@ -4944,6 +4988,7 @@ pub async fn delete_document_with<E: QueryEmbedder, Q: RetrievalStore>(
                     deps.indexing,
                     std::iter::once(PathBuf::from(rel_path))
                         .chain(rewritten_paths.iter().map(PathBuf::from))
+                        .chain(rebased_paths)
                         .collect(),
                 );
                 return Ok(WriteSuccess {
@@ -5270,6 +5315,84 @@ mod tests {
         let (fm, body) = split_frontmatter_bytes(content).unwrap();
         assert_eq!(fm, "---\ndescription: a---b\n---\n");
         assert_eq!(body, "\nBody\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_accepts_trailing_whitespace_on_both_delimiters() {
+        // gray_matter's rule (`heading::is_frontmatter_delimiter_line`): the indexer
+        // reads these as frontmatter, so the writer must too.
+        let content = "--- \ntitle: X\n---\t\n\nBody\n";
+        let (fm, body) = split_frontmatter_bytes(content).unwrap();
+        assert_eq!(fm, "--- \ntitle: X\n---\t\n");
+        assert_eq!(body, "\nBody\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_crlf_with_trailing_space_delimiters() {
+        let content = "---  \r\ntitle: X\r\n--- \r\n\r\nBody\r\n";
+        let (fm, body) = split_frontmatter_bytes(content).unwrap();
+        assert_eq!(fm, "---  \r\ntitle: X\r\n--- \r\n");
+        assert_eq!(body, "\r\nBody\r\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_leading_whitespace_is_not_a_delimiter() {
+        assert!(split_frontmatter_bytes(" ---\ntitle: X\n---\nBody\n").is_none());
+        // A ` ---` line inside the block does not close it either.
+        let (fm, _) = split_frontmatter_bytes("---\na: |\n ---\n---\nBody\n").unwrap();
+        assert_eq!(fm, "---\na: |\n ---\n---\n");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_agrees_with_body_line_offset() {
+        // One delimiter rule for the writer and the indexer: the frontmatter block
+        // the writer sees spans exactly the lines the indexer skips (no blank lines
+        // after the block in these inputs, which `body_line_offset` also skips).
+        for content in [
+            "---\ntitle: X\n---\nBody\n",
+            "--- \ntitle: X\n--- \nBody\n",
+            "---\r\ntitle: X\r\n---\t\r\nBody\r\n",
+            "---\ntitle: X\n---",
+        ] {
+            let (fm, _) = split_frontmatter_bytes(content).unwrap();
+            assert_eq!(
+                fm.split_inclusive('\n').count(),
+                crate::heading::body_line_offset(content),
+                "{content:?}"
+            );
+        }
+    }
+
+    /// A delimiter with trailing whitespace used to read as "no frontmatter" here
+    /// while the parser still found the fields, so the patch prepended a second
+    /// block and the old one became body text.
+    #[test]
+    fn apply_frontmatter_patch_trailing_space_delimiters_yield_one_block() {
+        for old in [
+            "--- \ntitle: X\nstatus: draft\n---  \n\n# Body\n",
+            "--- \r\ntitle: X\r\nstatus: draft\r\n--- \r\n\r\n# Body\r\n",
+        ] {
+            let new = apply_frontmatter_patch(
+                old,
+                &[FrontmatterEdit::SetField {
+                    field: "status".into(),
+                    value: serde_json::json!("archived"),
+                }],
+            )
+            .unwrap();
+            let delimiters = new
+                .lines()
+                .filter(|l| crate::heading::is_frontmatter_delimiter_line(l))
+                .count();
+            assert_eq!(delimiters, 2, "exactly one frontmatter block: {new:?}");
+            assert_eq!(new.matches("title: X").count(), 1, "{new:?}");
+            assert!(new.contains("status: archived"), "{new:?}");
+            assert!(!new.contains("draft"), "{new:?}");
+            assert!(new.trim_end().ends_with("\n# Body"), "{new:?}");
+            let (fm, body) = validate::parse_frontmatter_raw(&new);
+            assert_eq!(fm.get("status"), Some(&serde_json::json!("archived")));
+            assert_eq!(body.trim(), "# Body");
+        }
     }
 
     #[test]
@@ -8110,6 +8233,47 @@ mod tests {
             "# Already here",
             "the pre-existing destination file must be untouched"
         );
+    }
+
+    /// A move whose destination write fails part-way (ENOSPC, EIO) removes the
+    /// partly written destination again and leaves the source as it was, so a
+    /// retry does not fail `AlreadyExists` and the reconcile never indexes a
+    /// truncated copy.
+    #[tokio::test]
+    async fn move_whose_destination_write_fails_part_way_leaves_no_partial_destination() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        let original = "---\ntitle: T\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("docs/source.md"), original).unwrap();
+        git_commit_all(&work, "docs/source.md", "add docs/source.md");
+        let harness = git_backed_harness(&work);
+        let source_dir = work.path().join("docs");
+
+        let req = make_move_req("docs/source.md", "other/dest.md", original, original);
+        let err = FAIL_WRITE_AFTER_BYTES
+            .scope(5, write_document(&harness.deps(), req))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Io { .. }), "got {err:?}");
+        assert!(
+            !work.path().join("other/dest.md").exists(),
+            "the partly written destination must be removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_dir.join("source.md")).unwrap(),
+            original,
+            "the source must be untouched when the destination write fails"
+        );
+
+        // The retry is not blocked by a leftover destination.
+        let req = make_move_req("docs/source.md", "other/dest.md", original, original);
+        write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("other/dest.md")).unwrap(),
+            original
+        );
+        assert!(!work.path().join("docs/source.md").exists());
     }
 
     #[tokio::test]
@@ -11556,6 +11720,42 @@ mod tests {
             &harness.reindex_queue,
             &["old/loc.md", "_archive/old/loc.md", "referencing.md"],
         );
+    }
+
+    /// The archive's `status: archived` step goes through the frontmatter patch, so a
+    /// document whose delimiters carry trailing whitespace must still end up with one
+    /// frontmatter block, not a second one prepended above the old.
+    #[tokio::test]
+    async fn archive_status_patch_on_trailing_space_delimiters_keeps_one_block() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, _) = archive_fixture(&work, true).await;
+        let source = ARCHIVE_SOURCE
+            .replacen("---\n", "--- \n", 1)
+            .replace("active\n---\n", "active\n---  \n");
+        assert!(source.starts_with("--- \n") && source.contains("---  \n"));
+        std::fs::write(work.path().join("old/loc.md"), &source).unwrap();
+        git_commit_all(&work, "old/loc.md", "trailing-space delimiters");
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            &source,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert!(success.status_set);
+
+        let archived = std::fs::read_to_string(work.path().join("_archive/old/loc.md")).unwrap();
+        let delimiters = archived
+            .lines()
+            .filter(|l| crate::heading::is_frontmatter_delimiter_line(l))
+            .count();
+        assert_eq!(delimiters, 2, "{archived}");
+        assert_eq!(archived.matches("title: Old Page").count(), 1, "{archived}");
+        assert!(archived.contains("status: archived"), "{archived}");
+        assert!(!archived.contains("status: active"), "{archived}");
+        assert!(archived.ends_with("# Body\n"), "{archived}");
     }
 
     #[tokio::test]
