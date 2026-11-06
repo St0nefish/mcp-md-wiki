@@ -39,6 +39,8 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub lint: LintConfig,
+    #[serde(default)]
+    pub contradictions: ContradictionsConfig,
 }
 
 /// `source` — YAML side. Every setting is either a secret name-indirection field
@@ -1423,6 +1425,129 @@ fn default_lint_tags_field() -> String {
     "tags".into()
 }
 
+/// `contradictions` — the scheduled contradiction job (#355): for each document
+/// whose content changed since it was last analysed, find its nearest neighbours by
+/// stored vector, and (optionally) ask an LLM judge whether each pair conflicts.
+/// Report-only: the findings are stored in the state DB and listed by the
+/// `contradictions` subcommand and `GET /status/contradictions`; nothing is written
+/// to a document.
+///
+/// Every YAML key here is a tuning knob or a name indirection. The judge's endpoint
+/// and model are env-only, like `reranking`'s: `CONTRADICTIONS_JUDGE_MODEL`
+/// (required when `judge` is on; no model is defaulted), `CONTRADICTIONS_JUDGE_BASE_URL`
+/// (required for `openai`; optional for `anthropic`) and the API key named by
+/// `judge_api_key_env` live on [`ResolvedJudgeConfig`]. `enabled`, `interval_secs`,
+/// `top_k`, `min_similarity` and `max_pairs_per_run` are read fresh by every run; the
+/// judge settings are baked into a client built once at startup.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContradictionsConfig {
+    /// Run the scheduled job. Off by default: it reads document text and, with a
+    /// judge, spends model calls.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds between scheduled runs.
+    #[serde(default = "default_contradictions_interval_secs")]
+    pub interval_secs: u64,
+    /// Nearest neighbours considered per changed document.
+    #[serde(default = "default_contradictions_top_k")]
+    pub top_k: u64,
+    /// A neighbour scoring below this dense similarity is not a candidate pair.
+    #[serde(default = "default_contradictions_min_similarity")]
+    pub min_similarity: f32,
+    /// Most pairs one run evaluates; the rest carry over to the next run.
+    #[serde(default = "default_contradictions_max_pairs_per_run")]
+    pub max_pairs_per_run: usize,
+    /// Ask an LLM judge about each candidate pair. Off: pairs are recorded as
+    /// `candidate` and nothing leaves the process.
+    #[serde(default)]
+    pub judge: bool,
+    /// Wire format the judge speaks: `openai` (any OpenAI-compatible
+    /// `/chat/completions` server) or `anthropic` (the Messages API).
+    #[serde(default = "default_contradictions_judge_provider")]
+    pub judge_provider: crate::judge::Provider,
+    /// Name of the env var containing the judge's API key. Required for
+    /// `anthropic`, optional for `openai`. Only read when `judge` is on.
+    #[serde(default = "default_contradictions_judge_api_key_env")]
+    pub judge_api_key_env: String,
+    /// Per-request timeout for a judge call, in seconds.
+    #[serde(default = "default_contradictions_judge_timeout_secs")]
+    pub judge_timeout_secs: u64,
+    /// Per-document byte budget for the judge request.
+    #[serde(default = "default_contradictions_judge_max_document_bytes")]
+    pub judge_max_document_bytes: usize,
+}
+
+impl Default for ContradictionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_contradictions_interval_secs(),
+            top_k: default_contradictions_top_k(),
+            min_similarity: default_contradictions_min_similarity(),
+            max_pairs_per_run: default_contradictions_max_pairs_per_run(),
+            judge: false,
+            judge_provider: default_contradictions_judge_provider(),
+            judge_api_key_env: default_contradictions_judge_api_key_env(),
+            judge_timeout_secs: default_contradictions_judge_timeout_secs(),
+            judge_max_document_bytes: default_contradictions_judge_max_document_bytes(),
+        }
+    }
+}
+
+/// Shortest `contradictions.interval_secs`: a run reads documents and may call a
+/// paid model, so a tight loop is never what was meant.
+pub const MIN_CONTRADICTIONS_INTERVAL_SECS: u64 = 60;
+/// Largest `contradictions.top_k`.
+pub const MAX_CONTRADICTIONS_TOP_K: u64 = 20;
+
+fn default_contradictions_interval_secs() -> u64 {
+    86_400
+}
+
+fn default_contradictions_top_k() -> u64 {
+    5
+}
+
+fn default_contradictions_min_similarity() -> f32 {
+    0.80
+}
+
+fn default_contradictions_max_pairs_per_run() -> usize {
+    200
+}
+
+fn default_contradictions_judge_provider() -> crate::judge::Provider {
+    crate::judge::Provider::OpenAi
+}
+
+fn default_contradictions_judge_api_key_env() -> String {
+    "CONTRADICTIONS_JUDGE_API_KEY".into()
+}
+
+fn default_contradictions_judge_timeout_secs() -> u64 {
+    120
+}
+
+fn default_contradictions_judge_max_document_bytes() -> usize {
+    crate::judge::DEFAULT_JUDGE_DOC_BYTES
+}
+
+/// Resolved contradiction-judge wiring — only present when `contradictions.judge`
+/// is on and every required environment value is set.
+#[derive(Debug, Clone)]
+pub struct ResolvedJudgeConfig {
+    pub provider: crate::judge::Provider,
+    /// `CONTRADICTIONS_JUDGE_BASE_URL`; for `anthropic` an unset variable resolves to
+    /// [`crate::judge::ANTHROPIC_DEFAULT_BASE_URL`].
+    pub base_url: String,
+    /// `CONTRADICTIONS_JUDGE_MODEL`. No default: the operator names the model.
+    pub model: String,
+    pub api_key: Option<String>,
+    pub request_timeout: Duration,
+    pub max_document_bytes: usize,
+}
+
 /// Resolved embedding config — all required fields are guaranteed present.
 #[derive(Debug, Clone)]
 pub struct ResolvedEmbeddingConfig {
@@ -1623,6 +1748,16 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("lint.max_lines", "lint"),
     ("lint.max_bytes", "lint"),
     ("lint.tags_field", "lint"),
+    ("contradictions.enabled", "contradictions"),
+    ("contradictions.interval_secs", "contradictions"),
+    ("contradictions.top_k", "contradictions"),
+    ("contradictions.min_similarity", "contradictions"),
+    ("contradictions.max_pairs_per_run", "contradictions"),
+    ("contradictions.judge", "contradictions"),
+    ("contradictions.judge_provider", "contradictions"),
+    ("contradictions.judge_api_key_env", "contradictions"),
+    ("contradictions.judge_timeout_secs", "contradictions"),
+    ("contradictions.judge_max_document_bytes", "contradictions"),
 ];
 
 /// Recursively flattens a `serde_yaml_ng::Value` tree into dot-joined leaf paths,
@@ -1703,6 +1838,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "reranking",
     "ui",
     "lint",
+    "contradictions",
 ];
 
 /// Whether `content` sets `search.granularities` itself, as opposed to leaving it
@@ -1803,6 +1939,10 @@ pub struct ResolvedConfig {
     pub reranking: Option<ResolvedRerankingConfig>,
     pub ui: UiConfig,
     pub lint: LintConfig,
+    /// The scheduled contradiction job's YAML settings (#355).
+    pub contradictions: ContradictionsConfig,
+    /// The contradiction judge's wiring — `Some` only when `contradictions.judge` is on.
+    pub contradictions_judge: Option<ResolvedJudgeConfig>,
     /// Where every resolved setting's value came from — see [`ConfigProvenance`].
     pub provenance: ConfigProvenance,
 }
@@ -1841,6 +1981,37 @@ impl Config {
     #[cfg(test)]
     fn resolve(self) -> anyhow::Result<ResolvedConfig> {
         self.resolve_inner(&HashSet::new(), false)
+    }
+
+    /// Range checks for the `contradictions` section (#355). Always applied, like the
+    /// `lint` checks: the keys are plain numbers, and a reload that turns the job on
+    /// must not be the first time a bad value is noticed.
+    fn validate_contradictions(&self) -> anyhow::Result<()> {
+        let c = &self.contradictions;
+        if c.interval_secs < MIN_CONTRADICTIONS_INTERVAL_SECS {
+            anyhow::bail!(
+                "contradictions.interval_secs must be >= {MIN_CONTRADICTIONS_INTERVAL_SECS}"
+            );
+        }
+        if c.top_k == 0 || c.top_k > MAX_CONTRADICTIONS_TOP_K {
+            anyhow::bail!("contradictions.top_k must be between 1 and {MAX_CONTRADICTIONS_TOP_K}");
+        }
+        if !(0.0..=1.0).contains(&c.min_similarity) {
+            anyhow::bail!("contradictions.min_similarity must be between 0.0 and 1.0");
+        }
+        if c.max_pairs_per_run == 0 {
+            anyhow::bail!("contradictions.max_pairs_per_run must be >= 1");
+        }
+        if c.judge_api_key_env.trim().is_empty() {
+            anyhow::bail!("contradictions.judge_api_key_env must not be empty");
+        }
+        if c.judge_timeout_secs == 0 {
+            anyhow::bail!("contradictions.judge_timeout_secs must be >= 1");
+        }
+        if c.judge_max_document_bytes == 0 {
+            anyhow::bail!("contradictions.judge_max_document_bytes must be >= 1");
+        }
+        Ok(())
     }
 
     /// `granularities_explicit` is whether the YAML itself sets
@@ -1981,6 +2152,54 @@ impl Config {
             match &reranking_api_key {
                 Some(_) => SettingSource::Env {
                     var: crate::secrets::source_var(&reranking_api_key_env),
+                },
+                None => SettingSource::Default,
+            },
+        );
+
+        // The contradiction judge (#355): wired like reranking — endpoint and model
+        // from the environment only, the key through a name indirection — and read
+        // only while `contradictions.judge` is on, so a bad `<NAME>_FILE` for a feature
+        // that is off cannot refuse to load the config. A blank value counts as unset.
+        let judge_on = self.contradictions.judge;
+        let judge_env = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        let judge_base_url = if judge_on {
+            judge_env("CONTRADICTIONS_JUDGE_BASE_URL")
+        } else {
+            None
+        };
+        let judge_model = if judge_on {
+            judge_env("CONTRADICTIONS_JUDGE_MODEL")
+        } else {
+            None
+        };
+        for (key, var, value) in [
+            (
+                "contradictions.judge_base_url",
+                "CONTRADICTIONS_JUDGE_BASE_URL",
+                &judge_base_url,
+            ),
+            (
+                "contradictions.judge_model",
+                "CONTRADICTIONS_JUDGE_MODEL",
+                &judge_model,
+            ),
+        ] {
+            if value.is_some() {
+                provenance.insert(key, SettingSource::Env { var: var.into() });
+            }
+        }
+        let judge_api_key_env = self.contradictions.judge_api_key_env.clone();
+        let judge_api_key = if judge_on {
+            crate::secrets::resolve_nonempty_secret(&judge_api_key_env)?
+        } else {
+            None
+        };
+        provenance.insert(
+            "contradictions.judge_api_key",
+            match &judge_api_key {
+                Some(_) => SettingSource::Env {
+                    var: crate::secrets::source_var(&judge_api_key_env),
                 },
                 None => SettingSource::Default,
             },
@@ -2226,6 +2445,7 @@ impl Config {
         if self.lint.tags_field.trim().is_empty() {
             anyhow::bail!("lint.tags_field must not be empty");
         }
+        self.validate_contradictions()?;
         if self.ui.semantic_edges.k == 0 {
             anyhow::bail!("ui.semantic_edges.k must be >= 1");
         }
@@ -2250,6 +2470,24 @@ impl Config {
         }
         if qdrant_url.is_none() {
             missing.push("QDRANT_URL");
+        }
+        let judge_api_key_missing = format!(
+            "{judge_api_key_env} (or {judge_api_key_env}_FILE; the anthropic judge needs an API key)"
+        );
+        if judge_on {
+            if judge_model.is_none() {
+                missing.push("CONTRADICTIONS_JUDGE_MODEL");
+            }
+            if self.contradictions.judge_provider == crate::judge::Provider::OpenAi
+                && judge_base_url.is_none()
+            {
+                missing.push("CONTRADICTIONS_JUDGE_BASE_URL");
+            }
+            if self.contradictions.judge_provider == crate::judge::Provider::Anthropic
+                && judge_api_key.is_none()
+            {
+                missing.push(&judge_api_key_missing);
+            }
         }
         if self.reranking.enabled {
             if reranking_base_url.is_none() {
@@ -2379,6 +2617,20 @@ impl Config {
             },
             ui: self.ui,
             lint: self.lint,
+            contradictions_judge: if judge_on {
+                Some(ResolvedJudgeConfig {
+                    provider: self.contradictions.judge_provider,
+                    base_url: judge_base_url
+                        .unwrap_or_else(|| crate::judge::ANTHROPIC_DEFAULT_BASE_URL.to_string()),
+                    model: judge_model.unwrap(),
+                    api_key: judge_api_key,
+                    request_timeout: Duration::from_secs(self.contradictions.judge_timeout_secs),
+                    max_document_bytes: self.contradictions.judge_max_document_bytes,
+                })
+            } else {
+                None
+            },
+            contradictions: self.contradictions,
             provenance: ConfigProvenance(
                 provenance
                     .into_iter()
@@ -3111,6 +3363,8 @@ mcp:
             reranking: None,
             ui: UiConfig::default(),
             lint: LintConfig::default(),
+            contradictions: ContradictionsConfig::default(),
+            contradictions_judge: None,
             provenance: ConfigProvenance::default(),
         };
 
@@ -3304,6 +3558,21 @@ mcp:
         assert_eq!(cfg.lint.max_lines, 2000);
         assert_eq!(cfg.lint.max_bytes, None);
         assert_eq!(cfg.lint.tags_field, "tags");
+        // The example's contradictions section must match the compiled defaults (#355).
+        let defaults = ContradictionsConfig::default();
+        let c = &cfg.contradictions;
+        assert!(!c.enabled && !c.judge);
+        assert_eq!(c.interval_secs, defaults.interval_secs);
+        assert_eq!(c.top_k, defaults.top_k);
+        assert_eq!(c.min_similarity, defaults.min_similarity);
+        assert_eq!(c.max_pairs_per_run, defaults.max_pairs_per_run);
+        assert_eq!(c.judge_provider, defaults.judge_provider);
+        assert_eq!(c.judge_api_key_env, defaults.judge_api_key_env);
+        assert_eq!(c.judge_timeout_secs, defaults.judge_timeout_secs);
+        assert_eq!(
+            c.judge_max_document_bytes,
+            defaults.judge_max_document_bytes
+        );
     }
 
     #[test]
@@ -3337,6 +3606,155 @@ mcp:
         let cfg = Config::from_str(&ok).unwrap();
         assert_eq!(cfg.lint.max_bytes, Some(5000));
         assert!(!cfg.lint.orphans);
+        clear_required_env();
+    }
+
+    #[test]
+    fn contradictions_config_defaults_and_validation() {
+        let cfg = Config::from_str_raw("{}").unwrap();
+        let c = &cfg.contradictions;
+        assert!(!c.enabled && !c.judge);
+        assert_eq!(c.interval_secs, 86_400);
+        assert_eq!(c.top_k, 5);
+        assert_eq!(c.min_similarity, 0.80);
+        assert_eq!(c.max_pairs_per_run, 200);
+        assert_eq!(c.judge_provider, crate::judge::Provider::OpenAi);
+        assert_eq!(c.judge_api_key_env, "CONTRADICTIONS_JUDGE_API_KEY");
+        assert_eq!(c.judge_timeout_secs, 120);
+        assert_eq!(
+            c.judge_max_document_bytes,
+            crate::judge::DEFAULT_JUDGE_DOC_BYTES
+        );
+        // An unknown key and an unknown provider are schema errors.
+        assert!(Config::from_str_raw("contradictions:\n  nope: 1\n").is_err());
+        assert!(Config::from_str_raw("contradictions:\n  judge_provider: gemini\n").is_err());
+        // The judge's endpoint and model are env-only.
+        for key in ["judge_model", "judge_base_url", "judge_api_key"] {
+            let yaml = format!("contradictions:\n  {key}: x\n");
+            assert!(Config::from_str_raw(&yaml).is_err(), "{key}");
+        }
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        for (yaml, needle) in [
+            ("interval_secs: 59", "contradictions.interval_secs"),
+            ("top_k: 0", "contradictions.top_k"),
+            ("top_k: 21", "contradictions.top_k"),
+            ("min_similarity: 1.5", "contradictions.min_similarity"),
+            ("min_similarity: -0.1", "contradictions.min_similarity"),
+            ("max_pairs_per_run: 0", "contradictions.max_pairs_per_run"),
+            ("judge_api_key_env: ''", "contradictions.judge_api_key_env"),
+            ("judge_timeout_secs: 0", "contradictions.judge_timeout_secs"),
+            (
+                "judge_max_document_bytes: 0",
+                "contradictions.judge_max_document_bytes",
+            ),
+        ] {
+            let err = Config::from_str(&format!("{MINIMAL_CONFIG}\ncontradictions:\n  {yaml}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{yaml}: {err}");
+        }
+        let ok = format!(
+            "{MINIMAL_CONFIG}\ncontradictions:\n  enabled: true\n  interval_secs: 60\n  top_k: 20\n  \
+             min_similarity: 0.0\n  max_pairs_per_run: 1\n"
+        );
+        let cfg = Config::from_str(&ok).unwrap();
+        assert!(cfg.contradictions.enabled);
+        // Judge off: no wiring is resolved and no env var is required.
+        assert!(cfg.contradictions_judge.is_none());
+        clear_required_env();
+    }
+
+    fn clear_judge_env() {
+        // SAFETY: callers hold ENV_MUTEX
+        unsafe {
+            for var in [
+                "CONTRADICTIONS_JUDGE_MODEL",
+                "CONTRADICTIONS_JUDGE_BASE_URL",
+                "CONTRADICTIONS_JUDGE_API_KEY",
+                "CONTRADICTIONS_JUDGE_API_KEY_FILE",
+            ] {
+                std::env::remove_var(var);
+            }
+        }
+    }
+
+    #[test]
+    fn contradictions_judge_env_is_only_required_when_the_judge_is_on() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        clear_judge_env();
+
+        // Off: a broken key file for the feature must not refuse to load the config.
+        unsafe {
+            std::env::set_var("CONTRADICTIONS_JUDGE_API_KEY_FILE", "/nonexistent/key");
+        }
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert!(cfg.contradictions_judge.is_none());
+        clear_judge_env();
+
+        // openai: model and base URL are both named at once; the key is optional.
+        let yaml = format!("{MINIMAL_CONFIG}\ncontradictions:\n  judge: true\n");
+        let err = Config::from_str_raw(&yaml)
+            .unwrap()
+            .resolve()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CONTRADICTIONS_JUDGE_MODEL"), "{err}");
+        assert!(err.contains("CONTRADICTIONS_JUDGE_BASE_URL"), "{err}");
+        assert!(!err.contains("CONTRADICTIONS_JUDGE_API_KEY"), "{err}");
+
+        // anthropic: model and key are required, the base URL is not.
+        let yaml = format!(
+            "{MINIMAL_CONFIG}\ncontradictions:\n  judge: true\n  judge_provider: anthropic\n"
+        );
+        let err = Config::from_str_raw(&yaml)
+            .unwrap()
+            .resolve()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CONTRADICTIONS_JUDGE_MODEL"), "{err}");
+        assert!(err.contains("CONTRADICTIONS_JUDGE_API_KEY"), "{err}");
+        assert!(!err.contains("CONTRADICTIONS_JUDGE_BASE_URL"), "{err}");
+
+        // Everything set: wiring resolves, the anthropic base URL defaulting.
+        unsafe {
+            std::env::set_var("CONTRADICTIONS_JUDGE_MODEL", "some-model");
+            std::env::set_var("CONTRADICTIONS_JUDGE_API_KEY", "k");
+        }
+        let cfg = Config::from_str_raw(&yaml).unwrap().resolve().unwrap();
+        let judge = cfg.contradictions_judge.expect("judge resolved");
+        assert_eq!(judge.provider, crate::judge::Provider::Anthropic);
+        assert_eq!(judge.model, "some-model");
+        assert_eq!(judge.base_url, crate::judge::ANTHROPIC_DEFAULT_BASE_URL);
+        assert_eq!(judge.api_key.as_deref(), Some("k"));
+        assert_eq!(judge.request_timeout, Duration::from_secs(120));
+        assert_eq!(
+            judge.max_document_bytes,
+            crate::judge::DEFAULT_JUDGE_DOC_BYTES
+        );
+        // The key's value never reaches provenance, only where it came from.
+        assert_eq!(
+            cfg.provenance.0["contradictions.judge_api_key"],
+            SettingSource::Env {
+                var: "CONTRADICTIONS_JUDGE_API_KEY".into()
+            }
+        );
+
+        // openai with a base URL and no key: key stays None.
+        unsafe {
+            std::env::remove_var("CONTRADICTIONS_JUDGE_API_KEY");
+            std::env::set_var("CONTRADICTIONS_JUDGE_BASE_URL", "http://llm:8080/v1");
+        }
+        let yaml = format!("{MINIMAL_CONFIG}\ncontradictions:\n  judge: true\n");
+        let cfg = Config::from_str_raw(&yaml).unwrap().resolve().unwrap();
+        let judge = cfg.contradictions_judge.expect("judge resolved");
+        assert_eq!(judge.provider, crate::judge::Provider::OpenAi);
+        assert_eq!(judge.base_url, "http://llm:8080/v1");
+        assert!(judge.api_key.is_none());
+
+        clear_judge_env();
         clear_required_env();
     }
 
@@ -3766,6 +4184,8 @@ mcp:
             reranking: None,
             ui: UiConfig::default(),
             lint: LintConfig::default(),
+            contradictions: ContradictionsConfig::default(),
+            contradictions_judge: None,
             provenance: ConfigProvenance::default(),
         }
     }

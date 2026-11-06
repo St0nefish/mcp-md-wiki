@@ -983,6 +983,65 @@ lint:
   tags_field: tags
 
 
+# ----------------------------------------------------------------------------
+# contradictions — scheduled contradiction detection (#355)
+# ----------------------------------------------------------------------------
+# For every document whose content changed since it was last analysed, find its
+# nearest neighbours by the vectors already in Qdrant (chunk 0 only, no new
+# embedding calls) and record each close pair; with a judge configured, an LLM
+# then decides whether the pair makes conflicting claims. REPORT-ONLY: findings
+# are stored in the state DB and read through `mcp-md-wiki contradictions
+# --list` and GET /status/contradictions. Nothing is written to a document.
+# The job is always scheduled; `enabled` is checked on every tick, so it is
+# live-reloadable along with the other tuning keys.
+contradictions:
+
+  # Run the scheduled job. Off by default. `mcp-md-wiki contradictions` runs one
+  # pass on demand whatever this says.
+  enabled: false
+
+  # Seconds between scheduled runs. Minimum 60.
+  interval_secs: 86400
+
+  # Nearest neighbours considered per changed document (1-20).
+  top_k: 5
+
+  # A neighbour below this dense cosine similarity is not a candidate pair.
+  # Range: 0.0-1.0.
+  min_similarity: 0.80
+
+  # Most pairs a single run evaluates (and, with a judge, sends to the model).
+  # The rest carry over to the next run. Minimum 1.
+  max_pairs_per_run: 200
+
+  # Ask an LLM judge about each candidate pair. Off by default: pairs are then
+  # recorded as `candidate` and no document text leaves this process. Turning it
+  # on needs the CONTRADICTIONS_JUDGE_* variables at the bottom of this file, and
+  # a restart (the client is built once at startup).
+  #
+  # PRIVACY: with judge_provider: anthropic, the text of both documents of every
+  # judged pair is sent to Anthropic's API. With `openai` pointed at a server you
+  # run yourself (llama.cpp, vLLM, Ollama, LM Studio, ...) everything stays local.
+  judge: false
+
+  # Wire format of the judge endpoint: `openai` (an OpenAI-compatible
+  # /chat/completions server) or `anthropic` (the Messages API).
+  judge_provider: openai
+
+  # Name of the env var holding the judge's API key. Required for `anthropic`,
+  # optional for `openai`. Also accepts <NAME>_FILE. Only read when judge: true.
+  judge_api_key_env: "CONTRADICTIONS_JUDGE_API_KEY"
+
+  # Per-request timeout for one judge call, in seconds. Transient failures
+  # (timeouts, 429, 5xx) are retried for about two minutes before the pair is
+  # recorded as an error and retried on the next run.
+  judge_timeout_secs: 120
+
+  # Per-document byte budget for the judge request: each document is cut to this
+  # many bytes (on a character boundary) before being sent.
+  judge_max_document_bytes: 6000
+
+
 # ============================================================================
 # ENV-only settings — cannot be set here; setting any of these under the
 # matching YAML section above is a schema error (unknown field)
@@ -992,6 +1051,9 @@ lint:
 # the secret VALUE only ever comes from the named env var):
 #   EMBEDDING_API_KEY   — named by embedding.api_key_env, default name shown
 #   RERANKING_API_KEY   — named by reranking.api_key_env, default name shown
+#   CONTRADICTIONS_JUDGE_API_KEY — named by contradictions.judge_api_key_env;
+#                         read only when contradictions.judge: true (required
+#                         for judge_provider: anthropic, optional for openai)
 #   GIT_PULL_TOKEN      — named by source.git_token_env
 #   WEBHOOK_SECRET      — named by webhook.secret_env
 #   MCP_BEARER_TOKEN    — named by mcp.bearer_token_env
@@ -1004,6 +1066,10 @@ lint:
 #   EMBEDDING_BASE_URL  — base URL of the embedding API
 #   QDRANT_URL          — Qdrant gRPC endpoint (port 6334, not REST 6333)
 #   RERANKING_BASE_URL  — required only when reranking.enabled: true
+#   CONTRADICTIONS_JUDGE_BASE_URL — required when contradictions.judge: true with
+#                         judge_provider: openai (your OpenAI-compatible
+#                         server, e.g. http://llm:8080/v1); optional for
+#                         anthropic (default https://api.anthropic.com)
 #
 # Model identity:
 #   EMBEDDING_MODEL     — required, no default
@@ -1011,6 +1077,8 @@ lint:
 #                         output dimensionality. Changing it requires a full
 #                         reindex (drops + recreates the Qdrant collection).
 #   RERANKING_MODEL     — required only when reranking.enabled: true
+#   CONTRADICTIONS_JUDGE_MODEL — required when contradictions.judge: true; no
+#                         default, name the model your endpoint serves
 #
 # Bootstrap bindings (optional, sensible defaults — cannot change without a
 # restart):

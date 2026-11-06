@@ -1359,6 +1359,107 @@ const DIFF_TABLE: &[DiffField] = &[
             note: "read fresh by the next tag audit (lint.rs).",
         }],
     },
+    // ── contradictions (#355) ────────────────────────────────────────────────
+    // The scheduled job is always spawned (server.rs run_server) and every run loads a
+    // fresh snapshot, so the tuning keys apply to the next tick. The judge client
+    // (provider, endpoint, model, key, timeout, document budget) is built once at
+    // startup; its env-only values (CONTRADICTIONS_JUDGE_MODEL, _BASE_URL, the key
+    // itself) cannot change in a running process, so they have no row of their own.
+    DiffField {
+        path: "contradictions.enabled",
+        get: |c| Some(d(&c.contradictions.enabled)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "contradictions.enabled",
+            note: "the scheduled job re-reads it on every tick (server.rs run_server), so a \
+                   reload switches it on or off without a restart.",
+        }],
+    },
+    DiffField {
+        path: "contradictions.interval_secs",
+        get: |c| Some(d(&c.contradictions.interval_secs)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "contradictions.interval_secs",
+            note: "read fresh before every sleep of the scheduled job (server.rs \
+                   periodic_job_loop), so the new interval governs the next one.",
+        }],
+    },
+    DiffField {
+        path: "contradictions.top_k",
+        get: |c| Some(d(&c.contradictions.top_k)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "contradictions.top_k",
+            note: "read fresh by the next run (contradictions.rs run_once).",
+        }],
+    },
+    DiffField {
+        path: "contradictions.min_similarity",
+        get: |c| Some(d(&c.contradictions.min_similarity)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "contradictions.min_similarity",
+            note: "read fresh by the next run (contradictions.rs run_once).",
+        }],
+    },
+    DiffField {
+        path: "contradictions.max_pairs_per_run",
+        get: |c| Some(d(&c.contradictions.max_pairs_per_run)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "contradictions.max_pairs_per_run",
+            note: "read fresh by the next run (contradictions.rs run_once).",
+        }],
+    },
+    DiffField {
+        path: "contradictions.judge",
+        get: |c| Some(d(&c.contradictions.judge)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "contradictions.judge",
+            note: "whether the scheduled job holds a judge client at all is decided once at \
+                   startup (server.rs run_server); a reload cannot add or remove it.",
+        }],
+    },
+    DiffField {
+        path: "contradictions.judge_provider",
+        get: |c| Some(d(&c.contradictions.judge_provider)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "contradictions.judge_provider",
+            note: "the judge client is built once at startup (judge.rs build_judge); a reload \
+                   cannot hand the running job a client for another wire format.",
+        }],
+    },
+    DiffField {
+        path: "contradictions.judge_api_key_env",
+        get: |c| Some(d(&c.contradictions.judge_api_key_env)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "contradictions.judge_api_key_env",
+            note: "the judge client bakes in the key resolved at startup (judge.rs build_judge).",
+        }],
+    },
+    DiffField {
+        path: "contradictions.judge_timeout_secs",
+        get: |c| Some(d(&c.contradictions.judge_timeout_secs)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "contradictions.judge_timeout_secs",
+            note: "the judge client bakes in its request timeout at construction (judge.rs).",
+        }],
+    },
+    DiffField {
+        path: "contradictions.judge_max_document_bytes",
+        get: |c| Some(d(&c.contradictions.judge_max_document_bytes)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "contradictions.judge_max_document_bytes",
+            note: "the scheduled job's judge settings are resolved once at startup \
+                   (server.rs run_server).",
+        }],
+    },
 ];
 
 /// Compare every YAML-reloadable setting between `old` and `new`, recording each one
@@ -1890,6 +1991,55 @@ mod tests {
             ]
         );
         assert!(report.restart_required.is_empty());
+        assert!(report.reindex_required.is_empty());
+        assert!(report.reindex_scheduled.is_empty());
+    }
+
+    #[test]
+    fn contradictions_tuning_is_applied_and_judge_wiring_needs_a_restart() {
+        let mut old = base_config();
+        let mut new = base_config();
+        new.contradictions.enabled = true;
+        new.contradictions.interval_secs = 3600;
+        new.contradictions.top_k = 8;
+        new.contradictions.min_similarity = 0.9;
+        new.contradictions.max_pairs_per_run = 10;
+        new.contradictions.judge = true;
+        new.contradictions.judge_provider = crate::judge::Provider::Anthropic;
+        new.contradictions.judge_api_key_env = "OTHER_KEY".into();
+        new.contradictions.judge_timeout_secs = 30;
+        new.contradictions.judge_max_document_bytes = 1000;
+        old.contradictions.judge = false;
+
+        let report = diff(&old, &new);
+        let mut applied: Vec<&str> = report.applied.iter().map(|c| c.setting.as_str()).collect();
+        applied.sort_unstable();
+        assert_eq!(
+            applied,
+            [
+                "contradictions.enabled",
+                "contradictions.interval_secs",
+                "contradictions.max_pairs_per_run",
+                "contradictions.min_similarity",
+                "contradictions.top_k",
+            ]
+        );
+        let mut restart: Vec<&str> = report
+            .restart_required
+            .iter()
+            .map(|c| c.setting.as_str())
+            .collect();
+        restart.sort_unstable();
+        assert_eq!(
+            restart,
+            [
+                "contradictions.judge",
+                "contradictions.judge_api_key_env",
+                "contradictions.judge_max_document_bytes",
+                "contradictions.judge_provider",
+                "contradictions.judge_timeout_secs",
+            ]
+        );
         assert!(report.reindex_required.is_empty());
         assert!(report.reindex_scheduled.is_empty());
     }

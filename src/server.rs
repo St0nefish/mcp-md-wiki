@@ -844,6 +844,51 @@ async fn lint_handler(
     }
 }
 
+/// Query string for `GET /status/contradictions`.
+#[derive(serde::Deserialize)]
+struct ContradictionsQuery {
+    /// Maximum pairs listed; defaults to `contradictions::DEFAULT_LIST_LIMIT`,
+    /// clamped to `1..=contradictions::MAX_LIST_LIMIT`.
+    limit: Option<usize>,
+}
+
+/// `GET /status/contradictions?limit=`: the pairs the contradiction job has stored
+/// (#355), conflicts first, read-only, behind the same auth as `/status`. It reports
+/// what the last run recorded and never runs one. 503 when no index exists yet.
+async fn contradictions_handler(
+    State(state): State<StatusState>,
+    axum::extract::Query(q): axum::extract::Query<ContradictionsQuery>,
+) -> Response {
+    let cfg = config::load_shared_config(&state.config);
+    if !Path::new(&cfg.state_db_path()).exists() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no index yet"})),
+        )
+            .into_response();
+    }
+    let limit = q
+        .limit
+        .unwrap_or(crate::contradictions::DEFAULT_LIST_LIMIT)
+        .clamp(1, crate::contradictions::MAX_LIST_LIMIT);
+    let result = async {
+        let db = state.state_db().await?;
+        crate::contradictions::pairs_report(db, limit).await
+    }
+    .await;
+    match result {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => {
+            error!("contradictions report failed: {e:#}");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "contradictions report failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn metrics_handler(State(state): State<StatusState>) -> Response {
     let status = cached_status(&state).await;
     let retrieval = crate::status::QUERY_METRICS.snapshot();
@@ -1940,6 +1985,74 @@ async fn periodic_job_loop<F, Fut>(
     }
 }
 
+/// The scheduled contradiction job (#355): what one tick of `periodic_job_loop` does.
+///
+/// Spawned unconditionally by `run_server` so `contradictions.enabled` is
+/// reload-applied: [`Self::tick`] loads a fresh config snapshot and returns at once
+/// while it is off. The judge (`None` without `contradictions.judge`) and its document
+/// budget are fixed at startup, matching the `RestartRequired` classification in
+/// `reload.rs`; everything else is read per tick.
+struct ContradictionJob<N> {
+    shared_config: SharedConfig,
+    state_db: Arc<tokio::sync::OnceCell<crate::state::StateDb>>,
+    neighbors: Arc<N>,
+    judge: Option<Arc<dyn crate::judge::Judge>>,
+    judge_max_document_bytes: usize,
+    run_lock: crate::contradictions::RunLock,
+    ct: CancellationToken,
+}
+
+impl<N: ingest::NeighborStore> ContradictionJob<N> {
+    /// Run one pass if the job is enabled, no other run holds the lock and no
+    /// indexing run is in flight (the metadata and vectors it reads would be
+    /// half-updated, and `clear` on a full reindex would prune what it stored).
+    /// `None` when nothing ran or the run failed (logged).
+    async fn tick(
+        &self,
+        is_indexing: impl Fn() -> bool,
+    ) -> Option<crate::contradictions::RunSummary> {
+        let cfg = config::load_shared_config(&self.shared_config);
+        if !cfg.contradictions.enabled {
+            return None;
+        }
+        if is_indexing() {
+            debug!("Contradiction run postponed: an indexing run is in progress");
+            return None;
+        }
+        let result = async {
+            let db = self
+                .state_db
+                .get_or_try_init(|| async {
+                    crate::state::StateDb::new(Path::new(&cfg.state_db_path())).await
+                })
+                .await?;
+            let data_path = cfg.canonical_data_path();
+            let deps = crate::contradictions::RunDeps {
+                state: db,
+                neighbors: self.neighbors.as_ref(),
+                collection: &cfg.qdrant.collection,
+                judge: self.judge.as_deref(),
+                data_path: &data_path,
+                params: crate::contradictions::RunParams::new(
+                    &cfg.contradictions,
+                    self.judge_max_document_bytes,
+                ),
+            };
+            let ct = &self.ct;
+            crate::contradictions::run_once_exclusive(&self.run_lock, &deps, &|| ct.is_cancelled())
+                .await
+        }
+        .await;
+        match result {
+            Ok(summary) => summary,
+            Err(e) => {
+                error!("Contradiction run failed: {e:#}");
+                None
+            }
+        }
+    }
+}
+
 /// Wait for any in-flight indexing run to finish, bounded by `SHUTDOWN_INDEX_WAIT`.
 ///
 /// `is_indexing` is injected — production passes a closure reading
@@ -1976,6 +2089,7 @@ const STATUS_PATH: &str = "/status";
 const METRICS_PATH: &str = "/metrics";
 const STATUS_LINKS_PATH: &str = "/status/links";
 const STATUS_LINT_PATH: &str = "/status/lint";
+const STATUS_CONTRADICTIONS_PATH: &str = "/status/contradictions";
 const ADMIN_RELOAD_PATH: &str = "/admin/reload";
 const ADMIN_SYNC_PATH: &str = "/admin/sync";
 const MCP_PATH: &str = "/mcp";
@@ -2078,11 +2192,11 @@ fn unauthenticated_mcp_warning(bearer_token_env: &str) -> String {
     format!(
         "SECURITY: bearer token env var '{bearer_token_env}' (or '{bearer_token_env}_FILE') is \
          not set — {MCP_PATH}, \
-         {STATUS_PATH}, {STATUS_LINKS_PATH}, {STATUS_LINT_PATH}, {METRICS_PATH}, {ADMIN_RELOAD_PATH} and {ADMIN_SYNC_PATH} are all reachable WITHOUT \
+         {STATUS_PATH}, {STATUS_LINKS_PATH}, {STATUS_LINT_PATH}, {STATUS_CONTRADICTIONS_PATH}, {METRICS_PATH}, {ADMIN_RELOAD_PATH} and {ADMIN_SYNC_PATH} are all reachable WITHOUT \
          authentication. {MCP_PATH} will serve full document content to any caller; \
          {STATUS_PATH} and {METRICS_PATH} expose tag vocabularies, area names and document \
-         counts; {STATUS_LINKS_PATH} and {STATUS_LINT_PATH} list document paths and what \
-         is wrong with them; {ADMIN_RELOAD_PATH} lets any caller force a config reload and an \
+         counts; {STATUS_LINKS_PATH}, {STATUS_LINT_PATH} and {STATUS_CONTRADICTIONS_PATH} list document paths and \
+         what is wrong with them; {ADMIN_RELOAD_PATH} lets any caller force a config reload and an \
          unconditional full reindex reconcile; {ADMIN_SYNC_PATH} lets any caller trigger \
          a fetch from the remote. Set the env var or restrict network access. \
          (allow_unauthenticated is enabled in config)"
@@ -2182,6 +2296,10 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
         .route(METRICS_PATH, axum::routing::get(metrics_handler))
         .route(STATUS_LINKS_PATH, axum::routing::get(links_handler))
         .route(STATUS_LINT_PATH, axum::routing::get(lint_handler))
+        .route(
+            STATUS_CONTRADICTIONS_PATH,
+            axum::routing::get(contradictions_handler),
+        )
         .with_state(deps.status_state)
         .route_layer(middleware::from_fn_with_state(
             deps.auth.clone(),
@@ -2588,6 +2706,60 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         Arc::clone(&shared_state_db),
         Arc::clone(&reindex_queue),
     );
+
+    // The scheduled contradiction job (#355). Always spawned, so `contradictions.enabled`
+    // is a reload-applied switch: each tick re-reads the config and returns at once
+    // while it is off. The judge is built once here (it is `RestartRequired`), and
+    // only when `contradictions.judge` is on; with `judge_provider: anthropic` the text
+    // of judged documents is sent to that API.
+    let contradiction_judge: Option<Arc<dyn crate::judge::Judge>> =
+        match &config.contradictions_judge {
+            Some(j) => {
+                let judge = crate::judge::build_judge(
+                    j.provider,
+                    &j.base_url,
+                    &j.model,
+                    j.api_key.clone(),
+                    j.request_timeout,
+                )
+                .context("Failed to build the contradiction judge")?;
+                info!(
+                    provider = ?j.provider,
+                    model = %j.model,
+                    base_url = %j.base_url,
+                    "Contradiction judge configured: the text of judged document pairs is sent \
+                     to this endpoint"
+                );
+                Some(judge)
+            }
+            None => None,
+        };
+    let contradiction_job = Arc::new(ContradictionJob {
+        shared_config: Arc::clone(&shared_config),
+        state_db: Arc::clone(&shared_state_db),
+        neighbors: Arc::clone(&qdrant),
+        judge: contradiction_judge,
+        judge_max_document_bytes: config
+            .contradictions_judge
+            .as_ref()
+            .map_or(config.contradictions.judge_max_document_bytes, |j| {
+                j.max_document_bytes
+            }),
+        run_lock: crate::contradictions::new_run_lock(),
+        ct: ct.child_token(),
+    });
+    tokio::spawn(periodic_job_loop(
+        Arc::clone(&shared_config),
+        ct.child_token(),
+        |cfg| cfg.contradictions.interval_secs,
+        move || {
+            let job = Arc::clone(&contradiction_job);
+            async move {
+                job.tick(|| crate::status::INDEX_STATUS.snapshot().indexing)
+                    .await;
+            }
+        },
+    ));
 
     // Build the handler once and clone it per request. In stateless mode the factory
     // runs on every POST rather than once per session, and `KbSearchServer::new`
@@ -3350,6 +3522,8 @@ mod tests {
             reranking: None,
             ui: Default::default(),
             lint: Default::default(),
+            contradictions: Default::default(),
+            contradictions_judge: None,
             provenance: Default::default(),
         })
     }
@@ -5261,6 +5435,7 @@ mod tests {
             STATUS_PATH,
             STATUS_LINKS_PATH,
             STATUS_LINT_PATH,
+            STATUS_CONTRADICTIONS_PATH,
             METRICS_PATH,
             ADMIN_RELOAD_PATH,
             ADMIN_SYNC_PATH,
@@ -5298,6 +5473,224 @@ mod tests {
         assert!(parse_lint_query(Some("limit=many")).is_err());
     }
 
+    // --- the scheduled contradiction job (#355) ---
+
+    /// Every neighbour query answers with the same one document.
+    struct FixedNeighbor {
+        path: &'static str,
+        lookups: std::sync::atomic::AtomicU32,
+    }
+
+    impl ingest::NeighborStore for FixedNeighbor {
+        async fn recommend_by_point_id(
+            &self,
+            _collection: &str,
+            _point_id: &str,
+            _limit: u64,
+            _filter: Option<qdrant_client::qdrant::Filter>,
+        ) -> Result<Vec<crate::qdrant::SearchResult>> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let mut payload = HashMap::new();
+            payload.insert("file_path".to_string(), serde_json::json!(self.path));
+            Ok(vec![crate::qdrant::SearchResult {
+                score: 0.95,
+                pre_rerank_score: None,
+                dense_score: Some(0.95),
+                sparse_score: None,
+                phrase_score: None,
+                payload,
+            }])
+        }
+    }
+
+    /// A job over a state DB holding `a.md` and `b.md`, whose neighbour store always
+    /// answers `b.md` (so `a.md` pairs with it and `b.md` finds only itself).
+    async fn contradiction_job(
+        dir: &std::path::Path,
+        enabled: bool,
+    ) -> (ContradictionJob<FixedNeighbor>, SharedConfig) {
+        let mut cfg = (*status_config(dir)).clone();
+        cfg.contradictions.enabled = enabled;
+        let shared = config::shared_config(Arc::new(cfg));
+        let db = crate::state::StateDb::new(&dir.join("state.db"))
+            .await
+            .unwrap();
+        for p in ["a.md", "b.md"] {
+            db.upsert_document_metadata(p, &HashMap::new(), 1, &format!("h-{p}"), 1)
+                .await
+                .unwrap();
+        }
+        let state_db = Arc::new(tokio::sync::OnceCell::new());
+        state_db.set(db).ok().unwrap();
+        let job = ContradictionJob {
+            shared_config: Arc::clone(&shared),
+            state_db,
+            neighbors: Arc::new(FixedNeighbor {
+                path: "b.md",
+                lookups: std::sync::atomic::AtomicU32::new(0),
+            }),
+            judge: None,
+            judge_max_document_bytes: 6000,
+            run_lock: crate::contradictions::new_run_lock(),
+            ct: CancellationToken::new(),
+        };
+        (job, shared)
+    }
+
+    #[tokio::test]
+    async fn contradiction_tick_does_nothing_while_disabled_and_follows_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (job, shared) = contradiction_job(dir.path(), false).await;
+
+        assert!(job.tick(|| false).await.is_none());
+        assert_eq!(job.neighbors.lookups.load(Ordering::SeqCst), 0);
+
+        // A reload that switches the job on is picked up by the very next tick.
+        let mut cfg = (*config::load_shared_config(&shared)).clone();
+        cfg.contradictions.enabled = true;
+        config::store_shared_config(&shared, cfg);
+        let summary = job.tick(|| false).await.expect("the job ran");
+        assert_eq!(summary.pairs_evaluated, 1);
+        assert_eq!(summary.candidates, 1, "no judge: recorded as a candidate");
+        assert_eq!(
+            job.state_db
+                .get()
+                .unwrap()
+                .count_contradiction_pairs()
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Nothing changed since: the next tick evaluates nothing.
+        let again = job.tick(|| false).await.expect("the job ran");
+        assert_eq!(again, crate::contradictions::RunSummary::default());
+    }
+
+    #[tokio::test]
+    async fn contradiction_tick_waits_for_an_indexing_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (job, _shared) = contradiction_job(dir.path(), true).await;
+        assert!(job.tick(|| true).await.is_none());
+        assert_eq!(job.neighbors.lookups.load(Ordering::SeqCst), 0);
+        assert!(job.tick(|| false).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn contradiction_tick_stops_when_shutdown_is_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let (job, _shared) = contradiction_job(dir.path(), true).await;
+        job.ct.cancel();
+        let summary = job.tick(|| false).await.expect("the job ran");
+        assert!(summary.cancelled);
+        assert_eq!(summary.pairs_evaluated, 0);
+        assert_eq!(job.neighbors.lookups.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn contradiction_tick_skips_when_another_run_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (job, _shared) = contradiction_job(dir.path(), true).await;
+        let _held = job.run_lock.clone().lock_owned().await;
+        assert!(job.tick(|| false).await.is_none());
+        assert_eq!(job.neighbors.lookups.load(Ordering::SeqCst), 0);
+    }
+
+    /// A router serving only `GET /status/contradictions` over `config`, without auth
+    /// (the auth layering is covered by the route-list tests below).
+    fn contradictions_app(config: Arc<ResolvedConfig>) -> Router {
+        let state = StatusState {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+            config: config::shared_config(config),
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
+            schema_cache: None,
+        };
+        Router::new()
+            .route(
+                STATUS_CONTRADICTIONS_PATH,
+                axum::routing::get(contradictions_handler),
+            )
+            .with_state(state)
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn contradictions_endpoint_is_503_before_the_first_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = contradictions_app(status_config(dir.path()));
+        let (status, body) = get_json(&app, STATUS_CONTRADICTIONS_PATH).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, serde_json::json!({"error": "no index yet"}));
+    }
+
+    #[tokio::test]
+    async fn contradictions_endpoint_lists_stored_pairs_conflicts_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = status_config(dir.path());
+        let db = crate::state::StateDb::new(Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        let pair = |a: &str, b: &str, verdict: &str, statements: Option<&str>| {
+            crate::state::ContradictionPair {
+                path_a: a.into(),
+                path_b: b.into(),
+                hash_a: "ha".into(),
+                hash_b: "hb".into(),
+                similarity: 0.9,
+                verdict: verdict.into(),
+                confidence: statements.map(|_| "high".to_string()),
+                statements: statements.map(str::to_string),
+                judge_model: statements.map(|_| "m".to_string()),
+                error: None,
+                judged_at: String::new(),
+            }
+        };
+        db.upsert_contradiction_pair(&pair("a.md", "b.md", "no_conflict", None))
+            .await
+            .unwrap();
+        db.upsert_contradiction_pair(&pair(
+            "c.md",
+            "d.md",
+            "conflict",
+            Some(r#"[{"a":"5","b":"7"}]"#),
+        ))
+        .await
+        .unwrap();
+        drop(db);
+
+        let app = contradictions_app(config);
+        let (status, body) = get_json(&app, STATUS_CONTRADICTIONS_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["count"], 2);
+        assert!(body.get("truncated").is_none());
+        let first = &body["pairs"][0];
+        assert_eq!(first["path_a"], "c.md");
+        assert_eq!(first["verdict"], "conflict");
+        assert_eq!(first["confidence"], "high");
+        assert_eq!(first["judge_model"], "m");
+        assert_eq!(first["statements"][0]["b"], "7");
+        assert!(first["judged_at"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(body["pairs"][1].get("statements").is_none());
+        assert!(body["pairs"][1].get("error").is_none());
+
+        // `limit` caps the listing (and is clamped to at least 1); the count stays true.
+        let (_, body) = get_json(&app, "/status/contradictions?limit=0").await;
+        assert_eq!(body["count"], 2);
+        assert_eq!(body["pairs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["truncated"], true);
+    }
+
     #[tokio::test]
     async fn router_assembly_rejects_unauthenticated_requests_on_every_protected_route() {
         let dir = tempfile::tempdir().unwrap();
@@ -5311,6 +5704,7 @@ mod tests {
             ("GET", METRICS_PATH),
             ("GET", STATUS_LINKS_PATH),
             ("GET", STATUS_LINT_PATH),
+            ("GET", STATUS_CONTRADICTIONS_PATH),
             ("POST", ADMIN_RELOAD_PATH),
             ("POST", ADMIN_SYNC_PATH),
             ("POST", MCP_PATH),
@@ -5805,6 +6199,7 @@ mod tests {
             ("GET", METRICS_PATH),
             ("GET", STATUS_LINKS_PATH),
             ("GET", STATUS_LINT_PATH),
+            ("GET", STATUS_CONTRADICTIONS_PATH),
             ("POST", ADMIN_RELOAD_PATH),
             ("POST", ADMIN_SYNC_PATH),
             ("POST", MCP_PATH),

@@ -550,6 +550,66 @@ async fn rebuild_document_fields_if_old_shape(pool: &SqlitePool) -> Result<bool>
     }
 }
 
+/// One stored contradiction-detection result for a pair of documents (#355).
+///
+/// `path_a < path_b` always: [`StateDb::upsert_contradiction_pair`] swaps a pair
+/// handed over the other way round (hashes with it), so A→B and B→A are one row.
+/// `hash_a`/`hash_b` are the documents' `content_hash` when the pair was evaluated;
+/// a pair is current only while both still match. `verdict` is `conflict`,
+/// `no_conflict`, or `candidate` (close enough to be worth judging, but no verdict:
+/// no judge configured, or the judge failed — then `error` says why).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContradictionPair {
+    pub path_a: String,
+    pub path_b: String,
+    pub hash_a: String,
+    pub hash_b: String,
+    pub similarity: f64,
+    pub verdict: String,
+    pub confidence: Option<String>,
+    /// JSON array of `{a, b}` conflicting statements; opaque to this module.
+    pub statements: Option<String>,
+    pub judge_model: Option<String>,
+    pub error: Option<String>,
+    /// `datetime('now')` (UTC, `YYYY-MM-DD HH:MM:SS`) when stored; ignored on write.
+    pub judged_at: String,
+}
+
+type ContradictionPairRow = (
+    String,
+    String,
+    String,
+    String,
+    f64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+const CONTRADICTION_PAIR_COLUMNS: &str = "path_a, path_b, hash_a, hash_b, similarity, verdict, \
+     confidence, statements, judge_model, error, judged_at";
+
+impl From<ContradictionPairRow> for ContradictionPair {
+    fn from(r: ContradictionPairRow) -> Self {
+        Self {
+            path_a: r.0,
+            path_b: r.1,
+            hash_a: r.2,
+            hash_b: r.3,
+            similarity: r.4,
+            verdict: r.5,
+            confidence: r.6,
+            statements: r.7,
+            judge_model: r.8,
+            error: r.9,
+            judged_at: r.10,
+        }
+    }
+}
+
 pub struct StateDb {
     pool: SqlitePool,
     /// As opened; keys [`REPROJECT_FAILURES`].
@@ -823,6 +883,47 @@ impl StateDb {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_document_links_target
              ON document_links(target_path)",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Contradiction detection bookkeeping (#355). Both tables are additive and
+        // rebuildable: dropping them only makes the next run re-analyse every pair, so
+        // no reindex is involved. Like `document_links` there is no foreign key to
+        // `documents`; rows go via `delete_document` and `prune_contradiction_data`.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS contradiction_docs (
+                file_path     TEXT PRIMARY KEY,
+                analyzed_hash TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS contradiction_pairs (
+                path_a     TEXT NOT NULL,
+                path_b     TEXT NOT NULL,
+                hash_a     TEXT NOT NULL,
+                hash_b     TEXT NOT NULL,
+                similarity REAL NOT NULL,
+                verdict    TEXT NOT NULL,
+                confidence TEXT,
+                statements TEXT,
+                judge_model TEXT,
+                error      TEXT,
+                judged_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (path_a, path_b)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        // The primary key is `path_a`-first; deleting or pruning by the other member
+        // of a pair needs its own index.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_contradiction_pairs_b
+             ON contradiction_pairs(path_b)",
         )
         .execute(&pool)
         .await?;
@@ -1298,8 +1399,163 @@ impl StateDb {
             .await?;
 
         self.delete_links_for(file_path).await?;
+        self.delete_contradiction_data_for(file_path).await?;
 
         Ok(())
+    }
+
+    // ---- contradiction detection (#355) -------------------------------------
+
+    /// Drop a document's analysis marker and every stored pair it is part of.
+    async fn delete_contradiction_data_for(&self, file_path: &str) -> Result<()> {
+        sqlx::query("DELETE FROM contradiction_docs WHERE file_path = ?")
+            .bind(file_path)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM contradiction_pairs WHERE path_a = ? OR path_b = ?")
+            .bind(file_path)
+            .bind(file_path)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The `content_hash` each document had when the contradiction job last finished
+    /// analysing it, keyed by path. A document absent here, or whose current hash
+    /// differs, is "changed" and gets its neighbours re-examined.
+    pub async fn contradiction_analyzed_hashes(&self) -> Result<HashMap<String, String>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT file_path, analyzed_hash FROM contradiction_docs")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Record `(path, content_hash)` as fully analysed, in one transaction.
+    pub async fn mark_documents_analyzed(&self, docs: &[(String, String)]) -> Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for (path, hash) in docs {
+            sqlx::query(
+                "INSERT INTO contradiction_docs (file_path, analyzed_hash) VALUES (?, ?)
+                 ON CONFLICT(file_path) DO UPDATE SET analyzed_hash = excluded.analyzed_hash",
+            )
+            .bind(path)
+            .bind(hash)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The stored result for the pair `(a, b)`, in either order. The job reads the whole
+    /// table once per run instead ([`Self::all_contradiction_pairs`]), so only tests
+    /// look pairs up one at a time.
+    #[cfg(test)]
+    pub async fn get_contradiction_pair(
+        &self,
+        a: &str,
+        b: &str,
+    ) -> Result<Option<ContradictionPair>> {
+        let (path_a, path_b) = if a <= b { (a, b) } else { (b, a) };
+        let row: Option<ContradictionPairRow> = sqlx::query_as(&format!(
+            "SELECT {CONTRADICTION_PAIR_COLUMNS} FROM contradiction_pairs
+             WHERE path_a = ? AND path_b = ?"
+        ))
+        .bind(path_a)
+        .bind(path_b)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    /// Store a pair's result, replacing any earlier one. A pair given with
+    /// `path_a > path_b` is swapped (hashes with it) so each pair has one row;
+    /// `judged_at` is stamped by the database.
+    pub async fn upsert_contradiction_pair(&self, pair: &ContradictionPair) -> Result<()> {
+        let mut pair = pair.clone();
+        if pair.path_a > pair.path_b {
+            std::mem::swap(&mut pair.path_a, &mut pair.path_b);
+            std::mem::swap(&mut pair.hash_a, &mut pair.hash_b);
+        }
+        sqlx::query(
+            "INSERT INTO contradiction_pairs
+                 (path_a, path_b, hash_a, hash_b, similarity, verdict, confidence,
+                  statements, judge_model, error, judged_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(path_a, path_b) DO UPDATE SET
+                 hash_a = excluded.hash_a,
+                 hash_b = excluded.hash_b,
+                 similarity = excluded.similarity,
+                 verdict = excluded.verdict,
+                 confidence = excluded.confidence,
+                 statements = excluded.statements,
+                 judge_model = excluded.judge_model,
+                 error = excluded.error,
+                 judged_at = excluded.judged_at",
+        )
+        .bind(&pair.path_a)
+        .bind(&pair.path_b)
+        .bind(&pair.hash_a)
+        .bind(&pair.hash_b)
+        .bind(pair.similarity)
+        .bind(&pair.verdict)
+        .bind(&pair.confidence)
+        .bind(&pair.statements)
+        .bind(&pair.judge_model)
+        .bind(&pair.error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Stored pairs, at most `limit`, in a deterministic order: `conflict` verdicts
+    /// first, then `candidate`s, then `no_conflict`; within a verdict the most similar
+    /// first, then by path.
+    pub async fn list_contradiction_pairs(&self, limit: i64) -> Result<Vec<ContradictionPair>> {
+        let rows: Vec<ContradictionPairRow> = sqlx::query_as(&format!(
+            "SELECT {CONTRADICTION_PAIR_COLUMNS} FROM contradiction_pairs
+             ORDER BY CASE verdict WHEN 'conflict' THEN 0 WHEN 'candidate' THEN 1 ELSE 2 END,
+                      similarity DESC, path_a ASC, path_b ASC
+             LIMIT ?"
+        ))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Every stored pair, for the contradiction job's skip decisions.
+    pub async fn all_contradiction_pairs(&self) -> Result<Vec<ContradictionPair>> {
+        self.list_contradiction_pairs(i64::MAX).await
+    }
+
+    /// How many pairs are stored.
+    pub async fn count_contradiction_pairs(&self) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM contradiction_pairs")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
+    }
+
+    /// Delete contradiction rows that mention a document no longer in `documents`
+    /// (a belt for `delete_document`'s braces: a removal that bypassed it, or a
+    /// `clear`). Returns the number of rows removed.
+    pub async fn prune_contradiction_data(&self) -> Result<u64> {
+        let mut removed = 0;
+        for sql in [
+            "DELETE FROM contradiction_docs
+             WHERE file_path NOT IN (SELECT file_path FROM documents)",
+            "DELETE FROM contradiction_pairs
+             WHERE path_a NOT IN (SELECT file_path FROM documents)
+                OR path_b NOT IN (SELECT file_path FROM documents)",
+        ] {
+            removed += sqlx::query(sql).execute(&self.pool).await?.rows_affected();
+        }
+        Ok(removed)
     }
 
     /// Replace every `document_links` row for `(source_path, kind)` with `targets`.
@@ -1549,13 +1805,10 @@ impl StateDb {
 
     /// Content hash of every document that has metadata, keyed by path.
     ///
-    /// The scoped indexer (`ingest::index_paths`) now uses [`Self::get_document_hashes_many`]
-    /// instead, scoped to just the paths it is processing — loading every document's
-    /// hash at once does not scale to a large corpus. This whole-table equivalent is
-    /// kept as a general-purpose `StateDb` accessor (parallel to [`Self::list_all`])
-    /// rather than removed with its test coverage; `#[allow(dead_code)]` because
-    /// nothing in production calls it now.
-    #[allow(dead_code)]
+    /// The scoped indexer (`ingest::index_paths`) uses [`Self::get_document_hashes_many`]
+    /// instead, scoped to the paths it is processing. The contradiction job
+    /// (`contradictions::run_once`) needs the whole table: it compares every document
+    /// against the hash it was last analysed at.
     pub async fn list_document_hashes(&self) -> Result<HashMap<String, String>> {
         let rows: Vec<(String, String)> =
             sqlx::query_as("SELECT file_path, content_hash FROM documents")
@@ -6210,5 +6463,228 @@ mod tests {
         assert_eq!(summaries[0].file_path, "r.md");
         assert_eq!(summaries[0].mtime, 1700);
         assert!(summaries[0].frontmatter.is_object());
+    }
+
+    // ---- contradiction detection tables (#355) -------------------------------
+
+    fn pair(a: &str, b: &str, verdict: &str, similarity: f64) -> ContradictionPair {
+        ContradictionPair {
+            path_a: a.into(),
+            path_b: b.into(),
+            hash_a: format!("h-{a}"),
+            hash_b: format!("h-{b}"),
+            similarity,
+            verdict: verdict.into(),
+            confidence: None,
+            statements: None,
+            judge_model: None,
+            error: None,
+            judged_at: String::new(),
+        }
+    }
+
+    async fn seed_documents(db: &StateDb, paths: &[&str]) {
+        for p in paths {
+            db.upsert_document_metadata(p, &HashMap::new(), 1, &format!("h-{p}"), 1)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn contradiction_analyzed_hashes_round_trip_and_update() {
+        let (db, _dir) = test_db().await;
+        assert!(db.contradiction_analyzed_hashes().await.unwrap().is_empty());
+        db.mark_documents_analyzed(&[]).await.unwrap();
+
+        db.mark_documents_analyzed(&[("a.md".into(), "h1".into()), ("b.md".into(), "h2".into())])
+            .await
+            .unwrap();
+        db.mark_documents_analyzed(&[("a.md".into(), "h3".into())])
+            .await
+            .unwrap();
+        let hashes = db.contradiction_analyzed_hashes().await.unwrap();
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes["a.md"], "h3");
+        assert_eq!(hashes["b.md"], "h2");
+    }
+
+    #[tokio::test]
+    async fn contradiction_pair_is_normalised_and_round_trips() {
+        let (db, _dir) = test_db().await;
+        let mut p = pair("z.md", "a.md", "conflict", 0.91);
+        p.confidence = Some("high".into());
+        p.statements = Some(r#"[{"a":"x","b":"y"}]"#.into());
+        p.judge_model = Some("m".into());
+        db.upsert_contradiction_pair(&p).await.unwrap();
+
+        // Stored once, with the paths (and their hashes) put in order.
+        assert_eq!(db.count_contradiction_pairs().await.unwrap(), 1);
+        let stored = db
+            .get_contradiction_pair("a.md", "z.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (stored.path_a.as_str(), stored.path_b.as_str()),
+            ("a.md", "z.md")
+        );
+        assert_eq!(
+            (stored.hash_a.as_str(), stored.hash_b.as_str()),
+            ("h-a.md", "h-z.md")
+        );
+        assert_eq!(stored.verdict, "conflict");
+        assert_eq!(stored.confidence.as_deref(), Some("high"));
+        assert_eq!(stored.statements.as_deref(), Some(r#"[{"a":"x","b":"y"}]"#));
+        assert_eq!(stored.judge_model.as_deref(), Some("m"));
+        assert!(stored.error.is_none());
+        assert!(
+            !stored.judged_at.is_empty(),
+            "the database stamps judged_at"
+        );
+        // Either order finds it.
+        assert_eq!(
+            db.get_contradiction_pair("z.md", "a.md").await.unwrap(),
+            Some(stored.clone())
+        );
+
+        // The reverse direction replaces the same row.
+        let mut again = pair("a.md", "z.md", "no_conflict", 0.88);
+        again.error = Some("note".into());
+        db.upsert_contradiction_pair(&again).await.unwrap();
+        assert_eq!(db.count_contradiction_pairs().await.unwrap(), 1);
+        let stored = db
+            .get_contradiction_pair("z.md", "a.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.verdict, "no_conflict");
+        assert!(stored.confidence.is_none() && stored.statements.is_none());
+        assert_eq!(stored.error.as_deref(), Some("note"));
+        assert!(
+            db.get_contradiction_pair("a.md", "nope.md")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn contradiction_pairs_list_conflicts_first_then_candidates_then_clear() {
+        let (db, _dir) = test_db().await;
+        for p in [
+            pair("a.md", "b.md", "no_conflict", 0.99),
+            pair("c.md", "d.md", "candidate", 0.85),
+            pair("e.md", "f.md", "conflict", 0.81),
+            pair("g.md", "h.md", "conflict", 0.95),
+            pair("c.md", "e.md", "candidate", 0.85),
+        ] {
+            db.upsert_contradiction_pair(&p).await.unwrap();
+        }
+        let order: Vec<(String, String)> = db
+            .list_contradiction_pairs(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.path_a, p.path_b))
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("g.md", "h.md"),
+            ("e.md", "f.md"),
+            ("c.md", "d.md"),
+            ("c.md", "e.md"),
+            ("a.md", "b.md"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        assert_eq!(order, expected);
+        assert_eq!(db.list_contradiction_pairs(2).await.unwrap().len(), 2);
+        assert_eq!(db.all_contradiction_pairs().await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn prune_contradiction_data_drops_rows_for_missing_documents() {
+        let (db, _dir) = test_db().await;
+        seed_documents(&db, &["a.md", "b.md"]).await;
+        db.mark_documents_analyzed(&[
+            ("a.md".into(), "h-a.md".into()),
+            ("gone.md".into(), "x".into()),
+        ])
+        .await
+        .unwrap();
+        db.upsert_contradiction_pair(&pair("a.md", "b.md", "candidate", 0.9))
+            .await
+            .unwrap();
+        db.upsert_contradiction_pair(&pair("a.md", "gone.md", "candidate", 0.9))
+            .await
+            .unwrap();
+        db.upsert_contradiction_pair(&pair("0.md", "b.md", "candidate", 0.9))
+            .await
+            .unwrap();
+
+        assert_eq!(db.prune_contradiction_data().await.unwrap(), 3);
+        let hashes = db.contradiction_analyzed_hashes().await.unwrap();
+        assert_eq!(hashes.keys().collect::<Vec<_>>(), ["a.md"]);
+        let pairs = db.all_contradiction_pairs().await.unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].path_a, "a.md");
+        // Nothing left to prune.
+        assert_eq!(db.prune_contradiction_data().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_document_removes_its_contradiction_rows() {
+        let (db, _dir) = test_db().await;
+        seed_documents(&db, &["a.md", "b.md", "c.md"]).await;
+        db.mark_documents_analyzed(&[("a.md".into(), "h".into()), ("b.md".into(), "h".into())])
+            .await
+            .unwrap();
+        db.upsert_contradiction_pair(&pair("a.md", "b.md", "candidate", 0.9))
+            .await
+            .unwrap();
+        db.upsert_contradiction_pair(&pair("b.md", "c.md", "candidate", 0.9))
+            .await
+            .unwrap();
+        db.upsert_contradiction_pair(&pair("a.md", "c.md", "candidate", 0.9))
+            .await
+            .unwrap();
+
+        // Deleting `b.md` (the second member of one pair, the first of another).
+        db.delete_document("b.md").await.unwrap();
+        let pairs = db.all_contradiction_pairs().await.unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            (pairs[0].path_a.as_str(), pairs[0].path_b.as_str()),
+            ("a.md", "c.md")
+        );
+        let hashes = db.contradiction_analyzed_hashes().await.unwrap();
+        assert_eq!(hashes.keys().collect::<Vec<_>>(), ["a.md"]);
+    }
+
+    #[tokio::test]
+    async fn contradiction_tables_are_additive_on_an_existing_database() {
+        // A database from before the tables existed opens and gains them; reopening
+        // is a no-op that keeps their rows.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let db = StateDb::new(&path).await.unwrap();
+            sqlx::query("DROP TABLE contradiction_pairs")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            sqlx::query("DROP TABLE contradiction_docs")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        let db = StateDb::new(&path).await.unwrap();
+        db.upsert_contradiction_pair(&pair("a.md", "b.md", "candidate", 0.9))
+            .await
+            .unwrap();
+        drop(db);
+        let db = StateDb::new(&path).await.unwrap();
+        assert_eq!(db.count_contradiction_pairs().await.unwrap(), 1);
     }
 }

@@ -370,6 +370,8 @@ mod tests {
             reranking: None,
             ui: Default::default(),
             lint: Default::default(),
+            contradictions: Default::default(),
+            contradictions_judge: None,
             provenance: Default::default(),
         })
     }
