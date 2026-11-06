@@ -2820,7 +2820,9 @@ fn rewrite_outbound_links(
     apply_link_replacements_each(content, &replacements)
 }
 
-/// Apply a PER-OCCURRENCE text replacement at each occurrence's own span,
+/// Apply a PER-OCCURRENCE text replacement at each occurrence's own path span
+/// (`LinkOccurrence::path_span` — the replacement is a bare path, so a
+/// `#fragment`, `"title"` suffix or wiki `|alias` after it stays as written),
 /// back-to-front by span start so an earlier edit's byte-length change can
 /// never invalidate a later span still waiting to be applied. Every
 /// occurrence must have come from scanning `body` itself (e.g.
@@ -2845,7 +2847,7 @@ fn apply_link_replacements_each(
 ) -> String {
     let mut spans: Vec<(std::ops::Range<usize>, &str)> = replacements
         .iter()
-        .map(|(o, r)| (o.span.clone(), r.as_str()))
+        .map(|(o, r)| (o.path_span.clone(), r.as_str()))
         .collect();
     // Sort back-to-front (descending by start) so replacing an earlier-in-text
     // span never shifts the byte offsets a later-in-iteration-but-earlier-in-text
@@ -9227,6 +9229,119 @@ mod tests {
         );
     }
 
+    /// Body text exercising every link syntax with a `#fragment` and, where the
+    /// syntax allows one, a `"title"` suffix or wiki alias; `{p}` is the path each
+    /// link spells (the wiki ones `{wiki}`). The reference label is the path's last
+    /// component, which a move keeps, so two bodies in one document never share one.
+    fn fragment_links_body(p: &str, wiki: &str) -> String {
+        let r = p.rsplit('/').next().unwrap();
+        format!(
+            "See [inline]({p}#install \"Title\"), [bare]({p}#top), [[{wiki}#Set up]], \
+             [[{wiki}#h|Alias]], <{p}#x> and [ref style][{r}].\n\n[{r}]: {p}#y \"Ref title\"\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn move_keeps_fragments_titles_and_aliases_on_outbound_links() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        std::fs::create_dir_all(work.path().join("shared")).unwrap();
+        std::fs::write(
+            work.path().join("shared/doc.md"),
+            "---\ntitle: Shared\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Shared\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "shared/doc.md", "add shared/doc.md");
+
+        let front = "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        let source_original = format!(
+            "{front}{}Self: [me](a.md#top \"Me\").\n",
+            fragment_links_body("../shared/doc.md", "../shared/doc")
+        );
+        std::fs::write(work.path().join("old/a.md"), &source_original).unwrap();
+        git_commit_all(&work, "old/a.md", "add old/a.md");
+
+        let harness = git_backed_harness(&work);
+        let req = make_move_req(
+            "old/a.md",
+            "new/deep/a.md",
+            &source_original,
+            &source_original,
+        );
+        write_document(&harness.deps(), req).await.unwrap();
+
+        let dest = std::fs::read_to_string(work.path().join("new/deep/a.md")).unwrap();
+        // The wiki links' bare `../shared/doc` gains `.md` exactly as it does
+        // without a fragment; only the path portion changes.
+        let expected = format!(
+            "{front}{}Self: [me](a.md#top \"Me\").\n",
+            fragment_links_body("../../shared/doc.md", "../../shared/doc.md")
+        );
+        assert_eq!(dest, expected);
+    }
+
+    #[tokio::test]
+    async fn same_directory_rename_keeps_the_fragment_on_a_self_link() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        let source_original = "---\ntitle: Rename Me\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nTop: [me](a.md#top \"Me\"), [[a#Intro|here]], <a.md#x>.\n";
+        std::fs::write(work.path().join("docs/a.md"), source_original).unwrap();
+        git_commit_all(&work, "docs/a.md", "add docs/a.md");
+
+        let harness = git_backed_harness(&work);
+        let req = make_move_req("docs/a.md", "docs/b.md", source_original, source_original);
+        write_document(&harness.deps(), req).await.unwrap();
+
+        let dest = std::fs::read_to_string(work.path().join("docs/b.md")).unwrap();
+        assert!(
+            dest.ends_with("\nTop: [me](b.md#top \"Me\"), [[b.md#Intro|here]], <b.md#x>.\n"),
+            "{dest}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_repoints_inbound_links_keeping_fragments_and_titles() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let front = "---\ntitle: Referencer\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        let referencing_original =
+            format!("{front}{}", fragment_links_body("old/loc.md", "old/loc"));
+        std::fs::write(work.path().join("referencing.md"), &referencing_original).unwrap();
+        git_commit_all(&work, "referencing.md", "add referencing.md");
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing.md",
+                "markdown",
+                &[("old/loc.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let req = make_move_req("old/loc.md", "new/loc.md", source_original, source_original);
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+
+        let after = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert_eq!(
+            after,
+            format!("{front}{}", fragment_links_body("new/loc.md", "new/loc.md"))
+        );
+    }
+
     #[tokio::test]
     async fn move_outbound_rewrite_skips_links_inside_fences_and_code_spans() {
         let bare = crate::git::tests::create_bare_repo("master");
@@ -10325,6 +10440,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn move_directory_keeps_fragments_titles_and_aliases_on_every_rewritten_link() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("frag/sub")).unwrap();
+        std::fs::create_dir_all(work.path().join("shared")).unwrap();
+        let front = "---\ntitle: T\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        // `frag/a.md` links to a document moving with it and to one staying put.
+        let a = format!(
+            "{front}{}{}",
+            fragment_links_body("sub/b.md", "sub/b"),
+            fragment_links_body("../shared/s.md", "../shared/s")
+        );
+        let b = format!("{front}# B\n");
+        let s = format!("{front}# S\n");
+        let referencing = format!(
+            "{front}{}",
+            fragment_links_body("frag/sub/b.md", "frag/sub/b")
+        );
+        std::fs::write(work.path().join("frag/a.md"), &a).unwrap();
+        std::fs::write(work.path().join("frag/sub/b.md"), &b).unwrap();
+        std::fs::write(work.path().join("shared/s.md"), &s).unwrap();
+        std::fs::write(work.path().join("referencing5.md"), &referencing).unwrap();
+        git_commit_paths(
+            &work,
+            &[
+                "frag/a.md",
+                "frag/sub/b.md",
+                "shared/s.md",
+                "referencing5.md",
+            ],
+            "add frag",
+        );
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing5.md",
+                "markdown",
+                &[("frag/sub/b.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        move_directory(&harness.deps(), "frag", "moved5/deep", None)
+            .await
+            .unwrap();
+
+        let a_after = std::fs::read_to_string(work.path().join("moved5/deep/a.md")).unwrap();
+        assert_eq!(
+            a_after,
+            format!(
+                "{front}{}{}",
+                fragment_links_body("sub/b.md", "sub/b.md"),
+                fragment_links_body("../../shared/s.md", "../../shared/s.md")
+            )
+        );
+        let ref_after = std::fs::read_to_string(work.path().join("referencing5.md")).unwrap();
+        assert_eq!(
+            ref_after,
+            format!(
+                "{front}{}",
+                fragment_links_body("moved5/deep/sub/b.md", "moved5/deep/sub/b.md")
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn move_directory_validation_failure_for_one_document_aborts_the_whole_move() {
         let tmp = tempfile::tempdir().unwrap();
         let source_dir = tmp.path().join("loose5");
@@ -11338,7 +11523,7 @@ mod tests {
 
         let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
         assert!(
-            referencing.contains("[the page](_archive/old/loc.md)"),
+            referencing.contains("[the page](_archive/old/loc.md \"T\")"),
             "{referencing}"
         );
         assert!(
@@ -11370,6 +11555,38 @@ mod tests {
         crate::reindex::test_support::assert_marked_dirty(
             &harness.reindex_queue,
             &["old/loc.md", "_archive/old/loc.md", "referencing.md"],
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_repoint_keeps_fragments_titles_and_aliases() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (harness, _) = archive_fixture(&work, true).await;
+        let front = "---\ntitle: Referencer\ndescription: d\ntype: guide\ntags: [t]\n---\n\n";
+        std::fs::write(
+            work.path().join("referencing.md"),
+            format!("{front}{}", fragment_links_body("old/loc.md", "old/loc")),
+        )
+        .unwrap();
+        git_commit_all(&work, "referencing.md", "fragment links");
+
+        let req = archive_req(
+            "old/loc.md",
+            "_archive/old/loc.md",
+            ARCHIVE_SOURCE,
+            crate::config::ArchiveLinkPolicy::Repoint,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+
+        let referencing = std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert_eq!(
+            referencing,
+            format!(
+                "{front}{}",
+                fragment_links_body("_archive/old/loc.md", "_archive/old/loc.md")
+            )
         );
     }
 

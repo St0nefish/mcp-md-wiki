@@ -65,6 +65,19 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   outpost) example applied to the UI router only, with `/mcp` and the other
   self-authenticating routes on a separate router.
 
+### Fixed
+
+- **Moving or archiving a document keeps link anchors and titles.** The link
+  rewrite behind a document move, a directory move and `archive` with
+  `archive_links: repoint` replaced a link's whole target with the new bare path, so
+  `[x](guide.md#install "Title")` became `[x](../guide.md)` and `[[guide#Setup]]`
+  lost its anchor — for every link in a moved document, even on a rename within one
+  directory. Only the path portion is replaced now (`ingest::LinkOccurrence::path_span`);
+  a `#fragment`, a `"title"` and a wiki `|alias` stay as written, for inline,
+  wiki-style, reference-definition and autolink syntax. Links without a fragment or
+  title are rewritten exactly as before. Links already rewritten by an earlier move
+  are not repaired.
+
 ## [0.2.2] - 2026-11-03
 
 ### Added

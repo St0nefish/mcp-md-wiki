@@ -2154,6 +2154,12 @@ pub(crate) struct LinkOccurrence {
     /// document shifts a byte offset without shifting a char offset by the same
     /// amount.
     pub span: std::ops::Range<usize>,
+    /// Byte range in the original document, inside `span`, covering only the PATH
+    /// portion of the target — what [`resolve_link_target`] resolved, per
+    /// [`link_target_path_range`]: no `#fragment`, no `"title"` suffix, no
+    /// surrounding whitespace. A link rewrite replaces this range, so a fragment or
+    /// title after the path is kept as written.
+    pub path_span: std::ops::Range<usize>,
     /// The target exactly as written (between `(`/`)` for inline, between the
     /// double brackets for wiki-style, between `<`/`>` for an autolink, or after
     /// `[ref]:` for a reference definition) — before the title-suffix and
@@ -2195,10 +2201,14 @@ pub(crate) fn find_markdown_link_occurrences(
     scan_link_occurrences(body)
         .into_iter()
         .filter_map(|(span, raw, kind)| {
-            resolve_link_target(&raw, source_rel_path, kind).map(|resolved| LinkOccurrence {
-                span,
-                raw,
-                resolved,
+            resolve_link_target(&raw, source_rel_path, kind).map(|resolved| {
+                let path = link_target_path_range(&raw);
+                LinkOccurrence {
+                    path_span: span.start + path.start..span.start + path.end,
+                    span,
+                    raw,
+                    resolved,
+                }
             })
         })
         .collect()
@@ -2670,20 +2680,7 @@ fn resolve_link_target(
     source_rel_path: &str,
     kind: RawLinkKind,
 ) -> Option<String> {
-    let target = raw_target.trim();
-
-    // Strip an optional ` "title"` / ` 'title'` suffix (CommonMark link title) — take
-    // everything before the first whitespace as the actual target.
-    let target = match target.find(char::is_whitespace) {
-        Some(idx) => &target[..idx],
-        None => target,
-    };
-
-    // Strip a trailing #fragment.
-    let target = match target.find('#') {
-        Some(idx) => &target[..idx],
-        None => target,
-    };
+    let target = &raw_target[link_target_path_range(raw_target)];
 
     if target.is_empty() {
         return None;
@@ -2710,6 +2707,22 @@ fn resolve_link_target(
     };
 
     resolve_relative_md_path(target, source_rel_path)
+}
+
+/// The byte range, within `raw_target`, of the path portion of a raw link target:
+/// leading/trailing whitespace trimmed, an optional ` "title"` / ` 'title'` suffix
+/// (CommonMark link title — everything from the first whitespace on) dropped, then a
+/// trailing `#fragment` dropped. This is the one definition of "which bytes are the
+/// path" — [`resolve_link_target`] resolves exactly this slice, and a link rewrite
+/// replaces exactly this slice, leaving the fragment and title around it as written.
+fn link_target_path_range(raw_target: &str) -> std::ops::Range<usize> {
+    let lead = raw_target.len() - raw_target.trim_start().len();
+    let target = raw_target.trim();
+    let mut len = target.find(char::is_whitespace).unwrap_or(target.len());
+    if let Some(hash) = target[..len].find('#') {
+        len = hash;
+    }
+    lead..lead + len
 }
 
 /// Join `target` (a `.md`-relative path, possibly containing `./`/`../`) onto
@@ -5036,6 +5049,43 @@ mod tests {
         assert_eq!(occurrence.span.start, expected_start);
         assert_eq!(occurrence.span.end, expected_start + "guide".len());
         assert_eq!(&body[occurrence.span.clone()], "guide");
+    }
+
+    /// `path_span` covers only the path a link resolves through — never its
+    /// `#fragment`, `"title"` suffix or surrounding whitespace — so a rewrite
+    /// replacing it keeps those as written, for every syntax.
+    #[test]
+    fn find_markdown_link_occurrences_path_span_excludes_fragment_and_title() {
+        let body = "Café: [a](guide.md#install \"Title\") and [b]( other.md ) and \
+                    [[wiki#Set up|Alias]] and [[plain#h]] and <auto.md#x> and [r][ref].\n\
+                    \n[ref]: refd.md#y \"T\"\n";
+        let occurrences = find_markdown_link_occurrences(body, "docs/page.md");
+        let pairs: Vec<(&str, &str, &str)> = occurrences
+            .iter()
+            .map(|o| {
+                assert_eq!(&body[o.span.clone()], o.raw);
+                assert!(o.span.start <= o.path_span.start && o.path_span.end <= o.span.end);
+                (
+                    &body[o.span.clone()],
+                    &body[o.path_span.clone()],
+                    o.resolved.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("guide.md#install \"Title\"", "guide.md", "docs/guide.md"),
+                (" other.md ", "other.md", "docs/other.md"),
+                ("wiki#Set up", "wiki", "docs/wiki.md"),
+                ("plain#h", "plain", "docs/plain.md"),
+                ("auto.md#x", "auto.md", "docs/auto.md"),
+                ("refd.md#y", "refd.md", "docs/refd.md"),
+            ]
+        );
+        // Without a fragment or title, the path span is the whole span.
+        let plain = find_markdown_link_occurrences("[a](guide.md)", "page.md");
+        assert_eq!(plain[0].path_span, plain[0].span);
     }
 
     #[test]
