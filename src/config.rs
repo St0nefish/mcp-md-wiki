@@ -2409,12 +2409,14 @@ impl Config {
         if self.chunking.max_chunk_size == 0 {
             anyhow::bail!("chunking.max_chunk_size must be >= 1");
         }
+        // A name is looked up exactly, as a top-level frontmatter key: one with
+        // surrounding whitespace would match nothing while still re-embedding the corpus.
         if let Some(field) = &self.chunking.embedding_prefix_field
-            && field.trim().is_empty()
+            && (field.trim().is_empty() || field.trim() != field)
         {
             anyhow::bail!(
-                "chunking.embedding_prefix_field must name a frontmatter field (leave it unset \
-                 for `description`)"
+                "chunking.embedding_prefix_field must name a frontmatter field, without \
+                 surrounding whitespace (leave it unset for `description`)"
             );
         }
         if self.rate_limit.requests_per_second == 0 {
@@ -4054,7 +4056,7 @@ mcp:
             cfg.chunking.embedding_prefix_field.as_deref(),
             Some("summary")
         );
-        for blank in ["\"\"", "\"  \""] {
+        for blank in ["\"\"", "\"  \"", "\" summary\"", "\"summary \""] {
             let err = Config::from_str(&format!("chunking:\n  embedding_prefix_field: {blank}\n"))
                 .unwrap_err();
             assert!(

@@ -98,6 +98,10 @@ pub(crate) fn parse_date_midnight(text: &str) -> Option<Timestamp> {
 /// A date and time without an offset, read as UTC, in one of `formats` (strptime
 /// syntax); the first that matches wins.
 pub(crate) fn parse_civil_utc(text: &str, formats: &[&str]) -> Option<Timestamp> {
+    // `strptime` skips whitespace around the fields; a date never has any.
+    if text.trim() != text {
+        return None;
+    }
     formats.iter().find_map(|fmt| {
         let dt = DateTime::strptime(fmt, text).ok()?;
         TimeZone::UTC.to_timestamp(dt).ok()
@@ -292,5 +296,18 @@ mod tests {
         );
         assert!(parse_civil_utc("2026-03-01 12:30:00Z", &forms).is_none());
         assert!(parse_civil_utc("20260301", &forms).is_none());
+        // Text around or inside the fields is not a date either (a commit id must
+        // never be read as one).
+        for bad in [
+            "2026-03-01 12:30 ",
+            " 2026-03-01 12:30",
+            "2026-03-01 12:30:",
+            "2026-03-01 12:30abc",
+            "2026-03-01 12",
+            "2026-03-01 25:00",
+            "abc1234",
+        ] {
+            assert!(parse_civil_utc(bad, &forms).is_none(), "{bad:?}");
+        }
     }
 }

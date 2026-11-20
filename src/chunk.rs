@@ -473,6 +473,10 @@ pub fn chunk_markdown(
         && config.embedding_prefix_field.is_some()
         && let Some(text) = description.filter(|d| !d.trim().is_empty())
     {
+        // Cut to `max_chunk_size` like every other chunk: a long `summary`, or a list
+        // of thousands of `nodes`, must not become one embedding input over the
+        // model's limit and fail the whole batch it rides in.
+        let text = &text[..text.floor_char_boundary(max)];
         return vec![Chunk {
             text: text.to_string(),
             index: 0,
@@ -741,6 +745,19 @@ mod tests {
             ),
             (1, 1, 1, 1)
         );
+    }
+
+    #[test]
+    fn the_prefix_field_chunk_is_cut_to_max_chunk_size_on_a_char_boundary() {
+        let config = ChunkingConfig {
+            embedding_prefix_field: Some("summary".to_string()),
+            ..cfg(10, None, true, false)
+        };
+        let chunks = chunk_markdown("", Some("é".repeat(40).as_str()), &config);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.len() <= 10, "{}", chunks[0].text.len());
+        assert!(chunks[0].text.chars().all(|c| c == 'é'));
+        assert!(!chunks[0].text.is_empty());
     }
 
     #[test]
