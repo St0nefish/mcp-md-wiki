@@ -94,6 +94,18 @@ fn chunk_file(
     chunk_isolated(file_path, || {
         let mut chunks = chunk::chunk_markdown(body, description, chunking);
         shift_chunks_to_file_lines(&mut chunks, content);
+        // A blank body leaves only the prefix-field chunk (#386), which is not a
+        // piece of the body: a frontmatter-only file would put it one line past the
+        // end, so pin it to the file's own last line.
+        if body.trim().is_empty() {
+            let last = content.lines().count().max(1);
+            for c in &mut chunks {
+                c.line_start = c.line_start.min(last);
+                c.line_end = c.line_end.min(last);
+                c.section_line_start = c.section_line_start.min(last);
+                c.section_line_end = c.section_line_end.min(last);
+            }
+        }
         chunks
     })
 }
@@ -578,6 +590,7 @@ pub(crate) fn chunking_fingerprint(chunking: &crate::config::ChunkingConfig) -> 
         prepend_description,
         prepend_heading_path,
         heading_metadata,
+        embedding_prefix_field,
     } = chunking;
     // `target_chunk_size` only steers the accumulate-to-target merge, which
     // `heading_metadata` turns off, so it is left out while that flag is on.
@@ -586,10 +599,18 @@ pub(crate) fn chunking_fingerprint(chunking: &crate::config::ChunkingConfig) -> 
     } else {
         format!("target_chunk_size={};", chunking.target())
     };
+    // Only when set, the `embedding.document_prefix` pattern (`indexing_fingerprint`):
+    // an unset key leaves the fingerprint exactly as it was before the key existed, so
+    // upgrading re-embeds nothing (#386).
+    let prefix_field = embedding_prefix_field
+        .as_ref()
+        .map(|field| format!(";embedding_prefix_field={field:?}"))
+        .unwrap_or_default();
     let canonical = format!(
         "chunker_version={CHUNKER_VERSION};max_chunk_size={max_chunk_size};\
          {target}prepend_description={prepend_description};\
-         prepend_heading_path={prepend_heading_path};heading_metadata={heading_metadata}"
+         prepend_heading_path={prepend_heading_path};heading_metadata={heading_metadata}\
+         {prefix_field}"
     );
     compute_hash_from_bytes(canonical.as_bytes())
 }
@@ -1006,8 +1027,9 @@ fn refresh_plan(
         return false;
     };
     if chunking.prepend_description {
-        let prepended = rf.frontmatter.get("description").and_then(|v| v.as_str());
-        let was_prepended = stored.get("description").and_then(|v| v.as_str());
+        let field = chunking.embedding_prefix_field.as_deref();
+        let prepended = chunk::embedding_prefix(field, |name| rf.frontmatter.get(name));
+        let was_prepended = chunk::embedding_prefix(field, |name| stored.get(name));
         if prepended != was_prepended {
             return false;
         }
@@ -1024,11 +1046,9 @@ fn chunk_validated(
     chunking_fp: &str,
     chunking: &crate::config::ChunkingConfig,
 ) -> FileOutcome {
-    let description = rf
-        .frontmatter
-        .get("description")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
+    let description = chunk::embedding_prefix(chunking.embedding_prefix_field.as_deref(), |name| {
+        rf.frontmatter.get(name)
+    });
     let Some(chunks) = chunk_file(
         &rf.file_path,
         content,
@@ -6420,6 +6440,7 @@ mod tests {
             prepend_description: true,
             prepend_heading_path: true,
             heading_metadata: false,
+            embedding_prefix_field: None,
         };
         let base_fp = chunking_fingerprint(&base);
         assert!(
@@ -6463,6 +6484,20 @@ mod tests {
                 "heading_metadata",
                 ChunkingConfig {
                     heading_metadata: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "embedding_prefix_field",
+                ChunkingConfig {
+                    embedding_prefix_field: Some("summary".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "embedding_prefix_field (another field)",
+                ChunkingConfig {
+                    embedding_prefix_field: Some("nodes".to_string()),
                     ..base.clone()
                 },
             ),
@@ -6519,6 +6554,7 @@ mod tests {
             prepend_description: true,
             prepend_heading_path: true,
             heading_metadata: true,
+            embedding_prefix_field: None,
         };
         for target in [None, Some(1), Some(500), Some(1500)] {
             assert_eq!(
@@ -8664,6 +8700,66 @@ mod tests {
         assert!(matches!(outcome, FileOutcome::Empty { .. }));
     }
 
+    /// #386: a document with frontmatter and no body is `Empty` (not searchable) by
+    /// default, and with `chunking.embedding_prefix_field` set becomes one chunk of
+    /// that field's text, on the file's own last line.
+    #[tokio::test]
+    async fn a_body_less_document_is_chunked_from_its_prefix_field_when_configured() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\nsummary: What this record says.\nnodes: [alpha, beta]\n---\n";
+        std::fs::write(&path, content).unwrap();
+
+        let run = |config: ResolvedConfig| {
+            let path = path.clone();
+            async move {
+                process_file(
+                    &path,
+                    "doc.md",
+                    content,
+                    false,
+                    None,
+                    &config,
+                    &test_schema(),
+                    "",
+                    "",
+                    "",
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Unset: unchanged behaviour — nothing to embed.
+        assert!(matches!(
+            run(config_no_validation()).await,
+            FileOutcome::Empty { .. }
+        ));
+
+        for (field, expected) in [
+            ("summary", "What this record says."),
+            ("nodes", "alpha, beta"),
+        ] {
+            let mut config = config_no_validation();
+            config.chunking.embedding_prefix_field = Some(field.to_string());
+            let FileOutcome::Ready(pending) = run(config).await else {
+                panic!("{field}: expected one chunk from the prefix field");
+            };
+            assert_eq!(pending.chunks.len(), 1, "{field}");
+            let chunk = &pending.chunks[0];
+            assert_eq!(chunk.text, expected, "{field}");
+            assert_eq!(chunk.body_offset, 0, "{field}");
+            // The file has four lines; the chunk is not placed past its end.
+            assert_eq!((chunk.line_start, chunk.line_end), (4, 4), "{field}");
+        }
+
+        // A field the document does not have: still nothing to embed.
+        let mut config = config_no_validation();
+        config.chunking.embedding_prefix_field = Some("missing".to_string());
+        assert!(matches!(run(config).await, FileOutcome::Empty { .. }));
+    }
+
     #[tokio::test]
     async fn process_file_with_validation_valid_frontmatter() {
         let dir = TempDir::new().unwrap();
@@ -10558,6 +10654,7 @@ mod tests {
             prepend_description: false,
             prepend_heading_path: false,
             heading_metadata: true,
+            embedding_prefix_field: None,
         };
         let mut chunks = chunk::chunk_markdown(&body, None, &chunking);
         shift_chunks_to_file_lines(&mut chunks, content);
@@ -10766,6 +10863,7 @@ mod tests {
             prepend_description: false,
             prepend_heading_path: true,
             heading_metadata: true,
+            embedding_prefix_field: None,
         };
         let chunks = chunk::chunk_markdown(&body, None, &chunking);
         assert!(chunks.len() >= 100);

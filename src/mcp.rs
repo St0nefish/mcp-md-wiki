@@ -5548,6 +5548,7 @@ impl KbSearchServer {
             indexing: &config.indexing,
             markdown_format: &config.formatting.markdown,
             prepend_description: config.chunking.prepend_description,
+            embedding_prefix_field: config.chunking.embedding_prefix_field.as_deref(),
             dedup_enabled: config.write.dedup_enabled,
             dedup_threshold: config.write.dedup_threshold,
             related_limit: config.write.related_limit,

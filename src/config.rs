@@ -268,6 +268,25 @@ pub struct ChunkingConfig {
     /// above) into the Qdrant payload is gated by it.
     #[serde(default)]
     pub heading_metadata: bool,
+    /// The frontmatter field whose text is prepended to every chunk (what
+    /// `prepend_description` does with `description`), and — when set — the text of a
+    /// document's one chunk if its body is empty (#386).
+    ///
+    /// Unset (the default) keeps exactly the earlier behaviour: the `description`
+    /// field, a string only, prepended to the chunks a body produces; a document with
+    /// no body text produces no chunk and is not searchable. Set, e.g. to `summary`,
+    /// the named field is used instead — a string, or a list of strings joined with
+    /// `", "` — and a document whose body is empty or blank but whose field has text
+    /// gets a single chunk holding just that text, so a document whose meaning lives
+    /// in its frontmatter is still indexed and found. `prepend_description: false`
+    /// turns both off.
+    ///
+    /// Folded into `ingest::chunking_fingerprint` only when set, so an existing
+    /// deployment re-embeds nothing on upgrade; setting or changing it re-chunks and
+    /// re-embeds every document (`reload.rs` reports `reindex_scheduled`), because the
+    /// text each chunk embeds changes.
+    #[serde(default)]
+    pub embedding_prefix_field: Option<String>,
 }
 
 impl Default for ChunkingConfig {
@@ -278,6 +297,7 @@ impl Default for ChunkingConfig {
             prepend_description: true,
             prepend_heading_path: true,
             heading_metadata: false,
+            embedding_prefix_field: None,
         }
     }
 }
@@ -1741,6 +1761,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("chunking.prepend_description", "chunking"),
     ("chunking.prepend_heading_path", "chunking"),
     ("chunking.heading_metadata", "chunking"),
+    ("chunking.embedding_prefix_field", "chunking"),
     ("embedding.api_key_env", "embedding"),
     ("embedding.batch_size", "embedding"),
     ("embedding.request_timeout_secs", "embedding"),
@@ -2387,6 +2408,14 @@ impl Config {
         }
         if self.chunking.max_chunk_size == 0 {
             anyhow::bail!("chunking.max_chunk_size must be >= 1");
+        }
+        if let Some(field) = &self.chunking.embedding_prefix_field
+            && field.trim().is_empty()
+        {
+            anyhow::bail!(
+                "chunking.embedding_prefix_field must name a frontmatter field (leave it unset \
+                 for `description`)"
+            );
         }
         if self.rate_limit.requests_per_second == 0 {
             anyhow::bail!("rate_limit.requests_per_second must be >= 1");
@@ -4011,6 +4040,29 @@ mcp:
             "chunking:\n  heading_metadata: true\nsearch:\n  granularities: [section]\n",
         )
         .expect("section with heading_metadata on is a valid (query-only) set");
+        clear_required_env();
+    }
+
+    #[test]
+    fn embedding_prefix_field_is_unset_by_default_and_must_name_a_field() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let cfg = Config::from_str("{}").unwrap();
+        assert_eq!(cfg.chunking.embedding_prefix_field, None);
+        let cfg = Config::from_str("chunking:\n  embedding_prefix_field: summary\n").unwrap();
+        assert_eq!(
+            cfg.chunking.embedding_prefix_field.as_deref(),
+            Some("summary")
+        );
+        for blank in ["\"\"", "\"  \""] {
+            let err = Config::from_str(&format!("chunking:\n  embedding_prefix_field: {blank}\n"))
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("chunking.embedding_prefix_field must name a frontmatter field"),
+                "got: {err}"
+            );
+        }
         clear_required_env();
     }
 

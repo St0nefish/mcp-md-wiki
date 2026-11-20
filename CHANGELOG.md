@@ -83,6 +83,24 @@ still falls back to filesystem mtime. No operator action; the first reconcile af
 upgrading gets accurate `mtime` where it had fallen back before, and a document's
 `mtime` can change when it does.
 
+### Documents with no body can be indexed from a frontmatter field (#386)
+
+New `chunking.embedding_prefix_field` (default unset). A document whose body is empty or
+blank produces no chunk, so it was skipped (`No chunks produced for: …`) and could not be
+found, even when its meaning lives in frontmatter (`summary`, `nodes`, `tags`). Set the key
+to a field name and `prepend_description` uses that field instead of `description` — a
+string, or a list of strings joined with `,` — and a body-less document whose field has
+text is indexed as one chunk of just that text. (A body that is only a heading already
+produced a chunk; it is the blank body that did not.)
+
+- **Unset changes nothing**, including the fingerprint: an upgrade re-embeds nothing, and a
+  body-less document stays unindexed until the key is set.
+- **Setting or changing it re-chunks and re-embeds every document** on the next reconcile
+  (`reindex_scheduled`), since the text each chunk embeds changes — about 11.5k documents to
+  pick up 2.1k body-less ones on the corpus that reported it.
+- The create-path dedup query uses the same field. `prepend_description: false` turns the
+  prefix and this chunk off.
+
 ### YAML library replaced: `serde_yaml_ng` → `serde-saphyr`, `gray_matter` 0.3
 
 `unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained) is out of the dependency tree: every

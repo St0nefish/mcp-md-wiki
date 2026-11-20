@@ -194,6 +194,16 @@ chunking:
   # about what the chunk relates to.
   prepend_description: true
 
+  # Which frontmatter field prepend_description reads. Unset (the default) is
+  # `description`. Name another field (e.g. `summary`) to use it instead — a
+  # string, or a list of strings joined with ", " — and, only when this is set, a
+  # document whose body is empty or blank but whose field has text gets one chunk
+  # holding just that text, so documents whose meaning lives in their frontmatter
+  # are indexed rather than skipped ("No chunks produced"). Setting or changing it
+  # re-chunks and re-embeds every document on the next reconcile; leaving it unset
+  # re-embeds nothing.
+  # embedding_prefix_field: summary
+
   # Prepend the heading breadcrumb a chunk's content falls under (e.g.
   # "Spells > Fireball") ahead of its text, so the embedding and keyword arms
   # see section context even for a mid-document chunk. A chunk that starts

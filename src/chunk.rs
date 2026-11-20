@@ -238,6 +238,39 @@ fn format_heading_path(path: &[String], budget_chars: usize) -> Option<String> {
     }
 }
 
+/// The document-level text `chunking.prepend_description` puts in front of every
+/// chunk (and, with `chunking.embedding_prefix_field` set, stands in for the body of a
+/// document that has none — #386), read from a document's frontmatter: `get` looks a
+/// field up by name.
+///
+/// `field` is `chunking.embedding_prefix_field`. Unset it is `description`, a string
+/// exactly as written (the behaviour from before the key existed); set, the named
+/// field may also be a list of strings, joined with `", "` (blank entries dropped), so
+/// a `tags` or `nodes` list can serve as the text. Anything else — a number, an
+/// object, a list with no text in it — is no prefix.
+///
+/// One definition for the indexer (`ingest::chunk_validated`/`refresh_plan`) and the
+/// create-path dedup query (`write::dedup_gate`), which must embed the same text.
+pub(crate) fn embedding_prefix<'a>(
+    field: Option<&str>,
+    get: impl FnOnce(&str) -> Option<&'a serde_json::Value>,
+) -> Option<String> {
+    use serde_json::Value;
+    match get(field.unwrap_or("description"))? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) if field.is_some() => {
+            let parts: Vec<&str> = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(", "))
+        }
+        _ => None,
+    }
+}
+
 pub fn chunk_markdown(
     body: &str,
     description: Option<&str>,
@@ -431,6 +464,29 @@ pub fn chunk_markdown(
         chunks.push(cur);
     }
 
+    // A document with no body text of its own but a prefix field that has some (#386):
+    // one chunk holding just that text, so a document whose meaning lives in its
+    // frontmatter is still embedded and found. Only with `embedding_prefix_field` set
+    // — unset, an empty body stays "no chunks", as it always was.
+    if chunks.is_empty()
+        && config.prepend_description
+        && config.embedding_prefix_field.is_some()
+        && let Some(text) = description.filter(|d| !d.trim().is_empty())
+    {
+        return vec![Chunk {
+            text: text.to_string(),
+            index: 0,
+            line_start: 1,
+            line_end: 1,
+            heading_path: Vec::new(),
+            heading_level: 0,
+            section_line_start: 1,
+            section_line_end: 1,
+            // The text is the document's only content, so a snippet shows all of it.
+            body_offset: 0,
+        }];
+    }
+
     chunks
         .into_iter()
         .enumerate()
@@ -491,6 +547,7 @@ mod tests {
             // Off: the merge-across-headings behavior most tests here pin.
             // `cfg_isolated` turns it on for the no-merge tests.
             heading_metadata: false,
+            embedding_prefix_field: None,
         }
     }
 
@@ -631,6 +688,110 @@ mod tests {
     fn empty_body() {
         let chunks = chunk_markdown("", None, &cfg(1000, None, false, false));
         assert!(chunks.is_empty());
+    }
+
+    // --- embedding_prefix_field (#386) ------------------------------------------
+
+    fn prefixed(field: &str) -> ChunkingConfig {
+        ChunkingConfig {
+            embedding_prefix_field: Some(field.to_string()),
+            ..cfg(1000, None, true, true)
+        }
+    }
+
+    /// A body that is only a heading still produces a chunk, with or without
+    /// `heading_metadata`; only an empty or blank body produces none. The issue
+    /// reporting body-less documents attributed them to heading-only bodies.
+    #[test]
+    fn heading_only_body_chunks_but_blank_body_does_not() {
+        for heading_metadata in [false, true] {
+            let config = ChunkingConfig {
+                heading_metadata,
+                ..cfg(1000, None, true, false)
+            };
+            let heading_only = chunk_markdown("# Only a heading\n", Some("summary"), &config);
+            assert_eq!(heading_only.len(), 1, "heading_metadata={heading_metadata}");
+            assert!(heading_only[0].text.contains("Only a heading"));
+            for blank in ["", "\n", "  \n\n \n"] {
+                assert!(
+                    chunk_markdown(blank, Some("summary"), &config).is_empty(),
+                    "{blank:?} with heading_metadata={heading_metadata}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_blank_body_gets_one_chunk_of_the_prefix_field_text_when_the_key_is_set() {
+        let chunks = chunk_markdown("\n\n", Some("A short summary."), &prefixed("summary"));
+        assert_eq!(chunks.len(), 1);
+        let c = &chunks[0];
+        assert_eq!(c.text, "A short summary.");
+        assert_eq!(c.index, 0);
+        // The text is the document's only content: a snippet shows all of it.
+        assert_eq!(c.body_offset, 0);
+        assert!(c.heading_path.is_empty());
+        assert_eq!(c.heading_level, 0);
+        assert_eq!(
+            (
+                c.line_start,
+                c.line_end,
+                c.section_line_start,
+                c.section_line_end
+            ),
+            (1, 1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn a_blank_body_stays_empty_without_the_key_without_text_or_with_the_prefix_off() {
+        // Key unset: the pre-existing behaviour, even with a `description`.
+        assert!(chunk_markdown("", Some("desc"), &cfg(1000, None, true, true)).is_empty());
+        // Key set, but no text to use.
+        assert!(chunk_markdown("", None, &prefixed("summary")).is_empty());
+        assert!(chunk_markdown("", Some("  \n"), &prefixed("summary")).is_empty());
+        // `prepend_description: false` turns the whole prefix off, this chunk included.
+        let off = ChunkingConfig {
+            prepend_description: false,
+            ..prefixed("summary")
+        };
+        assert!(chunk_markdown("", Some("A summary."), &off).is_empty());
+    }
+
+    #[test]
+    fn a_body_with_text_is_chunked_as_before_when_the_key_is_set() {
+        let chunks = chunk_markdown("Body text.\n", Some("A summary."), &prefixed("summary"));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "A summary.\n\nBody text.\n");
+        assert_eq!(&chunks[0].text[chunks[0].body_offset..], "Body text.\n");
+    }
+
+    #[test]
+    fn embedding_prefix_reads_the_named_field() {
+        use serde_json::json;
+        let fm = json!({
+            "description": "plain",
+            "summary": "A summary.",
+            "nodes": ["alpha", " beta ", "", 3],
+            "empty": [],
+            "count": 4,
+        });
+        let get = |name: &str| fm.get(name);
+        // Unset: `description`, a string only.
+        assert_eq!(embedding_prefix(None, get).as_deref(), Some("plain"));
+        assert_eq!(
+            embedding_prefix(Some("summary"), get).as_deref(),
+            Some("A summary.")
+        );
+        // A list of strings reads only when a field is named; entries are trimmed.
+        assert_eq!(
+            embedding_prefix(Some("nodes"), get).as_deref(),
+            Some("alpha, beta")
+        );
+        assert_eq!(embedding_prefix(None, |_| fm.get("nodes")), None);
+        for none in ["empty", "count", "missing"] {
+            assert_eq!(embedding_prefix(Some(none), get), None, "{none}");
+        }
     }
 
     #[test]
@@ -1446,6 +1607,7 @@ mod tests {
     ) -> ChunkingConfig {
         ChunkingConfig {
             heading_metadata: true,
+            embedding_prefix_field: None,
             ..cfg(max, target, false, prepend_heading_path)
         }
     }
