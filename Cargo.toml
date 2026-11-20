@@ -129,8 +129,10 @@ similar = "3"
 # unbounded tasks.
 futures = "0.3"
 
-# Date/time parsing for mtime range filters and CLI date flags
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Date/time parsing for mtime range filters and CLI date flags (#383). UTC only, so no
+# tz database features; only `datetime.rs` names it. (chrono stays in the tree
+# transitively, via rmcp and schemars.)
+jiff = { version = "1", default-features = false, features = ["std"] }
 # OAuth 2.1 resource server (mcp-md-wiki#308): JWT access-token validation against a
 # JWKS, RFC 9728 metadata, the `WWW-Authenticate` challenges, the static-token policy,
 # and the axum middleware + well-known routes `server.rs` mounts. Published to

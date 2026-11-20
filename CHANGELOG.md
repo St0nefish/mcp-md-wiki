@@ -59,6 +59,11 @@ bulk rewrite happens on upgrade).
   the `/mcp` wire behaviour this server relies on: the stateless, JSON-response transport and
   the 10 MB request ceiling are configured exactly as before (rmcp 3's own body limit, 4 MiB by
   default, is raised to match).
+- **`chrono` → `jiff` for this crate's own date handling** (#383). Same accepted forms and
+  the same stored values: an RFC 3339 `timestamp` still needs seconds and `Z` or a `±HH:MM`
+  offset, a `date` is still `YYYY-MM-DD`, and the Qdrant datetime payload text is unchanged
+  (so no refresh or reindex). `chrono` itself remains in the dependency tree through `rmcp`
+  and `schemars`, so its RUSTSEC-2026-0543 ignore stays in `deny.toml`.
 - **Build requirement:** the pinned toolchain is now **1.98.0** (`rust-toolchain.toml`,
   `rust-version` in `Cargo.toml`, the Dockerfile's `RUST_VERSION`), up from 1.89. CI and the
   image follow the pin automatically; a local checkout is switched by rustup. Nothing

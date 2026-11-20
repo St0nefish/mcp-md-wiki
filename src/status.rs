@@ -34,12 +34,10 @@ fn unix_now() -> i64 {
 
 /// Format epoch seconds as RFC 3339 for the JSON view.
 ///
-/// `chrono` is built without the `clock` feature here, so `Utc::now()` is unavailable —
-/// wall-clock time comes from `SystemTime` and is only *formatted* by chrono.
+/// Wall-clock time comes from `SystemTime` (`unix_now`) and is only *formatted* by the
+/// date library; an out-of-range value is shown as the bare number.
 pub fn format_unix(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-        .unwrap_or_else(|| ts.to_string())
+    crate::datetime::format_rfc3339_secs(ts).unwrap_or_else(|| ts.to_string())
 }
 
 /// Whether the run rebuilds from scratch or only touches what changed.

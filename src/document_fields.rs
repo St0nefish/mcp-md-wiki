@@ -110,14 +110,8 @@ pub fn numeric_value(value: &Value) -> Option<f64> {
 /// date-string range bound in a filter) and [`payload_datetime`] (the Qdrant
 /// payload's datetime text, #350) both read through it, so the metadata index and
 /// the Qdrant payload cannot place one value at two instants.
-pub(crate) fn parse_instant(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(text) {
-        return Some(ts.with_timezone(&chrono::Utc));
-    }
-    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
-        .ok()
-        .and_then(|date| date.and_hms_opt(0, 0, 0))
-        .map(|midnight| midnight.and_utc())
+pub(crate) fn parse_instant(text: &str) -> Option<jiff::Timestamp> {
+    crate::datetime::parse_rfc3339(text).or_else(|| crate::datetime::parse_date_midnight(text))
 }
 
 /// Seconds since the Unix epoch (UTC, fractional seconds kept) of a `date` or an
@@ -125,8 +119,7 @@ pub(crate) fn parse_instant(text: &str) -> Option<chrono::DateTime<chrono::Utc>>
 /// date field's `value_num` and a date-string range bound in a filter, so a stored
 /// date and a filter bound always land on the same axis (#349).
 pub(crate) fn epoch_seconds(text: &str) -> Option<f64> {
-    parse_instant(text)
-        .map(|ts| ts.timestamp() as f64 + f64::from(ts.timestamp_subsec_nanos()) / 1e9)
+    parse_instant(text).map(crate::datetime::epoch_seconds_f64)
 }
 
 /// The RFC 3339 UTC text a `date` or `timestamp` value is written as in the Qdrant
@@ -142,11 +135,7 @@ pub(crate) fn epoch_seconds(text: &str) -> Option<f64> {
 /// for a datetime, and the precision `qdrant::epoch_to_timestamp` rounds filter
 /// bounds to — so a nanosecond timestamp is written with at most six.
 pub(crate) fn payload_datetime(text: &str) -> Option<String> {
-    use chrono::SubsecRound;
-    parse_instant(text).map(|ts| {
-        ts.round_subsecs(6)
-            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
-    })
+    parse_instant(text).and_then(crate::datetime::payload_text)
 }
 
 /// The `value_num` a scalar of a declared type stores, per that type's

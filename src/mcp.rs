@@ -3,8 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use chrono::{DateTime, NaiveDate};
-
 use anyhow::Context as _;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
@@ -72,23 +70,16 @@ fn resolve_limit(requested: Option<u64>, default_limit: u64, max_limit: u64) -> 
 /// Accepts RFC 3339 datetimes (e.g. `2024-01-15T12:00:00Z`) and date-only
 /// strings (e.g. `2024-01-15`, interpreted as midnight UTC).
 pub(crate) fn parse_date_to_timestamp(s: &str) -> Result<i64, String> {
-    // Try RFC 3339 / ISO 8601 datetime first
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.timestamp());
-    }
-    // Fall back to date-only YYYY-MM-DD (treated as start of day UTC)
-    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let dt = date
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is always valid")
-            .and_utc();
-        return Ok(dt.timestamp());
-    }
-    Err(format!(
-        "invalid date '{}': expected RFC 3339 (e.g. 2024-01-15T00:00:00Z) \
-         or date-only (e.g. 2024-01-15)",
-        s
-    ))
+    // RFC 3339 / ISO 8601 datetime first, then date-only YYYY-MM-DD (start of day UTC).
+    crate::document_fields::parse_instant(s)
+        .map(crate::datetime::floor_seconds)
+        .ok_or_else(|| {
+            format!(
+                "invalid date '{}': expected RFC 3339 (e.g. 2024-01-15T00:00:00Z) \
+                 or date-only (e.g. 2024-01-15)",
+                s
+            )
+        })
 }
 
 /// How many invalidated documents to name before summarizing the rest.
