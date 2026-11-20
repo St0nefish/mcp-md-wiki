@@ -986,6 +986,44 @@ lint:
 
 
 # ----------------------------------------------------------------------------
+# formatting — normalise a document before the write tools store it
+# ----------------------------------------------------------------------------
+# Every `.md` / `.markdown` document written through write_document (create, edit,
+# replace, batch, or a move that also changes the content) is run through rumdl's
+# auto-fixes in memory before it is committed and indexed: blank lines
+# around headings and lists, trailing whitespace, list markers, code-fence style, and
+# so on. A pure move is never reformatted, and a document already stored is only
+# formatted the next time it is written. The write result lists the rules that changed
+# something (`formatted`), or says why formatting was skipped (`formatting_skipped`) —
+# a formatter failure never blocks a write, the document is stored as sent.
+# The frontmatter is checked after formatting and must mean exactly what it did before.
+# Note rumdl's MD025: with a `title:` in the frontmatter, a body `# Heading` is the
+# second H1 and is demoted to `##`.
+# Pure YAML tuning, live-reloadable via POST /admin/reload.
+formatting:
+  markdown:
+
+    # Format on write. When false, content is stored exactly as sent.
+    enabled: true
+
+    # rumdl markdown flavor: standard (also gfm, commonmark), mkdocs, obsidian, mdx,
+    # pandoc, quarto, kramdown, hugo, myst, ... Unknown values fail config load.
+    flavor: standard
+
+    # Rule ids to switch off. The default is MD013 (line length), which is noise in
+    # knowledge-base prose full of URLs, tables and pasted configuration; every other
+    # rumdl rule runs at its own default.
+    disable: [MD013]
+
+    # A full rumdl config (`.rumdl.toml`), relative to the knowledge-base root.
+    # When set it REPLACES `flavor` and `disable`: rumdl reads the whole policy,
+    # per-rule options included, from that file, which is read again on every write.
+    # If it cannot be loaded, writes still succeed and report `formatting_skipped`.
+    # Example: ".rumdl.toml" (the file the KB's own editor tooling already uses).
+    config_file: null
+
+
+# ----------------------------------------------------------------------------
 # contradictions — scheduled contradiction detection (#355)
 # ----------------------------------------------------------------------------
 # For every document whose content changed since it was last analysed, find its

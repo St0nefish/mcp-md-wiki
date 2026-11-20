@@ -28,6 +28,16 @@ qdrant-client = "1"
 # Frontmatter parsing
 gray_matter = "0.3"
 
+# Markdown auto-fix applied to every `.md` document the write tools store
+# (`markdown_fmt.rs`, `formatting.markdown.*` config). Pinned to an EXACT version, not a
+# caret range, deliberately: rumdl's fix behaviour defines the bytes written into the
+# knowledge base, so a patch bump could silently change stored content. An upgrade is an
+# explicit, reviewable commit that re-runs `markdown_fmt`'s golden tests. Needs Rust
+# 1.98 (see rust-toolchain.toml). `default-features = false` drops the `parallel`
+# (rayon) and `native` (tower-lsp, tokio, notify, ...) feature sets, which belong to
+# rumdl's CLI and LSP server; the library API used here needs neither.
+rumdl = { version = "=0.3.5", default-features = false }
+
 # Markdown chunking. An upgrade that changes split points must bump
 # `ingest::CHUNKER_VERSION`, or the index silently mixes old and new chunks.
 text-splitter = { version = "0.18", features = ["markdown"] }
@@ -54,9 +64,10 @@ serde_json = "1"
 # exactly: its option defaults and scalar resolution decide how every YAML file this
 # server reads is understood and how frontmatter is written back, so an upgrade is a
 # reviewed commit. Same version rumdl (the markdown formatter) uses, so the tree
-# carries one YAML implementation. Default features off: no comment capture, only
-# (de)serialization.
-serde-saphyr = { version = "=2.1.1", default-features = false, features = ["serialize", "deserialize"] }
+# carries one YAML implementation. Default features off, and the `comments` feature
+# on only because rumdl enables it for the same crate (Cargo unifies features);
+# `yaml.rs` turns comment emission off; only (de)serialization is used.
+serde-saphyr = { version = "=2.1.1", default-features = false, features = ["serialize", "deserialize", "comments"] }
 
 # JSON Schema generation for MCP-facing types that live outside src/mcp.rs (e.g.
 # schema.rs's RawFieldDef, advertised as the `update_schema` `definition` parameter).

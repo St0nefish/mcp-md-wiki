@@ -39,6 +39,12 @@ fn read_options() -> Options {
         duplicate_keys: DuplicateKeyPolicy::Error,
         // YAML 1.2 booleans only.
         strict_booleans: true,
+        // Comments are never read. With the `comments` feature on (rumdl, the markdown
+        // formatter, turns it on for the one serde-saphyr in the tree, so it is on
+        // here whether or not this crate asks) the parser would otherwise buffer them
+        // and refuse a file with a long comment block (`config.example.yaml` has one
+        // of more than 100 lines) as "too many buffered comments".
+        emit_comments: false,
     }
 }
 
@@ -182,6 +188,21 @@ mod tests {
         enabled: bool,
         name: String,
         n: u32,
+    }
+
+    /// rumdl turns serde-saphyr's `comments` feature on for the whole build; with
+    /// comment emission left on, the parser refuses a long comment block outright.
+    #[test]
+    fn a_long_comment_block_is_not_a_parse_error() {
+        let mut text = String::from("name: a\n");
+        for i in 0..500 {
+            text.push_str(&format!("# comment line {i}\n"));
+        }
+        text.push_str("n: 3\n");
+        let probe: Probe = from_str(&text).unwrap();
+        assert_eq!((probe.name.as_str(), probe.n), ("a", 3));
+        let indented = format!("name: a\n{}n: 3\n", "  # c\n".repeat(300));
+        assert!(from_str::<Probe>(&indented).is_ok());
     }
 
     #[test]

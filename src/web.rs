@@ -248,6 +248,7 @@ impl UiState {
             schema_cache: &self.schema_cache,
             validation: &config.validation,
             indexing: &config.indexing,
+            markdown_format: &config.formatting.markdown,
             prepend_description: config.chunking.prepend_description,
             dedup_enabled: config.write.dedup_enabled,
             dedup_threshold: config.write.dedup_threshold,
@@ -1649,6 +1650,13 @@ fn write_success_response(success: WriteSuccess) -> Response {
     if let Some(related) = crate::mcp::related_json(&success.related) {
         body["related"] = related;
     }
+    // Omitted when formatting did nothing.
+    if !success.formatting.rules.is_empty() {
+        body["formatted"] = serde_json::json!(success.formatting.rules);
+    }
+    if let Some(reason) = &success.formatting.skipped {
+        body["formatting_skipped"] = serde_json::json!(reason);
+    }
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -2346,6 +2354,7 @@ mod tests {
             reranking: None,
             ui: Default::default(),
             lint: Default::default(),
+            formatting: crate::config::FormattingConfig::off(),
             contradictions: Default::default(),
             contradictions_judge: None,
             provenance: Default::default(),
@@ -4443,6 +4452,7 @@ mod tests {
             rewritten_paths: Vec::new(),
             referencing_paths: Vec::new(),
             status_set: false,
+            formatting: Default::default(),
             merged: false,
             version: None,
             related,
@@ -4475,6 +4485,7 @@ mod tests {
             rewritten_paths: Vec::new(),
             referencing_paths: vec!["referencer.md".to_string()],
             status_set: false,
+            formatting: Default::default(),
             merged: false,
             version: None,
             related: Vec::new(),

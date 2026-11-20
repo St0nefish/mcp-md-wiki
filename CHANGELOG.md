@@ -14,6 +14,40 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+### Markdown is formatted automatically when a document is written
+
+Every `.md` / `.markdown` document stored by `write_document` (create, edit, full replace,
+batch, and a move that also changes the content) is now normalised in memory by
+[rumdl](https://github.com/rvben/rumdl)'s auto-fixes before it is committed and
+indexed: blank lines around headings and lists, trailing whitespace, list markers,
+code-fence style and so on. **On by default.** A pure move is never reformatted, and a
+document already in the knowledge base is only formatted the next time it is written (no
+bulk rewrite happens on upgrade).
+
+- **Policy.** The default is rumdl's `standard` flavor with only `MD013` (line length)
+  switched off. A `title:` in the frontmatter counts as the document's H1 (rumdl's MD025), so
+  a body `# Heading` below it is demoted to `##`; set `formatting.markdown.disable:
+  [MD013, MD025]` for a corpus that wants both.
+- **Configuration** (`formatting.markdown`, live-reloadable): `enabled` (default `true`),
+  `flavor` (default `standard`), `disable` (default `[MD013]`) and `config_file`, a full
+  `.rumdl.toml` relative to the knowledge-base root (no `..`) that replaces the other two and
+  is read again on every write. A `disable` entry must be a rumdl rule id or alias
+  (`MD013`, `line-length`); an unknown one fails config load. See `deploy/config.example.yaml`.
+- **The first edit to a document that was not already formatted** commits the formatting
+  changes for the whole file along with the edit, and the returned `diff` shows them.
+- **The write result** says what happened: `formatted` lists the rumdl rule ids that changed
+  the content, and `formatting_skipped` explains why formatting could not be applied. Both
+  are omitted when formatting did nothing. The returned `diff` and `version` describe the
+  stored (formatted) bytes.
+- **It never blocks a write.** If rumdl fails, does not settle on one result, the configured
+  `config_file` cannot be loaded, or formatting would change what the frontmatter says, the
+  document is stored exactly as sent and `formatting_skipped` carries a short reason (no
+  filesystem path).
+- **Build:** adds `rumdl` 0.3.5 (library, pinned exactly, `default-features = false`) and
+  about 55 transitive crates; it requires Rust 1.98 (see below). `serde-saphyr`'s `comments`
+  feature is now on (rumdl enables it for the shared crate); `yaml.rs` sets
+  `emit_comments: false`, so a long comment block in `config.yaml` still loads.
+
 ### Security: dependency refresh, and the Rust toolchain moves to 1.98
 
 - **Dependencies:** `cargo update` clears the `openssl` (eight advisories, via

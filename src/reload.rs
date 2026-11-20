@@ -1359,6 +1359,47 @@ const DIFF_TABLE: &[DiffField] = &[
             note: "read fresh by the next tag audit (lint.rs).",
         }],
     },
+    // ── formatting ───────────────────────────────────────────────────────────
+    // Every `formatting.markdown.*` key is read from the live config snapshot on each
+    // write (`write.rs` `WriteDeps::markdown_format`), so a reload applies to the next
+    // write. Documents already stored are not reformatted.
+    DiffField {
+        path: "formatting.markdown.enabled",
+        get: |c| Some(d(&c.formatting.markdown.enabled)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "formatting.markdown.enabled",
+            note: "read fresh by the next write; stored documents are not reformatted.",
+        }],
+    },
+    DiffField {
+        path: "formatting.markdown.flavor",
+        get: |c| Some(d(&c.formatting.markdown.flavor)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "formatting.markdown.flavor",
+            note: "read fresh by the next write; stored documents are not reformatted.",
+        }],
+    },
+    DiffField {
+        path: "formatting.markdown.disable",
+        get: |c| Some(d(&c.formatting.markdown.disable)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "formatting.markdown.disable",
+            note: "read fresh by the next write; stored documents are not reformatted.",
+        }],
+    },
+    DiffField {
+        path: "formatting.markdown.config_file",
+        get: |c| Some(d(&c.formatting.markdown.config_file)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "formatting.markdown.config_file",
+            note: "loaded from disk on each write, so an edit to the file itself also \
+                   applies to the next write without a reload.",
+        }],
+    },
     // ── contradictions (#355) ────────────────────────────────────────────────
     // The scheduled job is always spawned (server.rs run_server) and every run loads a
     // fresh snapshot, so the tuning keys apply to the next tick. The judge client
