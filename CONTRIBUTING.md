@@ -62,7 +62,7 @@ anything it would have caught still has to pass in CI before the PR can merge.
 
 ## Rust toolchain / MSRV
 
-The pinned toolchain — currently **1.89** — lives in one place, `rust-toolchain.toml`
+The pinned toolchain — currently **1.98** — lives in one place, `rust-toolchain.toml`
 at the repo root, and everything else derives from it (#235):
 
 - **Local dev** needs nothing extra: rustup reads `rust-toolchain.toml` automatically
