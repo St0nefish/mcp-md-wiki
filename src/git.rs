@@ -674,6 +674,21 @@ fn parse_git_log_mtimes(raw: &[u8]) -> HashMap<String, i64> {
 /// a byte budget is what `ARG_MAX` itself actually measures.
 const GIT_LOG_MTIMES_ARG_BUDGET_BYTES: usize = 100_000;
 
+/// Most paths one pathspec `git log` call is given (#386), on top of the byte budget.
+///
+/// Pathspec matching costs commits × paths: measured on a flat directory with one
+/// file per commit, 6,000 commits took 0.8 s for 50 paths, 9 s for 200 and 189 s for
+/// 1,400, while the same history walked with no pathspec at all took 1.4 s. Short
+/// flat names let the byte budget alone admit thousands of paths per call, so every
+/// call of a large corpus hit [`GIT_TIMEOUT`]. A few dozen paths is the range where
+/// the pathspec form is still the cheaper one.
+const GIT_LOG_MTIMES_MAX_PATHS_PER_CHUNK: usize = 50;
+
+/// A path list longer than this is answered by one unscoped `git log` walk of the
+/// whole history instead of pathspec chunks (#386): past it, the single walk is
+/// cheaper than even one pathspec call, never mind the several a corpus needs.
+const GIT_LOG_MTIMES_UNSCOPED_THRESHOLD: usize = GIT_LOG_MTIMES_MAX_PATHS_PER_CHUNK;
+
 /// Splits `paths` into chunks whose total byte length (plus a small per-entry
 /// separator allowance) stays under [`GIT_LOG_MTIMES_ARG_BUDGET_BYTES`], so
 /// [`git_log_mtimes`] never builds a single `git log` argv that risks exceeding
@@ -695,7 +710,10 @@ fn chunk_paths_by_byte_budget(paths: &[String]) -> Vec<&[String]> {
         // overhead the kernel also counts against the same budget as the string
         // bytes themselves.
         let cost = p.len() + 1;
-        if i > start && used + cost > GIT_LOG_MTIMES_ARG_BUDGET_BYTES {
+        if i > start
+            && (used + cost > GIT_LOG_MTIMES_ARG_BUDGET_BYTES
+                || i - start >= GIT_LOG_MTIMES_MAX_PATHS_PER_CHUNK)
+        {
             chunks.push(&paths[start..i]);
             start = i;
             used = 0;
@@ -724,6 +742,13 @@ fn chunk_paths_by_byte_budget(paths: &[String]) -> Vec<&[String]> {
 /// return touched-path data for) the ENTIRE repository, which is not what an empty
 /// scope means here.
 ///
+/// #386: past [`GIT_LOG_MTIMES_UNSCOPED_THRESHOLD`] paths the pathspec form is not
+/// used at all — see [`git_log_mtimes_unscoped`] — and below it each pathspec call
+/// carries at most [`GIT_LOG_MTIMES_MAX_PATHS_PER_CHUNK`] paths, because matching a
+/// pathspec costs commits × paths. Both forms answer identically (the unscoped one
+/// also reports paths since deleted or renamed away, which are filtered out), and
+/// both pass `--no-renames`.
+///
 /// #237: unlike the pre-#237 version, this never builds one argv for the WHOLE
 /// `paths` list — [`chunk_paths_by_byte_budget`] splits it first, and each chunk
 /// runs as its own `git log` call via [`git_log_mtimes_chunk`], with results merged
@@ -750,6 +775,10 @@ pub async fn git_log_mtimes(
 ) -> HashMap<String, i64> {
     if paths.is_empty() {
         return HashMap::new();
+    }
+
+    if paths.len() > GIT_LOG_MTIMES_UNSCOPED_THRESHOLD {
+        return git_log_mtimes_unscoped(lock, data_path, paths).await;
     }
 
     let chunks = chunk_paths_by_byte_budget(paths);
@@ -805,6 +834,53 @@ async fn git_log_mtimes_chunk(
     data_path: &str,
     paths: &[String],
 ) -> Result<HashMap<String, i64>> {
+    run_git_log_mtimes(data_path, Some(paths)).await
+}
+
+/// One unscoped `git log --name-only` over the whole history (#386), keeping only
+/// the entries for `paths`. Used once the wanted set is large enough that matching a
+/// pathspec costs more than reading every commit's changed paths (see
+/// [`GIT_LOG_MTIMES_MAX_PATHS_PER_CHUNK`]); the output is about one line per touched
+/// file, a few hundred KB for ten thousand single-file commits.
+///
+/// Newest-first order and `.or_insert` in [`parse_git_log_mtimes`] give the same
+/// "latest touch wins" answer the pathspec form does, and the unscoped walk also
+/// lists paths that are gone or were renamed away, which the wanted-set filter
+/// drops. Unlike the chunked form this is one call, so a failure (or the
+/// [`GIT_TIMEOUT`]) leaves every path to fall back to filesystem mtime; it is
+/// logged once, and the next run at a new HEAD tries again.
+async fn git_log_mtimes_unscoped(
+    _lock: &GitLock,
+    data_path: &str,
+    paths: &[String],
+) -> HashMap<String, i64> {
+    match run_git_log_mtimes(data_path, None).await {
+        Ok(mut map) => {
+            let wanted: std::collections::HashSet<&str> =
+                paths.iter().map(String::as_str).collect();
+            map.retain(|path, _| wanted.contains(path.as_str()));
+            map
+        }
+        Err(e) => {
+            warn!(
+                paths = paths.len(),
+                "git log (mtime lookup) over the whole history failed — every path falls \
+                 back to filesystem mtime: {:#}",
+                e
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// Builds and runs the mtime `git log`: scoped to `pathspec` when given, over the
+/// whole history when `None`. `--no-renames` keeps the output independent of the
+/// user's `diff.renames` setting (copy/rename detection is extra work here, and a
+/// renamed file is listed under its new name as an addition either way).
+async fn run_git_log_mtimes(
+    data_path: &str,
+    pathspec: Option<&[String]>,
+) -> Result<HashMap<String, i64>> {
     let safe_dir = format!("safe.directory={}", data_path);
     let mut args: Vec<&str> = vec![
         "-c",
@@ -813,10 +889,13 @@ async fn git_log_mtimes_chunk(
         "--format=%x02%ct%x03",
         "--name-only",
         "--diff-filter=ACMR",
+        "--no-renames",
         "-z",
-        "--",
     ];
-    args.extend(paths.iter().map(|p| p.as_str()));
+    if let Some(paths) = pathspec {
+        args.push("--");
+        args.extend(paths.iter().map(|p| p.as_str()));
+    }
 
     let out = run_bounded(git_command().args(&args).current_dir(data_path))
         .await
@@ -4348,6 +4427,164 @@ pub(crate) mod tests {
             "the oversized path itself must simply be absent (falls back to \
              filesystem mtime at the caller), not present with some invented value"
         );
+    }
+
+    // --- git_log_mtimes scaling tests (#386) --------------------------------------
+
+    #[test]
+    fn chunk_paths_by_byte_budget_also_caps_the_path_count() {
+        let paths: Vec<String> = (0..120).map(|i| format!("c/{i}.md")).collect();
+        let chunks = chunk_paths_by_byte_budget(&paths);
+        assert_eq!(
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>(),
+            vec![
+                GIT_LOG_MTIMES_MAX_PATHS_PER_CHUNK,
+                GIT_LOG_MTIMES_MAX_PATHS_PER_CHUNK,
+                120 - 2 * GIT_LOG_MTIMES_MAX_PATHS_PER_CHUNK
+            ],
+            "short paths fit the byte budget many times over; the count cap decides"
+        );
+        let flattened: Vec<&String> = chunks.into_iter().flatten().collect();
+        assert_eq!(flattened, paths.iter().collect::<Vec<_>>());
+    }
+
+    /// Commits everything staged in `work` at `ts` (git's `@<secs> +0000` date form).
+    fn commit_everything_at(work: &str, message: &str, ts: i64) {
+        git_test_cmd(work).args(["add", "-A"]).output().unwrap();
+        let out = git_test_cmd(work)
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-q",
+                "-m",
+                message,
+            ])
+            .env("GIT_AUTHOR_DATE", format!("@{ts} +0000"))
+            .env("GIT_COMMITTER_DATE", format!("@{ts} +0000"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "commit failed: {out:?}");
+    }
+
+    /// A history with every shape the unscoped walk has to agree with the pathspec
+    /// form on: many single-file commits (so the wanted set crosses the threshold),
+    /// a rename, a delete-and-re-add, a file edited twice, and a no-ff merge of a
+    /// side branch. For every path on disk, [`git_log_mtimes`] (unscoped, the wanted
+    /// set is over the threshold) must give exactly what a pathspec call for that
+    /// one path gives.
+    #[tokio::test]
+    async fn git_log_mtimes_unscoped_walk_agrees_with_the_pathspec_form() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+        let base = 1_600_000_000_i64;
+
+        std::fs::create_dir(work.path().join("changes")).unwrap();
+        for i in 0..60 {
+            std::fs::write(work.path().join(format!("changes/{i:03}.md")), "v1").unwrap();
+            commit_everything_at(work_path, &format!("add {i}"), base + i * 100);
+        }
+        // Edited twice: the later edit wins.
+        std::fs::write(work.path().join("changes/005.md"), "v2").unwrap();
+        commit_everything_at(work_path, "edit 5", base + 10_000);
+        std::fs::write(work.path().join("changes/005.md"), "v3").unwrap();
+        commit_everything_at(work_path, "edit 5 again", base + 11_000);
+        // Renamed: the new name is a fresh addition, the old name is gone.
+        std::fs::rename(
+            work.path().join("changes/010.md"),
+            work.path().join("changes/renamed.md"),
+        )
+        .unwrap();
+        commit_everything_at(work_path, "rename 10", base + 12_000);
+        // Deleted, then added back later.
+        std::fs::remove_file(work.path().join("changes/020.md")).unwrap();
+        commit_everything_at(work_path, "delete 20", base + 13_000);
+        std::fs::write(work.path().join("changes/020.md"), "back").unwrap();
+        commit_everything_at(work_path, "re-add 20", base + 14_000);
+        // A side branch merged with a merge commit: the file keeps the side commit's time.
+        git_test_cmd(work_path)
+            .args(["checkout", "-q", "-b", "side"])
+            .output()
+            .unwrap();
+        std::fs::write(work.path().join("changes/side.md"), "side").unwrap();
+        commit_everything_at(work_path, "side work", base + 15_000);
+        git_test_cmd(work_path)
+            .args(["checkout", "-q", "main"])
+            .output()
+            .unwrap();
+        std::fs::write(work.path().join("changes/main-only.md"), "main").unwrap();
+        commit_everything_at(work_path, "main work", base + 16_000);
+        let merged = git_test_cmd(work_path)
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "merge side",
+                "side",
+            ])
+            .env("GIT_AUTHOR_DATE", format!("@{} +0000", base + 17_000))
+            .env("GIT_COMMITTER_DATE", format!("@{} +0000", base + 17_000))
+            .output()
+            .unwrap();
+        assert!(merged.status.success(), "merge failed: {merged:?}");
+
+        let mut wanted: Vec<String> = std::fs::read_dir(work.path().join("changes"))
+            .unwrap()
+            .map(|e| format!("changes/{}", e.unwrap().file_name().to_string_lossy()))
+            .collect();
+        wanted.sort();
+        assert!(wanted.len() > GIT_LOG_MTIMES_UNSCOPED_THRESHOLD);
+        // A path git has no history for must stay absent from the unscoped answer too.
+        wanted.push("changes/never-committed.md".to_string());
+
+        let lock = lock_git().await;
+        let unscoped = git_log_mtimes(&lock, work_path, &wanted).await;
+
+        let mut pathspec = HashMap::new();
+        for path in &wanted {
+            pathspec.extend(
+                git_log_mtimes_chunk(&lock, work_path, std::slice::from_ref(path))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            unscoped, pathspec,
+            "the two forms must give the same answer"
+        );
+        // And the answers are the ones this history implies.
+        assert_eq!(unscoped["changes/005.md"], base + 11_000);
+        assert_eq!(unscoped["changes/renamed.md"], base + 12_000);
+        assert_eq!(unscoped["changes/020.md"], base + 14_000);
+        assert_eq!(unscoped["changes/side.md"], base + 15_000);
+        assert_eq!(unscoped["changes/main-only.md"], base + 16_000);
+        assert!(
+            !unscoped.contains_key("changes/010.md"),
+            "renamed away, not on disk"
+        );
+        assert!(!unscoped.contains_key("changes/never-committed.md"));
+    }
+
+    /// A failure of the single unscoped call leaves every path to the filesystem
+    /// fallback — an empty map, not an error and not a partial answer.
+    #[tokio::test]
+    async fn git_log_mtimes_unscoped_failure_yields_an_empty_map() {
+        let lock = lock_git().await;
+        let paths: Vec<String> = (0..=GIT_LOG_MTIMES_UNSCOPED_THRESHOLD)
+            .map(|i| format!("{i}.md"))
+            .collect();
+        // Not a repository: `git log` exits non-zero.
+        let dir = tempfile::tempdir().unwrap();
+        let map = git_log_mtimes(&lock, dir.path().to_str().unwrap(), &paths).await;
+        assert!(map.is_empty());
     }
 
     /// Two independent new files, committed together via a two-element `paths`

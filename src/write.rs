@@ -275,6 +275,10 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     /// Mirrors `chunking.prepend_description` — the dedup query must be built on
     /// the same textual basis the indexer embeds.
     pub prepend_description: bool,
+    /// Mirrors `chunking.embedding_prefix_field`: the frontmatter field whose text
+    /// the indexer prepends (`description` when unset), so the dedup query starts
+    /// with the same text (#386).
+    pub embedding_prefix_field: Option<&'a str>,
     pub dedup_enabled: bool,
     pub dedup_threshold: f32,
     /// Global fallback for the create-path neighbour listing (#356); see
@@ -1730,8 +1734,10 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
     // the frontmatter-stripped basis the indexer embeds.
     let query_text = validated
         .map(|v| {
-            let description = v.frontmatter.get("description").and_then(|d| d.as_str());
-            build_dedup_query(&v.body, description, deps.prepend_description)
+            let description = crate::chunk::embedding_prefix(deps.embedding_prefix_field, |name| {
+                v.frontmatter.get(name)
+            });
+            build_dedup_query(&v.body, description.as_deref(), deps.prepend_description)
         })
         .unwrap_or_default();
     if query_text.trim().is_empty() {
@@ -6209,6 +6215,7 @@ mod tests {
                 indexing: &self.config.indexing,
                 markdown_format: &self.config.formatting.markdown,
                 prepend_description: self.config.chunking.prepend_description,
+                embedding_prefix_field: self.config.chunking.embedding_prefix_field.as_deref(),
                 dedup_enabled: self.config.write.dedup_enabled,
                 dedup_threshold: self.config.write.dedup_threshold,
                 related_limit: self.config.write.related_limit,

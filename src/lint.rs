@@ -396,9 +396,7 @@ fn stale_entries(docs: &[DocumentSummary], now: i64, lint: &LintConfig) -> Vec<(
             if age_days < 0 || (age_days as u64) < limit_days {
                 return None;
             }
-            let date = chrono::DateTime::from_timestamp(updated, 0)
-                .map(|t| t.date_naive().to_string())
-                .unwrap_or_else(|| updated.to_string());
+            let date = crate::datetime::format_date(updated).unwrap_or_else(|| updated.to_string());
             let finding = Finding::new(
                 doc.file_path.clone(),
                 format!(
@@ -841,10 +839,7 @@ mod tests {
     fn stale_uses_the_frontmatter_date_before_mtime() {
         let lint = LintConfig::default();
         let old = (days_ago(400) / SECONDS_PER_DAY) * SECONDS_PER_DAY;
-        let old_date = chrono::DateTime::from_timestamp(old, 0)
-            .unwrap()
-            .date_naive()
-            .to_string();
+        let old_date = crate::datetime::format_date(old).unwrap();
         let docs = vec![
             // Recent mtime, but the authored date says it is old: the field wins.
             doc("old-field.md", json!({"updated": old_date}), days_ago(1)),

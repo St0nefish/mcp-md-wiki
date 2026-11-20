@@ -2082,8 +2082,7 @@ pub async fn document_changes_json(
         .commits
         .into_iter()
         .map(|c| {
-            let date = chrono::DateTime::from_timestamp(c.timestamp, 0)
-                .map_or_else(String::new, |d| d.format("%Y-%m-%dT%H:%MZ").to_string());
+            let date = crate::datetime::format_minute(c.timestamp).unwrap_or_default();
             let mut entry = serde_json::json!({
                 "date": date,
                 "author": c.author_name,
@@ -2122,26 +2121,23 @@ pub enum ChangesSinceError {
 /// or with a space, UTC) — the forms `get_document`'s `history` dates round-trip
 /// through. A commit id never parses as one of these.
 fn parse_since_timestamp(s: &str) -> Option<i64> {
-    use chrono::{NaiveDate, NaiveDateTime};
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.timestamp());
-    }
-    for fmt in [
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%MZ",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-    ] {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(dt.and_utc().timestamp());
-        }
-    }
-    NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map(|dt| dt.and_utc().timestamp())
+    use crate::datetime;
+    datetime::parse_rfc3339(s)
+        .or_else(|| {
+            datetime::parse_civil_utc(
+                s,
+                &[
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    "%Y-%m-%dT%H:%MZ",
+                    "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%dT%H:%M",
+                    "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%d %H:%M",
+                ],
+            )
+        })
+        .or_else(|| datetime::parse_date_midnight(s))
+        .map(datetime::floor_seconds)
 }
 
 /// A page cursor: the range it was started on, pinned so every page reads the
@@ -2394,8 +2390,7 @@ pub async fn changes_since_json(
                 entry["commit"] = serde_json::json!(info.sha);
             }
             entry["date"] = serde_json::json!(
-                chrono::DateTime::from_timestamp(info.timestamp, 0)
-                    .map_or_else(String::new, |d| d.format("%Y-%m-%dT%H:%MZ").to_string())
+                crate::datetime::format_minute(info.timestamp).unwrap_or_default()
             );
             entry["author"] = serde_json::json!(info.author_name);
             entry["subject"] = serde_json::json!(info.subject);

@@ -8,10 +8,4 @@ ignore = [
     # qdrant-client, reqwest (quinn), governor, and rmcp. Drop when those
     # crates publish a release with the fixed `rand`.
     "RUSTSEC-2026-0097",
-
-    # rmcp's Streamable HTTP *client* buffers response bodies without a bound
-    # (patched in rmcp 3.9). We enable only rmcp's server transport and never
-    # construct an rmcp client, so the affected code is not compiled in. Drop
-    # when the rmcp 3 migration lands.
-    "RUSTSEC-2026-0462",
 ]

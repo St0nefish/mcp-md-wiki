@@ -1017,6 +1017,7 @@ pub(crate) mod tests {
             prepend_description: false,
             prepend_heading_path: true,
             heading_metadata: true,
+            embedding_prefix_field: None,
         };
         for chunk in crate::chunk::chunk_markdown(&body, None, &cfg) {
             for segment in &chunk.heading_path {
@@ -1097,6 +1098,7 @@ pub(crate) mod tests {
                     prepend_description: false,
                     prepend_heading_path: true,
                     heading_metadata: true,
+                    embedding_prefix_field: None,
                 },
             );
             assert!(!chunks.is_empty());
@@ -1283,6 +1285,7 @@ pub(crate) mod tests {
                         prepend_description: true,
                         prepend_heading_path: prepend,
                         heading_metadata,
+                        embedding_prefix_field: None,
                     };
                     let chunks = crate::chunk::chunk_markdown(&body, Some("desc"), &cfg);
                     assert_chunk_ranges_valid(&body, &chunks);
@@ -1477,6 +1480,7 @@ pub(crate) mod tests {
             prepend_description: false,
             prepend_heading_path: false,
             heading_metadata: true,
+            embedding_prefix_field: None,
         };
         let chunks = crate::chunk::chunk_markdown(&body, None, &cfg);
         assert_chunks_stay_within_one_section(&body, &chunks);

@@ -27,9 +27,7 @@ ignore = [
   # Unmaintained, no replacement reachable from this crate:
   { id = "RUSTSEC-2025-0012", reason = "backoff is unmaintained; transitive via async-openai, which owns the retry layer" },
   { id = "RUSTSEC-2024-0384", reason = "instant is unmaintained; transitive via backoff (async-openai)" },
-  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; a direct dependency (mtime/date filters) and also pulled by rmcp and schemars; moving to jiff is tracked in #383" },
-  # A vulnerability, ignored because the affected code path is not compiled in:
-  { id = "RUSTSEC-2026-0462", reason = "rmcp's Streamable HTTP *client* buffers response bodies unbounded; this crate enables only rmcp's server transport (features transport-streamable-http-server, server) and never constructs an rmcp client. Clears with the rmcp 3 migration, tracked in #382" },
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; no longer a direct dependency (date handling moved to jiff, #383) but still pulled transitively by rmcp and schemars; drop this when they do" },
 ]
 
 [licenses]

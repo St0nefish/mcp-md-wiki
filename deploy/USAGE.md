@@ -62,7 +62,7 @@ Documents are split into chunks before embedding. The chunker is **section-aware
 
 4. **Force-split oversized sections** — If a single section exceeds `max_chunk_size` (default: 1500 characters), it is split further by a secondary markdown-aware text splitter. Small fragments (under 200 characters, e.g. a lone heading) are merged into adjacent chunks to avoid orphaned headings (with `chunking.heading_metadata` on, only into chunks of the same section).
 
-5. **Prepend description** — If `chunking.prepend_description` is enabled (default: `true`) and the document has a `description` frontmatter field, that description is prepended to every chunk. This gives the embedding model context about what the chunk relates to. The prefix (and the heading breadcrumb `chunking.prepend_heading_path` adds) is for the embedding only: search snippets start at the chunk's own text.
+5. **Prepend description** — If `chunking.prepend_description` is enabled (default: `true`) and the document has a `description` frontmatter field, that description is prepended to every chunk. This gives the embedding model context about what the chunk relates to. `chunking.embedding_prefix_field` names a different frontmatter field to use in its place and, when set, lets a document with no body text of its own be indexed as one chunk of that field's text. The prefix (and the heading breadcrumb `chunking.prepend_heading_path` adds) is for the embedding only: search snippets start at the chunk's own text.
 
 ### Example
 
@@ -78,6 +78,8 @@ chunking:
   target_chunk_size: 1000   # ideal chunk size (characters)
   max_chunk_size: 1500      # hard upper limit
   prepend_description: true # prepend description to every chunk
+  # embedding_prefix_field: summary  # use this frontmatter field instead of `description`;
+  #                                  # also indexes documents with no body (one chunk of its text)
 ```
 
 - **Smaller chunks** (500–800) → more precise search results, more vectors, higher storage/compute cost.

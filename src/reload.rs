@@ -433,6 +433,18 @@ const DIFF_TABLE: &[DiffField] = &[
         }],
     },
     DiffField {
+        path: "chunking.embedding_prefix_field",
+        get: |c| Some(d(&c.chunking.embedding_prefix_field)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::ReindexScheduled,
+            setting: "chunking.embedding_prefix_field",
+            note: "changes the text every chunk embeds (the frontmatter field prepended in \
+                   place of `description`, and the one chunk a body-less document gets) and \
+                   the create_document dedup query text; every document is re-chunked and \
+                   re-embedded automatically by the full reconcile this reload queued (#386).",
+        }],
+    },
+    DiffField {
         path: "chunking.heading_metadata",
         get: |c| Some(d(&c.chunking.heading_metadata)),
         consumers: &[ConsumerEntry {
@@ -1717,7 +1729,7 @@ mod tests {
             .iter()
             .filter(|f| f.path.starts_with("chunking."))
             .collect();
-        assert_eq!(chunking.len(), 5);
+        assert_eq!(chunking.len(), 6);
         for field in chunking {
             for consumer in field.consumers {
                 assert_eq!(

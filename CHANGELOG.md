@@ -54,15 +54,52 @@ bulk rewrite happens on upgrade).
   `native-tls`), `quinn-udp` and `rustix` findings; `sqlx` 0.8 → 0.9 and `libsqlite3-sys`
   0.30 → 0.40 clear RUSTSEC-2026-0459 (bundled SQLite). No operator action: the state
   database file format is unchanged.
-- **rmcp stays on 1.x for now.** RUSTSEC-2026-0462 affects rmcp's Streamable HTTP
-  *client*, which this server does not compile in (server transport only); the advisory
-  is ignored with that reason in `deny.toml` and `.cargo/audit.toml`, and the migration is
-  tracked in #382. `chrono` (unmaintained, RUSTSEC-2026-0543) is ignored the same way,
-  tracked in #383.
+- **rmcp 1.8 → 3.11** (#382). Clears RUSTSEC-2026-0462; the ignore is gone from `deny.toml`
+  and `.cargo/audit.toml`. No operator action and no change to the tools, their schemas or
+  the `/mcp` wire behaviour this server relies on: the stateless, JSON-response transport and
+  the 10 MB request ceiling are configured exactly as before (rmcp 3's own body limit, 4 MiB by
+  default, is raised to match).
+- **`chrono` → `jiff` for this crate's own date handling** (#383). Same accepted forms and
+  the same stored values: an RFC 3339 `timestamp` still needs seconds and `Z` or a `±HH:MM`
+  offset, a `date` is still `YYYY-MM-DD`, and the Qdrant datetime payload text is unchanged
+  (so no refresh or reindex). `chrono` itself remains in the dependency tree through `rmcp`
+  and `schemars`, so its RUSTSEC-2026-0543 ignore stays in `deny.toml`.
 - **Build requirement:** the pinned toolchain is now **1.98.0** (`rust-toolchain.toml`,
   `rust-version` in `Cargo.toml`, the Dockerfile's `RUST_VERSION`), up from 1.89. CI and the
   image follow the pin automatically; a local checkout is switched by rustup. Nothing
   changes at runtime.
+
+### Large corpora: the git-derived mtime lookup no longer times out (#386)
+
+The reconcile's `git log` for each document's last-commit time passed every path as a
+pathspec, and pathspec matching costs commits × paths. On a corpus of about 11.5k
+single-file commits every chunk hit the 120 s timeout, so a first `index --full` spent
+most of its time there and then fell back to clone-time mtime for every document.
+`git_log_mtimes` now answers a list of more than 50 paths with one unscoped walk of the
+history (about 4.5 s at that size) and keeps only the wanted paths; below that, pathspec
+calls carry at most 50 paths each. The answers are the same, the walk passes
+`--no-renames` so they no longer depend on a `diff.renames` setting, and a failed walk
+still falls back to filesystem mtime. No operator action; the first reconcile after
+upgrading gets accurate `mtime` where it had fallen back before, and a document's
+`mtime` can change when it does.
+
+### Documents with no body can be indexed from a frontmatter field (#386)
+
+New `chunking.embedding_prefix_field` (default unset). A document whose body is empty or
+blank produces no chunk, so it was skipped (`No chunks produced for: …`) and could not be
+found, even when its meaning lives in frontmatter (`summary`, `nodes`, `tags`). Set the key
+to a field name and `prepend_description` uses that field instead of `description` — a
+string, or a list of strings joined with `,` — and a body-less document whose field has
+text is indexed as one chunk of just that text. (A body that is only a heading already
+produced a chunk; it is the blank body that did not.)
+
+- **Unset changes nothing**, including the fingerprint: an upgrade re-embeds nothing, and a
+  body-less document stays unindexed until the key is set.
+- **Setting or changing it re-chunks and re-embeds every document** on the next reconcile
+  (`reindex_scheduled`), since the text each chunk embeds changes — about 11.5k documents to
+  pick up 2.1k body-less ones on the corpus that reported it.
+- The create-path dedup query uses the same field. `prepend_description: false` turns the
+  prefix and this chunk off.
 
 ### YAML library replaced: `serde_yaml_ng` → `serde-saphyr`, `gray_matter` 0.3
 

@@ -4018,11 +4018,11 @@ pub fn set_by_dotpath(frontmatter: &mut HashMap<String, Value>, path: &str, valu
 }
 
 fn is_date(s: &str) -> bool {
-    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+    crate::datetime::parse_date(s).is_some()
 }
 
 fn is_timestamp(s: &str) -> bool {
-    chrono::DateTime::parse_from_rfc3339(s).is_ok()
+    crate::datetime::parse_rfc3339(s).is_some()
 }
 
 /// Describe a JSON value's kind for error messages.
