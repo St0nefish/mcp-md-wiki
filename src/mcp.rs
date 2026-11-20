@@ -2081,7 +2081,9 @@ pub struct WriteDocumentParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// The whole file, including YAML frontmatter: creates `path`, or
-    /// replaces it. Not combinable with another edit mode.
+    /// replaces it. Not combinable with another edit mode. Markdown is
+    /// auto-formatted on save, so the stored text can differ from what you
+    /// sent (`formatted` lists the changes): re-read before anchoring an edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// Exact text to replace with `new_string`; must occur exactly once. Not
@@ -2799,13 +2801,15 @@ fn batch_write_success_to_result(success: write::BatchWriteSuccess) -> CallToolR
         .documents
         .iter()
         .map(|d| {
-            serde_json::Value::Object(write_response(
+            let mut fields = write_response(
                 &d.rel_path,
                 if d.is_create { "created" } else { "updated" },
                 &d.diff,
                 d.version.as_deref(),
                 d.merged,
-            ))
+            );
+            insert_formatting(&mut fields, &d.formatting);
+            serde_json::Value::Object(fields)
         })
         .collect();
     CallToolResult::structured(serde_json::json!({ "documents": documents }))
@@ -2949,7 +2953,23 @@ fn create_edit_success_to_result(
     if let Some(related) = related_json(&success.related) {
         fields.insert("related".to_string(), related);
     }
+    insert_formatting(&mut fields, &success.formatting);
     CallToolResult::structured(serde_json::Value::Object(fields))
+}
+
+/// `formatted` (the rumdl rules that changed the stored markdown) and
+/// `formatting_skipped` (why formatting could not be applied) on a write result; both
+/// omitted when formatting did nothing.
+fn insert_formatting(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    formatting: &crate::write::FormatReport,
+) {
+    if !formatting.rules.is_empty() {
+        fields.insert("formatted".to_string(), serde_json::json!(formatting.rules));
+    }
+    if let Some(reason) = &formatting.skipped {
+        fields.insert("formatting_skipped".to_string(), serde_json::json!(reason));
+    }
 }
 
 /// The `related` array of a create result (#356): `[{path, score}]` nearest first,
@@ -5535,6 +5555,7 @@ impl KbSearchServer {
             schema_cache: &self.schema_cache,
             validation: &config.validation,
             indexing: &config.indexing,
+            markdown_format: &config.formatting.markdown,
             prepend_description: config.chunking.prepend_description,
             dedup_enabled: config.write.dedup_enabled,
             dedup_threshold: config.write.dedup_threshold,
@@ -6684,6 +6705,7 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
         reranking: None,
         ui: crate::config::UiConfig::default(),
         lint: crate::config::LintConfig::default(),
+        formatting: crate::config::FormattingConfig::off(),
         contradictions: crate::config::ContradictionsConfig::default(),
         contradictions_judge: None,
         provenance: Default::default(),
@@ -14548,6 +14570,7 @@ mod tests {
             reranking: None,
             ui: crate::config::UiConfig::default(),
             lint: crate::config::LintConfig::default(),
+            formatting: crate::config::FormattingConfig::off(),
             contradictions: crate::config::ContradictionsConfig::default(),
             contradictions_judge: None,
             provenance: Default::default(),
@@ -14816,6 +14839,7 @@ mod tests {
             reranking: None,
             ui: crate::config::UiConfig::default(),
             lint: crate::config::LintConfig::default(),
+            formatting: crate::config::FormattingConfig::off(),
             contradictions: crate::config::ContradictionsConfig::default(),
             contradictions_judge: None,
             provenance: Default::default(),
@@ -16952,6 +16976,7 @@ mod tests {
             rewritten_paths: Vec::new(),
             referencing_paths: Vec::new(),
             status_set: false,
+            formatting: Default::default(),
             merged: false,
             version: Some("v".into()),
             related,

@@ -269,6 +269,9 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     /// that gate never sees (rewritten referencing documents, rebase-pulled-in
     /// paths).
     pub indexing: &'a crate::config::IndexingConfig,
+    /// `formatting.markdown`: how a markdown document is normalised before it is
+    /// validated, written and committed (see `markdown_fmt.rs`).
+    pub markdown_format: &'a crate::config::MarkdownFormatConfig,
     /// Mirrors `chunking.prepend_description` — the dedup query must be built on
     /// the same textual basis the indexer embeds.
     pub prepend_description: bool,
@@ -417,6 +420,10 @@ pub struct WriteSuccess {
     /// every other change, and for an archive whose governing schema declares no
     /// `status` field allowing that value (the frontmatter is then left alone).
     pub status_set: bool,
+    /// What automatic markdown formatting did to the stored content (rules that
+    /// changed it, or why it was skipped); empty when it did nothing.
+    #[serde(skip_serializing_if = "FormatReport::is_empty")]
+    pub formatting: FormatReport,
     /// The written document had other concurrent changes that were merged with
     /// this one (a three-way merge of a stale full replace, a relative edit
     /// applied over changes made since its `expected_version`, or a clean rebase
@@ -1390,6 +1397,90 @@ impl DocChange<'_> {
 struct Applied {
     content: String,
     merged: bool,
+    /// What markdown formatting did to `content` (nothing, when it is off or the
+    /// document is not markdown).
+    format: FormatReport,
+}
+
+/// What automatic markdown formatting did to a document on its way to disk
+/// (`formatting.markdown.*`, `markdown_fmt.rs`). Reported on a write's result so a
+/// caller that sees its content come back different knows why.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FormatReport {
+    /// Ids of the rumdl rules that changed something (`MD009`, `MD022`, ...), sorted.
+    /// Empty when the content was already clean, or formatting is off.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<String>,
+    /// Why formatting was skipped for this document, when it could not be applied
+    /// (the formatter failed, or its result would have changed the frontmatter). The
+    /// document was stored exactly as sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+}
+
+impl FormatReport {
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty() && self.skipped.is_none()
+    }
+}
+
+/// Whether `rel_path` names a markdown document (`.md` / `.markdown`, any case).
+fn is_markdown_path(rel_path: &str) -> bool {
+    let lower = rel_path.to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown")
+}
+
+/// Format `content` for `rel_path` per `formatting.markdown`, failing open: when the
+/// formatter cannot run or its result would change the frontmatter, the content is
+/// stored as sent and the report says why. Formatting is CPU work on a document of at
+/// most [`MAX_CONTENT_LEN`] bytes, done inline under the write's lock acquisition.
+fn format_for_write<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    rel_path: &str,
+    content: String,
+) -> (String, FormatReport) {
+    if !deps.markdown_format.enabled || !is_markdown_path(rel_path) {
+        return (content, FormatReport::default());
+    }
+    let settings =
+        crate::markdown_fmt::Settings::from_config(deps.markdown_format, deps.canonical_data_path);
+    match crate::markdown_fmt::format(&content, &settings) {
+        Ok(formatted) => (
+            formatted.content,
+            FormatReport {
+                rules: formatted.rules_applied,
+                skipped: None,
+            },
+        ),
+        Err(e) => {
+            warn!("Markdown formatting skipped for '{rel_path}': {e}");
+            let skipped = e.public_reason();
+            (
+                content,
+                FormatReport {
+                    rules: Vec::new(),
+                    skipped: Some(skipped),
+                },
+            )
+        }
+    }
+}
+
+/// [`format_for_write`] over a computed [`Applied`]. A pure move (`Keep`) rewrites
+/// nothing, so it is never reformatted.
+fn format_applied<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    rel_path: &str,
+    change: &DocChange<'_>,
+    mut applied: Applied,
+) -> Applied {
+    if matches!(change, DocChange::Keep) {
+        return applied;
+    }
+    let (content, format) = format_for_write(deps, rel_path, std::mem::take(&mut applied.content));
+    applied.content = content;
+    applied.format = format;
+    applied
 }
 
 fn data_path_of<'a, E: QueryEmbedder, Q: RetrievalStore>(deps: &WriteDeps<'a, E, Q>) -> &'a str {
@@ -1473,6 +1564,7 @@ async fn apply_change(
     let applied = |content: String| Applied {
         content,
         merged: false,
+        format: FormatReport::default(),
     };
     match change {
         DocChange::Create(content) => Ok(applied(content.to_string())),
@@ -1511,6 +1603,7 @@ async fn apply_change(
                     Some(merged) => Ok(Applied {
                         content: merged,
                         merged: true,
+                        format: FormatReport::default(),
                     }),
                     None => Err(WriteError::EditedElsewhere),
                 }
@@ -1534,6 +1627,7 @@ async fn apply_change(
                     // even when `expected_version` is stale — and its result then
                     // carries the changes made since that version as well.
                     merged: expected_version.is_some_and(|e| !versions_match(e, current)),
+                    format: FormatReport::default(),
                 })
             }
             Err(msg) => {
@@ -1927,6 +2021,20 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
         let abs_path = safe_write_path(deps, rel_path)?;
 
         let (old_content, applied) = if let DocChange::Create(content) = change {
+            // Formatted once, here under the lock, so the bytes written, committed and
+            // diffed are the formatted ones. The frontmatter is unchanged by
+            // formatting, so the validation and dedup that ran on `content` still hold.
+            let applied = format_applied(
+                deps,
+                rel_path,
+                &change,
+                Applied {
+                    content: content.to_string(),
+                    merged: false,
+                    format: FormatReport::default(),
+                },
+            );
+            let bytes = applied.content.clone();
             let mut file = tokio::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1943,16 +2051,10 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                     }
                 })?;
             write_or_undo(&abs_path, None, async move {
-                write_and_flush(&mut file, content.as_bytes()).await
+                write_and_flush(&mut file, bytes.as_bytes()).await
             })
             .await?;
-            (
-                String::new(),
-                Applied {
-                    content: content.to_string(),
-                    merged: false,
-                },
-            )
+            (String::new(), applied)
         } else {
             let Some(current) = read_if_exists(&abs_path).await? else {
                 return Err(WriteError::NotFound);
@@ -1966,6 +2068,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                 pre_read.as_deref(),
             )
             .await?;
+            let applied = format_applied(deps, rel_path, &change, applied);
             validate_document(deps, rel_path, &applied.content).await?;
             // An edit that leaves the document exactly as it is has nothing to
             // commit (`git commit` refuses an empty change): the document already
@@ -1980,6 +2083,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                     rewritten_paths: Vec::new(),
                     referencing_paths: Vec::new(),
                     status_set: false,
+                    formatting: applied.format.clone(),
                     merged: applied.merged,
                     version: Some(document_version(current.as_bytes())),
                 });
@@ -2088,6 +2192,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                     rewritten_paths: Vec::new(),
                     referencing_paths: Vec::new(),
                     status_set: false,
+                    formatting: applied.format.clone(),
                     merged: applied.merged,
                     version: Some(document_version(applied.content.as_bytes())),
                 });
@@ -2135,6 +2240,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
             rewritten_paths: Vec::new(),
             referencing_paths: Vec::new(),
             status_set: false,
+            formatting: applied.format.clone(),
             merged: applied.merged || rebase_merged,
             version,
         });
@@ -2238,6 +2344,9 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
             None,
         )
         .await?;
+        // A move that also changes the content (an edit riding along) is formatted for
+        // the destination; a pure move rewrites nothing, so it is left byte-for-byte.
+        let applied = format_applied(deps, dest_rel, &change, applied);
 
         // 6. Outbound-link re-relativization: every relative link inside the
         //    moved document was authored against its OLD directory; each is
@@ -2505,6 +2614,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                     rewritten_paths,
                     referencing_paths: Vec::new(),
                     status_set,
+                    formatting: applied.format.clone(),
                     merged: applied.merged,
                     version: Some(document_version(content_to_write.as_bytes())),
                 });
@@ -2548,6 +2658,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
             rewritten_paths,
             referencing_paths: Vec::new(),
             status_set,
+            formatting: applied.format.clone(),
             merged: applied.merged || rebase_merged,
             version: (!dest_merged).then(|| document_version(content_to_write.as_bytes())),
         });
@@ -2964,6 +3075,9 @@ pub struct BatchDocumentResult {
     /// Same contract as `WriteSuccess::version`, for this document.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Same contract as `WriteSuccess::formatting`, for this document.
+    #[serde(skip_serializing_if = "FormatReport::is_empty")]
+    pub formatting: FormatReport,
 }
 
 /// A successful batch write: every document landed in ONE commit, pushed or —
@@ -3219,10 +3333,16 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                 let current = read_if_exists(&abs_path).await?;
                 let applied = match (req.change, current) {
                     (DocChange::Create(_), Some(_)) => return Err(WriteError::AlreadyExists),
-                    (DocChange::Create(content), None) => Applied {
-                        content: content.to_string(),
-                        merged: false,
-                    },
+                    (DocChange::Create(content), None) => format_applied(
+                        deps,
+                        req.rel_path,
+                        &req.change,
+                        Applied {
+                            content: content.to_string(),
+                            merged: false,
+                            format: FormatReport::default(),
+                        },
+                    ),
                     (_, None) => return Err(WriteError::NotFound),
                     (change, Some(current)) => {
                         let applied = apply_change(
@@ -3234,6 +3354,7 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                             pre_reads.get(req.rel_path).map(String::as_str),
                         )
                         .await?;
+                        let applied = format_applied(deps, req.rel_path, &change, applied);
                         validate_document(deps, req.rel_path, &applied.content).await?;
                         if applied.content == current {
                             unchanged.insert(req.rel_path);
@@ -3266,6 +3387,7 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                         diff: String::new(),
                         merged: applied.merged,
                         version: Some(document_version(applied.content.as_bytes())),
+                        formatting: applied.format.clone(),
                     })
                     .collect(),
             });
@@ -3383,6 +3505,7 @@ pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
                         merged: applied.merged || rebase_merged,
                         version: (!rebase_merged)
                             .then(|| document_version(applied.content.as_bytes())),
+                        formatting: applied.format.clone(),
                     }
                 })
                 .collect()
@@ -5002,6 +5125,7 @@ pub async fn delete_document_with<E: QueryEmbedder, Q: RetrievalStore>(
                     rewritten_paths,
                     referencing_paths,
                     status_set: false,
+                    formatting: FormatReport::default(),
                     merged: false,
                     version: None,
                 });
@@ -5042,6 +5166,7 @@ pub async fn delete_document_with<E: QueryEmbedder, Q: RetrievalStore>(
             rewritten_paths,
             referencing_paths,
             status_set: false,
+            formatting: FormatReport::default(),
             merged: rebase_merged,
             version: None,
         });
@@ -6082,6 +6207,7 @@ mod tests {
                 schema_cache: &self.schema_cache,
                 validation: &self.config.validation,
                 indexing: &self.config.indexing,
+                markdown_format: &self.config.formatting.markdown,
                 prepend_description: self.config.chunking.prepend_description,
                 dedup_enabled: self.config.write.dedup_enabled,
                 dedup_threshold: self.config.write.dedup_threshold,
@@ -6923,6 +7049,219 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(success.outcome, WriteOutcome::Synced);
+    }
+
+    // -----------------------------------------------------------------------
+    // Automatic markdown formatting (`formatting.markdown`, `markdown_fmt.rs`)
+    // -----------------------------------------------------------------------
+
+    /// A git-backed harness with markdown formatting ON (the test config default is
+    /// off, so every other test sees the bytes it sent).
+    fn formatting_harness(
+        work: &tempfile::TempDir,
+        tune: impl FnOnce(&mut crate::config::MarkdownFormatConfig),
+    ) -> Harness {
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        {
+            let config = Arc::get_mut(&mut config).unwrap();
+            config.write.dedup_enabled = false;
+            config.formatting.markdown.enabled = true;
+            tune(&mut config.formatting.markdown);
+        }
+        Harness::new(work, config)
+    }
+
+    const UNFORMATTED: &str = "---\ntitle: Notes\ntags: [a]\n---\n## One\ntext with trailing spaces   \n## Two\n* x\n* y\n\n\n\nend\n";
+
+    #[tokio::test]
+    async fn a_created_markdown_document_is_stored_formatted_and_the_result_says_so() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let harness = formatting_harness(&work, |_| {});
+
+        let success = write_document(&harness.deps(), make_req("docs/n.md", UNFORMATTED, true))
+            .await
+            .unwrap();
+
+        let stored = std::fs::read_to_string(work.path().join("docs/n.md")).unwrap();
+        assert_ne!(stored, UNFORMATTED);
+        assert!(!stored.contains("spaces   \n"), "{stored:?}");
+        assert!(!stored.contains("\n\n\n"), "{stored:?}");
+        assert!(stored.contains("## One\n\ntext"), "{stored:?}");
+        assert!(
+            !success.formatting.rules.is_empty(),
+            "{:?}",
+            success.formatting
+        );
+        assert!(success.formatting.skipped.is_none());
+        assert!(
+            success.diff.contains("+## One"),
+            "the diff is of what was stored"
+        );
+        // What was committed is what is on disk.
+        let committed = std::process::Command::new("git")
+            .args(["show", "HEAD:docs/n.md"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(committed.stdout).unwrap(), stored);
+        // The reported version is the stored bytes' version.
+        assert_eq!(success.version.as_deref(), harness.version_of("docs/n.md"));
+    }
+
+    #[tokio::test]
+    async fn an_already_clean_document_reports_no_formatting() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let harness = formatting_harness(&work, |_| {});
+        let clean = "---\ntitle: T\n---\n\n## One\n\ntext\n";
+
+        let success = write_document(&harness.deps(), make_req("docs/c.md", clean, true))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("docs/c.md")).unwrap(),
+            clean
+        );
+        assert!(success.formatting.is_empty(), "{:?}", success.formatting);
+    }
+
+    #[tokio::test]
+    async fn formatting_off_stores_exactly_what_was_sent() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let harness = formatting_harness(&work, |m| m.enabled = false);
+
+        let success = write_document(&harness.deps(), make_req("docs/n.md", UNFORMATTED, true))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("docs/n.md")).unwrap(),
+            UNFORMATTED
+        );
+        assert!(success.formatting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_edit_is_formatted_too_not_only_a_create() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        std::fs::write(
+            work.path().join("docs/e.md"),
+            "---\ntitle: E\n---\n\n## A\n\nold\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "docs/e.md", "add docs/e.md");
+        let harness = formatting_harness(&work, |_| {});
+
+        let mut req = make_req("docs/e.md", UNFORMATTED, false);
+        req.expected_version = harness.version_of("docs/e.md");
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        let stored = std::fs::read_to_string(work.path().join("docs/e.md")).unwrap();
+        assert!(stored.contains("## One\n\ntext"), "{stored:?}");
+        assert!(!success.formatting.rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_document_that_is_not_markdown_is_not_formatted() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let harness = formatting_harness(&work, |_| {});
+        let deps = harness.deps();
+        let (content, report) = format_for_write(&deps, "data/table.csv", UNFORMATTED.to_string());
+        assert_eq!(content, UNFORMATTED);
+        assert!(report.is_empty());
+        let (content, report) = format_for_write(&deps, "docs/N.MD", UNFORMATTED.to_string());
+        assert_ne!(
+            content, UNFORMATTED,
+            "the extension is matched case-insensitively"
+        );
+        assert!(!report.rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_formatter_that_cannot_run_fails_open_and_says_so() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let harness = formatting_harness(&work, |m| {
+            m.config_file = Some("no/such/.rumdl.toml".into());
+        });
+
+        let success = write_document(&harness.deps(), make_req("docs/n.md", UNFORMATTED, true))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("docs/n.md")).unwrap(),
+            UNFORMATTED,
+            "stored exactly as sent"
+        );
+        assert!(success.formatting.rules.is_empty());
+        let reason = success.formatting.skipped.expect("the skip is reported");
+        assert!(
+            !reason.contains("no/such") && !reason.contains(work.path().to_str().unwrap()),
+            "the reason must not leak a filesystem path: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pure_move_does_not_reformat_the_document() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        std::fs::write(work.path().join("old/m.md"), UNFORMATTED).unwrap();
+        git_commit_all(&work, "old/m.md", "add old/m.md");
+        let harness = formatting_harness(&work, |_| {});
+
+        let mut req = make_move_req("old/m.md", "new/m.md", UNFORMATTED, UNFORMATTED);
+        req.change = DocChange::Keep;
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("new/m.md")).unwrap(),
+            UNFORMATTED,
+            "moving a document is not editing it"
+        );
+        assert!(success.formatting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_batch_formats_each_document_and_reports_per_document() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let harness = formatting_harness(&work, |_| {});
+        let clean = "---\ntitle: C\n---\n\n## One\n\ntext\n";
+        let batch = [
+            BatchWriteRequest {
+                rel_path: "docs/a.md",
+                change: DocChange::Create(UNFORMATTED),
+                force_new: Some(true),
+                expected_version: None,
+            },
+            BatchWriteRequest {
+                rel_path: "docs/b.md",
+                change: DocChange::Create(clean),
+                force_new: Some(true),
+                expected_version: None,
+            },
+        ];
+
+        let success = write_documents_batch(&harness.deps(), &batch, None)
+            .await
+            .unwrap();
+
+        let a = std::fs::read_to_string(work.path().join("docs/a.md")).unwrap();
+        assert!(a.contains("## One\n\ntext"), "{a:?}");
+        assert!(!success.documents[0].formatting.rules.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("docs/b.md")).unwrap(),
+            clean
+        );
+        assert!(success.documents[1].formatting.is_empty());
     }
 
     #[tokio::test]

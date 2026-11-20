@@ -40,6 +40,8 @@ pub struct Config {
     #[serde(default)]
     pub lint: LintConfig,
     #[serde(default)]
+    pub formatting: FormattingConfig,
+    #[serde(default)]
     pub contradictions: ContradictionsConfig,
 }
 
@@ -1333,6 +1335,78 @@ fn default_semantic_edges_min_score() -> f32 {
     0.6
 }
 
+/// `formatting` — how the write tools normalise a document before storing it. Pure
+/// YAML tuning, no secrets, so the parsed struct is copied straight onto
+/// `ResolvedConfig` and read fresh on every write: a reload applies at once.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormattingConfig {
+    #[serde(default)]
+    pub markdown: MarkdownFormatConfig,
+}
+
+/// `formatting.markdown` — automatic markdown formatting (rumdl's auto-fixes) of every
+/// `.md` / `.markdown` document `write_document` stores. See `markdown_fmt.rs`.
+///
+/// The defaults are the maintainer's own policy: rumdl's `standard` flavor with only
+/// `MD013` (line length) switched off, everything else at rumdl's defaults.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarkdownFormatConfig {
+    /// Format documents on write. When off, content is stored exactly as sent.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// rumdl markdown flavor: `standard` (also `gfm`, `commonmark`), `mkdocs`,
+    /// `obsidian`, `mdx`, `pandoc`, `quarto`, `kramdown`, `hugo`, `myst`, ...
+    #[serde(default = "default_markdown_flavor")]
+    pub flavor: String,
+    /// Rule ids to switch off (`MD013`, `MD033`, ...).
+    #[serde(default = "default_markdown_disable")]
+    pub disable: Vec<String>,
+    /// Path of a full rumdl config (`.rumdl.toml`), relative to the knowledge-base
+    /// root. When set it replaces `flavor` and `disable`: rumdl reads the whole policy
+    /// from that file. A file that cannot be loaded leaves the document unformatted
+    /// and says so in the write result.
+    #[serde(default)]
+    pub config_file: Option<String>,
+}
+
+#[cfg(test)]
+impl FormattingConfig {
+    /// Formatting switched off: what every test that asserts the exact bytes a write
+    /// stores builds its `ResolvedConfig` with, so a markdown fix never changes them.
+    pub fn off() -> Self {
+        Self {
+            markdown: MarkdownFormatConfig {
+                enabled: false,
+                ..MarkdownFormatConfig::default()
+            },
+        }
+    }
+}
+
+impl Default for MarkdownFormatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            flavor: default_markdown_flavor(),
+            disable: default_markdown_disable(),
+            config_file: None,
+        }
+    }
+}
+
+fn default_markdown_flavor() -> String {
+    "standard".into()
+}
+
+fn default_markdown_disable() -> Vec<String> {
+    crate::markdown_fmt::DEFAULT_DISABLED_RULES
+        .iter()
+        .map(|rule| (*rule).to_string())
+        .collect()
+}
+
 /// `lint` — which corpus health checks run when none is named (#354), and their
 /// thresholds. Pure YAML tuning, no secrets, so like `ui` and `search` the parsed
 /// struct is copied straight onto `ResolvedConfig`. Every value is read fresh on
@@ -1748,6 +1822,10 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("lint.max_lines", "lint"),
     ("lint.max_bytes", "lint"),
     ("lint.tags_field", "lint"),
+    ("formatting.markdown.enabled", "formatting"),
+    ("formatting.markdown.flavor", "formatting"),
+    ("formatting.markdown.disable", "formatting"),
+    ("formatting.markdown.config_file", "formatting"),
     ("contradictions.enabled", "contradictions"),
     ("contradictions.interval_secs", "contradictions"),
     ("contradictions.top_k", "contradictions"),
@@ -1838,6 +1916,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "reranking",
     "ui",
     "lint",
+    "formatting",
     "contradictions",
 ];
 
@@ -1939,6 +2018,8 @@ pub struct ResolvedConfig {
     pub reranking: Option<ResolvedRerankingConfig>,
     pub ui: UiConfig,
     pub lint: LintConfig,
+    /// How the write tools format a markdown document before storing it.
+    pub formatting: FormattingConfig,
     /// The scheduled contradiction job's YAML settings (#355).
     pub contradictions: ContradictionsConfig,
     /// The contradiction judge's wiring — `Some` only when `contradictions.judge` is on.
@@ -2445,6 +2526,8 @@ impl Config {
         if self.lint.tags_field.trim().is_empty() {
             anyhow::bail!("lint.tags_field must not be empty");
         }
+        crate::markdown_fmt::validate_config(&self.formatting.markdown)
+            .map_err(|e| anyhow::anyhow!(e))?;
         self.validate_contradictions()?;
         if self.ui.semantic_edges.k == 0 {
             anyhow::bail!("ui.semantic_edges.k must be >= 1");
@@ -2617,6 +2700,7 @@ impl Config {
             },
             ui: self.ui,
             lint: self.lint,
+            formatting: self.formatting,
             contradictions_judge: if judge_on {
                 Some(ResolvedJudgeConfig {
                     provider: self.contradictions.judge_provider,
@@ -3363,6 +3447,7 @@ mcp:
             reranking: None,
             ui: UiConfig::default(),
             lint: LintConfig::default(),
+            formatting: FormattingConfig::default(),
             contradictions: ContradictionsConfig::default(),
             contradictions_judge: None,
             provenance: ConfigProvenance::default(),
@@ -4184,6 +4269,7 @@ mcp:
             reranking: None,
             ui: UiConfig::default(),
             lint: LintConfig::default(),
+            formatting: FormattingConfig::default(),
             contradictions: ContradictionsConfig::default(),
             contradictions_judge: None,
             provenance: ConfigProvenance::default(),

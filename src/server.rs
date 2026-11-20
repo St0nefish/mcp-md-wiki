@@ -3570,6 +3570,7 @@ mod tests {
             reranking: None,
             ui: Default::default(),
             lint: Default::default(),
+            formatting: crate::config::FormattingConfig::off(),
             contradictions: Default::default(),
             contradictions_judge: None,
             provenance: Default::default(),

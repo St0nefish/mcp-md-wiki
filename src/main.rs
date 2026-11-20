@@ -10,6 +10,7 @@ mod heading;
 mod ingest;
 mod judge;
 mod lint;
+mod markdown_fmt;
 mod mcp;
 mod qdrant;
 mod reindex;
