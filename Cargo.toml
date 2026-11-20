@@ -20,7 +20,7 @@ clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", features = ["macros"] }
 
 # MCP server (Streamable HTTP)
-rmcp = { version = "1", features = ["transport-streamable-http-server", "server"] }
+rmcp = { version = "3", features = ["transport-streamable-http-server", "server"] }
 
 # Qdrant vector DB (gRPC)
 qdrant-client = "1"

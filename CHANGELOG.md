@@ -54,11 +54,11 @@ bulk rewrite happens on upgrade).
   `native-tls`), `quinn-udp` and `rustix` findings; `sqlx` 0.8 → 0.9 and `libsqlite3-sys`
   0.30 → 0.40 clear RUSTSEC-2026-0459 (bundled SQLite). No operator action: the state
   database file format is unchanged.
-- **rmcp stays on 1.x for now.** RUSTSEC-2026-0462 affects rmcp's Streamable HTTP
-  *client*, which this server does not compile in (server transport only); the advisory
-  is ignored with that reason in `deny.toml` and `.cargo/audit.toml`, and the migration is
-  tracked in #382. `chrono` (unmaintained, RUSTSEC-2026-0543) is ignored the same way,
-  tracked in #383.
+- **rmcp 1.8 → 3.11** (#382). Clears RUSTSEC-2026-0462; the ignore is gone from `deny.toml`
+  and `.cargo/audit.toml`. No operator action and no change to the tools, their schemas or
+  the `/mcp` wire behaviour this server relies on: the stateless, JSON-response transport and
+  the 10 MB request ceiling are configured exactly as before (rmcp 3's own body limit, 4 MiB by
+  default, is raised to match).
 - **Build requirement:** the pinned toolchain is now **1.98.0** (`rust-toolchain.toml`,
   `rust-version` in `Cargo.toml`, the Dockerfile's `RUST_VERSION`), up from 1.89. CI and the
   image follow the pin automatically; a local checkout is switched by rustup. Nothing

@@ -1674,8 +1674,12 @@ fn mcp_transport_config(
     allowed_hosts: &[String],
 ) -> StreamableHttpServerConfig {
     let config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
+        // rmcp 3 enforces its own body ceiling (default 4 MiB, answering 413); keep
+        // it level with `RequestBodyLimitLayer` so `/mcp` still accepts up to
+        // `MCP_BODY_LIMIT` as it did on rmcp 1.
+        .with_max_request_body_bytes(MCP_BODY_LIMIT)
         .with_cancellation_token(cancellation_token);
 
     if allowed_hosts.is_empty() {

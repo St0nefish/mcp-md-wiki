@@ -6589,7 +6589,7 @@ fn build_section_search_payload(
 }
 #[tool_handler]
 impl ServerHandler for KbSearchServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let instructions = self
             .instructions
             .read()
@@ -6598,7 +6598,7 @@ impl ServerHandler for KbSearchServer {
                 poisoned.into_inner()
             })
             .clone();
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
@@ -6659,7 +6659,7 @@ impl ServerHandler for KbSearchServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let router = self.enabled_tool_router();
         let tcc = ToolCallContext::new(self, request, context);
         router.call(tcc).await
@@ -12524,8 +12524,8 @@ mod tests {
             .clone()
             .expect("every tool result carries structured_content");
         assert_eq!(result.content.len(), 1, "one content block: {result:?}");
-        let text = match &result.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
+        let text = match result.content[0].as_text() {
+            Some(t) => t.text.clone(),
             other => panic!("expected a text content block, got {other:?}"),
         };
         assert_eq!(
