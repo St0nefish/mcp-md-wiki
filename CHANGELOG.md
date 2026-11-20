@@ -69,6 +69,20 @@ bulk rewrite happens on upgrade).
   image follow the pin automatically; a local checkout is switched by rustup. Nothing
   changes at runtime.
 
+### Large corpora: the git-derived mtime lookup no longer times out (#386)
+
+The reconcile's `git log` for each document's last-commit time passed every path as a
+pathspec, and pathspec matching costs commits × paths. On a corpus of about 11.5k
+single-file commits every chunk hit the 120 s timeout, so a first `index --full` spent
+most of its time there and then fell back to clone-time mtime for every document.
+`git_log_mtimes` now answers a list of more than 50 paths with one unscoped walk of the
+history (about 4.5 s at that size) and keeps only the wanted paths; below that, pathspec
+calls carry at most 50 paths each. The answers are the same, the walk passes
+`--no-renames` so they no longer depend on a `diff.renames` setting, and a failed walk
+still falls back to filesystem mtime. No operator action; the first reconcile after
+upgrading gets accurate `mtime` where it had fallen back before, and a document's
+`mtime` can change when it does.
+
 ### YAML library replaced: `serde_yaml_ng` → `serde-saphyr`, `gray_matter` 0.3
 
 `unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained) is out of the dependency tree: every

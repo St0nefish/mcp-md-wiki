@@ -650,13 +650,15 @@ async fn file_mtime_nanos(path: &Path, label: &str) -> i64 {
 ///
 /// ## Why caching, and not one of the other options #236 lists
 ///
-/// `git log -- <pathspec>`'s cost is dominated by how far back it has to walk commit
-/// history looking for matches, not by how many paths are in the pathspec — a
-/// narrowly-scoped query over a long-history repo still walks the same history a
-/// broad one does, it just prints less of it. So "scope the query to the paths being
-/// indexed" (already true here — `rel_keys` was never the whole corpus for a scoped
-/// run) does not actually bound the walk cost the issue is about; the pathspec was
-/// always narrow, and the walk was expensive anyway.
+/// For a handful of paths, `git log -- <pathspec>`'s cost is dominated by how far back
+/// it has to walk commit history looking for matches — a narrowly-scoped query over a
+/// long-history repo still walks the same history a broad one does, it just prints
+/// less of it. So "scope the query to the paths being indexed" (already true here —
+/// `rel_keys` was never the whole corpus for a scoped run) does not actually bound
+/// the walk cost the issue is about; the pathspec was always narrow, and the walk was
+/// expensive anyway. (That stops being true for a *large* pathspec: matching cost
+/// grows with commits × paths, which is why `git::git_log_mtimes` switches to one
+/// unscoped walk past a few dozen paths, #386.)
 ///
 /// "Only run it on full reindexes" — the option this module would otherwise reach
 /// for first, since it is by far the simplest — is unsound here specifically because
