@@ -3082,7 +3082,7 @@ pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
 
 /// Query-mode search with no result paging (`offset` fixed at 0) — see
 /// [`search_paged`] for the funnel/offset-bound reasoning and the
-/// paging-capable version `search_chunks`/`search_grouped` in `mcp.rs` call
+/// paging-capable version `search_chunks`/`search_grouped` in `mcp/` call
 /// to honor the `search` tool's `offset` parameter (#224). Kept as a
 /// separate, thin entry point so this crate's non-MCP callers — the CLI
 /// `search` subcommand (`main.rs`), the write-path dedup gate (`write.rs`),
@@ -3144,7 +3144,7 @@ pub struct GroupedSearchOutcome {
 /// [`MAX_OFFSET_DEPTH`] ceiling; there is no `rerank_candidate_limit` to also
 /// consider. Unlike [`search`]/[`search_paged`], there is no separate
 /// `offset`-free wrapper here — this crate's only caller
-/// (`mcp.rs`'s `search_grouped` tool handler) always has an `offset` in hand
+/// (`mcp/`'s `search_grouped` tool handler) always has an `offset` in hand
 /// (`0` when the caller didn't ask for paging), so a second entry point would
 /// have no real caller of its own.
 pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>(
@@ -3692,7 +3692,7 @@ pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>
 /// document body it serves: a transient failure on either of these two queries
 /// must not turn an otherwise-successful read into an error. Same non-fatal
 /// posture as the fuzzy fallback's `all_paths()` call above, and the same
-/// rationale as `capped_casualties` in `mcp.rs` for why the cap is reported
+/// rationale as `capped_casualties` in `mcp/` for why the cap is reported
 /// (`LinkPage::total`/`has_more`) rather than silently applied.
 async fn document_links<D: DocumentIndex>(
     document_index: &D,
@@ -5438,7 +5438,7 @@ mod tests {
     #[tokio::test]
     async fn search_conditions_passed_through_unchanged() {
         // `SearchFilters` carries already-lowered Qdrant conditions now — building
-        // and validating them is the caller's job (mcp.rs's rich `filters`, or
+        // and validating them is the caller's job (mcp/'s rich `filters`, or
         // web.rs's plain domain/type/tags); `search` itself just ANDs whatever it's
         // handed onto the query, unexamined.
         let embed = MockEmbedder::ok(vec![0.1, 0.2, 0.3]);

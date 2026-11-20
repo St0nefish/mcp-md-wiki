@@ -50,7 +50,7 @@ use crate::state::{DocumentSummary, StateDb};
 use crate::write::{self, WriteDeps, WriteError, WriteOutcome, WriteRequest, WriteSuccess};
 
 /// Cap on a search query's length — the same value `mcp::MAX_QUERY_LEN` uses,
-/// redeclared here because that constant is private to `mcp.rs` and this route is
+/// redeclared here because that constant is private to `mcp/` and this route is
 /// reachable with no authentication at all.
 const MAX_SEARCH_QUERY_LEN: usize = 4096;
 /// Cap on a single `domain`/`type` filter value's length, mirroring
@@ -228,14 +228,14 @@ impl UiState {
     /// snapshot, same shape `KbSearchServer::write_document`/`delete_document`
     /// build for the MCP tool surface. `token` must outlive the returned value —
     /// callers read it from the environment once per request and hold it in a
-    /// local binding (see the handlers below), same convention `mcp.rs` uses.
+    /// local binding (see the handlers below), same convention `mcp/` uses.
     ///
     /// `state_db`: pass `Some` for a MOVE (`write::WriteRequest::dest_path` set)
     /// or a DELETE — `write::write_document_move` and `write::delete_document`
     /// are the only readers of `WriteDeps::state` (the latter for #229's
     /// inbound-link check), so a plain create/edit has no use for it. `None`
     /// there avoids lazily materializing `state.db` on disk for a request that
-    /// will never touch it (mirrors `mcp.rs`'s identical scoping).
+    /// will never touch it (mirrors `mcp/`'s identical scoping).
     fn write_deps<'a>(
         &'a self,
         config: &'a ResolvedConfig,
@@ -1588,7 +1588,7 @@ fn forbidden(msg: impl Into<String>) -> Response {
 
 /// Map a `retrieval::ResolveErr` produced while resolving a write/delete target
 /// onto an HTTP response. Mirrors the MCP write tools' own handling of this exact
-/// enum (`edit_document`/`delete_document` in `mcp.rs`) so the web UI enforces
+/// enum (`edit_document`/`delete_document` in `mcp/`) so the web UI enforces
 /// the same eligibility rules through a different transport: `NotPermitted`
 /// (a path the `indexing.include` globset would not index — e.g. anything
 /// outside `**/*.md`, including files under `.git/`) and `Outside` (path
@@ -1679,7 +1679,7 @@ fn write_success_response(success: WriteSuccess) -> Response {
 ///   (a clean rollback, or an I/O error before git was ever touched).
 ///
 /// `dest_path` disambiguates `WriteError::AlreadyExists`, the same way
-/// `mcp.rs`'s `create_edit_error_to_mcp_error` uses its own `dest_path`
+/// `mcp/`'s `create_edit_error_to_mcp_error` uses its own `dest_path`
 /// parameter for the identical problem: that variant carries no path of its
 /// own, so a plain create/edit collision (unambiguous — there is only one
 /// path in play) and a move-destination collision (which must name the
@@ -3698,7 +3698,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // /api/doc section/outline modes (#286) — parity with the MCP
-    // `get_document` tool's equivalent tests in mcp.rs.
+    // `get_document` tool's equivalent tests in mcp/.
     // ------------------------------------------------------------------
 
     const SECTION_DOC: &str = "# Guide\n\n## Alpha\n\nAlpha body.\n\n### Alpha Sub\n\nAlpha sub body.\n\n## Beta\n\nBeta body.\n";
@@ -3938,7 +3938,7 @@ mod tests {
         // Parity with the MCP tool, structurally: both adapters must emit
         // exactly `retrieval::document_view_json` plus their envelope, so
         // checking each against the shared core pins them to each other
-        // (mcp.rs has the mirror test).
+        // (mcp/ has the mirror test).
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
         let hash = crate::write::document_version(SECTION_DOC.as_bytes());
@@ -5265,7 +5265,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_doc_surfaces_referencing_paths_in_the_response() {
-        // (#229) Same proof as mcp.rs's equivalent test, for the HTTP transport:
+        // (#229) Same proof as mcp/'s equivalent test, for the HTTP transport:
         // the reverse-link check must reach the response body, not just a log.
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");

@@ -228,7 +228,7 @@ const DIFF_TABLE: &[DiffField] = &[
                 effect: ReloadEffect::Applied,
                 setting: "source.git_token_env (MCP write-tool commits)",
                 note: "create_document/edit_document/delete_document resolve this fresh from \
-                       the live config on every call (mcp.rs write_document/delete_document) \
+                       the live config on every call (mcp/ write_document/delete_document) \
                        before reading the named env var (or its `_FILE` variant, re-read on \
                        every call, so a rotated secret file is picked up too) — the very next \
                        write picks up a new var name.",
@@ -260,7 +260,7 @@ const DIFF_TABLE: &[DiffField] = &[
                 effect: ReloadEffect::RestartRequired,
                 setting: "indexing.include (MCP get_document path filter)",
                 note: "KbSearchServer compiles this into a GlobSet once at construction \
-                       (mcp.rs build_include_globset, invoked from KbSearchServer::new); \
+                       (mcp/ build_include_globset, invoked from KbSearchServer::new); \
                        get_document keeps filtering against the old patterns until restart.",
             },
             ConsumerEntry {
@@ -684,7 +684,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "mcp.enabled_tools / mcp.disabled_tools",
-            note: "`KbSearchServer::enabled_tool_router` (mcp.rs) reads the resolved effective \
+            note: "`KbSearchServer::enabled_tool_router` (mcp/) reads the resolved effective \
                    disabled set fresh from the live config on every tools/list, tools/get, and \
                    tools/call — a changed set (from either key) takes effect starting with the \
                    very next request, no metadata-refresh-tick or restart wait. An \
@@ -972,7 +972,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "write.dedup_enabled",
-            note: "read fresh from the live config on every create_document call (mcp.rs \
+            note: "read fresh from the live config on every create_document call (mcp/ \
                    write_document); the global fallback where no schema file `dedup:` \
                    block overrides it (write.rs effective_dedup, #272).",
         }],
@@ -983,7 +983,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "write.dedup_threshold",
-            note: "read fresh from the live config on every create_document call (mcp.rs \
+            note: "read fresh from the live config on every create_document call (mcp/ \
                    write_document); the global fallback where no schema file `dedup:` \
                    block overrides it (write.rs effective_dedup, #272).",
         }],
@@ -1017,7 +1017,7 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::Applied,
             setting: "write.archive_prefix",
             note: "read fresh from the live config on every archive write_document call \
-                   (mcp.rs write_deps, write.rs archive_destination, #357).",
+                   (mcp/ write_deps, write.rs archive_destination, #357).",
         }],
     },
     DiffField {
@@ -1036,7 +1036,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "write.commit_author_name",
-            note: "read fresh from the live config on every write-tool commit (mcp.rs).",
+            note: "read fresh from the live config on every write-tool commit (mcp/).",
         }],
     },
     DiffField {
@@ -1045,7 +1045,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "write.commit_author_email",
-            note: "read fresh from the live config on every write-tool commit (mcp.rs).",
+            note: "read fresh from the live config on every write-tool commit (mcp/).",
         }],
     },
     // ── search ───────────────────────────────────────────────────────────────
@@ -1055,7 +1055,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "search.phrase",
-            note: "read fresh from the live config on every search call (mcp.rs/web.rs, \
+            note: "read fresh from the live config on every search call (mcp//web.rs, \
                    gated by phrase_matching_available) and by the metadata-refresh \
                    timer (server.rs compose_tool_overlay) that recomposes the tool \
                    description overlay so `search` never advertises quoted-phrase support \
@@ -1068,7 +1068,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "search.hybrid",
-            note: "read fresh from the live config on every search call (mcp.rs search).",
+            note: "read fresh from the live config on every search call (mcp/ search).",
         }],
     },
     DiffField {
@@ -1077,7 +1077,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "search.rrf_candidates",
-            note: "read fresh from the live config on every search call (mcp.rs search).",
+            note: "read fresh from the live config on every search call (mcp/ search).",
         }],
     },
     DiffField {
@@ -1086,7 +1086,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "search.min_score",
-            note: "read fresh from the live config on every search call (mcp.rs search) \
+            note: "read fresh from the live config on every search call (mcp/ search) \
                    as the default when the caller does not pass their own min_score.",
         }],
     },
@@ -1096,7 +1096,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "search.diversity_max_per_document",
-            note: "read fresh from the live config on every search call (mcp.rs search, \
+            note: "read fresh from the live config on every search call (mcp/ search, \
                    retrieval::search's per-document diversity cap).",
         }],
     },
@@ -1106,7 +1106,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "search.default_limit",
-            note: "read fresh from the live config on every search call (mcp.rs \
+            note: "read fresh from the live config on every search call (mcp/ \
                    resolve_limit) when the caller omits limit.",
         }],
     },
@@ -1116,7 +1116,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "search.max_limit",
-            note: "read fresh from the live config on every search call (mcp.rs \
+            note: "read fresh from the live config on every search call (mcp/ \
                    resolve_limit) as the ceiling a requested limit is clamped to.",
         }],
     },
@@ -1126,7 +1126,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "search.section_max_bytes",
-            note: "read fresh from the live config on every get_document call (mcp.rs/web.rs, \
+            note: "read fresh from the live config on every get_document call (mcp//web.rs, \
                    retrieval::resolve_document_view) as the size cap a resolved section's text \
                    is checked against before falling back to an outline of its children.",
         }],
@@ -1173,7 +1173,7 @@ const DIFF_TABLE: &[DiffField] = &[
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::Applied,
             setting: "reranking.candidate_limit",
-            note: "read fresh from the live config on every search call (mcp.rs search) — \
+            note: "read fresh from the live config on every search call (mcp/ search) — \
                    but only takes effect when reranking was already enabled at startup; a \
                    server that started with it disabled has no RerankClient to hand this \
                    to regardless.",
@@ -2099,7 +2099,7 @@ mod tests {
 
     #[test]
     fn mcp_disabled_tools_is_reported_as_applied() {
-        // `KbSearchServer::enabled_tool_router` (mcp.rs) reads `mcp.disabled_tools`
+        // `KbSearchServer::enabled_tool_router` (mcp/) reads `mcp.disabled_tools`
         // fresh from the live config on every tools/list, tools/get, and
         // tools/call — no restart or metadata-refresh-tick wait, unlike the
         // instructions cross-reference sentences that also depend on it.

@@ -6629,7 +6629,7 @@ mod tests {
         // none any more), but installed at runtime via the description
         // overlay `test_mcp_router_with_hosts` builds from
         // `descriptions::compose_tool_descriptions`. This is the end-to-end
-        // half of the overlay contract; `mcp.rs`'s unit tests exercise
+        // half of the overlay contract; `mcp/`'s unit tests exercise
         // `overlay_description`/`get_tool` directly.
         // Same defaults `test_mcp_router_with_hosts` built the handler's overlay
         // from (`make_test_resolved_config`): heading_metadata off, all three
@@ -6679,8 +6679,8 @@ mod tests {
     /// rather than `make_test_resolved_config`'s defaults — needed by the
     /// `mcp.disabled_tools` end-to-end tests below, which exercise real
     /// `tools/list`/`tools/call` JSON-RPC dispatch through `KbSearchServer`'s
-    /// hand-written `ServerHandler` methods (`enabled_tool_router`, mcp.rs),
-    /// not the lower-level router calls `mcp.rs`'s own unit tests use.
+    /// hand-written `ServerHandler` methods (`enabled_tool_router`, mcp/),
+    /// not the lower-level router calls `mcp/`'s own unit tests use.
     fn test_mcp_router_with_config(config: Arc<ResolvedConfig>) -> Router {
         let tmp = tempfile::tempdir().unwrap();
         let instructions = Arc::new(RwLock::new("test instructions".to_string()));

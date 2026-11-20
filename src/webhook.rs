@@ -594,7 +594,7 @@ mod tests {
     // before the fetch (not after, which would diff an empty range), does the merge
     // really run, and does the result really reach `ReindexQueue::mark_paths`. A local
     // bare repo stands in for the live remote, following the same pattern already
-    // used by `git.rs`'s `commit_and_sync` tests and `mcp.rs`'s write-tool tests
+    // used by `git.rs`'s `commit_and_sync` tests and `mcp/`'s write-tool tests
     // (`crate::git::tests::create_bare_repo` / `clone_bare_repo`) — no live network,
     // no mocks.
 

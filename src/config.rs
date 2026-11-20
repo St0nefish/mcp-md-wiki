@@ -224,7 +224,7 @@ pub struct ChunkingConfig {
     /// Deliberately heading-ancestry only, not a separate frontmatter `title` or
     /// the file's repo-relative path: both would need `chunk::chunk_markdown`
     /// to take a new parameter, which would ripple into every caller
-    /// (`ingest.rs`, the dedup-query alignment test in `mcp.rs`) outside this
+    /// (`ingest.rs`, the dedup-query alignment test in `mcp/`) outside this
     /// module's own scope. Heading ancestry needs nothing beyond the section
     /// text `chunk_markdown` already parses, and for the extremely common
     /// single-root-H1 document shape it already carries the document's title as
@@ -634,7 +634,7 @@ pub struct McpConfig {
     ///
     /// Every entry must be one of `descriptions::TOOL_NAMES` (a cross-module edge
     /// from config validation into `descriptions.rs`'s tool-name list — the one
-    /// place both this check and `mcp.rs`'s dispatch agree on which names are
+    /// place both this check and `mcp/`'s dispatch agree on which names are
     /// real), duplicate-free, and must not name every tool at once. Mutually
     /// exclusive with `enabled_tools` below — see [`Config::resolve`]'s
     /// validation.
@@ -1983,7 +1983,7 @@ fn yaml_top_level_sections(content: &str) -> HashSet<&'static str> {
 /// since the two mean opposite things for the same edge case.
 ///
 /// Cross-module edge: `descriptions::TOOL_NAMES` is the one place both this check and
-/// `mcp.rs`'s dispatch (`KbSearchServer::enabled_tool_router`) agree on which tool
+/// `mcp/`'s dispatch (`KbSearchServer::enabled_tool_router`) agree on which tool
 /// names are real, so a typo here is caught at startup rather than silently doing
 /// nothing (an unknown name in `ToolRouter::disable_route` is a no-op) or crashing a
 /// live `tools/call`.

@@ -2,10 +2,10 @@
 //! gate, filesystem write/removal, git commit+sync, and the pre-commit /
 //! post-commit rollback state machine.
 //!
-//! Extracted out of `mcp.rs` so both the MCP tool surface (`create_document`,
+//! Extracted out of `mcp/` so both the MCP tool surface (`create_document`,
 //! `edit_document`, `delete_document`) and the HTTP UI (`web.rs`, a later chunk)
 //! drive the exact same commit/rollback logic instead of maintaining two copies of
-//! it. `mcp.rs`'s tool methods are thin adapters: they do transport-specific path
+//! it. `mcp/`'s tool methods are thin adapters: they do transport-specific path
 //! resolution (fuzzy basename matching, turning tool parameters into a
 //! [`DocChange`]) and map [`WriteSuccess`]/[`WriteError`] back onto the exact
 //! `CallToolResult`/`McpError` shapes their existing tests pin down.
@@ -87,7 +87,7 @@ pub fn dedup_verdict(top: Option<(String, f32)>, threshold: f32) -> Option<Dupli
 /// If a future chunking change breaks that invariant — anything that can give
 /// a document's first chunk a prefix this function does not build — the dedup
 /// gate silently starts comparing unlike text and lets near-duplicates through
-/// with no error. `mcp::tests::build_dedup_query_matches_chunk_prepend_format`
+/// with no error. `mcp::tests::write::build_dedup_query_matches_chunk_prepend_format`
 /// is the pin; keep it honest rather than adjusting it to match a regression.
 pub(crate) fn build_dedup_query(
     body: &str,
@@ -314,7 +314,7 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     /// is rebuilt from each document's current on-disk body, not trusted as an
     /// authoritative index). This exists for callers/tests that have no
     /// `StateDb` handle at all — it is NOT a normal operating mode. Both real
-    /// callers (`mcp.rs`'s `KbSearchServer`, `web.rs`'s `UiState`) have a
+    /// callers (`mcp/`'s `KbSearchServer`, `web.rs`'s `UiState`) have a
     /// `StateDb` available via their own `Arc<OnceCell<StateDb>>` and MUST
     /// pass `Some` here so production writes always rewrite incoming links.
     pub state: Option<&'a StateDb>,
@@ -482,7 +482,7 @@ pub enum WriteError {
     /// filesystem path in their message (e.g. "cannot canonicalize data root
     /// '<abs>': <io error>"). Kept distinct from `UnsafePath` so a transport
     /// that must not leak container paths to an untrusted caller (`web.rs`) can
-    /// map this to a generic message while `mcp.rs` — a trusted surface where
+    /// map this to a generic message while `mcp/` — a trusted surface where
     /// this text is diagnostically useful and was already being returned
     /// before this variant existed — keeps emitting it verbatim.
     Internal { msg: String },
@@ -685,13 +685,13 @@ fn resolve_safe_write_path_detailed(
 /// Validate that `rel_path` is safe to write inside `data_root`, returning the
 /// absolute target path on success or an error string on failure.
 ///
-/// Moved here (from `mcp.rs`) so this core write module does not depend back on
-/// the transport layer it is meant to be independent of — `mcp.rs`'s tool
+/// Moved here (from `mcp/`) so this core write module does not depend back on
+/// the transport layer it is meant to be independent of — `mcp/`'s tool
 /// methods call this via `crate::write::resolve_safe_write_path`.
 ///
 /// A thin `String`-returning wrapper over [`resolve_safe_write_path_detailed`]:
 /// every caller outside this module predates the `PathSafetyError` split and
-/// expects a flat string (several of them — `mcp.rs`'s `create_document` and
+/// expects a flat string (several of them — `mcp/`'s `create_document` and
 /// `write_raw_file` — relay it directly to a trusted MCP client), so this
 /// function's behavior and exact message text are unchanged by that split.
 pub fn resolve_safe_write_path(data_root: &Path, rel_path: &str) -> Result<PathBuf, String> {
@@ -735,13 +735,13 @@ fn safe_write_path<E: QueryEmbedder, Q: RetrievalStore>(
 ///
 /// Reuses `WriteError::UnsafePath` rather than adding a new variant so every
 /// existing caller's (necessarily exhaustive) match over `WriteError` keeps
-/// compiling unchanged — see `mcp.rs`'s and `web.rs`'s error-mapping functions.
+/// compiling unchanged — see `mcp/`'s and `web.rs`'s error-mapping functions.
 ///
 /// Also applies `indexing.exclude`/`exclude_files` (#312), so the gate answers
 /// "could this path ever be indexed" the same way a reconcile does.
 ///
 /// `pub(crate)` (rather than folded entirely into `check_include_pattern`
-/// below) so `mcp.rs`'s `create_document` adapter can run this exact check —
+/// below) so `mcp/`'s `create_document` adapter can run this exact check —
 /// same message text — ahead of its own `exists()` pre-check, restoring the
 /// pre-refactor error priority when a path both exists on disk and fails this
 /// check. See that call site's comment.
@@ -815,8 +815,8 @@ fn check_include_pattern<E: QueryEmbedder, Q: RetrievalStore>(
 // (#179) Content-mode helpers: frontmatter patch / append
 //
 // Both compute a full `new_content` string from the current content, the same
-// way `mcp.rs`'s `apply_surgical` does for old_string/new_string — pure
-// functions that `mcp.rs` wraps in a `DocChange::Relative` closure, which
+// way `mcp/`'s `apply_surgical` does for old_string/new_string — pure
+// functions that `mcp/` wraps in a `DocChange::Relative` closure, which
 // `write_document` runs on the content it reads under `GIT_LOCK`. That keeps
 // the core pipeline (schema validation, the dedup gate, the commit, the
 // pre-commit rollback) unaware of which kind of relative edit produced the new
@@ -909,7 +909,7 @@ fn split_frontmatter_bytes(content: &str) -> Option<(&str, &str)> {
 
 /// Remove the value at a dot-path, mirroring `schema::get_by_dotpath`'s own
 /// traversal. Not in `schema.rs` alongside its `get`/`set` siblings because
-/// this module's remit is deliberately kept to `write.rs`/`mcp.rs`/`web.rs`
+/// this module's remit is deliberately kept to `write.rs`/`mcp/`/`web.rs`
 /// (see this crate's write-pipeline module boundaries) — the two sibling
 /// functions are schema-declaration helpers `schema.rs` owns for its own
 /// `apply_defaults`; this one is document-frontmatter-only. Returns whether
@@ -5195,7 +5195,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // dedup_verdict / build_dedup_query / dedup_search_opts — pure unit tests
-    // (ported from mcp.rs; these are now write.rs's own logic)
+    // (ported from mcp/; these are now write.rs's own logic)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -5234,7 +5234,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_safe_write_path unit tests (ported from mcp.rs; the function
+    // resolve_safe_write_path unit tests (ported from mcp/; the function
     // itself moved here too — see this module's `resolve_safe_write_path`)
     // -----------------------------------------------------------------------
 
@@ -6093,7 +6093,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Test harness: a WriteDeps backed by a temp dir and (unreachable) real
-    // EmbedClient/QdrantStore — matching the pattern `mcp.rs`'s own write tests
+    // EmbedClient/QdrantStore — matching the pattern `mcp/`'s own write tests
     // use, since dedup is disabled by default in `make_test_resolved_config`.
     // -----------------------------------------------------------------------
 
@@ -6390,7 +6390,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // write_document core tests (ported from mcp.rs's write/delete suite,
+    // write_document core tests (ported from mcp/'s write/delete suite,
     // exercised directly against `write::write_document`/`write::delete_document`
     // rather than through the MCP tool layer)
     // -----------------------------------------------------------------------
@@ -6766,7 +6766,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Git-backed pre-commit / post-commit rollback tests (ported from mcp.rs)
+    // Git-backed pre-commit / post-commit rollback tests (ported from mcp/)
     // -----------------------------------------------------------------------
 
     fn head_sha(work: &tempfile::TempDir) -> String {
@@ -6834,7 +6834,7 @@ mod tests {
             .unwrap();
     }
 
-    /// See `mcp.rs`'s identical helper for why this is repo-local git CONFIG
+    /// See `mcp/`'s identical helper for why this is repo-local git CONFIG
     /// rather than a `.git/hooks/pre-commit` script.
     fn force_git_commit_to_fail(work: &tempfile::TempDir) {
         for args in [

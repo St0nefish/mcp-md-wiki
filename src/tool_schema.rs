@@ -15,7 +15,7 @@
 //! needs a `$ref` somewhere, so inlining alone can't reach zero refs — this module
 //! cuts the cycle instead.
 //!
-//! Called from `mcp.rs`'s `list_tools`/`get_tool` as the step after
+//! Called from `mcp/`'s `list_tools`/`get_tool` as the step after
 //! `overlay_input_schema` (#286), on the same `Tool::input_schema` — see that
 //! `ServerHandler` impl. [`self_contained`] then runs [`compact`], which drops
 //! what costs context without constraining anything (`$schema`, null arms of
@@ -52,7 +52,7 @@ const SUBSCHEMA_ARRAY_KEYS: &[&str] = &["prefixItems", "anyOf", "oneOf", "allOf"
 /// not a subschema, and is left untouched.
 const OBJECT_ONLY_SUBSCHEMA_KEYS: &[&str] = &["additionalProperties", "unevaluatedProperties"];
 
-/// `Tool`-level wrapper for the two `mcp.rs` call sites: clones the schema out
+/// `Tool`-level wrapper for the two `mcp/` call sites: clones the schema out
 /// of the `Arc`, rewrites it, and reassigns — the same clone-don't-mutate-through-
 /// the-`Arc` posture `overlay_input_schema` (#286) uses on the same field, so one
 /// request's rewrite can never leak into another's or into the router's own
