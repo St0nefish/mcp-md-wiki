@@ -14,6 +14,22 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+### Security: dependency refresh, and the Rust toolchain moves to 1.98
+
+- **Dependencies:** `cargo update` clears the `openssl` (eight advisories, via
+  `native-tls`), `quinn-udp` and `rustix` findings; `sqlx` 0.8 → 0.9 and `libsqlite3-sys`
+  0.30 → 0.40 clear RUSTSEC-2026-0459 (bundled SQLite). No operator action: the state
+  database file format is unchanged.
+- **rmcp stays on 1.x for now.** RUSTSEC-2026-0462 affects rmcp's Streamable HTTP
+  *client*, which this server does not compile in (server transport only); the advisory
+  is ignored with that reason in `deny.toml` and `.cargo/audit.toml`, and the migration is
+  tracked in #382. `chrono` (unmaintained, RUSTSEC-2026-0543) is ignored the same way,
+  tracked in #383.
+- **Build requirement:** the pinned toolchain is now **1.98.0** (`rust-toolchain.toml`,
+  `rust-version` in `Cargo.toml`, the Dockerfile's `RUST_VERSION`), up from 1.89. CI and the
+  image follow the pin automatically; a local checkout is switched by rustup. Nothing
+  changes at runtime.
+
 ### FULL RE-EMBED on the first reconcile after upgrading: typed, namespaced Qdrant payload (#350)
 
 **Coordinate the release with the owner.** This release changes what every Qdrant

@@ -6,13 +6,13 @@
 # a plain local `docker build .` run with no build args — same convention as
 # the VERSION/REVISION ARGs further down.
 #
-# MSRV 1.89: `ingest::acquire_reindex_lock` uses `std::fs::File::lock` /
-# `lock_shared`, stabilized in 1.89.0. Do not lower this pin (here or in
-# rust-toolchain.toml) without replacing that call. Before #235, this pin and
+# MSRV 1.98: the highest `rust-version` among our dependencies (see
+# rust-toolchain.toml). Do not lower this pin (here or in rust-toolchain.toml)
+# without re-checking that. Before #235, this pin and
 # CI's `dtolnay/rust-toolchain@stable` had no relationship at all: a too-old
 # pin here compiled clean through every cargo step CI ran and failed only in
 # this Docker build, at the end of a long job.
-ARG RUST_VERSION=1.89
+ARG RUST_VERSION=1.98.0
 # Dependency compilation goes through cargo-chef so it is an ordinary image layer
 # (keyed on Cargo.toml/Cargo.lock only, via recipe.json) that a buildx registry
 # cache can store and reuse. A `RUN --mount=type=cache` target dir cannot be

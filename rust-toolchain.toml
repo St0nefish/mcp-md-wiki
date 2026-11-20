@@ -10,12 +10,14 @@
 # apart the way they did before #235 (CI resolved `stable` while the
 # Dockerfile pinned an explicit, unrelated version).
 #
-# MSRV: `ingest::acquire_reindex_lock` uses `std::fs::File::lock` /
-# `lock_shared`, stabilized in 1.89.0 -- do not lower `channel` below that
-# without replacing that call. See also `rust-version` in Cargo.toml, which
-# makes a plain `cargo build` under a too-old toolchain fail fast with a
+# MSRV: the floor is the highest `rust-version` among our dependencies (the
+# markdown formatter `rumdl` needs 1.98.0, `sqlx` 0.9 needs 1.94), not our own
+# code: `ingest::acquire_reindex_lock` only needs `std::fs::File::lock` /
+# `lock_shared` (1.89.0). Do not lower `channel` without checking
+# `cargo metadata` for the new maximum. See also `rust-version` in Cargo.toml,
+# which makes a plain `cargo build` under a too-old toolchain fail fast with a
 # clear "package requires rustc X but Y is installed" instead of an obscure
 # type error deep in a build log.
 [toolchain]
-channel = "1.89"
+channel = "1.98.0"
 components = ["clippy", "rustfmt"]

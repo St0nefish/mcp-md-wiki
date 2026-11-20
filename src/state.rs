@@ -458,18 +458,22 @@ async fn add_column_if_missing(
     column: &str,
     definition: &str,
 ) -> Result<()> {
-    let existing: Vec<(i64, String)> = sqlx::query_as(&format!("PRAGMA table_info({table})"))
-        .fetch_all(pool)
-        .await
-        .with_context(|| format!("Failed to inspect columns of '{table}'"))?;
+    // sqlx 0.9 makes a dynamic SQL string an explicit audit point
+    // (`AssertSqlSafe`). Every caller passes string literals for `table`, `column`
+    // and `definition`; none of them is ever caller- or document-supplied.
+    let existing: Vec<(i64, String)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
+            .fetch_all(pool)
+            .await
+            .with_context(|| format!("Failed to inspect columns of '{table}'"))?;
 
     if existing.iter().any(|(_, name)| name == column) {
         return Ok(());
     }
 
-    match sqlx::query(&format!(
+    match sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-    ))
+    )))
     .execute(pool)
     .await
     {
@@ -807,9 +811,10 @@ impl StateDb {
             ("idx_documents_indexed_at_asc", "indexed_at ASC"),
             ("idx_documents_indexed_at_desc", "indexed_at DESC"),
         ] {
-            sqlx::query(&format!(
+            // `name` and `column` come from the literal table above.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "CREATE INDEX IF NOT EXISTS {name} ON documents({column}, file_path ASC)"
-            ))
+            )))
             .execute(&pool)
             .await?;
         }
@@ -1180,7 +1185,8 @@ impl StateDb {
             "documents",
             "document_links",
         ] {
-            sqlx::query(&format!("DELETE FROM {table}"))
+            // `table` iterates the literal list above.
+            sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
                 .execute(&mut *tx)
                 .await?;
         }
@@ -1346,9 +1352,12 @@ impl StateDb {
                     report.failed
                 );
             }
-            sqlx::query(&format!("PRAGMA user_version = {PROJECTION_VERSION}"))
-                .execute(&self.pool)
-                .await?;
+            // A PRAGMA cannot take a bound parameter; `PROJECTION_VERSION` is a const.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA user_version = {PROJECTION_VERSION}"
+            )))
+            .execute(&self.pool)
+            .await?;
             Ok(report)
         }
         .await;
@@ -1461,10 +1470,11 @@ impl StateDb {
         b: &str,
     ) -> Result<Option<ContradictionPair>> {
         let (path_a, path_b) = if a <= b { (a, b) } else { (b, a) };
-        let row: Option<ContradictionPairRow> = sqlx::query_as(&format!(
+        // `CONTRADICTION_PAIR_COLUMNS` is a const column list; the paths are bound.
+        let row: Option<ContradictionPairRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {CONTRADICTION_PAIR_COLUMNS} FROM contradiction_pairs
              WHERE path_a = ? AND path_b = ?"
-        ))
+        )))
         .bind(path_a)
         .bind(path_b)
         .fetch_optional(&self.pool)
@@ -1516,12 +1526,12 @@ impl StateDb {
     /// first, then `candidate`s, then `no_conflict`; within a verdict the most similar
     /// first, then by path.
     pub async fn list_contradiction_pairs(&self, limit: i64) -> Result<Vec<ContradictionPair>> {
-        let rows: Vec<ContradictionPairRow> = sqlx::query_as(&format!(
+        let rows: Vec<ContradictionPairRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {CONTRADICTION_PAIR_COLUMNS} FROM contradiction_pairs
              ORDER BY CASE verdict WHEN 'conflict' THEN 0 WHEN 'candidate' THEN 1 ELSE 2 END,
                       similarity DESC, path_a ASC, path_b ASC
              LIMIT ?"
-        ))
+        )))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -1971,7 +1981,7 @@ impl StateDb {
     /// Field paths and filter values are always bound parameters — under this schema a
     /// field name is row data, never a SQL identifier, so caller-supplied field names
     /// cannot reach the statement text.
-    fn push_where(builder: &mut QueryBuilder<'_, Sqlite>, query: &DocumentQuery) {
+    fn push_where(builder: &mut QueryBuilder<Sqlite>, query: &DocumentQuery) {
         builder.push(" WHERE 1 = 1");
 
         if let Some(needle) = &query.path_prefix {
@@ -2271,7 +2281,7 @@ enum ElemAtom<'a> {
 ///
 /// An empty condition list, an empty set, or a nested `Elem` (none of which the
 /// tool parser lets through) is unsatisfiable rather than dropped.
-fn push_elem_filter(builder: &mut QueryBuilder<'_, Sqlite>, conditions: &[(String, FieldFilter)]) {
+fn push_elem_filter(builder: &mut QueryBuilder<Sqlite>, conditions: &[(String, FieldFilter)]) {
     let mut atoms: Vec<(&String, ElemAtom<'_>)> = Vec::new();
     for (field, filter) in conditions {
         match filter {
@@ -2296,7 +2306,7 @@ fn push_elem_filter(builder: &mut QueryBuilder<'_, Sqlite>, conditions: &[(Strin
         return;
     };
 
-    fn push_atom(builder: &mut QueryBuilder<'_, Sqlite>, alias: &str, atom: &ElemAtom<'_>) {
+    fn push_atom(builder: &mut QueryBuilder<Sqlite>, alias: &str, atom: &ElemAtom<'_>) {
         match atom {
             ElemAtom::In(values) => {
                 builder.push(format!(" AND {alias}.value_text IN ("));

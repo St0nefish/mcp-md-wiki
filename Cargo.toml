@@ -7,7 +7,7 @@ license = "AGPL-3.0-or-later"
 # in Dockerfile (#235) -- this makes cargo itself refuse a too-old local
 # toolchain with a clear "package requires rustc X but Y is installed"
 # message, instead of a confusing compile error deep in a build log.
-rust-version = "1.89"
+rust-version = "1.98"
 
 [dependencies]
 # Async runtime
@@ -59,7 +59,7 @@ serde_json = "1"
 schemars = "1"
 
 # SQLite state DB
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "derive"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "derive"] }
 
 # Logging
 tracing = "0.1"
