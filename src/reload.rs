@@ -2136,7 +2136,7 @@ mod tests {
             "mcp:\n  oauth:\n    enabled: true\n    issuer: \"https://idp.example.test/\"\n    \
              resource: \"https://kb.example.test/mcp\"\n    audience: \"c\"\n{scope_keys}"
         );
-        let raw: Config = serde_yaml_ng::from_str(&yaml).unwrap();
+        let raw: Config = crate::yaml::from_str(&yaml).unwrap();
         let mut resolved = base_config();
         resolved.mcp.oauth = crate::config::resolve_mcp_oauth(raw.mcp.oauth).unwrap();
         resolved

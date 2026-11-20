@@ -150,7 +150,7 @@ struct EvalFile {
 pub fn load_cases(path: &Path) -> anyhow::Result<Vec<EvalCase>> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read '{}': {e}", path.display()))?;
-    let file: EvalFile = serde_yaml_ng::from_str(&raw)
+    let file: EvalFile = crate::yaml::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("failed to parse '{}': {e}", path.display()))?;
 
     if file.cases.is_empty() {

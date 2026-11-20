@@ -946,12 +946,12 @@ fn render_frontmatter_block(
     newline: &str,
 ) -> Result<String, String> {
     let ordered: BTreeMap<&String, &serde_json::Value> = frontmatter.iter().collect();
-    let yaml = serde_yaml_ng::to_string(&ordered)
+    let yaml = crate::yaml::to_string(&ordered)
         .map_err(|e| format!("failed to serialize frontmatter: {e}"))?;
     if newline == "\n" {
         return Ok(format!("---\n{yaml}---\n"));
     }
-    // serde_yaml_ng always emits LF. Re-terminate every line with the
+    // The YAML writer always emits LF. Re-terminate every line with the
     // document's own ending so a patch does not silently convert a CRLF file
     // into a mixed-ending one — the bytes would all still be there, but every
     // subsequent diff of that document would show the whole frontmatter block
@@ -971,7 +971,7 @@ fn render_frontmatter_entry(
     newline: &str,
 ) -> Result<String, String> {
     let single: BTreeMap<&str, &serde_json::Value> = BTreeMap::from([(key, value)]);
-    let yaml = serde_yaml_ng::to_string(&single)
+    let yaml = crate::yaml::to_string(&single)
         .map_err(|e| format!("failed to serialize frontmatter: {e}"))?;
     Ok(yaml
         .split_inclusive('\n')
@@ -996,7 +996,7 @@ fn top_level_key(line: &str) -> Option<String> {
         if !(rest.starts_with(':') && (rest.len() == 1 || rest[1..].starts_with(' '))) {
             return None;
         }
-        return serde_yaml_ng::from_str::<String>(&line[..=close]).ok();
+        return crate::yaml::from_str::<String>(&line[..=close]).ok();
     }
     let colon = line
         .char_indices()
@@ -1016,7 +1016,7 @@ fn top_level_key(line: &str) -> Option<String> {
 /// all travel with their key). Trailing blank and `#` comment lines of an
 /// entry are kept when the entry is re-rendered or removed, since they
 /// usually describe what follows. A changed field is re-rendered in place with
-/// `serde_yaml_ng`, so a nested edit (`planning.role`) re-renders its whole
+/// the YAML writer, so a nested edit (`planning.role`) re-renders its whole
 /// top-level field; a new field is appended in sorted order; a removed one is
 /// dropped.
 ///
@@ -5644,7 +5644,7 @@ mod tests {
     }
 
     /// A frontmatter patch re-serializes the whole block, so it is the other
-    /// place a CRLF document can silently become mixed — `serde_yaml_ng`
+    /// place a CRLF document can silently become mixed — the YAML writer
     /// always emits LF.
     #[test]
     fn apply_frontmatter_patch_preserves_crlf_line_endings() {
@@ -5677,6 +5677,123 @@ mod tests {
             field: field.into(),
             value,
         }
+    }
+
+    /// The written form of every kind of value a frontmatter field can hold, pinned
+    /// byte for byte: this is what lands in users' documents, and the YAML library
+    /// behind it is pinned exactly so an upgrade is a reviewed change to this test.
+    /// Strings that would read back as a boolean, number, date or null are quoted, a
+    /// multi-line string is a literal block, and a long single line stays one line.
+    #[test]
+    fn frontmatter_entries_are_written_in_the_pinned_form() {
+        let long = "word ".repeat(30);
+        let long = long.trim_end();
+        let cases: Vec<(&str, serde_json::Value, String)> = vec![
+            (
+                "plain",
+                serde_json::json!("hello world"),
+                "plain: hello world\n".into(),
+            ),
+            (
+                "quoted_number",
+                serde_json::json!("123"),
+                "quoted_number: \"123\"\n".into(),
+            ),
+            (
+                "quoted_bool",
+                serde_json::json!("yes"),
+                "quoted_bool: \"yes\"\n".into(),
+            ),
+            (
+                "quoted_null",
+                serde_json::json!("null"),
+                "quoted_null: \"null\"\n".into(),
+            ),
+            (
+                "quoted_date",
+                serde_json::json!("2026-01-02"),
+                "quoted_date: \"2026-01-02\"\n".into(),
+            ),
+            (
+                "quoted_colon",
+                serde_json::json!("a: b"),
+                "quoted_colon: \"a: b\"\n".into(),
+            ),
+            ("empty", serde_json::json!(""), "empty: \"\"\n".into()),
+            ("int", serde_json::json!(42), "int: 42\n".into()),
+            ("flag", serde_json::json!(true), "flag: true\n".into()),
+            ("nothing", serde_json::Value::Null, "nothing: null\n".into()),
+            (
+                "unicode",
+                serde_json::json!("café ☕"),
+                "unicode: café ☕\n".into(),
+            ),
+            (
+                "block",
+                serde_json::json!("l1\nl2\n"),
+                "block: |\n  l1\n  l2\n".into(),
+            ),
+            (
+                "block_nonl",
+                serde_json::json!("l1\nl2"),
+                "block_nonl: |-\n  l1\n  l2\n".into(),
+            ),
+            (
+                "tags",
+                serde_json::json!(["a", "b"]),
+                "tags:\n- a\n- b\n".into(),
+            ),
+            ("none", serde_json::json!([]), "none: []\n".into()),
+            (
+                "people",
+                serde_json::json!([{"name": "a", "role": "x"}, {"name": "b"}]),
+                "people:\n- name: a\n  role: x\n- name: b\n".into(),
+            ),
+            (
+                "planning",
+                serde_json::json!({"effort": "low", "n": 1}),
+                "planning:\n  effort: low\n  \"n\": 1\n".into(),
+            ),
+            ("long", serde_json::json!(long), format!("long: {long}\n")),
+        ];
+        for (key, value, expected) in cases {
+            let doc =
+                apply_frontmatter_patch("---\ntitle: T\n---\nbody\n", &[set(key, value.clone())])
+                    .unwrap();
+            assert!(
+                doc.contains(&expected),
+                "{key}: expected the entry {expected:?} in {doc:?}"
+            );
+            let (read_back, body) = crate::validate::parse_frontmatter_raw(&doc);
+            assert_eq!(read_back[key], value, "{key} must read back as written");
+            assert_eq!(body.trim(), "body");
+        }
+    }
+
+    /// An existing entry whose key is quoted (a key that reads as a number or
+    /// boolean has to be) is found by the entry splicer: editing it replaces that
+    /// entry, and editing a neighbour leaves it byte-for-byte alone.
+    #[test]
+    fn a_quoted_top_level_key_is_found_and_left_alone_by_the_splicer() {
+        let doc = "---\ntitle: T\n'null': one\n\"yes\": two\nplain: x\n---\nbody\n";
+        let touched =
+            apply_frontmatter_patch(doc, &[set("plain", serde_json::json!("changed"))]).unwrap();
+        assert!(
+            touched.contains("'null': one\n\"yes\": two\nplain: changed\n"),
+            "{touched:?}"
+        );
+
+        let replaced =
+            apply_frontmatter_patch(doc, &[set("null", serde_json::json!("uno"))]).unwrap();
+        assert!(replaced.contains("title: T\n"), "{replaced:?}");
+        assert!(replaced.contains("\"yes\": two\n"), "{replaced:?}");
+        assert_eq!(
+            replaced.matches("null").count(),
+            1,
+            "one entry for the key: {replaced:?}"
+        );
+        let (read_back, _) = crate::validate::parse_frontmatter_raw(&replaced);
+        assert_eq!(read_back["null"], serde_json::json!("uno"));
     }
 
     const FOLDED_DOC: &str = concat!(

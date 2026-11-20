@@ -30,6 +30,30 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
   image follow the pin automatically; a local checkout is switched by rustup. Nothing
   changes at runtime.
 
+### YAML library replaced: `serde_yaml_ng` → `serde-saphyr`, `gray_matter` 0.3
+
+`unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained) is out of the dependency tree: every
+read and write of YAML text now goes through the new `yaml` module on `serde-saphyr`
+(pinned exactly; the same library and version the rumdl markdown formatter uses), and
+frontmatter splitting uses `gray_matter` 0.3 (`yaml-rust2`, no C). No operator action and no
+reindex. What can be seen from outside:
+
+- **Quoting in written YAML.** A string that would read back as another type is now
+  written with **double** quotes (`"123"`, `"yes"`, `"2026-01-02"`) where it was single-quoted
+  before, and a mapping key such as `n` or `yes` is quoted. The written text reads back to
+  the same value. A document's frontmatter entries are only re-rendered when that entry is
+  edited, so existing single-quoted entries are left alone until then; a `.schema.yaml`
+  rewritten by `update_schema` is normalised the first time it is rewritten. Multi-line
+  strings are still literal blocks and long lines are still not folded.
+- **Config and schema error messages** keep the line and column but no longer name the key
+  path (`search.granularities: unknown variant …` is now `unknown variant … at line 2, column
+  26`), and the "expected one of" list is no longer backtick-quoted.
+- **Stricter in two places.** A bare null where a `String` is expected (`name:` with no
+  value) is now an error instead of the empty string; a typed boolean accepts only
+  `true`/`false` in any of the YAML 1.2 spellings (`yes`/`no`/`on` were already rejected).
+- **Frontmatter `True`/`TRUE`/`False`/`FALSE`** now read as booleans (YAML 1.2), where they
+  were strings. A document that uses them is re-projected the next time it is indexed.
+
 ### FULL RE-EMBED on the first reconcile after upgrading: typed, namespaced Qdrant payload (#350)
 
 **Coordinate the release with the owner.** This release changes what every Qdrant

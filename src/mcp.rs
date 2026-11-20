@@ -5166,7 +5166,7 @@ impl KbSearchServer {
 
             // Re-parse what we are about to write. A schema that does not round-trip
             // would be refused by the next schema rebuild.
-            serde_yaml_ng::from_str::<crate::schema::SchemaFile>(&yaml).map_err(|e| {
+            crate::yaml::from_str::<crate::schema::SchemaFile>(&yaml).map_err(|e| {
                 McpError::internal_error(
                     format!("Refusing to write a schema that does not parse: {e}"),
                     None,
@@ -8387,7 +8387,7 @@ mod tests {
     #[test]
     fn field_def_json_reports_items_only_when_declared() {
         let resolved = crate::schema::ResolvedSchema::default().merged_with_for_test(
-            &serde_yaml_ng::from_str(
+            &crate::yaml::from_str(
                 "fields:\n  npcs:\n    required: true\n    items:\n      type: object\n      \
                  fields:\n        name:\n          type: text\n          required: true\n  \
                  title:\n    type: text\n",
@@ -8539,7 +8539,7 @@ mod tests {
         .unwrap();
 
         let yaml = file.to_yaml().unwrap();
-        let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+        let reparsed: crate::schema::SchemaFile = crate::yaml::from_str(&yaml).unwrap();
 
         assert_eq!(
             reparsed.fields["tags"].values,
@@ -10089,7 +10089,7 @@ mod tests {
             "a non-breaking change must be written and committed"
         );
         let yaml = std::fs::read_to_string(&written).unwrap();
-        let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+        let reparsed: crate::schema::SchemaFile = crate::yaml::from_str(&yaml).unwrap();
         assert_eq!(
             reparsed.fields["status"].values,
             Some(vec!["active".to_string(), "draft".to_string()])
@@ -10450,7 +10450,7 @@ mod tests {
                 .expect("an unguarded root edit needs no acknowledgement");
             let yaml =
                 std::fs::read_to_string(work.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap();
-            let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+            let reparsed: crate::schema::SchemaFile = crate::yaml::from_str(&yaml).unwrap();
             assert_eq!(reparsed.fields["tags"].values, Some(vec!["x".to_string()]));
         }
     }
@@ -10567,7 +10567,7 @@ mod tests {
 
         let yaml =
             std::fs::read_to_string(work.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap();
-        let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+        let reparsed: crate::schema::SchemaFile = crate::yaml::from_str(&yaml).unwrap();
         assert_eq!(
             reparsed.fields["tags"].values,
             Some(vec!["identity".to_string()]),
@@ -10656,7 +10656,7 @@ mod tests {
 
         let written = work.path().join(crate::schema::SCHEMA_FILE_NAME);
         let yaml = std::fs::read_to_string(&written).unwrap();
-        let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+        let reparsed: crate::schema::SchemaFile = crate::yaml::from_str(&yaml).unwrap();
         assert_eq!(reparsed.fields["tags"].values, Some(vec!["x".to_string()]));
     }
 
@@ -18746,7 +18746,7 @@ mod tests {
                 .join(crate::schema::SCHEMA_FILE_NAME),
         )
         .unwrap();
-        let parsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&written).unwrap();
+        let parsed: crate::schema::SchemaFile = crate::yaml::from_str(&written).unwrap();
         let tags = &parsed.fields["tags"];
         assert_eq!(
             tags.values.as_deref(),
@@ -19545,7 +19545,7 @@ mod tests {
             .join(crate::schema::SCHEMA_FILE_NAME);
         std::fs::read_to_string(path)
             .ok()
-            .map(|yaml| serde_yaml_ng::from_str(&yaml).unwrap())
+            .map(|yaml| crate::yaml::from_str(&yaml).unwrap())
     }
 
     #[test]
@@ -19916,7 +19916,7 @@ mod tests {
         let root_values = || {
             let yaml =
                 std::fs::read_to_string(work.path().join(crate::schema::SCHEMA_FILE_NAME)).unwrap();
-            serde_yaml_ng::from_str::<crate::schema::SchemaFile>(&yaml)
+            crate::yaml::from_str::<crate::schema::SchemaFile>(&yaml)
                 .unwrap()
                 .fields["tags"]
                 .values
