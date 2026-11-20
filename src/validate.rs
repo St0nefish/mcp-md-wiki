@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio::task::JoinSet;
 
-use gray_matter::engine::YAML;
+use gray_matter::engine::{Engine, YAML};
 use gray_matter::{Matter, Pod};
 use serde_json::Value;
 
@@ -140,8 +140,12 @@ pub(crate) fn parse_frontmatter(
 
 /// Parse frontmatter and body with no schema involvement at all.
 pub(crate) fn parse_frontmatter_raw(content: &str) -> (HashMap<String, Value>, String) {
-    let matter = Matter::<YAML>::new();
-    let parsed = matter.parse(content);
+    let matter = Matter::<LenientYaml>::new();
+    // `LenientYaml` never errors, so `parse` cannot fail here; were it to, the document
+    // reads as having no frontmatter, the same as a block that is not valid YAML.
+    let Ok(parsed) = matter.parse::<Pod>(content) else {
+        return (HashMap::new(), content.to_string());
+    };
 
     let mut frontmatter: HashMap<String, Value> = HashMap::new();
     if let Some(Pod::Hash(map)) = parsed.data {
@@ -151,6 +155,20 @@ pub(crate) fn parse_frontmatter_raw(content: &str) -> (HashMap<String, Value>, S
     }
 
     (frontmatter, parsed.content)
+}
+
+/// `gray_matter`'s YAML engine, except that a frontmatter block that is not valid YAML
+/// reads as "no fields" instead of failing the parse. `gray_matter` 0.2 did exactly that
+/// (its engine could not fail); 0.3 made the engine fallible. Everything downstream
+/// (schema validation, indexing, the write path) already treats a document with
+/// unparseable frontmatter as one with missing fields, so keeping that behaviour changes
+/// no outcome.
+struct LenientYaml;
+
+impl Engine for LenientYaml {
+    fn parse(content: &str) -> gray_matter::Result<Pod> {
+        Ok(YAML::parse(content).unwrap_or(Pod::Null))
+    }
 }
 
 /// Fill in schema-declared defaults for fields the document omitted. A default
@@ -965,7 +983,7 @@ mod tests {
 
     #[tokio::test]
     async fn nested_defaults_create_their_parent_object() {
-        let schema: SchemaFile = serde_yaml_ng::from_str(
+        let schema: SchemaFile = crate::yaml::from_str(
             "fields:\n  planning:\n    type: object\n    fields:\n      effort:\n        default: medium\n",
         )
         .unwrap();
@@ -982,7 +1000,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_objects_reject_undeclared_keys() {
-        let schema: SchemaFile = serde_yaml_ng::from_str(
+        let schema: SchemaFile = crate::yaml::from_str(
             "fields:\n  planning:\n    type: object\n    open: false\n    fields:\n      effort:\n        type: text\n",
         )
         .unwrap();
@@ -1008,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_objects_permit_undeclared_keys() {
-        let schema: SchemaFile = serde_yaml_ng::from_str(
+        let schema: SchemaFile = crate::yaml::from_str(
             "fields:\n  planning:\n    type: object\n    fields:\n      effort:\n        type: text\n",
         )
         .unwrap();
@@ -1030,7 +1048,7 @@ mod tests {
 
     /// A schema resolved from one root file's YAML.
     fn resolve(yaml: &str) -> ResolvedSchema {
-        let schema: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+        let schema: SchemaFile = crate::yaml::from_str(yaml).unwrap();
         ResolvedSchema::default().merged_with_for_test(&schema, "s")
     }
 
@@ -1660,7 +1678,7 @@ tags: [a, z]
         // file, not the root the cascade started from — the whole point of provenance
         // is that a deeper scope can override a shallower one's rule.
         let schema: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  status:\n    type: enum\n    values: [archived]\n")
+            crate::yaml::from_str("fields:\n  status:\n    type: enum\n    values: [archived]\n")
                 .unwrap();
         let resolved = ResolvedSchema::default().merged_with_for_test(&schema, "food/");
 
@@ -1700,7 +1718,7 @@ tags: [a, z]
         // `schema.origin` itself — the rule ("no undeclared keys") belongs to the
         // parent object field `planning`, so provenance must be looked up under that
         // key, not the synthesized child path.
-        let schema: SchemaFile = serde_yaml_ng::from_str(
+        let schema: SchemaFile = crate::yaml::from_str(
             "fields:\n  planning:\n    type: object\n    open: false\n    fields:\n      effort:\n        type: text\n",
         )
         .unwrap();

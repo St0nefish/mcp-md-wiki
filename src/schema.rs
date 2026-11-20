@@ -2402,8 +2402,8 @@ impl SchemaFile {
     pub fn to_yaml(&self) -> Result<String, String> {
         // `fields` is a BTreeMap at every level, so key order (and a rewrite's diff) is
         // deterministic.
-        let doc = serde_yaml_ng::to_string(self)
-            .map_err(|e| format!("could not serialize schema: {e}"))?;
+        let doc =
+            crate::yaml::to_string(self).map_err(|e| format!("could not serialize schema: {e}"))?;
         Ok(format!(
             "# Frontmatter schema for this directory and everything beneath it.\n\
              # Managed by the update_schema MCP tool; hand edits are fine but must stay\n\
@@ -2986,7 +2986,7 @@ pub(crate) fn parse_schema_text(text: &str) -> Result<SchemaFile, String> {
     if text.len() as u64 > MAX_SCHEMA_FILE_BYTES {
         return Err(over_size_limit_reason(text.len() as u64));
     }
-    let file = serde_yaml_ng::from_str::<SchemaFile>(text).map_err(|e| e.to_string())?;
+    let file = crate::yaml::from_str::<SchemaFile>(text).map_err(|e| e.to_string())?;
     file.validate_self()?;
     Ok(file)
 }
@@ -3480,7 +3480,7 @@ impl SchemaCache {
             if found.is_some() {
                 return Err(BOTH_NAMES_REASON.to_string());
             }
-            let parsed = serde_yaml_ng::from_str(&text).map_err(|e| e.to_string())?;
+            let parsed = crate::yaml::from_str(&text).map_err(|e| e.to_string())?;
             found = Some((parsed, name));
         }
         Ok(match found {
@@ -4428,11 +4428,11 @@ mod tests {
 
     #[test]
     fn nested_and_flat_authoring_produce_identical_schemas() {
-        let nested: SchemaFile = serde_yaml_ng::from_str(
+        let nested: SchemaFile = crate::yaml::from_str(
             "fields:\n  planning:\n    type: object\n    fields:\n      prep_minutes:\n        type: integer\n        indexed: true\n",
         )
         .unwrap();
-        let flat: SchemaFile = serde_yaml_ng::from_str(
+        let flat: SchemaFile = crate::yaml::from_str(
             "fields:\n  planning:\n    type: object\n  planning.prep_minutes:\n    type: integer\n    indexed: true\n",
         )
         .unwrap();
@@ -4447,7 +4447,7 @@ mod tests {
 
     #[test]
     fn nested_container_defaults_to_object_type() {
-        let file: SchemaFile = serde_yaml_ng::from_str(
+        let file: SchemaFile = crate::yaml::from_str(
             "fields:\n  planning:\n    fields:\n      rating:\n        type: integer\n",
         )
         .unwrap();
@@ -4699,7 +4699,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let candidate: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [$values, only]\n").unwrap();
+            crate::yaml::from_str("fields:\n  tags:\n    values: [$values, only]\n").unwrap();
 
         let effective = cache
             .resolve_with_candidate(Path::new("doc.md"), Path::new(""), &candidate)
@@ -4719,7 +4719,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let candidate: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [$values]\n").unwrap();
+            crate::yaml::from_str("fields:\n  tags:\n    values: [$values]\n").unwrap();
 
         let effective = cache
             .resolve_with_candidate(Path::new("doc.md"), Path::new(""), &candidate)
@@ -4788,7 +4788,7 @@ mod tests {
     #[test]
     fn an_unrecognized_dollar_token_is_a_loud_parse_error() {
         let file: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [$typo, a]\n").unwrap();
+            crate::yaml::from_str("fields:\n  tags:\n    values: [$typo, a]\n").unwrap();
         let err = file.validate_self().unwrap_err();
         assert!(err.contains("$typo"), "names the offending token: {err}");
         assert!(err.contains("$values"), "names what IS recognized: {err}");
@@ -4797,27 +4797,60 @@ mod tests {
     #[test]
     fn more_than_one_sentinel_in_a_values_list_is_a_parse_error() {
         let file: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [$values, a, $values]\n")
-                .unwrap();
+            crate::yaml::from_str("fields:\n  tags:\n    values: [$values, a, $values]\n").unwrap();
         let err = file.validate_self().unwrap_err();
         assert!(err.contains("tags"), "got: {err}");
     }
 
     #[test]
     fn combining_extend_true_with_an_explicit_sentinel_is_a_parse_error() {
-        let file: SchemaFile = serde_yaml_ng::from_str(
-            "fields:\n  tags:\n    extend: true\n    values: [$values, a]\n",
-        )
-        .unwrap();
+        let file: SchemaFile =
+            crate::yaml::from_str("fields:\n  tags:\n    extend: true\n    values: [$values, a]\n")
+                .unwrap();
         let err = file.validate_self().unwrap_err();
         assert!(err.contains("extend"), "got: {err}");
         assert!(err.contains("$values"), "got: {err}");
     }
 
+    /// The schema file `update_schema` writes, pinned: a value that would read back as
+    /// a boolean, number or date is quoted, so what is written means what was meant, and
+    /// rendering a parsed file again yields the same bytes.
+    #[test]
+    fn to_yaml_quotes_values_that_would_read_back_as_other_types_and_is_stable() {
+        let file: SchemaFile = crate::yaml::from_str(
+            "fields:\n  status:\n    type: enum\n    values: [draft, 'yes', '123', '2026-01-02', active]\n    default: draft\n",
+        )
+        .unwrap();
+        let rendered = file.to_yaml().unwrap();
+        for line in [
+            "    - draft\n",
+            "    - \"yes\"\n",
+            "    - \"123\"\n",
+            "    - \"2026-01-02\"\n",
+            "    - active\n",
+        ] {
+            assert!(rendered.contains(line), "missing {line:?} in:\n{rendered}");
+        }
+        let reparsed: SchemaFile = crate::yaml::from_str(&rendered).unwrap();
+        assert_eq!(
+            reparsed.fields["status"].values.as_deref(),
+            Some(
+                &[
+                    "draft".to_string(),
+                    "yes".into(),
+                    "123".into(),
+                    "2026-01-02".into(),
+                    "active".into()
+                ][..]
+            )
+        );
+        assert_eq!(reparsed.to_yaml().unwrap(), rendered);
+    }
+
     const NESTED_SCHEMA: &str = "fields:\n  planning:\n    type: object\n    open: false\n    fields:\n      method:\n        type: enum\n        open: false\n        values: [braise, oven]\n";
 
     fn nested_file() -> SchemaFile {
-        serde_yaml_ng::from_str(NESTED_SCHEMA).unwrap()
+        crate::yaml::from_str(NESTED_SCHEMA).unwrap()
     }
 
     #[test]
@@ -4878,10 +4911,9 @@ mod tests {
 
     #[test]
     fn a_flat_dot_path_key_is_edited_in_place() {
-        let mut file: SchemaFile = serde_yaml_ng::from_str(
-            "fields:\n  planning.method:\n    type: enum\n    values: [a]\n",
-        )
-        .unwrap();
+        let mut file: SchemaFile =
+            crate::yaml::from_str("fields:\n  planning.method:\n    type: enum\n    values: [a]\n")
+                .unwrap();
         file.apply(&SchemaEdit::AddValues {
             field: "planning.method".into(),
             values: vec!["b".into()],
@@ -4918,7 +4950,7 @@ mod tests {
     #[test]
     fn a_flat_dotted_key_inside_a_container_is_found_and_edited() {
         // `planning.x.y` is spelled as container `planning` + child key `x.y`.
-        let mut file: SchemaFile = serde_yaml_ng::from_str(
+        let mut file: SchemaFile = crate::yaml::from_str(
             "fields:\n  planning:\n    type: object\n    fields:\n      x.y:\n        type: enum\n        values: [a]\n",
         )
         .unwrap();
@@ -4957,7 +4989,7 @@ mod tests {
     fn remove_field_on_a_doubly_declared_path_removes_the_flat_key_first() {
         // A file damaged by the pre-#268 bug: both spellings of one path. The flat key
         // is the one `update_schema` removes, leaving the nested declaration valid.
-        let mut file: SchemaFile = serde_yaml_ng::from_str(&format!(
+        let mut file: SchemaFile = crate::yaml::from_str(&format!(
             "{NESTED_SCHEMA}  planning.method:\n    type: enum\n    values: [slow-cooker]\n"
         ))
         .unwrap();
@@ -4974,7 +5006,7 @@ mod tests {
     #[test]
     fn nesting_under_a_scalar_field_is_rejected() {
         let mut file: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  planning:\n    type: text\n").unwrap();
+            crate::yaml::from_str("fields:\n  planning:\n    type: text\n").unwrap();
         let err = file
             .apply(&SchemaEdit::AddValues {
                 field: "planning.method".into(),
@@ -4989,7 +5021,7 @@ mod tests {
         // `values:` with no `type:` is a leniently-enforced scalar; nesting under it
         // would let `flatten_raw` retype it as an object.
         let mut file: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  status:\n    values: [a, b]\n").unwrap();
+            crate::yaml::from_str("fields:\n  status:\n    values: [a, b]\n").unwrap();
         let err = file
             .apply(&SchemaEdit::AddValues {
                 field: "status.sub".into(),
@@ -5001,7 +5033,7 @@ mod tests {
 
     #[test]
     fn nested_and_flat_declarations_of_one_path_are_a_validation_error() {
-        let file: SchemaFile = serde_yaml_ng::from_str(&format!(
+        let file: SchemaFile = crate::yaml::from_str(&format!(
             "{NESTED_SCHEMA}  planning.method:\n    type: enum\n    values: [slow-cooker]\n"
         ))
         .unwrap();
@@ -5216,7 +5248,7 @@ mod tests {
         let cache = SchemaCache::build_for_test(dir.path(), &config);
 
         let candidate: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  title:\n    required: true\n").unwrap();
+            crate::yaml::from_str("fields:\n  title:\n    required: true\n").unwrap();
         let effective = cache
             .resolve_with_candidate(Path::new("doc.md"), Path::new(""), &candidate)
             .expect("root always governs a root-level document");
@@ -5243,7 +5275,7 @@ mod tests {
         let cache = SchemaCache::build_for_test(dir.path(), &config);
 
         let candidate: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  cook_minutes:\n    type: integer\n").unwrap();
+            crate::yaml::from_str("fields:\n  cook_minutes:\n    type: integer\n").unwrap();
         let effective = cache
             .resolve_with_candidate(Path::new("food/chili.md"), Path::new("food"), &candidate)
             .expect("food/ covers this document");
@@ -5734,7 +5766,7 @@ mod tests {
         // A local list that deliberately replaces the inherited set stays a
         // replacement: the new value is appended, no sentinel added.
         let mut file: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [x]\n").unwrap();
+            crate::yaml::from_str("fields:\n  tags:\n    values: [x]\n").unwrap();
         file.apply_inheriting(
             &SchemaEdit::AddValues {
                 field: "tags".into(),
@@ -5793,7 +5825,7 @@ mod tests {
         // A scope that declares the field without a list inherits the set
         // verbatim, so an inherited value changes nothing and leaves it unlisted.
         let mut file: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  tags:\n    required: true\n").unwrap();
+            crate::yaml::from_str("fields:\n  tags:\n    required: true\n").unwrap();
         let summary = file
             .apply_inheriting(&add(&["a"]), Some(&inherited))
             .unwrap();
@@ -5803,7 +5835,7 @@ mod tests {
         // A local list that replaces the inherited set (no sentinel) does not
         // inherit, so an inherited value is a real addition there.
         let mut file: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [x]\n").unwrap();
+            crate::yaml::from_str("fields:\n  tags:\n    values: [x]\n").unwrap();
         file.apply_inheriting(&add(&["a"]), Some(&inherited))
             .unwrap();
         assert_eq!(
@@ -5891,7 +5923,7 @@ mod tests {
     #[test]
     fn unknown_schema_keys_are_rejected() {
         let parsed: Result<SchemaFile, _> =
-            serde_yaml_ng::from_str("fields:\n  title:\n    requried: true\n");
+            crate::yaml::from_str("fields:\n  title:\n    requried: true\n");
         assert!(parsed.is_err(), "a typo'd key must not be silently ignored");
     }
 
@@ -5950,16 +5982,16 @@ mod tests {
 
     #[test]
     fn dedup_typos_and_out_of_range_thresholds_are_rejected() {
-        assert!(serde_yaml_ng::from_str::<SchemaFile>("dedup:\n  treshold: 0.9\n").is_err());
-        assert!(serde_yaml_ng::from_str::<SchemaFile>("dedup:\n  enabled: maybe\n").is_err());
+        assert!(crate::yaml::from_str::<SchemaFile>("dedup:\n  treshold: 0.9\n").is_err());
+        assert!(crate::yaml::from_str::<SchemaFile>("dedup:\n  enabled: maybe\n").is_err());
 
         for bad in ["1.5", "-0.1"] {
             let file: SchemaFile =
-                serde_yaml_ng::from_str(&format!("dedup:\n  threshold: {bad}\n")).unwrap();
+                crate::yaml::from_str(&format!("dedup:\n  threshold: {bad}\n")).unwrap();
             let err = file.validate_self().unwrap_err();
             assert!(err.contains("dedup.threshold"), "got: {err}");
         }
-        let ok: SchemaFile = serde_yaml_ng::from_str("dedup:\n  threshold: 1.0\n").unwrap();
+        let ok: SchemaFile = crate::yaml::from_str("dedup:\n  threshold: 1.0\n").unwrap();
         ok.validate_self().unwrap();
     }
 
@@ -5986,11 +6018,11 @@ mod tests {
             ("dedup:\n  related_min_score: 1.5\n", "related_min_score"),
             ("dedup:\n  related_limit: 21\n", "related_limit"),
         ] {
-            let file: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+            let file: SchemaFile = crate::yaml::from_str(yaml).unwrap();
             let err = file.validate_self().unwrap_err();
             assert!(err.contains(key), "got: {err}");
         }
-        assert!(serde_yaml_ng::from_str::<SchemaFile>("dedup:\n  related_limit: -1\n").is_err());
+        assert!(crate::yaml::from_str::<SchemaFile>("dedup:\n  related_limit: -1\n").is_err());
     }
 
     #[test]
@@ -6014,7 +6046,7 @@ mod tests {
 
     #[test]
     fn dedup_block_survives_an_edit_and_yaml_round_trip() {
-        let mut file: SchemaFile = serde_yaml_ng::from_str(
+        let mut file: SchemaFile = crate::yaml::from_str(
             "dedup:\n  enabled: false\n  threshold: 0.9\nfields:\n  tags:\n    values: [a]\n",
         )
         .unwrap();
@@ -6024,12 +6056,12 @@ mod tests {
         })
         .unwrap();
 
-        let reparsed: SchemaFile = serde_yaml_ng::from_str(&file.to_yaml().unwrap()).unwrap();
+        let reparsed: SchemaFile = crate::yaml::from_str(&file.to_yaml().unwrap()).unwrap();
         let dedup = reparsed.dedup.expect("dedup block preserved");
         assert_eq!(dedup.enabled, Some(false));
         assert_eq!(dedup.threshold, Some(0.9));
 
-        let plain: SchemaFile = serde_yaml_ng::from_str("fields: {}\n").unwrap();
+        let plain: SchemaFile = crate::yaml::from_str("fields: {}\n").unwrap();
         assert!(
             !plain.to_yaml().unwrap().contains("dedup"),
             "an absent block is not serialized"
@@ -6040,8 +6072,8 @@ mod tests {
     fn fingerprint_ignores_dedup_keys() {
         let base = ResolvedSchema::default();
         let plain: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  t:\n    required: true\n").unwrap();
-        let with_dedup: SchemaFile = serde_yaml_ng::from_str(
+            crate::yaml::from_str("fields:\n  t:\n    required: true\n").unwrap();
+        let with_dedup: SchemaFile = crate::yaml::from_str(
             "dedup:\n  enabled: false\n  threshold: 0.9\nfields:\n  t:\n    required: true\n",
         )
         .unwrap();
@@ -6055,7 +6087,7 @@ mod tests {
     // -- corpus policy: derived fields and the root-edit guard (#345) ---------
 
     fn root_resolved(yaml: &str) -> ResolvedSchema {
-        let file: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+        let file: SchemaFile = crate::yaml::from_str(yaml).unwrap();
         file.validate_self().unwrap();
         ResolvedSchema::default().merged_with_for_test(&file, "/")
     }
@@ -6164,7 +6196,7 @@ mod tests {
         let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let from_disk = cache.resolve_from_disk(Path::new("food"), None).unwrap();
         assert!(from_disk.is_derived("domain"));
-        let candidate: SchemaFile = serde_yaml_ng::from_str("fields: {}\n").unwrap();
+        let candidate: SchemaFile = crate::yaml::from_str("fields: {}\n").unwrap();
         let resolved = cache
             .resolve_with_candidate(Path::new("food/a.md"), Path::new("food"), &candidate)
             .unwrap();
@@ -6316,7 +6348,7 @@ mod tests {
         let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
 
         let candidate: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  format:\n    required: true\n").unwrap();
+            crate::yaml::from_str("fields:\n  format:\n    required: true\n").unwrap();
         let effective = cache
             .resolve_with_candidate(Path::new("recipes/chili.md"), Path::new(""), &candidate)
             .expect("the edit reaches this document");
@@ -6348,7 +6380,7 @@ mod tests {
         );
         let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
 
-        let candidate: SchemaFile = serde_yaml_ng::from_str(
+        let candidate: SchemaFile = crate::yaml::from_str(
             "fields:\n  status:\n    type: enum\n    values: [active]\n    required: true\n",
         )
         .unwrap();
@@ -6373,7 +6405,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let candidate: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  x:\n    required: true\n").unwrap();
+            crate::yaml::from_str("fields:\n  x:\n    required: true\n").unwrap();
 
         assert!(
             cache
@@ -6391,7 +6423,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = SchemaCache::build_for_test(dir.path(), &empty_config());
         let candidate: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  x:\n    required: true\n").unwrap();
+            crate::yaml::from_str("fields:\n  x:\n    required: true\n").unwrap();
 
         let effective = cache
             .resolve_with_candidate(Path::new("food/a.md"), Path::new("food"), &candidate)
@@ -6449,14 +6481,12 @@ mod tests {
 
     #[test]
     fn fingerprint_is_stable_and_order_independent() {
-        let a: SchemaFile = serde_yaml_ng::from_str(
-            "fields:\n  b:\n    values: [x, y]\n  a:\n    required: true\n",
-        )
-        .unwrap();
-        let b: SchemaFile = serde_yaml_ng::from_str(
-            "fields:\n  a:\n    required: true\n  b:\n    values: [y, x]\n",
-        )
-        .unwrap();
+        let a: SchemaFile =
+            crate::yaml::from_str("fields:\n  b:\n    values: [x, y]\n  a:\n    required: true\n")
+                .unwrap();
+        let b: SchemaFile =
+            crate::yaml::from_str("fields:\n  a:\n    required: true\n  b:\n    values: [y, x]\n")
+                .unwrap();
 
         let base = ResolvedSchema::default();
         let first = base.merged_with(&a, "s").fingerprint();
@@ -6473,9 +6503,9 @@ mod tests {
     #[test]
     fn fingerprint_changes_when_a_rule_tightens() {
         let loose: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  title:\n    required: false\n").unwrap();
+            crate::yaml::from_str("fields:\n  title:\n    required: false\n").unwrap();
         let tight: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  title:\n    required: true\n").unwrap();
+            crate::yaml::from_str("fields:\n  title:\n    required: true\n").unwrap();
 
         let base = ResolvedSchema::default();
         assert_ne!(
@@ -6491,10 +6521,9 @@ mod tests {
         // #152's fix, hashed identically because the values loop contributes
         // zero bytes when the list is empty OR absent.
         let unconstrained: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  status:\n    type: text\n").unwrap();
+            crate::yaml::from_str("fields:\n  status:\n    type: text\n").unwrap();
         let closed: SchemaFile =
-            serde_yaml_ng::from_str("fields:\n  status:\n    type: text\n    values: []\n")
-                .unwrap();
+            crate::yaml::from_str("fields:\n  status:\n    type: text\n    values: []\n").unwrap();
 
         let base = ResolvedSchema::default();
         let unconstrained_resolved = base.merged_with(&unconstrained, "s");
@@ -6524,7 +6553,7 @@ mod tests {
     #[test]
     fn payload_fingerprint_tracks_defaults_and_derived_only() {
         let resolve = |yaml: &str| {
-            let file: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+            let file: SchemaFile = crate::yaml::from_str(yaml).unwrap();
             ResolvedSchema::default().merged_with(&file, &scope_label(Path::new("")))
         };
         let base = resolve("fields:\n  status:\n    values: [draft, done]\n    default: draft\n");
@@ -6644,7 +6673,7 @@ mod tests {
         // a `default`; a typeless values-only field; a `$values` splice inherited from
         // a parent scope; and the siblings `a`, `a-b`, `a.b`, which sort differently
         // under a depth-first walk than in flat dot-path order ('-' < '.').
-        let parent: SchemaFile = serde_yaml_ng::from_str(
+        let parent: SchemaFile = crate::yaml::from_str(
             "fields:\n  \
                title:\n    type: text\n    required: true\n    indexed: true\n  \
                tags:\n    values: [b, a]\n  \
@@ -6652,7 +6681,7 @@ mod tests {
                a-b:\n    type: text\n",
         )
         .unwrap();
-        let child: SchemaFile = serde_yaml_ng::from_str(
+        let child: SchemaFile = crate::yaml::from_str(
             "fields:\n  \
                tags:\n    values: [$values, c]\n  \
                planning:\n    type: object\n    open: false\n    fields:\n      \
@@ -6743,7 +6772,7 @@ mod tests {
     // -- lint warnings (#347) -------------------------------------------------
 
     fn lint(yaml: &str) -> Vec<String> {
-        let file: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+        let file: SchemaFile = crate::yaml::from_str(yaml).unwrap();
         file.validate_self()
             .expect("lint findings are never load errors");
         lint_raw(&file, false)
@@ -7117,7 +7146,7 @@ mod tests {
     // -- tree model (#346) --------------------------------------------------
 
     fn file(yaml: &str) -> SchemaFile {
-        let file: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+        let file: SchemaFile = crate::yaml::from_str(yaml).unwrap();
         file.validate_self().unwrap();
         file
     }
@@ -7678,7 +7707,7 @@ mod tests {
                 "declared more than once",
             ),
         ] {
-            let parsed: SchemaFile = serde_yaml_ng::from_str(yaml).unwrap();
+            let parsed: SchemaFile = crate::yaml::from_str(yaml).unwrap();
             let err = parsed.validate_self().unwrap_err();
             assert!(err.contains(needle), "{yaml}: {err}");
         }
@@ -7894,7 +7923,7 @@ mod tests {
 
     #[test]
     fn a_removed_declaration_carries_nothing_else() {
-        let err = serde_yaml_ng::from_str::<SchemaFile>(
+        let err = crate::yaml::from_str::<SchemaFile>(
             "fields:\n  status:\n    removed: true\n    required: true\n",
         )
         .unwrap()
@@ -7948,7 +7977,7 @@ mod tests {
         );
         assert_eq!(open.fields["planning.method"].values, None);
 
-        let err = serde_yaml_ng::from_str::<SchemaFile>(
+        let err = crate::yaml::from_str::<SchemaFile>(
             "fields:\n  status:\n    exclude_values: [$values]\n",
         )
         .unwrap()
@@ -8215,7 +8244,7 @@ mod tests {
         );
 
         // Round trip: the exclusion survives YAML, and adding the value back drops it.
-        let mut child: SchemaFile = serde_yaml_ng::from_str(&child.to_yaml().unwrap()).unwrap();
+        let mut child: SchemaFile = crate::yaml::from_str(&child.to_yaml().unwrap()).unwrap();
         let summary = child
             .apply_inheriting(
                 &SchemaEdit::AddValues {

@@ -1760,18 +1760,18 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("contradictions.judge_max_document_bytes", "contradictions"),
 ];
 
-/// Recursively flattens a `serde_yaml_ng::Value` tree into dot-joined leaf paths,
+/// Recursively flattens a `serde_json::Value` tree into dot-joined leaf paths,
 /// mirroring [`YAML_ONLY_SETTINGS`]'s naming convention (e.g. `"ui.semantic_edges.k"`).
 /// A non-empty mapping is a sub-struct and is descended into; anything else —
 /// including an EMPTY mapping, which is how a `HashMap`-typed field
 /// (`frontmatter.defaults`/`allowed`) serializes at its default value — is treated
 /// as a leaf, since no real config sub-struct in this file has zero fields.
 #[cfg(test)]
-fn collect_leaf_paths(value: &serde_yaml_ng::Value, prefix: String, out: &mut HashSet<String>) {
-    match value.as_mapping() {
+fn collect_leaf_paths(value: &serde_json::Value, prefix: String, out: &mut HashSet<String>) {
+    match value.as_object() {
         Some(map) if !map.is_empty() => {
             for (k, v) in map {
-                let key = k.as_str().expect("Config keys are always strings");
+                let key = k.as_str();
                 let path = if prefix.is_empty() {
                     key.to_string()
                 } else {
@@ -1812,8 +1812,8 @@ pub(crate) fn config_setting_leaf_paths() -> HashSet<String> {
         .oauth
         .scopes_supported
         .get_or_insert_with(Vec::new);
-    let value = serde_yaml_ng::to_value(config)
-        .expect("every Config field type must round-trip through serde_yaml_ng");
+    let value = serde_json::to_value(config)
+        .expect("every Config field type must round-trip through serde_json");
     let mut leaves = HashSet::new();
     collect_leaf_paths(&value, String::new(), &mut leaves);
     leaves
@@ -1846,7 +1846,7 @@ const KNOWN_SECTIONS: &[&str] = &[
 /// section that only sets `hybrid` does not count. Best-effort in the same way —
 /// unparseable content reports `false`.
 fn yaml_sets_search_granularities(content: &str) -> bool {
-    serde_yaml_ng::from_str::<serde_yaml_ng::Value>(content)
+    crate::yaml::from_str::<serde_json::Value>(content)
         .ok()
         .as_ref()
         .and_then(|v| v.get("search"))
@@ -1861,16 +1861,16 @@ fn yaml_sets_search_granularities(content: &str) -> bool {
 /// makes every YAML-only setting report `Default` provenance rather than failing
 /// the whole load over an observability nicety.
 fn yaml_top_level_sections(content: &str) -> HashSet<&'static str> {
-    let Ok(value) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(content) else {
+    let Ok(value) = crate::yaml::from_str::<serde_json::Value>(content) else {
         return HashSet::new();
     };
-    let Some(mapping) = value.as_mapping() else {
+    let Some(mapping) = value.as_object() else {
         return HashSet::new();
     };
     KNOWN_SECTIONS
         .iter()
         .copied()
-        .filter(|section| mapping.contains_key(serde_yaml_ng::Value::String((*section).into())))
+        .filter(|section| mapping.contains_key(*section))
         .collect()
 }
 
@@ -1952,7 +1952,7 @@ impl Config {
         let (config, present_sections, granularities_explicit) = if path.exists() {
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read config file '{}'", path.display()))?;
-            let config: Config = serde_yaml_ng::from_str(&content).with_context(|| {
+            let config: Config = crate::yaml::from_str(&content).with_context(|| {
                 format!(
                     "Failed to parse config file '{}'. \
                      If you see 'unknown field', compare your config against \
@@ -2849,13 +2849,13 @@ mod tests {
     impl Config {
         /// Deserialize + resolve (requires env vars for the required fields)
         fn from_str(yaml: &str) -> anyhow::Result<ResolvedConfig> {
-            let config: Config = serde_yaml_ng::from_str(yaml)?;
+            let config: Config = crate::yaml::from_str(yaml)?;
             config.resolve()
         }
 
         /// Deserialize only — no env var resolution or validation
         fn from_str_raw(yaml: &str) -> anyhow::Result<Self> {
-            Ok(serde_yaml_ng::from_str(yaml)?)
+            Ok(crate::yaml::from_str(yaml)?)
         }
     }
 
@@ -2961,10 +2961,10 @@ mcp:
             ),
         ] {
             let cfg: RateLimitConfig =
-                serde_yaml_ng::from_str(&format!("client_ip_source: {text}")).unwrap();
+                crate::yaml::from_str(&format!("client_ip_source: {text}")).unwrap();
             assert_eq!(cfg.client_ip_source, want, "{text}");
         }
-        assert!(serde_yaml_ng::from_str::<RateLimitConfig>("client_ip_source: smart").is_err());
+        assert!(crate::yaml::from_str::<RateLimitConfig>("client_ip_source: smart").is_err());
     }
 
     #[test]
@@ -3406,7 +3406,7 @@ source:
   git_token_env: "X"
 unknown_top_level: true
 "#;
-        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+        let result: Result<Config, _> = crate::yaml::from_str(yaml);
         assert!(
             result.is_err(),
             "top-level unknown field should be rejected"
@@ -3420,7 +3420,7 @@ mcp:
   bearer_token_env: "X"
   unknown_nested: "oops"
 "#;
-        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+        let result: Result<Config, _> = crate::yaml::from_str(yaml);
         assert!(result.is_err(), "nested unknown field should be rejected");
     }
 
@@ -3443,7 +3443,7 @@ mcp:
             "reranking:\n  api_key: \"sk-leaked\"\n",
             "mcp:\n  port: 9002\n",
         ] {
-            let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+            let result: Result<Config, _> = crate::yaml::from_str(yaml);
             assert!(
                 result.is_err(),
                 "expected '{yaml}' to be rejected as an unknown field"
@@ -3527,7 +3527,7 @@ mcp:
     #[test]
     fn example_config_deserializes() {
         let yaml = include_str!("../deploy/config.example.yaml");
-        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("config.example.yaml should parse");
+        let cfg: Config = crate::yaml::from_str(yaml).expect("config.example.yaml should parse");
         // Spot-check a few values to catch drift between example and struct
         assert_eq!(cfg.chunking.max_chunk_size, 1500);
         assert_eq!(cfg.chunking.target_chunk_size, Some(1000));
@@ -3887,8 +3887,7 @@ mcp:
         let err = Config::from_str("search:\n  granularities: [chunk, paragraph]\n").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("unknown variant `paragraph`")
-                && msg.contains("`chunk`, `document`, `section`"),
+            msg.contains("unknown variant `paragraph`") && msg.contains("chunk, document, section"),
             "expected serde's unknown-variant message naming the accepted values, got: {msg}"
         );
         clear_required_env();
@@ -3896,15 +3895,16 @@ mcp:
 
     #[test]
     fn search_granularities_unknown_value_is_rejected_by_config_load_with_its_location() {
-        // The production path (`Config::load`) — the message must say WHERE the
-        // bad value is, not just that some enum somewhere failed to parse.
+        // The production path (`Config::load`) — the message must say WHERE the bad value
+        // is (line and column; the YAML library reports no key path), not just that some
+        // enum somewhere failed to parse.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.yaml");
         std::fs::write(&path, "search:\n  granularities: [chunk, paragraph]\n").unwrap();
         let err = Config::load(&path).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("search.granularities") && msg.contains("unknown variant `paragraph`"),
+            msg.contains("line 2") && msg.contains("unknown variant `paragraph`"),
             "got: {msg}"
         );
     }
@@ -4291,7 +4291,7 @@ write:
 webhook:
   provider: "bitbucket"
 "#;
-        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+        let result: Result<Config, _> = crate::yaml::from_str(yaml);
         assert!(
             result.is_err(),
             "unknown provider should be rejected at parse time"
@@ -5184,14 +5184,14 @@ mcp:
     #[test]
     fn ui_semantic_edges_unknown_field_is_rejected() {
         let yaml = "ui:\n  semantic_edges:\n    bogus: true\n";
-        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+        let result: Result<Config, _> = crate::yaml::from_str(yaml);
         assert!(
             result.is_err(),
             "unknown field under ui.semantic_edges should be rejected"
         );
 
         let yaml_top = "ui:\n  bogus: true\n";
-        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml_top);
+        let result: Result<Config, _> = crate::yaml::from_str(yaml_top);
         assert!(result.is_err(), "unknown field under ui should be rejected");
     }
 

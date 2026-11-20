@@ -28,6 +28,7 @@ mod validate;
 mod web;
 mod webhook;
 mod write;
+mod yaml;
 
 use std::path::{Path, PathBuf};
 
