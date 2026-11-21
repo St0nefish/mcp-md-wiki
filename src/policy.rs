@@ -195,12 +195,29 @@ impl Policy {
             }
             Ok(out.into_iter().collect())
         };
+        let read = paths("read", &cfg.read)?;
+        let write = paths("write", &cfg.write)?;
+        // A write answers with the diff it made, a refused edit says whether its
+        // anchor matched, and a move or schema change reports what it touched: a
+        // write grant over a directory the principal cannot read would let it read
+        // that directory through the write tools. So every write prefix must sit
+        // inside a read prefix.
+        for w in &write {
+            if !read.iter().any(|r| prefix_covers(r, w)) {
+                let shown = if w.is_empty() { "/" } else { w.as_str() };
+                bail!(
+                    "mcp.policy.{name}.write: '{shown}' is not inside any `read` prefix; \
+                     a principal that may write a directory must be able to read it, since \
+                     a write returns what it changed"
+                );
+            }
+        }
         Ok(Self {
             name: name.to_string(),
             tools,
             all_tools,
-            read: paths("read", &cfg.read)?,
-            write: paths("write", &cfg.write)?,
+            read,
+            write,
             admin: cfg.admin,
         })
     }
@@ -329,9 +346,10 @@ impl Principal {
         }
     }
 
-    /// The one decision function: may this principal call `tool` and, when the
-    /// call touches a document, `op` it at `path`? `path` is KB-relative; a call
-    /// that touches no document passes `None`.
+    /// Tool and path together, as a test convenience: may this principal call
+    /// `tool` and, when the call touches a document, `op` it at `path`? Production
+    /// code asks [`Self::authorize_tool`] in the dispatcher and
+    /// [`Self::authorize_path`] at each path it resolves.
     #[cfg(test)]
     pub fn authorize(&self, tool: &str, path: Option<&str>, op: Op) -> Result<(), Denied> {
         self.authorize_tool(tool)?;
@@ -844,6 +862,43 @@ mod tests {
         for bad in ["a/../b", "./a", ".git", "a/.GIT/b", "a/*", "a\\b", "a//b"] {
             assert!(normalize_prefix(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_write_grant_must_sit_inside_a_read_grant() {
+        let policy = |read: &[&str], write: &[&str]| {
+            let cfg = PolicyConfig {
+                tools: vec![ALL_TOOLS.into()],
+                read: read.iter().map(|s| s.to_string()).collect(),
+                write: write.iter().map(|s| s.to_string()).collect(),
+                admin: false,
+            };
+            AccessControl::compile(
+                &BTreeMap::from([("p".to_string(), cfg)]),
+                &[],
+                &[],
+                TOOLS,
+                false,
+            )
+        };
+        // A write returns a diff and answers "anchor matched or not", so writing
+        // what you cannot read is reading it.
+        for (read, write) in [
+            (&[][..], &["memory"][..]),
+            (&["memory"], &["notes"]),
+            (&["memory/general"], &["memory"]),
+            (&["memory"], &["/"]),
+        ] {
+            let e = policy(read, write).unwrap_err().to_string();
+            assert!(
+                e.contains("mcp.policy.p.write") && e.contains("read"),
+                "{e}"
+            );
+        }
+        assert!(policy(&["memory"], &["memory"]).is_ok());
+        assert!(policy(&["memory"], &["memory/general"]).is_ok());
+        assert!(policy(&["/"], &["notes", "memory"]).is_ok());
+        assert!(policy(&["memory"], &[]).is_ok());
     }
 
     #[test]

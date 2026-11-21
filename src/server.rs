@@ -7468,18 +7468,93 @@ mod tests {
         assert!(!dir.path().join("memory/new.md").exists());
     }
 
+    async fn api_body(app: &Router, uri: &str, bearer: &str) -> serde_json::Value {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("{uri}: {status}: {e}: {}", String::from_utf8_lossy(&bytes)))
+    }
+
     #[tokio::test]
-    async fn a_scoped_token_gets_only_its_own_area_in_the_graph_and_changes() {
+    async fn a_scoped_token_gets_only_its_own_area_in_the_graph_and_the_listing() {
         let dir = tempfile::tempdir().unwrap();
-        let app = policy_assembled(dir.path(), None).await;
-        // The index is empty here, so the point is the status and the shape: the
-        // routes answer for a scoped caller without leaking, and never with 403 for
-        // the in-reach listing.
-        for uri in ["/api/graph", "/api/enumerate", "/api/changes"] {
-            let status = api_status(&app, "GET", uri, "reader-secret", None).await;
-            assert_ne!(status, StatusCode::UNAUTHORIZED, "{uri}");
-            assert_ne!(status, StatusCode::FORBIDDEN, "{uri}");
+        // Seed the index the assembled router will open lazily, at the path its
+        // config names.
+        let db = crate::state::StateDb::new(std::path::Path::new(
+            &status_config(dir.path()).state_db_path(),
+        ))
+        .await
+        .unwrap();
+        for path in ["memory/m.md", "notes/secret.md", "notes-old/x.md"] {
+            let fm =
+                std::collections::HashMap::from([("title".to_string(), serde_json::json!(path))]);
+            db.upsert_document_metadata(path, &fm, 0, "h", 1)
+                .await
+                .unwrap();
         }
+        db.replace_links(
+            "memory/m.md",
+            "markdown",
+            &[("notes/secret.md".to_string(), None)],
+        )
+        .await
+        .unwrap();
+        let app = policy_assembled(dir.path(), None).await;
+
+        let graph = api_body(&app, "/api/graph", "reader-secret").await;
+        let text = graph.to_string();
+        assert!(text.contains("memory/m.md"), "{text}");
+        assert!(
+            !text.contains("notes"),
+            "no node or edge may name it: {text}"
+        );
+
+        let listing = api_body(&app, "/api/enumerate", "reader-secret").await;
+        assert_eq!(listing["total"], serde_json::json!(1), "{listing}");
+        assert!(!listing.to_string().contains("notes"), "{listing}");
+
+        // The same routes for an unrestricted caller show everything.
+        let all = api_body(&app, "/api/graph", "ops-secret").await.to_string();
+        assert!(all.contains("notes/secret.md"), "{all}");
+
+        // Changes is git-backed and this directory is not a repository: it must
+        // answer without 403 and without leaking.
+        let status = api_status(&app, "GET", "/api/changes", "reader-secret", None).await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn initialize_gives_a_scoped_token_instructions_naming_only_its_areas() {
+        let dir = tempfile::tempdir().unwrap();
+        for area in ["memory", "notes", "secrets"] {
+            std::fs::create_dir_all(dir.path().join(area)).unwrap();
+        }
+        let app = policy_assembled(dir.path(), None).await;
+        let body = initialize_request_body();
+
+        let instructions = |bearer: &'static str| {
+            let app = app.clone();
+            let body = body.clone();
+            async move { mcp_json(&app, bearer, body).await["result"]["instructions"].to_string() }
+        };
+        let reader = instructions("reader-secret").await;
+        assert!(reader.contains("memory"), "{reader}");
+        assert!(
+            !reader.contains("notes") && !reader.contains("secrets"),
+            "{reader}"
+        );
+
+        let ops = instructions("ops-secret").await;
+        assert!(ops.contains("notes") && ops.contains("secrets"), "{ops}");
     }
 
     #[tokio::test]

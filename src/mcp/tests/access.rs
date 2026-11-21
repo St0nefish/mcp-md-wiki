@@ -243,3 +243,82 @@ fn the_restricted_search_context_is_confined_and_skips_the_corpus_wide_vocabular
         "an unrestricted caller's queries carry none"
     );
 }
+
+#[tokio::test]
+async fn enumeration_lists_only_the_reach_with_its_own_total_and_no_hints_outside_it() {
+    let (_tmp, server) = kb();
+    seed_document(&server, "memory/m.md", serde_json::json!({"title": "M"})).await;
+    seed_document(
+        &server,
+        "notes/secret.md",
+        serde_json::json!({"title": "S"}),
+    )
+    .await;
+    seed_document(&server, "notes-old/x.md", serde_json::json!({"title": "X"})).await;
+
+    let run = |params: crate::mcp::search::SearchParams| {
+        let server = &server;
+        async move {
+            CURRENT_PRINCIPAL
+                .scope(reader(), server.search(Parameters(params)))
+                .await
+        }
+    };
+
+    let listed = run(Default::default())
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(listed["total"], serde_json::json!(1), "{listed}");
+    let text = listed.to_string();
+    assert!(text.contains("memory/m.md"), "{text}");
+    assert!(!text.contains("notes"), "{text}");
+
+    // Naming the hidden area yields nothing, and nothing that names it back.
+    for prefix in ["notes", "notes/secret.md", "notes-old"] {
+        let scoped = run(crate::mcp::search::SearchParams {
+            path_prefix: Some(prefix.into()),
+            ..Default::default()
+        })
+        .await;
+        let shown = match scoped {
+            Ok(r) => r.structured_content.unwrap().to_string(),
+            Err(e) => format!("{e:?}"),
+        };
+        assert!(!shown.contains("notes/secret"), "{prefix}: {shown}");
+        assert!(!shown.contains("notes-old/x"), "{prefix}: {shown}");
+        assert!(!shown.contains("\"total\":1"), "{prefix}: {shown}");
+    }
+
+    // The unrestricted caller still sees all three.
+    let all = server.search(Parameters(Default::default())).await.unwrap();
+    assert_eq!(
+        all.structured_content.unwrap()["total"],
+        serde_json::json!(3)
+    );
+}
+
+#[tokio::test]
+async fn every_query_mode_condition_set_carries_the_reach_whatever_the_caller_filters_on() {
+    let (_tmp, server) = kb();
+    let config = server.config();
+    let schemas = crate::schema::load_shared(&server.schema_cache);
+    let ctx = CURRENT_PRINCIPAL.sync_scope(reader(), || server.search_ctx());
+    let want =
+        crate::similarity::reach_condition(&crate::policy::Reach::Prefixes(vec!["memory".into()]))
+            .unwrap();
+
+    for params in [
+        crate::mcp::search::SearchParams::default(),
+        crate::mcp::search::SearchParams {
+            path_prefix: Some("notes".into()),
+            ..Default::default()
+        },
+    ] {
+        let conditions = ctx
+            .query_conditions(&params, &config, &schemas)
+            .expect("these parameters are valid");
+        assert!(conditions.contains(&want), "{params:?}: {conditions:?}");
+    }
+}
