@@ -12,3 +12,5 @@ deploy/deploy.env
 # else under .claude/ (local settings, worktrees, plugin caches).
 !.claude/settings.json
 .serena/
+__pycache__/
+*.pyc

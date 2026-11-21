@@ -693,6 +693,33 @@ mcp:
 
 
 # ----------------------------------------------------------------------------
+# memory — an agent-memory tool group (docs/memory.md)
+# ----------------------------------------------------------------------------
+# Off by default: with no `memory` section, or `enabled: false`, the server has
+# exactly the seven core tools. When on it adds memory_create, memory_search,
+# memory_get, memory_update, memory_forget and memory_recall. A memory is an
+# ordinary markdown document under `root`, validated by a schema compiled into the
+# server (a .schema.yaml file under `root` is refused, update_schema refuses the
+# area), so access control, indexing and history apply to it unchanged. Give an
+# agent a policy that reads and writes only `root` (see mcp.policy above).
+#
+# Every key here needs a restart (the tools and the built-in schema are fixed at
+# startup).
+# memory:
+#   enabled: false
+#   # Folder (relative to the knowledge base root) that holds the memories.
+#   root: memory
+#   # Subfolder used when memory_create is not given an `area`.
+#   default_area: general
+#   # Status a new memory starts in: `proposed` (a person confirms it before
+#   # memory_recall uses it) or `confirmed`.
+#   default_status: proposed
+#   # Cosine similarity at or above which a live memory counts as a duplicate of a
+#   # new one (0.0-1.0). Starting point only; tune against your own memories.
+#   duplicate_threshold: 0.85
+
+
+# ----------------------------------------------------------------------------
 # write — behaviour of the write_document MCP write tool
 # ----------------------------------------------------------------------------
 write:

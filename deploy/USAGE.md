@@ -470,6 +470,20 @@ as a scratchpad for session notes, intermediate analysis, or task state.
 
 `mcp.instructions` in `config.yaml` is a **deprecated** narrative override — still honored (logged as deprecated at startup), but a `server.md` extension file, if present, wins over it entirely. New deployments should write policy into `<extensions_path>/server.md` instead; it travels with the knowledge base rather than living on the deploying host.
 
+## Restricting callers and agent memory
+
+Every credential has full access unless you set `mcp.policy` (see
+[`config.example.yaml`](config.example.yaml)): named policies list the tools a caller may
+use and the directories it may read and write, `mcp.tokens` gives each static caller its own
+secret (`mcp-md-wiki token mint --name <name> --policy <policy> --out <file>`), and
+`mcp.principals` maps OAuth callers. Once one policy exists, anything unmapped is denied,
+and `/status`, `/metrics` and `/admin/*` need an `admin: true` policy.
+
+To run the server as agent memory, set `memory.enabled: true` and give each agent a policy
+that reads and writes only `memory`. The agent plugins for Hermes and Open WebUI are in
+`clients/`. Setup, behaviour and caveats: [`docs/memory.md`](../docs/memory.md); tool
+contract: [`docs/memory-contract.md`](../docs/memory-contract.md).
+
 ## Knowledge Base Storage
 
 There are two ways to provide your knowledge base to the container. The **named volume** approach is recommended for most deployments.

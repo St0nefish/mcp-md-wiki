@@ -14,6 +14,45 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+### Per-caller access control and an agent-memory tool group (#381)
+
+**Nothing changes unless you opt in:** with no `mcp.policy` and no `memory` section the server
+behaves as before (same seven tools, same credentials, full access for every credential that
+gets in). The release is 0.3.0 because the two features below add configuration and a CLI
+subcommand.
+
+- **Per-principal access control.** `mcp.policy` names policies (`tools`, `read` and `write`
+  directory prefixes, `admin`), `mcp.tokens` gives each static caller its own named secret, and
+  `mcp.principals` maps OAuth callers (by scope, `client_id` or a claim). Once any policy exists
+  the server is **default-deny**: a credential nothing maps to can do nothing (an OAuth token
+  that matches no rule gets `403`), the single `bearer_token_env` token stays full access and
+  counts as admin so an upgrade does not lock anyone out, and `/status*`, `/metrics` and
+  `/admin/*` need an `admin: true` policy. A path outside a caller's `read` prefixes is treated
+  as absent by search, enumeration, `get_document` (and its links and history),
+  `changes_since`, `get_schema`, the web UI and the server instructions; every path a write
+  touches must lie inside a `write` prefix. Config load refuses a write prefix outside the read
+  prefixes, and a policy combined with `ui.api_auth: false` or `allow_unauthenticated`.
+  `mcp.policy` and `mcp.principals` are live-reloadable; `mcp.tokens` needs a restart.
+  Two exposures are accepted and documented: operator extension text is shown to every caller,
+  and a commit subject in history can name a path outside reach when one commit touched several.
+- **`mcp-md-wiki token mint --name N --policy P --out FILE`** writes a random secret to a new
+  file (mode 0600, never overwritten) and prints the `mcp.tokens` entry, never the secret.
+- **Memory tool group** (`memory.enabled`, default off, restart required):
+  `memory_create` (with a duplicate check: `on_duplicate` `reject` by default, `supersede`,
+  `keep_both`), `memory_search`, `memory_get`, `memory_update`, `memory_forget` (a soft delete)
+  and `memory_recall` (a stable, size-bounded block of `confirmed` memories). Memories are
+  ordinary markdown documents under `memory.root`, validated by a schema compiled into the
+  binary; `update_schema` refuses that area and a `.schema.yaml` file under it is rejected. New
+  memories start `proposed` and are used by recall only once confirmed. The three write tools
+  need `mcp:write` under OAuth. The server reports `memory_contract_version` (in `get_schema`
+  and `initialize`). `memory.duplicate_threshold` (0.85) is a starting value, not calibrated
+  on memory text. See `docs/memory.md` and `docs/memory-contract.md`.
+- **Client plugins** (`clients/hermes`, `clients/open-webui`): fail-open recall for Hermes and
+  Open WebUI, tested with stubs only; not yet run against the real products.
+- **Under the hood:** `src/mcp.rs` is split into `src/mcp/` (no behaviour change), and the
+  near-duplicate query and neighbour ranking moved from `write.rs` into `similarity.rs`, shared
+  with the contradiction job and the semantic-edge builder.
+
 ### Markdown is formatted automatically when a document is written
 
 Every `.md` / `.markdown` document stored by `write_document` (create, edit, full replace,

@@ -48,6 +48,14 @@ changes until you edit its config.
 > when `mcp.oauth.scopes_supported` omits `mcp:write`, since clients are then never
 > told to request it. (The MCP spec asks servers to account for a broader scope
 > implying narrower ones; this server does not yet.)
+>
+> Scopes say read versus write, not *where*. To restrict a caller to some
+> directories or tools, use `mcp.policy` with `mcp.principals` (OAuth callers, matched
+> on a scope, `client_id` or a claim) or `mcp.tokens` (named static tokens); see
+> [memory.md](memory.md). Once any policy exists the server is default-deny: a valid
+> token that no `mcp.principals` rule maps is answered `403`, and `mcp:write` is still
+> required on top of a policy's `write` prefixes. Without `mcp.policy`, a static bearer
+> token still has full access to every path.
 
 ## How it works
 
