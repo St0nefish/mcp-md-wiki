@@ -400,10 +400,11 @@ mcp:
   # Both must stay publicly reachable — they are how a client with no token
   # finds out where to get one.
   #
-  # NOTE: per-tool write-scope enforcement is NOT implemented — the auth
-  # middleware cannot see which MCP tool a request invokes. Any token that
-  # passes required_scope/required_scopes currently has full access, writes
-  # included.
+  # NOTE: write tools (write_document, delete_document, update_schema, and the
+  # web UI's POST/DELETE /api/doc) additionally require the `mcp:write` scope,
+  # so a token carrying only the read scope can read but not write. A static
+  # bearer token is not scope-checked and keeps full access; to narrow it, or
+  # to restrict by directory, use mcp.policy / mcp.tokens below.
   #
   # RESTART REQUIRED for every key below: the validator, its JWKS cache and the
   # metadata document are all built once at startup, the same posture as
@@ -626,6 +627,69 @@ mcp:
   # named there.
   # Live-reloadable, same as disabled_tools above.
   # enabled_tools: [search, get_document, get_schema]
+
+  # ---- Per-principal access control (mcp.policy / mcp.tokens / mcp.principals) ----
+  #
+  # By default every credential that gets in has full access. A policy narrows
+  # that per caller. Leave `policy` empty (the default) and nothing here applies.
+  #
+  # As soon as ONE policy exists the server is in default-deny mode:
+  #   - a credential that no token entry or principals rule maps to a policy can
+  #     do nothing (a valid but unmapped OAuth token is answered 403);
+  #   - the single token in bearer_token_env (id "default") stays full access,
+  #     so an existing deployment keeps working while you migrate to named tokens;
+  #   - /status*, /metrics and /admin/* need a policy with `admin: true` (the
+  #     bearer_token_env token counts as admin);
+  #   - config load REFUSES a policy combined with ui.api_auth: false (the web
+  #     routes would have no caller to scope) or with allow_unauthenticated.
+  #
+  # `read` and `write` are directory PREFIXES, not globs: "memory" covers
+  # memory/a.md and memory/x/y.md but never memory-old/a.md; "/" is the whole
+  # knowledge base. A document outside a principal's `read` is invisible to it:
+  # search, listings, links, history, schema lookups and instructions all
+  # behave as if it did not exist. `write` is checked on every path a write
+  # touches (create, edit, move source and destination, archive, delete,
+  # directory move). A link in a document the principal cannot write is left
+  # alone when a move would otherwise rewrite it.
+  #
+  # `tools` names the MCP tools the principal may call ("*" is all of them); a
+  # tool outside the list is neither listed nor callable.
+  #
+  # Live-reloadable (POST /admin/reload): policy, principals. Restart required: tokens.
+  #
+  # policy:
+  #   memory-agent:
+  #     tools: [search, get_document, write_document]
+  #     read: [memory]
+  #     write: [memory]
+  #   reader:
+  #     tools: [search, get_document, get_schema, changes_since]
+  #     read: [/]
+  #   ops:
+  #     tools: ["*"]
+  #     read: [/]
+  #     write: [/]
+  #     admin: true
+  #
+  # Named static tokens. Mint the secret file with
+  #   mcp-md-wiki token mint --name <name> --policy <policy> --out /run/secrets/<file>
+  # (written 0600, never overwritten, never printed), then point secret_env at
+  # a variable holding it; `<secret_env>_FILE` reads it from a file instead.
+  # Names are unique, "default" is reserved, and each name is the label shown in logs.
+  # tokens:
+  #   - name: hermes
+  #     secret_env: MCP_TOKEN_HERMES
+  #     policy: memory-agent
+  #
+  # OAuth callers (requires mcp.oauth): the first matching rule wins; match on
+  # exactly one of scope, client_id or claim.
+  # principals:
+  #   - match: { scope: "mcp:ops" }
+  #     policy: ops
+  #   - match: { client_id: "open-webui" }
+  #     policy: memory-agent
+  #   - match: { claim: { name: "groups", value: "kb-readers" } }
+  #     policy: reader
 
 
 # ----------------------------------------------------------------------------

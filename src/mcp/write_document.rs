@@ -1310,6 +1310,7 @@ impl KbSearchServer {
     ) -> WriteDeps<'a, EmbedClient, QdrantStore> {
         WriteDeps {
             retrieval: self.deps(),
+            principal: self.principal(),
             canonical_data_path: &self.canonical_data_path,
             schema_cache: &self.schema_cache,
             validation: &config.validation,
@@ -1749,6 +1750,13 @@ impl KbSearchServer {
             .documents
             .expect("write_document_batch is only called when params.documents.is_some()");
 
+        // Every entry's path, before anything is validated, resolved or read: an
+        // entry the policy does not grant refuses the whole batch with the same
+        // answer whether or not that path exists.
+        for doc in &documents {
+            self.authorize_write(doc.path.trim())?;
+        }
+
         if documents.is_empty() {
             return Err(McpError::invalid_params(
                 "documents must not be empty".to_string(),
@@ -1947,6 +1955,15 @@ impl KbSearchServer {
             ));
         }
 
+        // Authorized before any branch that depends on what exists at `path` (a
+        // directory move, an edit, a create): which of those it is must not be
+        // readable from the refusal. The write pipeline checks every path it
+        // resolves again (`write::safe_write_path`); this is the early answer.
+        self.authorize_write(&raw)?;
+        if let Some(new_path) = params.new_path.as_deref() {
+            self.authorize_write(new_path.trim())?;
+        }
+
         // Branch 1: a directory move. Detected via the literal (non-fuzzy)
         // resolver — a directory can never satisfy `resolve_within_data`'s
         // include-pattern check, so that resolver cannot be used for this test.
@@ -2018,6 +2035,10 @@ impl KbSearchServer {
                 None,
             ));
         }
+
+        // Before the existence check below, so "not permitted" and "does not exist"
+        // cannot be told apart for a path outside the caller's write grants.
+        self.authorize_write(raw)?;
 
         // Resolve the path (must already exist on disk) with `resolve_within_data`,
         // the literal resolver `write_document` also tries first: relative to the KB

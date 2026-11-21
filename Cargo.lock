@@ -1972,6 +1972,7 @@ dependencies = [
  "backoff",
  "clap",
  "futures",
+ "getrandom 0.3.4",
  "globset",
  "gray_matter",
  "hex",

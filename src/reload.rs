@@ -636,6 +636,37 @@ const DIFF_TABLE: &[DiffField] = &[
         }],
     },
     DiffField {
+        path: "mcp.policy",
+        get: |c| Some(d(&c.mcp.policy)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "mcp.policy",
+            note: "the principal layer (server.rs) resolves each request's principal from \
+                   the live config, so a changed policy governs the next request. A reload \
+                   that adds a first policy is validated like a start (ui.api_auth must be on).",
+        }],
+    },
+    DiffField {
+        path: "mcp.principals",
+        get: |c| Some(d(&c.mcp.principals)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::Applied,
+            setting: "mcp.principals",
+            note: "read fresh from the live config by the principal layer on every request.",
+        }],
+    },
+    DiffField {
+        path: "mcp.tokens",
+        get: |c| Some(d(&c.mcp.tokens)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.tokens",
+            note: "the named static tokens' secrets are resolved once in run_server and baked \
+                   into the AuthLayer (and the token-to-policy map is read from the live \
+                   config, which a reload may only point at a policy that exists).",
+        }],
+    },
+    DiffField {
         path: "mcp.metadata_refresh_secs",
         get: |c| Some(d(&c.mcp.metadata_refresh_secs)),
         consumers: &[ConsumerEntry {

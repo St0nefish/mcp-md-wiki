@@ -20,6 +20,7 @@ use std::path::Path;
 use qdrant_client::qdrant::Condition;
 
 use crate::embed::QueryEmbedder;
+use crate::policy::Reach;
 use crate::qdrant::{PATH_ANCESTORS_KEY, RetrievalStore};
 use crate::retrieval::{RetrievalDeps, SearchFilters};
 
@@ -120,26 +121,28 @@ pub(crate) struct Neighbour {
     pub score: f32,
 }
 
-/// The Qdrant condition confining a search to the documents under `dir` (a
-/// KB-relative directory without a trailing slash, or a document's own path).
+/// The Qdrant condition confining a search to what `reach` covers, `None` when it
+/// covers everything.
 ///
-/// A plain match on `path_ancestors`, which holds every ancestor directory and
-/// the document's own path. It is deliberately NOT
-/// `retrieval::path_filter_condition`: that one ORs `is_empty(path_ancestors)`
-/// so a document indexed before the field existed still passes, which makes it a
-/// relevance filter, not a boundary. A similarity query that must stay inside a
-/// directory can have no such escape.
-pub(crate) fn scope_condition(dir: &str) -> Condition {
-    Condition::matches(
-        PATH_ANCESTORS_KEY,
-        crate::retrieval::kb_root_relative(dir)
-            .trim_end_matches('/')
-            .to_string(),
-    )
+/// A plain match-any on `path_ancestors`, which holds every ancestor directory and
+/// the document's own path; for a reach with nothing in it, the unsatisfiable
+/// condition (never an empty match-any, whose meaning is not worth relying on). It
+/// is deliberately NOT `retrieval::path_filter_condition`: that one ORs
+/// `is_empty(path_ancestors)` so a document indexed before the field existed still
+/// passes, which makes it a relevance filter, not a boundary. A query that must
+/// stay inside a directory can have no such escape.
+pub(crate) fn reach_condition(reach: &Reach) -> Option<Condition> {
+    match reach {
+        Reach::All => None,
+        Reach::Prefixes(dirs) if dirs.is_empty() => {
+            Some(crate::qdrant::unsatisfiable(PATH_ANCESTORS_KEY))
+        }
+        Reach::Prefixes(dirs) => Some(Condition::matches(PATH_ANCESTORS_KEY, dirs.clone())),
+    }
 }
 
 /// The nearest documents to `query_text`, nearest first, one per document, at
-/// most `limit`, optionally only those under `scope`.
+/// most `limit`, among the documents `scope` covers.
 ///
 /// `query_text` is embedded on the document side (it is compared against indexed
 /// chunks, so it takes `embedding.document_prefix`, not the query prefix), the
@@ -155,7 +158,7 @@ pub(crate) async fn find_near_duplicates<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &RetrievalDeps<'_, E, Q>,
     canonical_data_path: &Path,
     query_text: &str,
-    scope: Option<&str>,
+    scope: &Reach,
     limit: usize,
 ) -> Result<Vec<Neighbour>, crate::retrieval::SearchError> {
     let document_side = DocumentSideEmbedder(deps.embed_client);
@@ -168,7 +171,7 @@ pub(crate) async fn find_near_duplicates<E: QueryEmbedder, Q: RetrievalStore>(
         reranker: None,
     };
     let filters = SearchFilters {
-        conditions: scope.map(scope_condition).into_iter().collect(),
+        conditions: reach_condition(scope).into_iter().collect(),
     };
     let results = crate::retrieval::search(
         &dedup_deps,
@@ -295,10 +298,22 @@ mod tests {
     }
 
     #[test]
-    fn scope_condition_is_a_plain_match_with_no_empty_escape() {
-        let expected = Condition::matches(PATH_ANCESTORS_KEY, "memory/general".to_string());
-        assert_eq!(scope_condition("memory/general"), expected);
-        // A trailing or leading slash names the same directory.
-        assert_eq!(scope_condition("/memory/general/"), expected);
+    fn reach_condition_is_a_plain_match_with_no_empty_escape() {
+        assert_eq!(reach_condition(&Reach::All), None);
+        assert_eq!(
+            reach_condition(&Reach::Prefixes(vec![
+                "memory/general".into(),
+                "notes".into()
+            ])),
+            Some(Condition::matches(
+                PATH_ANCESTORS_KEY,
+                vec!["memory/general".to_string(), "notes".to_string()]
+            ))
+        );
+        // Nothing to read: unsatisfiable, never a match on an empty list.
+        assert_eq!(
+            reach_condition(&Reach::Prefixes(Vec::new())),
+            Some(crate::qdrant::unsatisfiable(PATH_ANCESTORS_KEY))
+        );
     }
 }

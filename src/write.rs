@@ -173,6 +173,11 @@ pub fn render_unified_diff(old: &str, new: &str, relpath: &str) -> String {
 /// create-path dedup gate — see `crate::retrieval::RetrievalDeps`.
 pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     pub retrieval: RetrievalDeps<'a, E, Q>,
+    /// Who is writing. Every path the pipeline touches is checked against this
+    /// principal's write grants in [`safe_write_path`], and the create-path dedup
+    /// query is confined to what it may read, so neither a refusal nor a `related`
+    /// list names a document it may not see.
+    pub principal: crate::policy::Principal,
     /// Canonicalized knowledge-base root. Every filesystem action re-resolves
     /// against this immediately before it happens (see `resolve_safe_write_path`),
     /// closing the TOCTOU window a slow schema/dedup lookup would otherwise leave
@@ -629,15 +634,34 @@ fn safe_write_path<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     rel_path: &str,
 ) -> Result<PathBuf, WriteError> {
-    resolve_safe_write_path_detailed(deps.canonical_data_path, rel_path).map_err(|e| match e {
-        PathSafetyError::Rejected(msg) => WriteError::UnsafePath {
-            msg: format!("Invalid path: {}", msg),
+    let abs = resolve_safe_write_path_detailed(deps.canonical_data_path, rel_path).map_err(
+        |e| match e {
+            PathSafetyError::Rejected(msg) => WriteError::UnsafePath {
+                msg: format!("Invalid path: {}", msg),
+            },
+            PathSafetyError::Internal(msg) => WriteError::Internal {
+                msg: format!("Invalid path: {}", msg),
+            },
         },
-        PathSafetyError::Internal(msg) => WriteError::Internal {
-            msg: format!("Invalid path: {}", msg),
-        },
-    })
+    )?;
+    // Access control. Every create, edit, move (source and destination), delete,
+    // archive, batch entry, directory move and rewritten referencing document
+    // resolves its path here, so this one check is what keeps a principal's write
+    // grant from being wider than its policy, in the pipeline both transports
+    // share rather than in either adapter. It runs after path safety, so a
+    // malformed path keeps its own refusal, and it says nothing about whether the
+    // target exists.
+    deps.principal
+        .authorize_path(rel_path, crate::policy::Op::Write)
+        .map_err(|_| WriteError::UnsafePath {
+            msg: NOT_PERMITTED.to_string(),
+        })?;
+    Ok(abs)
 }
+
+/// The refusal text for a write the caller's policy does not grant. The web adapter
+/// maps exactly this text to `403`.
+pub const NOT_PERMITTED: &str = "not permitted";
 
 /// Reject `rel_path` if it does not match `include_patterns` — a path the
 /// indexer would never pick up (e.g. anything outside `**/*.md`, including
@@ -1665,7 +1689,7 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
         &deps.retrieval,
         deps.canonical_data_path,
         &query_text,
-        None,
+        &deps.principal.reach(crate::policy::Op::Read),
         related_limit,
     )
     .await
@@ -4856,7 +4880,10 @@ pub async fn delete_document_with<E: QueryEmbedder, Q: RetrievalStore>(
                     inbound.len(),
                     inbound.join(", ")
                 );
-                referencing_paths = inbound;
+                // Only documents the caller may read: the warning is for the
+                // caller, and a path outside its reach is not something it may learn.
+                let reach = deps.principal.reach(crate::policy::Op::Read);
+                referencing_paths = inbound.into_iter().filter(|p| reach.covers(p)).collect();
             }
             Ok(_) => {}
             Err(e) => {
@@ -6033,6 +6060,8 @@ mod tests {
         /// git working copy, or every git-backed test's `git status --porcelain
         /// == ""` assertion would start seeing it as an untracked file.
         _state_db_dir: Option<tempfile::TempDir>,
+        /// Who writes; `None` is an unrestricted principal.
+        principal: Option<crate::policy::Principal>,
     }
 
     impl Harness {
@@ -6066,6 +6095,7 @@ mod tests {
                 token: None,
                 state_db: None,
                 reindex_queue: crate::reindex::ReindexQueue::new(),
+                principal: None,
                 _state_db_dir: None,
             }
         }
@@ -6085,6 +6115,12 @@ mod tests {
 
         fn deps(&self) -> WriteDeps<'_, EmbedClient, QdrantStore> {
             WriteDeps {
+                principal: self.principal.clone().unwrap_or_else(|| {
+                    crate::policy::Principal::unrestricted(
+                        "test",
+                        crate::policy::PrincipalSource::Anonymous,
+                    )
+                }),
                 retrieval: RetrievalDeps {
                     embed_client: &self.embed,
                     qdrant: &self.qdrant,
@@ -6164,6 +6200,163 @@ mod tests {
             expected_version: Some(leak(document_version(old_content.as_bytes()))),
             dest_path: Some(dest_rel),
             archive: None,
+        }
+    }
+
+    /// Access control in the shared write pipeline: a principal confined to
+    /// `memory/` is refused every write that touches anything else, with one answer
+    /// whether or not the target exists, and nothing on disk changes.
+    mod access_control {
+        use super::*;
+        use crate::policy::scoped_principal_for_test;
+
+        const TOOLS: &[&str] = &["write_document", "delete_document", "search"];
+
+        fn is_not_permitted(err: &WriteError) -> bool {
+            matches!(err, WriteError::UnsafePath { msg } if msg == NOT_PERMITTED)
+        }
+
+        fn kb() -> (tempfile::TempDir, Harness) {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("memory/general")).unwrap();
+            std::fs::create_dir_all(tmp.path().join("notes")).unwrap();
+            std::fs::create_dir_all(tmp.path().join("notes-old")).unwrap();
+            std::fs::write(
+                tmp.path().join("notes/secret.md"),
+                "---\ntitle: S\n---\nbody",
+            )
+            .unwrap();
+            let mut config = crate::mcp::make_test_resolved_config(tmp.path());
+            Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
+            let mut harness = Harness::new(&tmp, config);
+            harness.principal = Some(scoped_principal_for_test(
+                TOOLS,
+                &["memory"],
+                &["memory/general"],
+            ));
+            (tmp, harness)
+        }
+
+        #[tokio::test]
+        async fn create_edit_and_delete_outside_the_write_grant_are_refused_the_same_way() {
+            let (tmp, harness) = kb();
+            let before = std::fs::read_to_string(tmp.path().join("notes/secret.md")).unwrap();
+            // An existing document, a missing one, a sibling that only shares a name
+            // prefix, and a path inside the READ grant but outside the write grant.
+            for rel in [
+                "notes/secret.md",
+                "notes/absent.md",
+                "notes-old/a.md",
+                "memory/other.md",
+            ] {
+                for is_create in [true, false] {
+                    let err = write_document(&harness.deps(), make_req(rel, "x", is_create))
+                        .await
+                        .unwrap_err();
+                    assert!(is_not_permitted(&err), "{rel} create={is_create}: {err:?}");
+                }
+                let err = delete_document(&harness.deps(), rel, None, None)
+                    .await
+                    .unwrap_err();
+                assert!(is_not_permitted(&err), "delete {rel}: {err:?}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("notes/secret.md")).unwrap(),
+                before
+            );
+            assert!(!tmp.path().join("notes/absent.md").exists());
+            assert!(!tmp.path().join("memory/other.md").exists());
+        }
+
+        #[tokio::test]
+        async fn a_move_is_refused_when_either_end_is_outside_the_write_grant() {
+            let (tmp, harness) = kb();
+            std::fs::write(
+                tmp.path().join("memory/general/a.md"),
+                "---\ntitle: A\n---\nbody",
+            )
+            .unwrap();
+            // Source in scope, destination out; and the reverse (pulling a document
+            // out of notes/ into the grant would be a read of it).
+            for (src, dest) in [
+                ("memory/general/a.md", "notes/a.md"),
+                ("notes/secret.md", "memory/general/s.md"),
+            ] {
+                let err = write_document(&harness.deps(), make_move_req(src, dest, "x", "x"))
+                    .await
+                    .unwrap_err();
+                assert!(is_not_permitted(&err), "{src} -> {dest}: {err:?}");
+            }
+            assert!(tmp.path().join("memory/general/a.md").exists());
+            assert!(tmp.path().join("notes/secret.md").exists());
+            assert!(!tmp.path().join("notes/a.md").exists());
+            assert!(!tmp.path().join("memory/general/s.md").exists());
+        }
+
+        #[tokio::test]
+        async fn a_directory_move_needs_a_write_grant_over_both_directories() {
+            let (tmp, harness) = kb();
+            for (src, dest) in [
+                ("notes", "memory/general/notes"),
+                ("memory/general", "notes/stolen"),
+                // The grant is `memory/general`, so its parent is not covered.
+                ("memory", "memory-new"),
+            ] {
+                let err = move_directory(&harness.deps(), src, dest, None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&err, DirectoryMoveError::UnsafePath { msg } if msg == NOT_PERMITTED),
+                    "{src} -> {dest}: {err:?}"
+                );
+            }
+            assert!(tmp.path().join("notes/secret.md").exists());
+        }
+
+        #[tokio::test]
+        async fn one_entry_outside_the_grant_refuses_the_whole_batch() {
+            let (tmp, harness) = kb();
+            let requests = [
+                BatchWriteRequest {
+                    rel_path: "memory/general/ok.md",
+                    change: DocChange::Create("---\ntitle: Ok\n---\nbody"),
+                    force_new: Some(true),
+                    expected_version: None,
+                },
+                BatchWriteRequest {
+                    rel_path: "notes/evil.md",
+                    change: DocChange::Create("---\ntitle: E\n---\nbody"),
+                    force_new: Some(true),
+                    expected_version: None,
+                },
+            ];
+            let err = write_documents_batch(&harness.deps(), &requests, None)
+                .await
+                .unwrap_err();
+            match err {
+                BatchWriteError::Documents { failures } => {
+                    assert!(
+                        failures
+                            .iter()
+                            .any(|(p, e)| p == "notes/evil.md" && is_not_permitted(e)),
+                        "{failures:?}"
+                    );
+                }
+                other => panic!("expected a refused batch, got {other:?}"),
+            }
+            assert!(!tmp.path().join("memory/general/ok.md").exists());
+            assert!(!tmp.path().join("notes/evil.md").exists());
+        }
+
+        #[tokio::test]
+        async fn a_principal_with_no_write_grant_cannot_write_inside_its_read_area() {
+            let (tmp, mut harness) = kb();
+            harness.principal = Some(scoped_principal_for_test(TOOLS, &["memory"], &[]));
+            let err = write_document(&harness.deps(), make_req("memory/general/x.md", "x", true))
+                .await
+                .unwrap_err();
+            assert!(is_not_permitted(&err), "{err:?}");
+            assert!(!tmp.path().join("memory/general/x.md").exists());
         }
     }
 

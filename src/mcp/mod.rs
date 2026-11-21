@@ -45,6 +45,20 @@ use crate::{
     write::{self},
 };
 
+use crate::policy::{Op, Principal};
+
+tokio::task_local! {
+    /// The principal of the tool call being served, set by `call_tool` for the
+    /// duration of the handler (`KbSearchServer::principal` reads it).
+    static CURRENT_PRINCIPAL: Principal;
+}
+
+/// What a caller is told when its policy does not permit what it asked for.
+/// Deliberately generic: it names no path, tool or reason.
+fn denied_error() -> McpError {
+    McpError::invalid_params("not permitted".to_string(), None)
+}
+
 const MAX_QUERY_LEN: usize = 4096;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
@@ -525,7 +539,8 @@ impl KbSearchServer {
         }
     }
 
-    /// The `search` call's view of this server's state.
+    /// The `search` call's view of this server's state, confined to what the calling
+    /// principal may read.
     fn search_ctx(&self) -> SearchCtx<'_> {
         SearchCtx {
             deps: self.deps(),
@@ -533,7 +548,39 @@ impl KbSearchServer {
             schema_cache: &self.schema_cache,
             state_db: &self.state_db,
             extra_conditions: Vec::new(),
+            reach: self.principal().reach(Op::Read),
         }
+    }
+
+    /// The principal behind the tool call being served. Set around every dispatched
+    /// call ([`ServerHandler::call_tool`]); a handler reached any other way (a unit
+    /// test, a future in-process caller) gets the unrestricted principal while no
+    /// policy is configured and none at all once one is, so a path that skips the
+    /// dispatcher fails closed.
+    pub(crate) fn principal(&self) -> Principal {
+        CURRENT_PRINCIPAL
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| {
+                Principal::from_extension(None, self.config().mcp.access.enforcing())
+            })
+    }
+
+    /// The principal the principal layer stored on the HTTP request that carried
+    /// `context`'s message; fail-closed under a policy when there is none.
+    fn principal_of(&self, context: &RequestContext<RoleServer>) -> Principal {
+        let stored = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Principal>());
+        Principal::from_extension(stored, self.config().mcp.access.enforcing())
+    }
+
+    /// Refuse a write the calling principal's policy does not grant. The refusal
+    /// names nothing about the document: not whether it exists, not why.
+    fn authorize_write(&self, path: &str) -> Result<(), McpError> {
+        self.principal()
+            .authorize_path(path, Op::Write)
+            .map_err(|_| denied_error())
     }
 
     /// See [`SearchCtx::resolve_path_filter`].
@@ -596,17 +643,47 @@ impl ServerHandler for KbSearchServer {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        // A principal sees only the tools its policy lets it call, so an agent is
+        // never offered a tool that would be refused.
+        let principal = self.principal_of(&context);
         let tools = self
             .enabled_tool_router()
             .list_all()
             .into_iter()
+            .filter(|tool| principal.authorize_tool(&tool.name).is_ok())
             .map(|tool| self.overlay_description(tool))
             .map(|tool| self.overlay_input_schema(tool))
             .map(tool_schema::self_contained)
             .collect();
         Ok(ListToolsResult::with_all_items(tools))
+    }
+
+    /// The default `initialize`, except that a reader confined to part of the
+    /// knowledge base is given instructions that list only the areas it can read.
+    /// `get_info` takes no request context, so this is where the calling principal
+    /// is known.
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        context.peer.set_peer_info(request.clone());
+        let mut result = self.negotiate_initialize(&request)?;
+        let principal = self.principal_of(&context);
+        if principal.is_restricted() {
+            let config = self.config();
+            result.instructions = Some(
+                crate::server::compose_server_instructions_for(
+                    &config,
+                    &self.canonical_data_path,
+                    &principal.reach(Op::Read),
+                )
+                .await,
+            );
+        }
+        Ok(result)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -633,7 +710,16 @@ impl ServerHandler for KbSearchServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let router = self.enabled_tool_router();
+        // The principal comes from the HTTP request THIS call arrived on (rmcp
+        // attaches each message's own `Parts`, not the session's first), resolved by
+        // the principal layer in front of `/mcp`. A tool the policy does not grant is
+        // refused exactly as an unknown tool is, so a policy reveals nothing about
+        // which tools exist.
+        let principal = self.principal_of(&context);
+        if principal.authorize_tool(&request.name).is_err() {
+            return Err(McpError::invalid_params("tool not found".to_string(), None));
+        }
         let tcc = ToolCallContext::new(self, request, context);
-        router.call(tcc).await
+        CURRENT_PRINCIPAL.scope(principal, router.call(tcc)).await
     }
 }

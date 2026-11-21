@@ -657,6 +657,25 @@ pub struct McpConfig {
     /// (which would disable every tool) — see [`Config::resolve`].
     #[serde(default)]
     pub enabled_tools: Option<Vec<String>>,
+    /// Named access policies (`policy.<name>`): the tools, directories and operator
+    /// routes a principal may use (`crate::policy::PolicyConfig`). Empty (the
+    /// default) means no policy is enforced and every authenticated caller keeps
+    /// today's full access. Once any policy is defined, a caller no token name or
+    /// principal rule maps to is refused everything, and `ui.api_auth` must be on
+    /// (the web routes would otherwise have no principal). The legacy
+    /// `bearer_token_env` token stays full access. Applied on reload.
+    #[serde(default)]
+    pub policy: std::collections::BTreeMap<String, crate::policy::PolicyConfig>,
+    /// Named static tokens, each acting under a policy (`crate::policy::TokenConfig`).
+    /// They are accepted alongside `bearer_token_env` and OAuth. Restart required
+    /// (the auth layer is built once).
+    #[serde(default)]
+    pub tokens: Vec<crate::policy::TokenConfig>,
+    /// Rules mapping an OAuth token (by scope, client id or claim) to a policy;
+    /// the first match wins and a token that matches none gets no access once a
+    /// policy exists. Needs `mcp.oauth`. Applied on reload.
+    #[serde(default)]
+    pub principals: Vec<crate::policy::PrincipalRule>,
 }
 
 impl Default for McpConfig {
@@ -671,6 +690,9 @@ impl Default for McpConfig {
             oauth: default_mcp_oauth(),
             disabled_tools: Vec::new(),
             enabled_tools: None,
+            policy: std::collections::BTreeMap::new(),
+            tokens: Vec::new(),
+            principals: Vec::new(),
         }
     }
 }
@@ -817,6 +839,16 @@ pub struct ResolvedMcpConfig {
     /// `enabled_tools` at all. Validated in [`Config::resolve`], so a live
     /// `ResolvedConfig` never carries an unknown, duplicate, or all-disabling set.
     pub disabled_tools: Vec<String>,
+    /// The compiled `mcp.policy` / `mcp.tokens` / `mcp.principals` (validated in
+    /// [`Config::resolve`]); not enforcing when no policy is configured.
+    pub access: crate::policy::AccessControl,
+    /// `mcp.policy` as configured (what `access` was compiled from; kept so a
+    /// reload can report a change to it).
+    pub policy: std::collections::BTreeMap<String, crate::policy::PolicyConfig>,
+    /// `mcp.tokens` as configured, for the startup secret lookup.
+    pub tokens: Vec<crate::policy::TokenConfig>,
+    /// `mcp.principals` as configured.
+    pub principals: Vec<crate::policy::PrincipalRule>,
 }
 
 impl Default for ResolvedMcpConfig {
@@ -831,6 +863,10 @@ impl Default for ResolvedMcpConfig {
             extensions_path: default_extensions_path(),
             oauth: None,
             disabled_tools: Vec::new(),
+            access: crate::policy::AccessControl::default(),
+            policy: std::collections::BTreeMap::new(),
+            tokens: Vec::new(),
+            principals: Vec::new(),
         }
     }
 }
@@ -1782,6 +1818,9 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("mcp.extensions_path", "mcp"),
     ("mcp.disabled_tools", "mcp"),
     ("mcp.enabled_tools", "mcp"),
+    ("mcp.policy", "mcp"),
+    ("mcp.tokens", "mcp"),
+    ("mcp.principals", "mcp"),
     ("mcp.oauth.enabled", "mcp"),
     ("mcp.oauth.issuer", "mcp"),
     ("mcp.oauth.jwks_uri", "mcp"),
@@ -2572,6 +2611,34 @@ impl Config {
         // once, same reasoning as the missing-env-var block below.
         let oauth = resolve_mcp_oauth(self.mcp.oauth.clone())?;
 
+        // Access policies (`mcp.policy`, `mcp.tokens`, `mcp.principals`). Compiled
+        // here so a bad policy is a startup / reload refusal, never a request-time
+        // surprise. A policy needs every request to carry an authenticated
+        // principal: the unauthenticated pass-through has none, and the web routes
+        // only get one through the auth layer (`ui.api_auth`), so either setting
+        // alongside a policy would leave a route that enforces nothing.
+        let access = crate::policy::AccessControl::compile(
+            &self.mcp.policy,
+            &self.mcp.tokens,
+            &self.mcp.principals,
+            &crate::descriptions::TOOL_NAMES,
+            oauth.is_some(),
+        )?;
+        if access.enforcing() {
+            if self.mcp.allow_unauthenticated {
+                anyhow::bail!(
+                    "mcp.policy is set but mcp.allow_unauthenticated is true: a policy needs an \
+                     authenticated principal on every request"
+                );
+            }
+            if !self.ui.api_auth {
+                anyhow::bail!(
+                    "mcp.policy is set but ui.api_auth is false: the web UI's /api/* routes would \
+                     serve every document with no principal to check; set ui.api_auth: true"
+                );
+            }
+        }
+
         // Validate required env vars — named all at once, not one at a time, so a
         // fresh deployment finds every missing var on the first failed start
         // instead of fixing them one restart at a time.
@@ -2713,6 +2780,10 @@ impl Config {
                     extensions_path: self.mcp.extensions_path,
                     oauth,
                     disabled_tools: effective_disabled_tools,
+                    access,
+                    policy: self.mcp.policy,
+                    tokens: self.mcp.tokens,
+                    principals: self.mcp.principals,
                 }
             },
             rate_limit: self.rate_limit,
@@ -4128,6 +4199,66 @@ mcp:
     fn search_granularities_custom_subset_round_trips() {
         let cfg = Config::from_str_raw("search:\n  granularities: [document]\n").unwrap();
         assert_eq!(cfg.search.granularities, vec![Granularity::Document]);
+    }
+
+    const POLICY_YAML: &str =
+        "mcp:\n  policy:\n    agent:\n      tools: [search]\n      read: [memory]\n";
+
+    #[test]
+    fn mcp_policy_absent_means_nothing_is_enforced() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let cfg = Config::from_str("").unwrap();
+        assert!(!cfg.mcp.access.enforcing());
+        assert!(cfg.mcp.policy.is_empty() && cfg.mcp.tokens.is_empty());
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_policy_needs_api_auth_and_an_authenticated_caller() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        // The web routes only get a principal through the auth layer.
+        let err = Config::from_str(POLICY_YAML).unwrap_err().to_string();
+        assert!(err.contains("ui.api_auth"), "{err}");
+        let ok = format!("{POLICY_YAML}ui:\n  api_auth: true\n");
+        assert!(Config::from_str(&ok).unwrap().mcp.access.enforcing());
+        // No principal exists on the unauthenticated pass-through.
+        let open = format!("{POLICY_YAML}  allow_unauthenticated: true\nui:\n  api_auth: true\n");
+        let err = Config::from_str(&open).unwrap_err().to_string();
+        assert!(err.contains("allow_unauthenticated"), "{err}");
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_policy_mistakes_name_the_setting() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let ui = "ui:\n  api_auth: true\n";
+        for (yaml, needle) in [
+            (
+                format!("mcp:\n  policy:\n    a:\n      tools: [nope]\n{ui}"),
+                "mcp.policy.a.tools",
+            ),
+            (
+                format!("mcp:\n  policy:\n    a:\n      read: [\"../x\"]\n{ui}"),
+                "mcp.policy.a.read",
+            ),
+            (
+                format!(
+                    "mcp:\n  policy:\n    a: {{}}\n  tokens:\n    - name: t\n      secret_env: S\n      policy: b\n{ui}"
+                ),
+                "not defined under mcp.policy",
+            ),
+            (
+                format!("mcp:\n  policy:\n    a: {{}}\n  unknown_key: 1\n{ui}"),
+                "unknown_key",
+            ),
+        ] {
+            let err = Config::from_str(&yaml).unwrap_err().to_string();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        clear_required_env();
     }
 
     #[test]

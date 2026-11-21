@@ -1242,6 +1242,14 @@ impl KbSearchServer {
     ) -> Result<CallToolResult, McpError> {
         let raw = params.path.clone().unwrap_or_default();
         let rel = normalize_scope_path(&raw)?;
+        // A restricted principal reads schema only inside its reach, under the exact
+        // path it names: the partial-reference resolution below enumerates scope
+        // names (in its candidate list), which is a view of the whole tree.
+        let reach = self.principal().reach(Op::Read);
+        let restricted = !matches!(reach, crate::policy::Reach::All);
+        if restricted && !reach.covers(&rel.to_string_lossy()) {
+            return Err(denied_error());
+        }
         // Reads the shared, server-owned cache rather than walking the tree on every
         // call — this tool is the one the server's own instructions tell agents to
         // call before every write, so it needs to be cheap. See
@@ -1251,7 +1259,7 @@ impl KbSearchServer {
         // A document path resolves via its parent; a directory resolves to itself. A
         // partial directory reference resolves like a partial document path does —
         // exact match wins, otherwise report the candidates rather than guessing.
-        let rel = if raw.ends_with(".md") || rel.as_os_str().is_empty() {
+        let rel = if restricted || raw.ends_with(".md") || rel.as_os_str().is_empty() {
             rel
         } else {
             resolve_scope_reference(&schemas, &rel)?
@@ -1427,6 +1435,11 @@ impl KbSearchServer {
         let invalid = |msg: String| McpError::invalid_params(msg, None);
 
         let requested = normalize_scope_path(params.path.as_deref().unwrap_or(""))?;
+        // A schema governs everything under its directory, so changing one is a write
+        // to that whole directory: it needs a write grant covering it. Checked before
+        // the partial-reference resolution below (whose "matches N scopes" error lists
+        // scope names) and again on what that resolution picked.
+        self.authorize_write(&requested.to_string_lossy())?;
         let edits = build_schema_edits(&params)?;
 
         // Read the shared cache for the pre-edit view (casualty check, raw file
@@ -1459,6 +1472,8 @@ impl KbSearchServer {
                 ));
             }
         };
+
+        self.authorize_write(&rel_dir.to_string_lossy())?;
 
         // Root-scope mutations need an explicit opt-in when the root schema's
         // `root_edit: {require_ack: true}` asks for one (#345; see

@@ -118,6 +118,11 @@ pub struct DocumentQuery {
     pub mtime_after: Option<i64>,
     /// Exclude documents whose `mtime` is after this Unix timestamp.
     pub mtime_before: Option<i64>,
+    /// Confine the listing (and its `total`) to documents under these directories
+    /// (KB-relative, no trailing slash). `None` is no restriction; `Some` of an
+    /// empty list matches nothing. Compared exactly, never with `LIKE`, so a `_` or
+    /// `%` in a directory name is just a character.
+    pub scope: Option<Vec<String>>,
 }
 
 impl Default for DocumentQuery {
@@ -132,8 +137,42 @@ impl Default for DocumentQuery {
             fields: None,
             mtime_after: None,
             mtime_before: None,
+            scope: None,
         }
     }
+}
+
+/// Append `AND (<column> is under one of `scope`'s directories)`, or nothing when
+/// `scope` is `None`. Each directory matches the document at exactly that path and
+/// anything below it (`column = dir OR substr(column, 1, len(dir) + 1) = dir || '/'`),
+/// so `notes` never matches `notes-old/…`, and no `LIKE` wildcard can widen a grant
+/// (`_archive` is a real top-level area, and `_` matches any character in a pattern).
+fn push_scope(builder: &mut QueryBuilder<Sqlite>, column: &str, scope: Option<&[String]>) {
+    let Some(dirs) = scope else { return };
+    if dirs.is_empty() {
+        builder.push(" AND 0 = 1");
+        return;
+    }
+    builder.push(" AND (");
+    for (i, dir) in dirs.iter().enumerate() {
+        if i > 0 {
+            builder.push(" OR ");
+        }
+        if dir.is_empty() {
+            builder.push("1 = 1");
+            continue;
+        }
+        builder.push(column);
+        builder.push(" = ");
+        builder.push_bind(dir.clone());
+        builder.push(" OR substr(");
+        builder.push(column);
+        builder.push(", 1, ");
+        builder.push_bind(dir.chars().count() as i64 + 1);
+        builder.push(") = ");
+        builder.push_bind(format!("{dir}/"));
+    }
+    builder.push(")");
 }
 
 /// One document in a listing.
@@ -194,7 +233,12 @@ pub trait DocumentIndex: Send + Sync {
     /// index each deciding differently for the same input (issue #259).
     ///
     /// Matching is case-insensitive for ASCII, inherited from SQLite's `LIKE`.
-    async fn paths_matching(&self, needle: &str, cap: u64) -> Result<PathMatches>;
+    async fn paths_matching(
+        &self,
+        needle: &str,
+        scope: Option<&[String]>,
+        cap: u64,
+    ) -> Result<PathMatches>;
 
     /// Every indexed document's file path, unfiltered and unordered.
     ///
@@ -1983,6 +2027,7 @@ impl StateDb {
     /// cannot reach the statement text.
     fn push_where(builder: &mut QueryBuilder<Sqlite>, query: &DocumentQuery) {
         builder.push(" WHERE 1 = 1");
+        push_scope(builder, "d.file_path", query.scope.as_deref());
 
         if let Some(needle) = &query.path_prefix {
             builder.push(" AND d.file_path LIKE ");
@@ -2509,27 +2554,33 @@ impl DocumentIndex for StateDb {
         Ok(rows.into_iter().map(|(file_path,)| file_path).collect())
     }
 
-    async fn paths_matching(&self, needle: &str, cap: u64) -> Result<PathMatches> {
+    async fn paths_matching(
+        &self,
+        needle: &str,
+        scope: Option<&[String]>,
+        cap: u64,
+    ) -> Result<PathMatches> {
         let pattern = escape_like_substring(needle);
 
         // Count and page share one transaction so `total` and `paths` reflect the same
         // committed snapshot — same reasoning as `query_documents`.
         let mut tx = self.pool.begin().await?;
 
-        let total: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM documents WHERE file_path LIKE ? ESCAPE '\\'")
-                .bind(&pattern)
-                .fetch_one(&mut *tx)
-                .await?;
+        let mut count: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT COUNT(*) FROM documents WHERE file_path LIKE ");
+        count.push_bind(&pattern);
+        count.push(" ESCAPE '\\'");
+        push_scope(&mut count, "file_path", scope);
+        let total: i64 = count.build_query_scalar().fetch_one(&mut *tx).await?;
 
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT file_path FROM documents WHERE file_path LIKE ? ESCAPE '\\' \
-             ORDER BY file_path ASC LIMIT ?",
-        )
-        .bind(&pattern)
-        .bind(cap as i64)
-        .fetch_all(&mut *tx)
-        .await?;
+        let mut page: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT file_path FROM documents WHERE file_path LIKE ");
+        page.push_bind(&pattern);
+        page.push(" ESCAPE '\\'");
+        push_scope(&mut page, "file_path", scope);
+        page.push(" ORDER BY file_path ASC LIMIT ");
+        page.push_bind(cap as i64);
+        let rows: Vec<(String,)> = page.build_query_as().fetch_all(&mut *tx).await?;
 
         tx.commit().await?;
 
@@ -4979,10 +5030,76 @@ mod tests {
         assert_eq!(paths(&result), vec!["kitchen/recipes/stir_fry.md"]);
     }
 
+    /// `scope` confines a listing, its `total` and a path search to the granted
+    /// directories exactly: a sibling sharing a name prefix, and a directory whose
+    /// name carries a `LIKE` wildcard, are never swept in.
+    #[tokio::test]
+    async fn a_scope_confines_listings_totals_and_path_matches_exactly() {
+        let (db, _dir) = test_db().await;
+        let paths = [
+            "_archive/a.md",
+            "_archive/deep/b.md",
+            "xarchive/a.md",
+            "_archive-old/a.md",
+            "100%/a.md",
+            "1000/a.md",
+            "notes/a.md",
+        ];
+        for p in paths {
+            let fm = fm_of(serde_json::json!({"title": p}));
+            db.upsert_document_metadata(p, &fm, 0, "h", 1)
+                .await
+                .unwrap();
+        }
+        let listed = |scope: Option<Vec<&'static str>>| {
+            let db = &db;
+            async move {
+                let result = db
+                    .query_documents(&DocumentQuery {
+                        scope: scope.map(|s| s.into_iter().map(String::from).collect()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let mut got: Vec<String> =
+                    result.documents.into_iter().map(|d| d.file_path).collect();
+                got.sort();
+                (result.total, got)
+            }
+        };
+
+        let (total, got) = listed(Some(vec!["_archive"])).await;
+        assert_eq!(got, ["_archive/a.md", "_archive/deep/b.md"]);
+        assert_eq!(total, 2, "the total is counted inside the scope");
+
+        let (_, got) = listed(Some(vec!["100%"])).await;
+        assert_eq!(got, ["100%/a.md"], "a % in a directory name is a character");
+
+        let (_, got) = listed(Some(vec!["_archive", "notes"])).await;
+        assert_eq!(got, ["_archive/a.md", "_archive/deep/b.md", "notes/a.md"]);
+
+        let (total, got) = listed(Some(vec![])).await;
+        assert_eq!(total, 0, "an empty grant matches nothing");
+        assert!(got.is_empty());
+
+        let (total, _) = listed(Some(vec![""])).await;
+        assert_eq!(total, paths.len() as u64, "the root grant is everything");
+        let (total, _) = listed(None).await;
+        assert_eq!(total, paths.len() as u64);
+
+        // A path search never reaches outside the scope either.
+        let scope = vec!["_archive".to_string()];
+        let matches = db.paths_matching("a.md", Some(&scope), 100).await.unwrap();
+        let mut got = matches.paths;
+        got.sort();
+        assert_eq!(got, ["_archive/a.md"]);
+        assert_eq!(matches.total, 1);
+    }
+
     #[tokio::test]
     async fn paths_matching_returns_every_match_under_the_cap() {
         let (db, _dir) = seeded_db().await;
-        let matches = db.paths_matching("recipes", 100).await.unwrap();
+        let matches = db.paths_matching("recipes", None, 100).await.unwrap();
 
         assert_eq!(matches.total, 3);
         assert_eq!(
@@ -5002,7 +5119,7 @@ mod tests {
         // The cap must never look like exhaustion — `total` is what tells a caller
         // its filter is an incomplete picture of what matches.
         let (db, _dir) = seeded_db().await;
-        let matches = db.paths_matching("recipes", 2).await.unwrap();
+        let matches = db.paths_matching("recipes", None, 2).await.unwrap();
 
         assert_eq!(matches.paths.len(), 2);
         assert_eq!(matches.total, 3);
@@ -5015,10 +5132,10 @@ mod tests {
         // resolution path this time: `_` must be a literal underscore.
         let (db, _dir) = seeded_db().await;
 
-        let hit = db.paths_matching("stir_fry", 100).await.unwrap();
+        let hit = db.paths_matching("stir_fry", None, 100).await.unwrap();
         assert_eq!(hit.paths, vec!["kitchen/recipes/stir_fry.md"]);
 
-        let miss = db.paths_matching("stirXfry", 100).await.unwrap();
+        let miss = db.paths_matching("stirXfry", None, 100).await.unwrap();
         assert_eq!(
             miss.total, 0,
             "underscore must not behave as a wildcard during resolution either"
@@ -5026,7 +5143,7 @@ mod tests {
 
         // `%` likewise — a needle of pure wildcards must match nothing, not
         // everything.
-        let percent = db.paths_matching("%", 100).await.unwrap();
+        let percent = db.paths_matching("%", None, 100).await.unwrap();
         assert_eq!(percent.total, 0);
     }
 
@@ -5036,7 +5153,7 @@ mod tests {
         // If they ever disagree, one needle means two things again.
         let (db, _dir) = seeded_db().await;
         for needle in ["recipes", "stir_fr", "STIR_FRY", "sysadmin", "zfs.md", "/"] {
-            let resolved = db.paths_matching(needle, 100).await.unwrap();
+            let resolved = db.paths_matching(needle, None, 100).await.unwrap();
             let query = DocumentQuery {
                 path_prefix: Some(needle.into()),
                 ..Default::default()

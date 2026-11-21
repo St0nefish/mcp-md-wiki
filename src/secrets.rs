@@ -107,11 +107,90 @@ impl StartupSecrets {
     }
 }
 
+/// The secrets of the `mcp.tokens` entries, as `(name, secret)` in config order.
+/// Every configured token must resolve to a non-blank secret: a token that is
+/// declared but has no secret would otherwise silently not exist, and the principal
+/// the operator meant to confine to a policy would just fail to authenticate.
+pub fn named_token_secrets(
+    tokens: &[crate::policy::TokenConfig],
+) -> anyhow::Result<Vec<(String, String)>> {
+    named_token_secrets_with(tokens, |v| std::env::var(v).ok(), read_secret_file)
+}
+
+/// [`named_token_secrets`] with the lookup and file reader injected.
+pub fn named_token_secrets_with(
+    tokens: &[crate::policy::TokenConfig],
+    lookup: impl Fn(&str) -> Option<String>,
+    read_file: impl Fn(&str) -> io::Result<String>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        let secret = nonempty_with(&t.secret_env, &lookup, &read_file)
+            .map_err(|e| anyhow::anyhow!("mcp.tokens '{}': {e}", t.name))?
+            .filter(|s| !s.trim().is_empty());
+        let Some(secret) = secret else {
+            anyhow::bail!(
+                "mcp.tokens '{}': environment variable '{}' (or '{}_FILE') is not set or empty",
+                t.name,
+                t.secret_env,
+                t.secret_env
+            );
+        };
+        out.push((t.name.clone(), secret));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn named_token_secrets_resolve_every_token_or_refuse() {
+        let tokens = vec![
+            crate::policy::TokenConfig {
+                name: "a".into(),
+                secret_env: "TOK_A".into(),
+                policy: "p".into(),
+            },
+            crate::policy::TokenConfig {
+                name: "b".into(),
+                secret_env: "TOK_B".into(),
+                policy: "p".into(),
+            },
+        ];
+        let both = |v: &str| match v {
+            "TOK_A" => Some("secret-a".to_string()),
+            "TOK_B" => Some("secret-b".to_string()),
+            _ => None,
+        };
+        let no_files = |_: &str| Err(io::Error::from(io::ErrorKind::NotFound));
+        let got = named_token_secrets_with(&tokens, both, no_files).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_string(), "secret-a".to_string()),
+                ("b".to_string(), "secret-b".to_string())
+            ]
+        );
+        // A missing one names the token and the variable, never a secret.
+        let only_a = |v: &str| (v == "TOK_A").then(|| "secret-a".to_string());
+        let e = named_token_secrets_with(&tokens, only_a, no_files)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'b'") && e.contains("TOK_B"), "{e}");
+        assert!(!e.contains("secret-a"), "{e}");
+        // A blank one is refused too.
+        let blank = |v: &str| Some(if v == "TOK_A" { "x" } else { "   " }.to_string());
+        assert!(named_token_secrets_with(&tokens, blank, no_files).is_err());
+        assert!(
+            named_token_secrets_with(&[], both, no_files)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     /// The three configurable startup secrets, with their defaults.
     const TOKEN_VARS: [&str; 3] = ["GIT_PULL_TOKEN", "WEBHOOK_SECRET", "MCP_BEARER_TOKEN"];

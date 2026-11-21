@@ -30,6 +30,11 @@ pub(crate) struct SearchCtx<'a> {
     /// Qdrant conditions ANDed onto the lowered `filters` in query mode. The
     /// MCP tool passes none; the REST `domain`/`type`/`tags` sugar lands here.
     pub(crate) extra_conditions: Vec<qdrant_client::qdrant::Condition>,
+    /// What the calling principal may read. Every query this context runs is
+    /// confined to it, in both backends: a Qdrant condition ANDed onto each query-mode
+    /// search ([`Self::reach_condition`]) and a scope clause on each metadata-index
+    /// query ([`Self::scope_dirs`]).
+    pub(crate) reach: crate::policy::Reach,
 }
 
 impl<'a> SearchCtx<'a> {
@@ -73,7 +78,22 @@ impl<'a> SearchCtx<'a> {
     ) -> Result<Vec<qdrant_client::qdrant::Condition>, McpError> {
         let mut conditions = build_query_conditions(params, config, schemas)?;
         conditions.extend(self.extra_conditions.iter().cloned());
+        conditions.extend(self.reach_condition());
         Ok(conditions)
+    }
+
+    /// The directories a restricted principal may read, `None` when unrestricted.
+    pub(crate) fn scope_dirs(&self) -> Option<Vec<String>> {
+        match &self.reach {
+            crate::policy::Reach::All => None,
+            crate::policy::Reach::Prefixes(dirs) => Some(dirs.clone()),
+        }
+    }
+
+    /// The Qdrant condition that confines a query to [`Self::reach`]
+    /// ([`crate::similarity::reach_condition`]).
+    pub(crate) fn reach_condition(&self) -> Option<qdrant_client::qdrant::Condition> {
+        crate::similarity::reach_condition(&self.reach)
     }
 
     /// Refuse a `search` filter that can only ever match nothing, listing what
@@ -103,6 +123,13 @@ impl<'a> SearchCtx<'a> {
         params: &SearchParams,
     ) -> Result<(), McpError> {
         if params.filters.as_ref().is_none_or(|f| f.0.is_empty()) {
+            return Ok(());
+        }
+        // The refusals below list fields and values taken from the whole corpus.
+        // A restricted principal would learn what lies outside its reach from them,
+        // so for one the filter simply runs as given (and matches nothing it should
+        // not).
+        if self.scope_dirs().is_some() {
             return Ok(());
         }
         let filters = parse_filters(&params.filters)?;
@@ -278,7 +305,11 @@ impl<'a> SearchCtx<'a> {
             McpError::internal_error(format!("Document index unavailable: {}", e), None)
         })?;
         let matches = index
-            .paths_matching(needle, retrieval::PATH_FILTER_MAX_PATHS)
+            .paths_matching(
+                needle,
+                self.scope_dirs().as_deref(),
+                retrieval::PATH_FILTER_MAX_PATHS,
+            )
             .await
             .map_err(|e| {
                 error!("search could not resolve path_prefix '{}': {:#}", needle, e);
@@ -677,7 +708,8 @@ impl<'a> SearchCtx<'a> {
                 None,
             ));
         }
-        let query = build_document_query(params)?;
+        let mut query = build_document_query(params)?;
+        query.scope = self.scope_dirs();
 
         let index = self.state_db().await.map_err(|e| {
             error!(

@@ -127,6 +127,47 @@ pub struct UiState {
     reindex_queue: Arc<crate::reindex::ReindexQueue>,
 }
 
+/// The principal behind a `/api/*` request, resolved by `server::principal_layer`
+/// when `ui.api_auth` puts the auth layer in front of these routes. A request that
+/// reaches a handler with none (the layer is absent) is unrestricted while no policy
+/// is enforced and gets nothing once one is, so a route left out of the layer
+/// fails closed.
+pub(crate) struct Caller(pub crate::policy::Principal);
+
+impl axum::extract::FromRequestParts<UiState> for Caller {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &UiState,
+    ) -> Result<Self, Self::Rejection> {
+        let enforcing = state.config().mcp.access.enforcing();
+        Ok(Caller(crate::policy::Principal::from_extension(
+            parts.extensions.get::<crate::policy::Principal>(),
+            enforcing,
+        )))
+    }
+}
+
+/// The refusal for something the caller's policy does not grant. Names nothing
+/// about what was asked for.
+fn not_permitted() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({"error": crate::write::NOT_PERMITTED})),
+    )
+        .into_response()
+}
+
+/// Whether `principal`'s policy grants a write to `rel_path`. The write pipeline
+/// checks every path again (`write::safe_write_path`); this is the early answer a
+/// handler gives before it touches the filesystem.
+fn may_write(principal: &crate::policy::Principal, rel_path: &str) -> bool {
+    principal
+        .authorize_path(rel_path, crate::policy::Op::Write)
+        .is_ok()
+}
+
 /// Build an include `GlobSet` for the UI's document-serving routes.
 ///
 /// Mirrors `mcp::build_include_globset` (private to that module, hence this small,
@@ -214,6 +255,7 @@ impl UiState {
     fn search_ctx(
         &self,
         extra_conditions: Vec<qdrant_client::qdrant::Condition>,
+        reach: crate::policy::Reach,
     ) -> crate::mcp::SearchCtx<'_> {
         crate::mcp::SearchCtx {
             deps: self.deps(),
@@ -221,6 +263,7 @@ impl UiState {
             schema_cache: &self.schema_cache,
             state_db: &self.state_db,
             extra_conditions,
+            reach,
         }
     }
 
@@ -241,9 +284,11 @@ impl UiState {
         config: &'a ResolvedConfig,
         token: &'a Option<String>,
         state_db: Option<&'a StateDb>,
+        principal: crate::policy::Principal,
     ) -> WriteDeps<'a, EmbedClient, QdrantStore> {
         WriteDeps {
             retrieval: self.deps(),
+            principal,
             canonical_data_path: &self.canonical_data_path,
             schema_cache: &self.schema_cache,
             validation: &config.validation,
@@ -610,7 +655,7 @@ fn build_graph_response(
     }
 }
 
-async fn graph_handler(State(state): State<UiState>) -> Response {
+async fn graph_handler(State(state): State<UiState>, Caller(principal): Caller) -> Response {
     let db = match state.state_db().await {
         Ok(db) => db,
         Err(e) => {
@@ -624,7 +669,14 @@ async fn graph_handler(State(state): State<UiState>) -> Response {
     };
 
     let summaries = match db.all_document_summaries().await {
-        Ok(s) => s,
+        // Nodes first, edges after: `build_graph_response` keeps only edges between
+        // surviving nodes, so cutting the nodes to the caller's reach cuts the edges
+        // too.
+        Ok(mut s) => {
+            let reach = principal.reach(crate::policy::Op::Read);
+            s.retain(|d| reach.covers(&d.file_path));
+            s
+        }
         Err(e) => {
             error!("graph: failed to list documents: {:#}", e);
             return (
@@ -789,6 +841,7 @@ fn search_error_response(err: &retrieval::SearchError) -> (StatusCode, serde_jso
 
 async fn search_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     Query(params): Query<SearchQueryParams>,
     Query(raw_pairs): Query<Vec<(String, String)>>,
 ) -> Response {
@@ -881,7 +934,7 @@ async fn search_handler(
         params.r#type.as_deref(),
         tags.as_deref(),
     );
-    let ctx = state.search_ctx(sugar.conditions);
+    let ctx = state.search_ctx(sugar.conditions, principal.reach(crate::policy::Op::Read));
     if let Err(e) = ctx.check_filter_vocabulary(&search_params).await {
         return mcp_error_response(e);
     }
@@ -1029,6 +1082,7 @@ struct EnumerateQueryParams {
 /// refusals, `path_prefix` matching and paging, so the two cannot disagree.
 async fn enumerate_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     Query(params): Query<EnumerateQueryParams>,
 ) -> Response {
     let filters = match parse_filters_param(params.filters.as_deref()) {
@@ -1042,7 +1096,7 @@ async fn enumerate_handler(
         offset: params.offset,
         ..Default::default()
     };
-    let ctx = state.search_ctx(Vec::new());
+    let ctx = state.search_ctx(Vec::new(), principal.reach(crate::policy::Op::Read));
     if let Err(e) = ctx.check_filter_vocabulary(&search_params).await {
         return mcp_error_response(e);
     }
@@ -1138,6 +1192,7 @@ struct DocQueryParams {
 
 async fn get_doc_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     AxumPath(raw_path): AxumPath<String>,
     Query(params): Query<DocQueryParams>,
     Query(raw_pairs): Query<Vec<(String, String)>>,
@@ -1189,7 +1244,8 @@ async fn get_doc_handler(
         }
     };
 
-    match retrieval::get_document(&state.deps(), index, &raw_path).await {
+    let reach = principal.reach(crate::policy::Op::Read);
+    match retrieval::get_document_in(&state.deps(), index, &raw_path, &reach).await {
         Ok(doc) => {
             // Always over the whole file, never a slice/section: this is the
             // version the editor sends back as `expected_version` on POST and
@@ -1281,6 +1337,7 @@ fn normalize_ui_path(raw: &str) -> Result<PathBuf, String> {
 
 async fn get_schema_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     AxumPath(raw_path): AxumPath<String>,
 ) -> Response {
     let rel = match normalize_ui_path(&raw_path) {
@@ -1293,6 +1350,14 @@ async fn get_schema_handler(
                 .into_response();
         }
     };
+
+    // A schema is readable only inside the caller's reach, as the MCP tool does.
+    if !principal
+        .reach(crate::policy::Op::Read)
+        .covers(&rel.to_string_lossy())
+    {
+        return not_permitted();
+    }
 
     let schemas = schema::load_shared(&state.schema_cache);
     // A document path resolves via its parent directory; a directory reference
@@ -1372,9 +1437,25 @@ struct HistoryQueryParams {
 
 async fn history_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     Query(params): Query<HistoryQueryParams>,
 ) -> Response {
     let data_path = state.canonical_data_path.to_string_lossy().into_owned();
+
+    // A history listing is corpus-wide (every commit, whatever it touched), so a
+    // caller confined to part of the knowledge base gets history only for one
+    // document it may read, never the listing.
+    let reach = principal.reach(crate::policy::Op::Read);
+    if !matches!(reach, crate::policy::Reach::All) {
+        let covered = params
+            .path
+            .as_deref()
+            .map(|p| retrieval::kb_root_relative(p.trim()))
+            .is_some_and(|p| !p.is_empty() && reach.covers(p));
+        if !covered {
+            return not_permitted();
+        }
+    }
 
     // Parameter-shape validation runs BEFORE the not-a-git-repo check below:
     // a malformed request (`commit` with no `path`) is a client error
@@ -1506,6 +1587,7 @@ struct ChangesQueryParams {
 
 async fn changes_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     Query(params): Query<ChangesQueryParams>,
 ) -> Response {
     let data_path = state.canonical_data_path.to_string_lossy().into_owned();
@@ -1518,6 +1600,7 @@ async fn changes_handler(
         params.path_prefix.as_deref(),
         params.limit,
         params.cursor.as_deref(),
+        &principal.reach(crate::policy::Op::Read),
     )
     .await
     {
@@ -1715,6 +1798,8 @@ fn write_error_response(err: &WriteError, dest_path: Option<&str>) -> Response {
         )
             .into_response(),
         WriteError::InvalidCommitMessage { reason } => bad_request(reason.clone()),
+        // The pipeline's refusal of a path outside the caller's write grants.
+        WriteError::UnsafePath { msg } if msg == crate::write::NOT_PERMITTED => not_permitted(),
         WriteError::UnsafePath { msg } => bad_request(msg.clone()),
         // `msg` embeds a server-side absolute filesystem path (a
         // `resolve_safe_write_path` canonicalize failure) — see
@@ -1832,12 +1917,18 @@ fn write_error_response(err: &WriteError, dest_path: Option<&str>) -> Response {
 /// re-reading a file the caller may not have looked at recently.
 async fn post_doc_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     AxumPath(raw_path): AxumPath<String>,
     Json(body): Json<WriteDocBody>,
 ) -> Response {
     let rel_path = retrieval::kb_root_relative(raw_path.trim()).to_string();
     if rel_path.is_empty() {
         return bad_request("path parameter is empty");
+    }
+    // Before anything that looks at the filesystem, so the refusal cannot tell a
+    // document that exists from one that does not.
+    if !may_write(&principal, &rel_path) {
+        return not_permitted();
     }
     if body.content.len() > MAX_WRITE_CONTENT_LEN {
         return bad_request(format!(
@@ -1860,6 +1951,12 @@ async fn post_doc_handler(
         Some(p) => Some(retrieval::kb_root_relative(p).to_string()),
         None => None,
     };
+    if dest_rel
+        .as_deref()
+        .is_some_and(|d| !may_write(&principal, d))
+    {
+        return not_permitted();
+    }
 
     // Include-pattern eligibility guard, same rule the MCP write tools enforce
     // (`create_document`'s explicit `include_patterns.is_match` check /
@@ -1913,7 +2010,7 @@ async fn post_doc_handler(
         } else {
             None
         };
-        let deps = state.write_deps(&config, &token, state_db);
+        let deps = state.write_deps(&config, &token, state_db, principal);
 
         let req = WriteRequest {
             rel_path: &rel_path,
@@ -1983,12 +2080,16 @@ async fn detached(write: impl std::future::Future<Output = Response> + Send + 's
 /// `DELETE /api/doc/{*path}`: thin adapter over `write::delete_document`.
 async fn delete_doc_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     AxumPath(raw_path): AxumPath<String>,
     Json(body): Json<DeleteDocBody>,
 ) -> Response {
     let rel_path = retrieval::kb_root_relative(raw_path.trim()).to_string();
     if rel_path.is_empty() {
         return bad_request("path parameter is empty");
+    }
+    if !may_write(&principal, &rel_path) {
+        return not_permitted();
     }
 
     // Same include-pattern eligibility guard as `post_doc_handler`'s edit
@@ -2028,7 +2129,7 @@ async fn delete_doc_handler(
         // never sees a `StateDb` at all, and `referencing_paths` would always come
         // back empty regardless of what actually links to the document being deleted.
         let state_db = state.state_db().await.ok();
-        let deps = state.write_deps(&config, &token, state_db);
+        let deps = state.write_deps(&config, &token, state_db, principal);
 
         match write::delete_document(
             &deps,
@@ -2278,8 +2379,18 @@ pub fn ui_router_with_api_auth(
         .merge(doc_router)
         .with_state(state.clone());
     if let Some(auth) = api_auth {
-        api_router =
-            api_router.route_layer(axum::middleware::from_fn_with_state(auth, require_auth));
+        // The principal layer sits just inside the auth layer, so each handler's
+        // `Caller` is the principal the credential `require_auth` accepted maps to.
+        let principals = crate::server::PrincipalState {
+            config: state.config.clone(),
+            oauth: auth.oauth().cloned(),
+        };
+        api_router = api_router
+            .route_layer(axum::middleware::from_fn_with_state(
+                principals,
+                crate::server::principal_layer,
+            ))
+            .route_layer(axum::middleware::from_fn_with_state(auth, require_auth));
     }
     let api_router = api_router.route_layer(axum::middleware::from_fn_with_state(
         ApiRequestGuard {

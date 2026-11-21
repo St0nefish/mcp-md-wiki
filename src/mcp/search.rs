@@ -517,6 +517,8 @@ pub(super) fn build_document_query(params: &SearchParams) -> Result<DocumentQuer
         fields: params.fields.clone(),
         mtime_after,
         mtime_before,
+        // Set by the caller from the principal's read reach.
+        scope: None,
     })
 }
 
@@ -1262,6 +1264,7 @@ impl KbSearchServer {
             params.path_prefix.as_deref(),
             params.limit,
             params.cursor.as_deref(),
+            &self.principal().reach(Op::Read),
         )
         .await
         {

@@ -194,7 +194,8 @@ impl KbSearchServer {
             McpError::internal_error(format!("Document index unavailable: {}", e), None)
         })?;
 
-        match retrieval::get_document(&self.deps(), index, raw).await {
+        let reach = self.principal().reach(Op::Read);
+        match retrieval::get_document_in(&self.deps(), index, raw, &reach).await {
             Ok(doc) => {
                 debug!(path = %raw, "get_document served");
                 // The caller round-trips this into write_document/delete_document as
