@@ -1736,31 +1736,18 @@ async fn update_semantic_edges<N: NeighborStore>(
             }
         };
 
-        // Dedupe by target file, keeping the best score seen for each. Also drop the
-        // source file itself defensively: the `must_not` filter above is the real
-        // exclusion, this is a second, filter-independent guard so an incomplete
-        // filter can never make a document recommend itself.
-        let mut best: HashMap<String, f32> = HashMap::new();
-        for hit in &hits {
-            let Some(target) = hit.payload.get("file_path").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if target == pf.file_path || hit.score < cfg.min_score {
-                continue;
-            }
-            best.entry(target.to_string())
-                .and_modify(|s| *s = s.max(hit.score))
-                .or_insert(hit.score);
-        }
-
-        let mut ranked: Vec<(String, f32)> = best.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-        ranked.truncate(cfg.k as usize);
-
-        let targets: Vec<(String, Option<f64>)> = ranked
-            .into_iter()
-            .map(|(target, score)| (target, Some(score as f64)))
-            .collect();
+        // One edge per target file at its best score, never the source file itself
+        // (the `must_not` filter above is the real exclusion; `rank_neighbours` is a
+        // second, filter-independent guard so an incomplete filter can never make a
+        // document recommend itself), under `min_score`, top `k`.
+        let hits = hits
+            .iter()
+            .filter_map(|hit| Some((hit.payload.get("file_path")?.as_str()?, hit.score)));
+        let targets: Vec<(String, Option<f64>)> =
+            crate::similarity::rank_neighbours(hits, &pf.file_path, cfg.min_score, cfg.k as usize)
+                .into_iter()
+                .map(|n| (n.path, Some(n.score as f64)))
+                .collect();
 
         if let Err(e) = state
             .replace_links(&pf.file_path, "semantic", &targets)
@@ -3267,7 +3254,7 @@ async fn discover_relative(config: &ResolvedConfig) -> Result<(PathBuf, Vec<Path
 /// worker classifies the failure as permanent (`reindex::is_permanent_failure`) —
 /// no retry can fix a file on disk, and the fix itself queues a full reconcile.
 fn build_run_schemas(data_path: &Path, config: &ResolvedConfig) -> Result<SchemaCache> {
-    SchemaCache::build(data_path, &config.frontmatter, &config.indexing).map_err(|e| {
+    SchemaCache::build_for_config(data_path, config).map_err(|e| {
         anyhow::Error::new(e).context("Refusing to index while a schema file is invalid")
     })
 }
@@ -4561,6 +4548,7 @@ mod tests {
             formatting: crate::config::FormattingConfig::off(),
             contradictions: Default::default(),
             contradictions_judge: None,
+            memory: Default::default(),
             provenance: Default::default(),
         }
     }

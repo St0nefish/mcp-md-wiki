@@ -42,7 +42,7 @@
 //! caught only under `--test-threads=1`, where libtest's alphabetical ordering made the
 //! collision deterministic. Making the queue a constructor argument instead of ambient
 //! state means each test can hold a private `ReindexQueue::new()` (see `write::Harness`,
-//! `mcp.rs`'s `make_write_test_server`, etc.), so that class of collision is now a
+//! `mcp/`'s `make_write_test_server`, etc.), so that class of collision is now a
 //! compile-time non-issue rather than a convention every future test author has to
 //! remember.
 
@@ -182,7 +182,7 @@ impl ReindexQueue {
     /// to `snapshot()`'s `pending_paths` count.
     ///
     /// Each test now builds and owns its own `ReindexQueue` (see `ReindexQueue::new`
-    /// and `write.rs`'s `Harness`, `mcp.rs`'s `make_write_test_server`, etc.), so
+    /// and `write.rs`'s `Harness`, `mcp/`'s `make_write_test_server`, etc.), so
     /// there is no more risk of a path literal colliding with an unrelated test's —
     /// that used to be this method's whole reason for existing (a bare
     /// `snapshot().pending_paths` count can't distinguish "my path was marked" from
@@ -443,10 +443,8 @@ fn schema_rebuild_runner(
 ) -> RebuildFuture {
     Box::pin(async move {
         let data_path = config.canonical_data_path();
-        let frontmatter = config.frontmatter.clone();
-        let indexing = config.indexing.clone();
         match tokio::task::spawn_blocking(move || {
-            crate::schema::SchemaCache::build(&data_path, &frontmatter, &indexing)
+            crate::schema::SchemaCache::build_for_config(&data_path, &config)
         })
         .await
         {
@@ -642,7 +640,7 @@ async fn run_with_retry(
 }
 
 /// Test-only assertion helper shared across every module whose tests assert that
-/// a specific path was marked dirty on a `ReindexQueue` (`mcp.rs`, `write.rs`,
+/// a specific path was marked dirty on a `ReindexQueue` (`mcp/`, `write.rs`,
 /// `webhook.rs`, `server.rs`). Deliberately `pub(crate)` rather than
 /// private-to-`mod tests`, the same reasoning as `config::test_support`: those
 /// call sites live in other files' `#[cfg(test)]` modules, not this one.

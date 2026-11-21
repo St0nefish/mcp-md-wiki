@@ -9,6 +9,8 @@ Built as a single Rust binary for type safety, small Docker images, and simple d
 - [`deploy/USAGE.md`](deploy/USAGE.md) — Setup guide, configuration, frontmatter, chunking
 - [`deploy/TROUBLESHOOTING.md`](deploy/TROUBLESHOOTING.md) — Common issues and fixes
 - [`docs/oauth.md`](docs/oauth.md) — OAuth setup (recommended auth): the `mcp.oauth` keys and defaults, and this server's setup; provider recipes marked by what was actually tested live in the [`oauth-resource-server`](https://github.com/St0nefish/oauth-resource-server) crate's `docs/providers.md`
+- [`docs/memory.md`](docs/memory.md) — Memory mode: per-caller access control, the memory tool group, and the Hermes / Open WebUI clients
+- [`docs/memory-contract.md`](docs/memory-contract.md) — The memory tools' contract (version 1) that clients code against
 - [`deploy/config.example.yaml`](deploy/config.example.yaml) — Full annotated config reference
 - [`deploy/ci-examples/`](deploy/ci-examples/) — Sample CI workflows for webhook-triggered reindex
 
@@ -65,6 +67,22 @@ static bearer token keeps working alongside OAuth unless you turn it off
 (`write_document`, `delete_document`, `update_schema`) additionally require the
 `mcp:write` scope (a token with only `mcp:read` gets `403 insufficient_scope`);
 static bearer tokens keep full access.
+
+### Authentication: per-caller access control
+
+By default every credential that gets in has full access to every tool and path
+(an OAuth token is narrowed only by the `mcp:read` / `mcp:write` scopes, and a static
+token and an OAuth-off deployment not at all). To narrow a caller by tool and by
+directory, define `mcp.policy` entries, give each caller a named `mcp.tokens` entry
+(or map OAuth callers with `mcp.principals`), and mint the secret with
+`mcp-md-wiki token mint --name <name> --policy <policy> --out <file>`. Once one policy
+exists the server is **default-deny**: an unmapped credential can do nothing, the
+single `bearer_token_env` token stays full access, and `/status*`, `/metrics` and
+`/admin/*` need a policy with `admin: true`. A path outside a caller's `read` prefixes
+is invisible to it on every surface (search, listings, links, history, schema, the web
+UI), and a write is checked on every path it touches. A deployment without `mcp.policy`
+behaves exactly as before. See [docs/memory.md](docs/memory.md) and the `mcp.policy`
+section of [deploy/config.example.yaml](deploy/config.example.yaml).
 
 ### Claude Desktop
 
@@ -126,6 +144,7 @@ mcp-md-wiki status             # Aggregate counts + metadata breakdown
 mcp-md-wiki status --json      # Same data as the server's /status endpoint
 mcp-md-wiki status --files     # List every indexed file instead
 mcp-md-wiki health             # Check if server is healthy
+mcp-md-wiki token mint --name hermes --policy memory-agent --out /run/secrets/hermes   # New secret for an mcp.tokens entry (0600, never overwritten, never printed)
 mcp-md-wiki reproject-fields   # Rebuild document_fields from stored frontmatter under the schema (no re-embed; also automatic after an upgrade)
 mcp-md-wiki git-pull           # Fetch + fast-forward the clone from its remote, then index what changed (no server needed)
 mcp-md-wiki lint               # Corpus health report from the last indexed state: every check the `lint:` config enables (read-only; exit 0 unless there is no state DB)
@@ -205,7 +224,7 @@ See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 - **validation** — Strict/lenient mode, optional lint command
 - **formatting** — `formatting.markdown`: every `.md` document a write tool stores is normalised in memory by rumdl's auto-fixes (blank lines around headings and lists, trailing whitespace, list markers, code-fence style, ...) before it is committed and indexed; `enabled` (default `true`), `flavor` (default `standard`), `disable` (default `[MD013]`, the line-length rule) and `config_file` (a full `.rumdl.toml`, relative to the KB root, replacing the other two). A pure move is never reformatted, a document already stored is formatted only when next written, and a formatter failure never blocks a write (the result carries `formatting_skipped`). Live-reloadable. See [deploy/config.example.yaml](deploy/config.example.yaml)
 - **webhook** — HMAC verification for Gitea/GitHub/GitLab (disabled if `WEBHOOK_SECRET` is unset)
-- **mcp** — Server port, authentication (OAuth resource server — recommended, see [docs/oauth.md](docs/oauth.md) — and/or a static bearer token), `extensions_path` (where per-KB tool/server description policy lives in the served knowledge base; `instructions` is a deprecated narrative override — see [MCP Tools](#mcp-tools) below), and `disabled_tools` (default `[]`) — a list of MCP tool names to hide from `tools/list`/`tools/get` and refuse from `tools/call` (same error as an unknown tool name). Every name must be one of the seven MCP tools, with no duplicates, and the list may not name all seven. `enabled_tools` (default: unset) is the allowlist alternative — when set, every tool NOT named is disabled, exactly as if it had been listed in `disabled_tools`; set one or the other, never both (config load fails if both are set), and an empty `enabled_tools: []` is rejected the same way an all-seven `disabled_tools` is, since it would disable every tool. An allowlist also disables any tool added to this binary in a future release until the allowlist itself names it — `disabled_tools` has no such trap, since a new tool starts enabled by default. The server instructions' one pointer to `get_schema` ("Field values and per-folder rules: get_schema with a path.") is dropped while `get_schema` is disabled (from the next `mcp.metadata_refresh_secs` refresh on, since the instructions are recomposed on that timer), rather than pointing at a tool that no longer answers; the top-level-areas line names no tool and stays whichever tools are enabled. The web UI's `/api/doc/*` write routes go through `write::write_document`/`write::delete_document` directly, not through MCP dispatch, so neither setting has any effect on them.
+- **mcp** — Server port, authentication (OAuth resource server — recommended, see [docs/oauth.md](docs/oauth.md) — and/or a static bearer token), `extensions_path` (where per-KB tool/server description policy lives in the served knowledge base; `instructions` is a deprecated narrative override — see [MCP Tools](#mcp-tools) below), and `disabled_tools` (default `[]`) — a list of MCP tool names to hide from `tools/list`/`tools/get` and refuse from `tools/call` (same error as an unknown tool name). Every name must be one of the seven core MCP tools or the six memory tools (valid even while `memory.enabled` is off), with no duplicates, and the list may not disable every tool that exists. `enabled_tools` (default: unset) is the allowlist alternative — when set, every tool NOT named is disabled, exactly as if it had been listed in `disabled_tools`; set one or the other, never both (config load fails if both are set), and an empty `enabled_tools: []` is rejected the same way an all-seven `disabled_tools` is, since it would disable every tool. An allowlist also disables any tool added to this binary in a future release until the allowlist itself names it — `disabled_tools` has no such trap, since a new tool starts enabled by default. The server instructions' one pointer to `get_schema` ("Field values and per-folder rules: get_schema with a path.") is dropped while `get_schema` is disabled (from the next `mcp.metadata_refresh_secs` refresh on, since the instructions are recomposed on that timer), rather than pointing at a tool that no longer answers; the top-level-areas line names no tool and stays whichever tools are enabled. The web UI's `/api/doc/*` write routes go through `write::write_document`/`write::delete_document` directly, not through MCP dispatch, so neither setting has any effect on them.
 - **write** — Behaviour of the write tools: near-duplicate detection (`dedup_enabled`, `dedup_threshold`), the related-documents listing a create returns (`related_min_score`, default `0.50`; `related_limit`, default `5`, `0` turns it off, max `20`), the archive flow (`archive_prefix`, default `_archive`, which must not be excluded by `indexing.exclude`; `archive_links`, default `repoint`) and the git commit identity. All are applied on reload.
 - **search** — Retrieval behaviour: hybrid sparse+dense search with RRF fusion (`hybrid`, default `true`) and per-arm candidate count (`rrf_candidates`). Set `hybrid: false` for legacy dense-only search. See the migration note below. Also `phrase` (default `true`) — exact-phrase matching for double-quoted spans in a `search` query, fused as a third RRF arm. `granularities` (default: all of `chunk`, `document`, `section`) restricts which `search` granularity values this instance exposes — the effective set additionally drops `section` whenever `chunking.heading_metadata` is off and must not end up empty (config load fails; explicitly listing `section` while the flag is off logs a warning — the default, which never names `section` in `config.yaml`, does not), and disabled values are removed from the MCP tool schema/description, not just rejected at call time. The same goes for everything that only applies to a disabled granularity or, when `document` is disabled, to searching without a query: `explain`/`fields`/`order_by`/`descending` drop out of the schema, the no-query sentences drop out of the tool and server descriptions, and rejection errors never suggest a disabled granularity. `section_max_bytes` (default `16000`) is the size cap on every `get_document` read the caller did not bound itself: a resolved section falls back to an outline of its children past it, a whole-document read falls back to the document's own outline (or truncated text when the document has no headings), and outlines are capped to roughly that many bytes of entries. An explicit `start_line`/`end_line` range is exempt.
 - **reranking** — Optional cross-encoder reranking pass over the top hybrid candidates (`enabled`, default `false`; `candidate_limit`, default `50`; `max_document_bytes`, default `6144` — per-document byte budget for the rerank request, sized to an 8192-token reranker served with `--ubatch-size` equal to `--ctx-size`; restart required). Requires `RERANKING_BASE_URL`/`RERANKING_MODEL` when enabled — see [Configuration](#configuration) above and `deploy/config.example.yaml`
@@ -325,7 +344,7 @@ Skip the bundled embedding service entirely. Point `EMBEDDING_BASE_URL` at any O
 
 ## MCP Tools
 
-The server exposes exactly seven MCP tools. Read tools (`search`, `get_document`, `get_schema`, `changes_since`) are always safe; write tools (`write_document`, `delete_document`, `update_schema`) mutate the knowledge base and commit to git.
+The server exposes exactly seven MCP tools (plus the optional [memory tools](#memory-tools-optional)). Read tools (`search`, `get_document`, `get_schema`, `changes_since`) are always safe; write tools (`write_document`, `delete_document`, `update_schema`) mutate the knowledge base and commit to git.
 
 **Every tool result is one JSON object.** It is the MCP `structured_content`, and the result's single text block is that same object serialized compactly (the MCP spec's recommended fallback for text-only clients), so a client that reads only one of the two misses nothing. Keys whose value would be `false`, `null`, empty or a default are left out — an absent flag means false, an absent list means none. Errors are plain MCP error messages.
 
@@ -528,6 +547,21 @@ When validation fails, write tools return a structured error whose `data.field_e
 Server and tool descriptions are assembled from three layers, in order: mechanics true of every deployment (compiled into the binary), short sentences that depend on this deployment's config or corpus (e.g. the quoted-phrase sentence on `search` when `search.phrase` is on, the enabled granularities, and — in the server instructions — the top-level areas plus one pointer to `get_schema` for field values and per-folder rules; no field vocabularies, scoped folders or authoring rules are enumerated up front), and this knowledge base's own policy — what belongs here, tagging conventions, writing style — loaded at runtime from `<mcp.extensions_path>/` in the served repo (default `meta/mcp`) and refreshed on `mcp.metadata_refresh_secs`. The per-KB layer is append-only: editing it is a normal `write_document` call, no restart required. `mcp.instructions` is a deprecated narrative override that still works but is superseded by `<extensions_path>/server.md` when both are set.
 
 **Description length budget.** Claude Code truncates each tool description and the server instructions at 2048 characters (its observed behavior, not an MCP spec limit); input-schema *parameter* descriptions are not truncated. So each rule has one home: tool descriptions carry what a tool does, when to use it, and the cross-parameter workflow a model would get wrong without being told; per-parameter rules live on the parameters; responses describe themselves; and the server instructions repeat nothing a tool description says. The compiled and config-derived text is held to 600 characters per description by tests (server instructions measured against a realistic corpus), which leaves roughly 1400 characters for each per-KB extension file — keep extensions under that, or Claude Code cuts the end off. Input schemas are compacted before they are served (no `$schema`, no `null` arm on optional properties, no `"default": null`, no non-standard `format`), and `operation`, `frontmatter_patch[].operation` and `order_by` advertise their values as an `enum` (the server still accepts the same strings and aliases as before). The server logs a warning when a fully composed description or the server instructions exceed 2048 characters, naming the surface and its length. See the [`mcp` section of the config reference](deploy/config.example.yaml) and [deploy/USAGE.md](deploy/USAGE.md#agent-write-tools) for details.
+
+### Memory tools (optional)
+
+With `memory.enabled: true` the server adds six tools for agent memory: `memory_create`
+(duplicate-checked; `on_duplicate`: `reject` by default, `supersede`, `keep_both`),
+`memory_search`, `memory_get` (with the supersede chain), `memory_update`,
+`memory_forget` (a soft delete: the status becomes `forgotten`) and `memory_recall` (a
+stable, budgeted block of `confirmed` memories for a client to put in front of a model).
+`memory_create`, `memory_update` and `memory_forget` need `mcp:write` like the other
+write tools. A memory is an ordinary markdown document under `memory.root`, validated by a
+schema compiled into the server, so access control, indexing and history apply to it
+unchanged. With the group off the server has exactly the seven tools above. The server
+reports `memory_contract_version` (in the `initialize` capabilities under
+`experimental["mcp-md-wiki/memory"]`, and in `get_schema`). Full description:
+[docs/memory.md](docs/memory.md); contract: [docs/memory-contract.md](docs/memory-contract.md).
 
 ## Web UI
 

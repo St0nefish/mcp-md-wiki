@@ -41,7 +41,7 @@
 //!
 //! - **Ancestry, not a separate title or file path.** Both of those would
 //!   require `chunk_markdown` to take a new parameter, rippling into every
-//!   caller (`ingest.rs`, and the dedup-query alignment test in `mcp.rs`) that
+//!   caller (`ingest.rs`, and the dedup-query alignment test in `mcp/`) that
 //!   this change's scope does not touch. Heading ancestry needs nothing beyond
 //!   the heading structure this module already parses — and for the common
 //!   single-root-H1 document, the root heading naturally becomes the top of
@@ -222,7 +222,7 @@ impl RawChunk {
 /// breadcrumb followed by the `"\n\n"` separator.
 ///
 /// The truncation is a hard character-count cut, deliberately matching
-/// `write::build_dedup_query`'s `DEDUP_QUERY_CHAR_LIMIT` truncation style
+/// `similarity::build_dedup_query`'s `DEDUP_QUERY_CHAR_LIMIT` truncation style
 /// (`.chars().take(n).collect()`, no ellipsis) rather than word-wrapping —
 /// this is a budget backstop for a pathological document, not something
 /// expected to fire in normal use, so simplicity wins over a prettier cut.
@@ -1066,7 +1066,7 @@ mod tests {
     #[test]
     fn flat_single_heading_document_gets_no_heading_path_prefix() {
         // Regression guard for a cross-file invariant this module cannot enforce
-        // by compiling against it directly: `mcp.rs`'s
+        // by compiling against it directly: `mcp/`'s
         // `build_dedup_query_matches_chunk_prepend_format` pins dedup-query /
         // chunk-text alignment using a body of exactly this flat, unnested shape
         // under `ChunkingConfig::default()` (both prepend knobs on). Since this

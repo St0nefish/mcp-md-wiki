@@ -43,6 +43,79 @@ pub struct Config {
     pub formatting: FormattingConfig,
     #[serde(default)]
     pub contradictions: ContradictionsConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+/// `memory` — the memory tool group (`memory_create`, `memory_search`, ...). Off
+/// unless `enabled`: with the section absent the server exposes exactly the tools it
+/// always has. Every key is restart-required: the tool list, the hidden schema for
+/// the memory area and the per-area folders are all fixed when the server starts.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Turn the group on. Needs a section (`memory: {enabled: true}`); a bare
+    /// `memory:` is a null, which is the same as leaving it out.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory (KB-relative) the memories live under, one subfolder per area.
+    /// Its schema is built into the binary; an on-disk `.schema.yaml` at or under it
+    /// is refused.
+    #[serde(default = "default_memory_root")]
+    pub root: String,
+    /// The area (subfolder of `root`) a memory goes to when the caller names none.
+    #[serde(default = "default_memory_area")]
+    pub default_area: String,
+    /// `status` a new memory gets. `proposed` keeps it out of `memory_recall` until
+    /// someone confirms it.
+    #[serde(default)]
+    pub default_status: MemoryDefaultStatus,
+    /// Cosine similarity at or above which `memory_create` treats an existing live
+    /// memory as a duplicate. Same scale as `write.dedup_threshold`.
+    #[serde(default = "default_memory_duplicate_threshold")]
+    pub duplicate_threshold: f32,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root: default_memory_root(),
+            default_area: default_memory_area(),
+            default_status: MemoryDefaultStatus::default(),
+            duplicate_threshold: default_memory_duplicate_threshold(),
+        }
+    }
+}
+
+/// The `status` a newly created memory starts in (`memory.default_status`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryDefaultStatus {
+    #[default]
+    Proposed,
+    Confirmed,
+}
+
+impl MemoryDefaultStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Confirmed => "confirmed",
+        }
+    }
+}
+
+fn default_memory_root() -> String {
+    "memory".to_string()
+}
+
+fn default_memory_area() -> String {
+    "general".to_string()
+}
+
+fn default_memory_duplicate_threshold() -> f32 {
+    0.85
 }
 
 /// `source` — YAML side. Every setting is either a secret name-indirection field
@@ -224,7 +297,7 @@ pub struct ChunkingConfig {
     /// Deliberately heading-ancestry only, not a separate frontmatter `title` or
     /// the file's repo-relative path: both would need `chunk::chunk_markdown`
     /// to take a new parameter, which would ripple into every caller
-    /// (`ingest.rs`, the dedup-query alignment test in `mcp.rs`) outside this
+    /// (`ingest.rs`, the dedup-query alignment test in `mcp/`) outside this
     /// module's own scope. Heading ancestry needs nothing beyond the section
     /// text `chunk_markdown` already parses, and for the extremely common
     /// single-root-H1 document shape it already carries the document's title as
@@ -634,7 +707,7 @@ pub struct McpConfig {
     ///
     /// Every entry must be one of `descriptions::TOOL_NAMES` (a cross-module edge
     /// from config validation into `descriptions.rs`'s tool-name list — the one
-    /// place both this check and `mcp.rs`'s dispatch agree on which names are
+    /// place both this check and `mcp/`'s dispatch agree on which names are
     /// real), duplicate-free, and must not name every tool at once. Mutually
     /// exclusive with `enabled_tools` below — see [`Config::resolve`]'s
     /// validation.
@@ -657,6 +730,25 @@ pub struct McpConfig {
     /// (which would disable every tool) — see [`Config::resolve`].
     #[serde(default)]
     pub enabled_tools: Option<Vec<String>>,
+    /// Named access policies (`policy.<name>`): the tools, directories and operator
+    /// routes a principal may use (`crate::policy::PolicyConfig`). Empty (the
+    /// default) means no policy is enforced and every authenticated caller keeps
+    /// today's full access. Once any policy is defined, a caller no token name or
+    /// principal rule maps to is refused everything, and `ui.api_auth` must be on
+    /// (the web routes would otherwise have no principal). The legacy
+    /// `bearer_token_env` token stays full access. Applied on reload.
+    #[serde(default)]
+    pub policy: std::collections::BTreeMap<String, crate::policy::PolicyConfig>,
+    /// Named static tokens, each acting under a policy (`crate::policy::TokenConfig`).
+    /// They are accepted alongside `bearer_token_env` and OAuth. Restart required
+    /// (the auth layer is built once).
+    #[serde(default)]
+    pub tokens: Vec<crate::policy::TokenConfig>,
+    /// Rules mapping an OAuth token (by scope, client id or claim) to a policy;
+    /// the first match wins and a token that matches none gets no access once a
+    /// policy exists. Needs `mcp.oauth`. Applied on reload.
+    #[serde(default)]
+    pub principals: Vec<crate::policy::PrincipalRule>,
 }
 
 impl Default for McpConfig {
@@ -671,6 +763,9 @@ impl Default for McpConfig {
             oauth: default_mcp_oauth(),
             disabled_tools: Vec::new(),
             enabled_tools: None,
+            policy: std::collections::BTreeMap::new(),
+            tokens: Vec::new(),
+            principals: Vec::new(),
         }
     }
 }
@@ -817,6 +912,16 @@ pub struct ResolvedMcpConfig {
     /// `enabled_tools` at all. Validated in [`Config::resolve`], so a live
     /// `ResolvedConfig` never carries an unknown, duplicate, or all-disabling set.
     pub disabled_tools: Vec<String>,
+    /// The compiled `mcp.policy` / `mcp.tokens` / `mcp.principals` (validated in
+    /// [`Config::resolve`]); not enforcing when no policy is configured.
+    pub access: crate::policy::AccessControl,
+    /// `mcp.policy` as configured (what `access` was compiled from; kept so a
+    /// reload can report a change to it).
+    pub policy: std::collections::BTreeMap<String, crate::policy::PolicyConfig>,
+    /// `mcp.tokens` as configured, for the startup secret lookup.
+    pub tokens: Vec<crate::policy::TokenConfig>,
+    /// `mcp.principals` as configured.
+    pub principals: Vec<crate::policy::PrincipalRule>,
 }
 
 impl Default for ResolvedMcpConfig {
@@ -831,6 +936,10 @@ impl Default for ResolvedMcpConfig {
             extensions_path: default_extensions_path(),
             oauth: None,
             disabled_tools: Vec::new(),
+            access: crate::policy::AccessControl::default(),
+            policy: std::collections::BTreeMap::new(),
+            tokens: Vec::new(),
+            principals: Vec::new(),
         }
     }
 }
@@ -943,7 +1052,7 @@ pub struct WriteConfig {
     ///
     /// Always compared against a *dense* cosine score: the dedup search is
     /// pinned to dense-only with the reranker detached (see
-    /// `mcp::dedup_search_opts`), so this value is independent of
+    /// `similarity::dedup_search_opts_with_limit`), so this value is independent of
     /// `search.hybrid` — whose RRF scores top out near 0.03 — and of
     /// `reranking.enabled`, whose relevance scores are not similarities.
     #[serde(default = "default_dedup_threshold")]
@@ -1782,6 +1891,9 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("mcp.extensions_path", "mcp"),
     ("mcp.disabled_tools", "mcp"),
     ("mcp.enabled_tools", "mcp"),
+    ("mcp.policy", "mcp"),
+    ("mcp.tokens", "mcp"),
+    ("mcp.principals", "mcp"),
     ("mcp.oauth.enabled", "mcp"),
     ("mcp.oauth.issuer", "mcp"),
     ("mcp.oauth.jwks_uri", "mcp"),
@@ -1857,6 +1969,11 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("contradictions.judge_api_key_env", "contradictions"),
     ("contradictions.judge_timeout_secs", "contradictions"),
     ("contradictions.judge_max_document_bytes", "contradictions"),
+    ("memory.enabled", "memory"),
+    ("memory.root", "memory"),
+    ("memory.default_area", "memory"),
+    ("memory.default_status", "memory"),
+    ("memory.duplicate_threshold", "memory"),
 ];
 
 /// Recursively flattens a `serde_json::Value` tree into dot-joined leaf paths,
@@ -1974,6 +2091,17 @@ fn yaml_top_level_sections(content: &str) -> HashSet<&'static str> {
         .collect()
 }
 
+/// Whether `area` can name a folder under `memory.root`: one path segment, visible
+/// ASCII letters, digits, `-` and `_`, not starting with `_` or `.` (which are reserved
+/// for archive and hidden directories).
+pub(crate) fn valid_memory_area(area: &str) -> bool {
+    (1..=64).contains(&area.len())
+        && area
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && !area.starts_with('_')
+}
+
 /// Validates a tool-name list — `mcp.disabled_tools` or `mcp.enabled_tools` — against
 /// `descriptions::TOOL_NAMES`: bails naming every unknown name at once, then bails on
 /// the first duplicate. Shared by both settings' validation in
@@ -1983,13 +2111,12 @@ fn yaml_top_level_sections(content: &str) -> HashSet<&'static str> {
 /// since the two mean opposite things for the same edge case.
 ///
 /// Cross-module edge: `descriptions::TOOL_NAMES` is the one place both this check and
-/// `mcp.rs`'s dispatch (`KbSearchServer::enabled_tool_router`) agree on which tool
+/// `mcp/`'s dispatch (`KbSearchServer::enabled_tool_router`) agree on which tool
 /// names are real, so a typo here is caught at startup rather than silently doing
 /// nothing (an unknown name in `ToolRouter::disable_route` is a no-op) or crashing a
 /// live `tools/call`.
 fn validate_tool_name_list(names: &[String], setting: &str) -> anyhow::Result<()> {
-    let valid: std::collections::HashSet<&str> =
-        crate::descriptions::TOOL_NAMES.iter().copied().collect();
+    let valid: std::collections::HashSet<&str> = crate::descriptions::all_tool_names().collect();
     let mut unknown: Vec<&str> = names
         .iter()
         .map(|t| t.as_str())
@@ -2001,7 +2128,9 @@ fn validate_tool_name_list(names: &[String], setting: &str) -> anyhow::Result<()
         anyhow::bail!(
             "{setting} names unknown tool(s): {} — valid names are {}",
             unknown.join(", "),
-            crate::descriptions::TOOL_NAMES.join(", ")
+            crate::descriptions::all_tool_names()
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     let mut seen = std::collections::HashSet::new();
@@ -2045,6 +2174,8 @@ pub struct ResolvedConfig {
     pub contradictions: ContradictionsConfig,
     /// The contradiction judge's wiring — `Some` only when `contradictions.judge` is on.
     pub contradictions_judge: Option<ResolvedJudgeConfig>,
+    /// The memory tool group's settings (validated; `enabled` is what turns it on).
+    pub memory: MemoryConfig,
     /// Where every resolved setting's value came from — see [`ConfigProvenance`].
     pub provenance: ConfigProvenance,
 }
@@ -2083,6 +2214,48 @@ impl Config {
     #[cfg(test)]
     fn resolve(self) -> anyhow::Result<ResolvedConfig> {
         self.resolve_inner(&HashSet::new(), false)
+    }
+
+    /// Checks for the `memory` section. Always applied: a reload that turns the group
+    /// on must not be the first time a bad value is noticed.
+    fn validate_memory(&self) -> anyhow::Result<()> {
+        let m = &self.memory;
+        if !(0.0..=1.0).contains(&m.duplicate_threshold) {
+            anyhow::bail!("memory.duplicate_threshold must be between 0.0 and 1.0");
+        }
+        if !valid_memory_area(&m.default_area) {
+            anyhow::bail!(
+                "memory.default_area {:?} must be 1 to 64 characters of letters, digits, '-' \
+                 and '_', not starting with '_' or '.' (it becomes a folder name)",
+                m.default_area
+            );
+        }
+        let root = crate::policy::normalize_prefix(&m.root)
+            .map_err(|e| anyhow::anyhow!("memory.root: {e}"))?;
+        if root.is_empty() {
+            anyhow::bail!(
+                "memory.root must be a directory under the knowledge base root, not the root itself"
+            );
+        }
+        if m.enabled {
+            // memory_search and memory_recall rank whole documents.
+            if !effective_granularities(&self.search, &self.chunking)
+                .contains(&Granularity::Document)
+            {
+                anyhow::bail!(
+                    "memory.enabled needs 'document' in search.granularities: memory_search and \
+                     memory_recall search at document granularity"
+                );
+            }
+            let archive = self.write.archive_prefix.trim_matches('/');
+            if root == archive || root.starts_with(&format!("{archive}/")) {
+                anyhow::bail!(
+                    "memory.root '{root}' is inside write.archive_prefix '{archive}': an archived \
+                     document would be indistinguishable from a memory"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Range checks for the `contradictions` section (#355). Always applied, like the
@@ -2516,11 +2689,18 @@ impl Config {
                 anyhow::bail!("set one of mcp.enabled_tools / mcp.disabled_tools, not both");
             }
             validate_tool_name_list(&self.mcp.disabled_tools, "mcp.disabled_tools")?;
-            if self.mcp.disabled_tools.len() == crate::descriptions::TOOL_NAMES.len() {
+            // The memory tools count only when the group is on: with it off they are
+            // never exposed, so disabling the core tools would leave nothing.
+            let available: Vec<&str> =
+                crate::descriptions::available_tool_names(self.memory.enabled).collect();
+            if available
+                .iter()
+                .all(|t| self.mcp.disabled_tools.iter().any(|d| d == t))
+            {
                 anyhow::bail!(
                     "mcp.disabled_tools disables every tool ({}) — the server would have no \
                      usable MCP surface at all",
-                    crate::descriptions::TOOL_NAMES.join(", ")
+                    available.join(", ")
                 );
             }
             if let Some(enabled) = &self.mcp.enabled_tools {
@@ -2529,7 +2709,9 @@ impl Config {
                     anyhow::bail!(
                         "mcp.enabled_tools is empty — that would disable every tool ({}); name \
                          at least one, or omit mcp.enabled_tools entirely",
-                        crate::descriptions::TOOL_NAMES.join(", ")
+                        crate::descriptions::all_tool_names()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
             }
@@ -2560,6 +2742,7 @@ impl Config {
         crate::markdown_fmt::validate_config(&self.formatting.markdown)
             .map_err(|e| anyhow::anyhow!(e))?;
         self.validate_contradictions()?;
+        self.validate_memory()?;
         if self.ui.semantic_edges.k == 0 {
             anyhow::bail!("ui.semantic_edges.k must be >= 1");
         }
@@ -2571,6 +2754,34 @@ impl Config {
         // message far from the config that caused it. Every problem is named at
         // once, same reasoning as the missing-env-var block below.
         let oauth = resolve_mcp_oauth(self.mcp.oauth.clone())?;
+
+        // Access policies (`mcp.policy`, `mcp.tokens`, `mcp.principals`). Compiled
+        // here so a bad policy is a startup / reload refusal, never a request-time
+        // surprise. A policy needs every request to carry an authenticated
+        // principal: the unauthenticated pass-through has none, and the web routes
+        // only get one through the auth layer (`ui.api_auth`), so either setting
+        // alongside a policy would leave a route that enforces nothing.
+        let access = crate::policy::AccessControl::compile(
+            &self.mcp.policy,
+            &self.mcp.tokens,
+            &self.mcp.principals,
+            &crate::descriptions::all_tool_names().collect::<Vec<_>>(),
+            oauth.is_some(),
+        )?;
+        if access.enforcing() {
+            if self.mcp.allow_unauthenticated {
+                anyhow::bail!(
+                    "mcp.policy is set but mcp.allow_unauthenticated is true: a policy needs an \
+                     authenticated principal on every request"
+                );
+            }
+            if !self.ui.api_auth {
+                anyhow::bail!(
+                    "mcp.policy is set but ui.api_auth is false: the web UI's /api/* routes would \
+                     serve every document with no principal to check; set ui.api_auth: true"
+                );
+            }
+        }
 
         // Validate required env vars — named all at once, not one at a time, so a
         // fresh deployment finds every missing var on the first failed start
@@ -2695,9 +2906,8 @@ impl Config {
                     Some(enabled) => {
                         let enabled_set: std::collections::HashSet<&str> =
                             enabled.iter().map(String::as_str).collect();
-                        crate::descriptions::TOOL_NAMES
-                            .iter()
-                            .filter(|t| !enabled_set.contains(*t))
+                        crate::descriptions::available_tool_names(self.memory.enabled)
+                            .filter(|t| !enabled_set.contains(t))
                             .map(|t| t.to_string())
                             .collect()
                     }
@@ -2713,6 +2923,10 @@ impl Config {
                     extensions_path: self.mcp.extensions_path,
                     oauth,
                     disabled_tools: effective_disabled_tools,
+                    access,
+                    policy: self.mcp.policy,
+                    tokens: self.mcp.tokens,
+                    principals: self.mcp.principals,
                 }
             },
             rate_limit: self.rate_limit,
@@ -2746,6 +2960,7 @@ impl Config {
                 None
             },
             contradictions: self.contradictions,
+            memory: self.memory,
             provenance: ConfigProvenance(
                 provenance
                     .into_iter()
@@ -3481,6 +3696,7 @@ mcp:
             formatting: FormattingConfig::default(),
             contradictions: ContradictionsConfig::default(),
             contradictions_judge: None,
+            memory: MemoryConfig::default(),
             provenance: ConfigProvenance::default(),
         };
 
@@ -4130,6 +4346,162 @@ mcp:
         assert_eq!(cfg.search.granularities, vec![Granularity::Document]);
     }
 
+    const POLICY_YAML: &str =
+        "mcp:\n  policy:\n    agent:\n      tools: [search]\n      read: [memory]\n";
+
+    #[test]
+    fn memory_is_off_unless_the_section_turns_it_on() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let off = Config::from_str("").unwrap();
+        assert!(!off.memory.enabled);
+        // A section that only sets values does not enable it either.
+        let still_off = Config::from_str("memory:\n  root: notes-memory\n").unwrap();
+        assert!(!still_off.memory.enabled);
+
+        let on = Config::from_str("memory:\n  enabled: true\n").unwrap();
+        assert!(on.memory.enabled);
+        assert_eq!(on.memory.root, "memory");
+        assert_eq!(on.memory.default_area, "general");
+        assert_eq!(on.memory.default_status, MemoryDefaultStatus::Proposed);
+        assert_eq!(on.memory.duplicate_threshold, 0.85);
+        clear_required_env();
+    }
+
+    #[test]
+    fn disabling_every_tool_that_exists_is_refused_with_memory_on_too() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let all = crate::descriptions::all_tool_names()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let e = Config::from_str(&format!(
+            "memory:\n  enabled: true\nmcp:\n  disabled_tools: [{all}]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("disables every tool"), "{e}");
+        clear_required_env();
+    }
+
+    #[test]
+    fn memory_mistakes_name_the_setting() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        for (yaml, needle) in [
+            (
+                "memory:\n  duplicate_threshold: 1.5\n",
+                "memory.duplicate_threshold",
+            ),
+            ("memory:\n  default_area: \"../x\"\n", "memory.default_area"),
+            ("memory:\n  default_area: _hidden\n", "memory.default_area"),
+            ("memory:\n  default_area: \"\"\n", "memory.default_area"),
+            ("memory:\n  root: \"/\"\n", "memory.root"),
+            ("memory:\n  root: \"a/../b\"\n", "memory.root"),
+            (
+                "memory:\n  enabled: true\n  root: _archive/m\n",
+                "write.archive_prefix",
+            ),
+            ("memory:\n  default_status: maybe\n", "unknown variant"),
+            (
+                "memory:\n  enabled: true\nsearch:\n  granularities: [chunk]\n",
+                "search.granularities",
+            ),
+            ("memory:\n  surprise: 1\n", "unknown field"),
+        ] {
+            let e = Config::from_str(yaml).unwrap_err().to_string();
+            assert!(e.contains(needle), "{yaml:?}: {e}");
+        }
+        clear_required_env();
+    }
+
+    #[test]
+    fn the_memory_tool_names_are_valid_in_every_tool_list_but_only_exist_while_enabled() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        // Valid names even with the group off: a policy may be written ahead of it.
+        Config::from_str("mcp:\n  disabled_tools: [memory_forget]\n").unwrap();
+        // An allowlist's complement is taken over the tools that exist.
+        let off = Config::from_str("mcp:\n  enabled_tools: [search]\n").unwrap();
+        assert!(
+            off.mcp
+                .disabled_tools
+                .iter()
+                .all(|t| !t.starts_with("memory_")),
+            "{:?}",
+            off.mcp.disabled_tools
+        );
+        let on = Config::from_str("memory:\n  enabled: true\nmcp:\n  enabled_tools: [search]\n")
+            .unwrap();
+        for tool in crate::descriptions::MEMORY_TOOL_NAMES {
+            assert!(on.mcp.disabled_tools.iter().any(|t| t == tool), "{tool}");
+        }
+        // Disabling every core tool leaves the memory tools as the surface.
+        let all_core = crate::descriptions::TOOL_NAMES.join(", ");
+        assert!(Config::from_str(&format!("mcp:\n  disabled_tools: [{all_core}]\n")).is_err());
+        Config::from_str(&format!(
+            "memory:\n  enabled: true\nmcp:\n  disabled_tools: [{all_core}]\n"
+        ))
+        .unwrap();
+        clear_required_env();
+    }
+    #[test]
+    fn mcp_policy_absent_means_nothing_is_enforced() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let cfg = Config::from_str("").unwrap();
+        assert!(!cfg.mcp.access.enforcing());
+        assert!(cfg.mcp.policy.is_empty() && cfg.mcp.tokens.is_empty());
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_policy_needs_api_auth_and_an_authenticated_caller() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        // The web routes only get a principal through the auth layer.
+        let err = Config::from_str(POLICY_YAML).unwrap_err().to_string();
+        assert!(err.contains("ui.api_auth"), "{err}");
+        let ok = format!("{POLICY_YAML}ui:\n  api_auth: true\n");
+        assert!(Config::from_str(&ok).unwrap().mcp.access.enforcing());
+        // No principal exists on the unauthenticated pass-through.
+        let open = format!("{POLICY_YAML}  allow_unauthenticated: true\nui:\n  api_auth: true\n");
+        let err = Config::from_str(&open).unwrap_err().to_string();
+        assert!(err.contains("allow_unauthenticated"), "{err}");
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_policy_mistakes_name_the_setting() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let ui = "ui:\n  api_auth: true\n";
+        for (yaml, needle) in [
+            (
+                format!("mcp:\n  policy:\n    a:\n      tools: [nope]\n{ui}"),
+                "mcp.policy.a.tools",
+            ),
+            (
+                format!("mcp:\n  policy:\n    a:\n      read: [\"../x\"]\n{ui}"),
+                "mcp.policy.a.read",
+            ),
+            (
+                format!(
+                    "mcp:\n  policy:\n    a: {{}}\n  tokens:\n    - name: t\n      secret_env: S\n      policy: b\n{ui}"
+                ),
+                "not defined under mcp.policy",
+            ),
+            (
+                format!("mcp:\n  policy:\n    a: {{}}\n  unknown_key: 1\n{ui}"),
+                "unknown_key",
+            ),
+        ] {
+            let err = Config::from_str(&yaml).unwrap_err().to_string();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        clear_required_env();
+    }
+
     #[test]
     fn mcp_disabled_tools_unknown_names_are_all_named_at_once() {
         let _lock = ENV_MUTEX.lock().unwrap();
@@ -4326,6 +4698,7 @@ mcp:
             formatting: FormattingConfig::default(),
             contradictions: ContradictionsConfig::default(),
             contradictions_judge: None,
+            memory: MemoryConfig::default(),
             provenance: ConfigProvenance::default(),
         }
     }

@@ -50,7 +50,7 @@ use crate::state::{DocumentSummary, StateDb};
 use crate::write::{self, WriteDeps, WriteError, WriteOutcome, WriteRequest, WriteSuccess};
 
 /// Cap on a search query's length — the same value `mcp::MAX_QUERY_LEN` uses,
-/// redeclared here because that constant is private to `mcp.rs` and this route is
+/// redeclared here because that constant is private to `mcp/` and this route is
 /// reachable with no authentication at all.
 const MAX_SEARCH_QUERY_LEN: usize = 4096;
 /// Cap on a single `domain`/`type` filter value's length, mirroring
@@ -125,6 +125,54 @@ pub struct UiState {
     /// `reindex::ReindexQueue`'s doc comment on `run_worker` for why there is
     /// no ambient default to fall back on.
     reindex_queue: Arc<crate::reindex::ReindexQueue>,
+}
+
+/// The principal behind a `/api/*` request, resolved by `server::principal_layer`
+/// when `ui.api_auth` puts the auth layer in front of these routes. A request that
+/// reaches a handler with none (the layer is absent) is unrestricted while no policy
+/// is enforced and gets nothing once one is, so a route left out of the layer
+/// fails closed.
+pub(crate) struct Caller(pub crate::policy::Principal);
+
+impl axum::extract::FromRequestParts<UiState> for Caller {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &UiState,
+    ) -> Result<Self, Self::Rejection> {
+        let enforcing = state.config().mcp.access.enforcing();
+        Ok(Caller(crate::policy::Principal::from_extension(
+            parts.extensions.get::<crate::policy::Principal>(),
+            enforcing,
+        )))
+    }
+}
+
+/// The refusal for something the caller's policy does not grant. Names nothing
+/// about what was asked for.
+fn not_permitted() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({"error": crate::write::NOT_PERMITTED})),
+    )
+        .into_response()
+}
+
+/// Whether `principal`'s `tools` allowlist grants `tool`. A `/api/*` route does what the
+/// MCP tool of that name does, so it is bound by the same allowlist; without this a
+/// token limited to `search` could still read or write documents through the web API.
+fn tool_allowed(principal: &crate::policy::Principal, tool: &str) -> bool {
+    principal.authorize_tool(tool).is_ok()
+}
+
+/// Whether `principal`'s policy grants a write to `rel_path`. The write pipeline
+/// checks every path again (`write::safe_write_path`); this is the early answer a
+/// handler gives before it touches the filesystem.
+fn may_write(principal: &crate::policy::Principal, rel_path: &str) -> bool {
+    principal
+        .authorize_path(rel_path, crate::policy::Op::Write)
+        .is_ok()
 }
 
 /// Build an include `GlobSet` for the UI's document-serving routes.
@@ -214,6 +262,7 @@ impl UiState {
     fn search_ctx(
         &self,
         extra_conditions: Vec<qdrant_client::qdrant::Condition>,
+        reach: crate::policy::Reach,
     ) -> crate::mcp::SearchCtx<'_> {
         crate::mcp::SearchCtx {
             deps: self.deps(),
@@ -221,6 +270,7 @@ impl UiState {
             schema_cache: &self.schema_cache,
             state_db: &self.state_db,
             extra_conditions,
+            reach,
         }
     }
 
@@ -228,22 +278,24 @@ impl UiState {
     /// snapshot, same shape `KbSearchServer::write_document`/`delete_document`
     /// build for the MCP tool surface. `token` must outlive the returned value —
     /// callers read it from the environment once per request and hold it in a
-    /// local binding (see the handlers below), same convention `mcp.rs` uses.
+    /// local binding (see the handlers below), same convention `mcp/` uses.
     ///
     /// `state_db`: pass `Some` for a MOVE (`write::WriteRequest::dest_path` set)
     /// or a DELETE — `write::write_document_move` and `write::delete_document`
     /// are the only readers of `WriteDeps::state` (the latter for #229's
     /// inbound-link check), so a plain create/edit has no use for it. `None`
     /// there avoids lazily materializing `state.db` on disk for a request that
-    /// will never touch it (mirrors `mcp.rs`'s identical scoping).
+    /// will never touch it (mirrors `mcp/`'s identical scoping).
     fn write_deps<'a>(
         &'a self,
         config: &'a ResolvedConfig,
         token: &'a Option<String>,
         state_db: Option<&'a StateDb>,
+        principal: crate::policy::Principal,
     ) -> WriteDeps<'a, EmbedClient, QdrantStore> {
         WriteDeps {
             retrieval: self.deps(),
+            principal,
             canonical_data_path: &self.canonical_data_path,
             schema_cache: &self.schema_cache,
             validation: &config.validation,
@@ -610,7 +662,10 @@ fn build_graph_response(
     }
 }
 
-async fn graph_handler(State(state): State<UiState>) -> Response {
+async fn graph_handler(State(state): State<UiState>, Caller(principal): Caller) -> Response {
+    if !tool_allowed(&principal, "search") {
+        return not_permitted();
+    }
     let db = match state.state_db().await {
         Ok(db) => db,
         Err(e) => {
@@ -624,7 +679,14 @@ async fn graph_handler(State(state): State<UiState>) -> Response {
     };
 
     let summaries = match db.all_document_summaries().await {
-        Ok(s) => s,
+        // Nodes first, edges after: `build_graph_response` keeps only edges between
+        // surviving nodes, so cutting the nodes to the caller's reach cuts the edges
+        // too.
+        Ok(mut s) => {
+            let reach = principal.reach(crate::policy::Op::Read);
+            s.retain(|d| reach.covers(&d.file_path));
+            s
+        }
         Err(e) => {
             error!("graph: failed to list documents: {:#}", e);
             return (
@@ -789,9 +851,13 @@ fn search_error_response(err: &retrieval::SearchError) -> (StatusCode, serde_jso
 
 async fn search_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     Query(params): Query<SearchQueryParams>,
     Query(raw_pairs): Query<Vec<(String, String)>>,
 ) -> Response {
+    if !tool_allowed(&principal, "search") {
+        return not_permitted();
+    }
     let q = params.q.as_deref().map(str::trim).unwrap_or("");
     if q.is_empty() {
         return (
@@ -881,7 +947,7 @@ async fn search_handler(
         params.r#type.as_deref(),
         tags.as_deref(),
     );
-    let ctx = state.search_ctx(sugar.conditions);
+    let ctx = state.search_ctx(sugar.conditions, principal.reach(crate::policy::Op::Read));
     if let Err(e) = ctx.check_filter_vocabulary(&search_params).await {
         return mcp_error_response(e);
     }
@@ -1029,8 +1095,12 @@ struct EnumerateQueryParams {
 /// refusals, `path_prefix` matching and paging, so the two cannot disagree.
 async fn enumerate_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     Query(params): Query<EnumerateQueryParams>,
 ) -> Response {
+    if !tool_allowed(&principal, "search") {
+        return not_permitted();
+    }
     let filters = match parse_filters_param(params.filters.as_deref()) {
         Ok(f) => f,
         Err(msg) => return bad_request(msg),
@@ -1042,7 +1112,7 @@ async fn enumerate_handler(
         offset: params.offset,
         ..Default::default()
     };
-    let ctx = state.search_ctx(Vec::new());
+    let ctx = state.search_ctx(Vec::new(), principal.reach(crate::policy::Op::Read));
     if let Err(e) = ctx.check_filter_vocabulary(&search_params).await {
         return mcp_error_response(e);
     }
@@ -1138,10 +1208,14 @@ struct DocQueryParams {
 
 async fn get_doc_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     AxumPath(raw_path): AxumPath<String>,
     Query(params): Query<DocQueryParams>,
     Query(raw_pairs): Query<Vec<(String, String)>>,
 ) -> Response {
+    if !tool_allowed(&principal, "get_document") {
+        return not_permitted();
+    }
     // Repeated `?heading_path=...` occurrences, in order. Empty (the
     // "omitted" case, since a query string cannot distinguish "omitted" from
     // "given zero times", and a lone `?heading_path=` gives one empty-string
@@ -1189,7 +1263,8 @@ async fn get_doc_handler(
         }
     };
 
-    match retrieval::get_document(&state.deps(), index, &raw_path).await {
+    let reach = principal.reach(crate::policy::Op::Read);
+    match retrieval::get_document_in(&state.deps(), index, &raw_path, &reach).await {
         Ok(doc) => {
             // Always over the whole file, never a slice/section: this is the
             // version the editor sends back as `expected_version` on POST and
@@ -1281,8 +1356,12 @@ fn normalize_ui_path(raw: &str) -> Result<PathBuf, String> {
 
 async fn get_schema_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     AxumPath(raw_path): AxumPath<String>,
 ) -> Response {
+    if !tool_allowed(&principal, "get_schema") {
+        return not_permitted();
+    }
     let rel = match normalize_ui_path(&raw_path) {
         Ok(r) => r,
         Err(msg) => {
@@ -1293,6 +1372,14 @@ async fn get_schema_handler(
                 .into_response();
         }
     };
+
+    // A schema is readable only inside the caller's reach, as the MCP tool does.
+    if !principal
+        .reach(crate::policy::Op::Read)
+        .covers(&rel.to_string_lossy())
+    {
+        return not_permitted();
+    }
 
     let schemas = schema::load_shared(&state.schema_cache);
     // A document path resolves via its parent directory; a directory reference
@@ -1372,9 +1459,28 @@ struct HistoryQueryParams {
 
 async fn history_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     Query(params): Query<HistoryQueryParams>,
 ) -> Response {
+    if !tool_allowed(&principal, "get_document") {
+        return not_permitted();
+    }
     let data_path = state.canonical_data_path.to_string_lossy().into_owned();
+
+    // A history listing is corpus-wide (every commit, whatever it touched), so a
+    // caller confined to part of the knowledge base gets history only for one
+    // document it may read, never the listing.
+    let reach = principal.reach(crate::policy::Op::Read);
+    if !matches!(reach, crate::policy::Reach::All) {
+        let covered = params
+            .path
+            .as_deref()
+            .map(|p| retrieval::kb_root_relative(p.trim()))
+            .is_some_and(|p| !p.is_empty() && reach.covers(p));
+        if !covered {
+            return not_permitted();
+        }
+    }
 
     // Parameter-shape validation runs BEFORE the not-a-git-repo check below:
     // a malformed request (`commit` with no `path`) is a client error
@@ -1506,8 +1612,12 @@ struct ChangesQueryParams {
 
 async fn changes_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     Query(params): Query<ChangesQueryParams>,
 ) -> Response {
+    if !tool_allowed(&principal, "changes_since") {
+        return not_permitted();
+    }
     let data_path = state.canonical_data_path.to_string_lossy().into_owned();
     let indexing = state.config().indexing.clone();
     match retrieval::changes_since_json(
@@ -1518,6 +1628,7 @@ async fn changes_handler(
         params.path_prefix.as_deref(),
         params.limit,
         params.cursor.as_deref(),
+        &principal.reach(crate::policy::Op::Read),
     )
     .await
     {
@@ -1588,7 +1699,7 @@ fn forbidden(msg: impl Into<String>) -> Response {
 
 /// Map a `retrieval::ResolveErr` produced while resolving a write/delete target
 /// onto an HTTP response. Mirrors the MCP write tools' own handling of this exact
-/// enum (`edit_document`/`delete_document` in `mcp.rs`) so the web UI enforces
+/// enum (`edit_document`/`delete_document` in `mcp/`) so the web UI enforces
 /// the same eligibility rules through a different transport: `NotPermitted`
 /// (a path the `indexing.include` globset would not index — e.g. anything
 /// outside `**/*.md`, including files under `.git/`) and `Outside` (path
@@ -1679,7 +1790,7 @@ fn write_success_response(success: WriteSuccess) -> Response {
 ///   (a clean rollback, or an I/O error before git was ever touched).
 ///
 /// `dest_path` disambiguates `WriteError::AlreadyExists`, the same way
-/// `mcp.rs`'s `create_edit_error_to_mcp_error` uses its own `dest_path`
+/// `mcp/`'s `create_edit_error_to_mcp_error` uses its own `dest_path`
 /// parameter for the identical problem: that variant carries no path of its
 /// own, so a plain create/edit collision (unambiguous — there is only one
 /// path in play) and a move-destination collision (which must name the
@@ -1715,6 +1826,8 @@ fn write_error_response(err: &WriteError, dest_path: Option<&str>) -> Response {
         )
             .into_response(),
         WriteError::InvalidCommitMessage { reason } => bad_request(reason.clone()),
+        // The pipeline's refusal of a path outside the caller's write grants.
+        WriteError::UnsafePath { msg } if msg == crate::write::NOT_PERMITTED => not_permitted(),
         WriteError::UnsafePath { msg } => bad_request(msg.clone()),
         // `msg` embeds a server-side absolute filesystem path (a
         // `resolve_safe_write_path` canonicalize failure) — see
@@ -1832,12 +1945,21 @@ fn write_error_response(err: &WriteError, dest_path: Option<&str>) -> Response {
 /// re-reading a file the caller may not have looked at recently.
 async fn post_doc_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     AxumPath(raw_path): AxumPath<String>,
     Json(body): Json<WriteDocBody>,
 ) -> Response {
+    if !tool_allowed(&principal, "write_document") {
+        return not_permitted();
+    }
     let rel_path = retrieval::kb_root_relative(raw_path.trim()).to_string();
     if rel_path.is_empty() {
         return bad_request("path parameter is empty");
+    }
+    // Before anything that looks at the filesystem, so the refusal cannot tell a
+    // document that exists from one that does not.
+    if !may_write(&principal, &rel_path) {
+        return not_permitted();
     }
     if body.content.len() > MAX_WRITE_CONTENT_LEN {
         return bad_request(format!(
@@ -1860,6 +1982,12 @@ async fn post_doc_handler(
         Some(p) => Some(retrieval::kb_root_relative(p).to_string()),
         None => None,
     };
+    if dest_rel
+        .as_deref()
+        .is_some_and(|d| !may_write(&principal, d))
+    {
+        return not_permitted();
+    }
 
     // Include-pattern eligibility guard, same rule the MCP write tools enforce
     // (`create_document`'s explicit `include_patterns.is_match` check /
@@ -1913,7 +2041,7 @@ async fn post_doc_handler(
         } else {
             None
         };
-        let deps = state.write_deps(&config, &token, state_db);
+        let deps = state.write_deps(&config, &token, state_db, principal);
 
         let req = WriteRequest {
             rel_path: &rel_path,
@@ -1983,12 +2111,19 @@ async fn detached(write: impl std::future::Future<Output = Response> + Send + 's
 /// `DELETE /api/doc/{*path}`: thin adapter over `write::delete_document`.
 async fn delete_doc_handler(
     State(state): State<UiState>,
+    Caller(principal): Caller,
     AxumPath(raw_path): AxumPath<String>,
     Json(body): Json<DeleteDocBody>,
 ) -> Response {
+    if !tool_allowed(&principal, "delete_document") {
+        return not_permitted();
+    }
     let rel_path = retrieval::kb_root_relative(raw_path.trim()).to_string();
     if rel_path.is_empty() {
         return bad_request("path parameter is empty");
+    }
+    if !may_write(&principal, &rel_path) {
+        return not_permitted();
     }
 
     // Same include-pattern eligibility guard as `post_doc_handler`'s edit
@@ -2028,7 +2163,7 @@ async fn delete_doc_handler(
         // never sees a `StateDb` at all, and `referencing_paths` would always come
         // back empty regardless of what actually links to the document being deleted.
         let state_db = state.state_db().await.ok();
-        let deps = state.write_deps(&config, &token, state_db);
+        let deps = state.write_deps(&config, &token, state_db, principal);
 
         match write::delete_document(
             &deps,
@@ -2278,8 +2413,18 @@ pub fn ui_router_with_api_auth(
         .merge(doc_router)
         .with_state(state.clone());
     if let Some(auth) = api_auth {
-        api_router =
-            api_router.route_layer(axum::middleware::from_fn_with_state(auth, require_auth));
+        // The principal layer sits just inside the auth layer, so each handler's
+        // `Caller` is the principal the credential `require_auth` accepted maps to.
+        let principals = crate::server::PrincipalState {
+            config: state.config.clone(),
+            oauth: auth.oauth().cloned(),
+        };
+        api_router = api_router
+            .route_layer(axum::middleware::from_fn_with_state(
+                principals,
+                crate::server::principal_layer,
+            ))
+            .route_layer(axum::middleware::from_fn_with_state(auth, require_auth));
     }
     let api_router = api_router.route_layer(axum::middleware::from_fn_with_state(
         ApiRequestGuard {
@@ -2358,6 +2503,7 @@ mod tests {
             formatting: crate::config::FormattingConfig::off(),
             contradictions: Default::default(),
             contradictions_judge: None,
+            memory: Default::default(),
             provenance: Default::default(),
         })
     }
@@ -3698,7 +3844,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // /api/doc section/outline modes (#286) — parity with the MCP
-    // `get_document` tool's equivalent tests in mcp.rs.
+    // `get_document` tool's equivalent tests in mcp/.
     // ------------------------------------------------------------------
 
     const SECTION_DOC: &str = "# Guide\n\n## Alpha\n\nAlpha body.\n\n### Alpha Sub\n\nAlpha sub body.\n\n## Beta\n\nBeta body.\n";
@@ -3938,7 +4084,7 @@ mod tests {
         // Parity with the MCP tool, structurally: both adapters must emit
         // exactly `retrieval::document_view_json` plus their envelope, so
         // checking each against the shared core pins them to each other
-        // (mcp.rs has the mirror test).
+        // (mcp/ has the mirror test).
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
         let hash = crate::write::document_version(SECTION_DOC.as_bytes());
@@ -5265,7 +5411,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_doc_surfaces_referencing_paths_in_the_response() {
-        // (#229) Same proof as mcp.rs's equivalent test, for the HTTP transport:
+        // (#229) Same proof as mcp/'s equivalent test, for the HTTP transport:
         // the reverse-link check must reach the response body, not just a log.
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");

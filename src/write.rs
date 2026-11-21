@@ -2,10 +2,10 @@
 //! gate, filesystem write/removal, git commit+sync, and the pre-commit /
 //! post-commit rollback state machine.
 //!
-//! Extracted out of `mcp.rs` so both the MCP tool surface (`create_document`,
+//! Extracted out of `mcp/` so both the MCP tool surface (`create_document`,
 //! `edit_document`, `delete_document`) and the HTTP UI (`web.rs`, a later chunk)
 //! drive the exact same commit/rollback logic instead of maintaining two copies of
-//! it. `mcp.rs`'s tool methods are thin adapters: they do transport-specific path
+//! it. `mcp/`'s tool methods are thin adapters: they do transport-specific path
 //! resolution (fuzzy basename matching, turning tool parameters into a
 //! [`DocChange`]) and map [`WriteSuccess`]/[`WriteError`] back onto the exact
 //! `CallToolResult`/`McpError` shapes their existing tests pin down.
@@ -29,19 +29,15 @@ use crate::config::ValidationConfig;
 use crate::embed::QueryEmbedder;
 use crate::git;
 use crate::qdrant::RetrievalStore;
-use crate::retrieval::{RetrievalDeps, SearchFilters};
+use crate::retrieval::RetrievalDeps;
 use crate::schema::{self, SharedSchemaCache};
+use crate::similarity::build_dedup_query;
 use crate::state::StateDb;
 use crate::validate::{self, ValidationResult};
 
 // ---------------------------------------------------------------------------
 // Dedup gate (create-path near-duplicate refusal)
 // ---------------------------------------------------------------------------
-
-/// Maximum number of characters from the new document's content used to build
-/// the dedup query text. Keeps the embedding request within typical token limits
-/// (most embedding models cap at ~512–8192 tokens; 2000 chars ≈ 400–500 tokens).
-const DEDUP_QUERY_CHAR_LIMIT: usize = 2000;
 
 /// A near-duplicate found during dedup gate evaluation.
 #[derive(Debug, Clone)]
@@ -63,42 +59,6 @@ pub fn dedup_verdict(top: Option<(String, f32)>, threshold: f32) -> Option<Dupli
         }),
         _ => None,
     }
-}
-
-/// Build the dedup query text on the same textual basis the indexer uses, then
-/// truncate it to `DEDUP_QUERY_CHAR_LIMIT`.
-///
-/// This must stay aligned with `chunk::chunk_markdown`: every indexed chunk is
-/// prefixed with its document's own `description` when
-/// `chunking.prepend_description` is set, so a dedup query built without that
-/// prefix would be compared against a different textual basis than the
-/// candidates it is scored against.
-///
-/// It deliberately does NOT reproduce `chunking.prepend_heading_path`'s
-/// breadcrumb, and that is safe for a non-obvious structural reason worth
-/// stating: a chunk's breadcrumb is seeded from the section that starts it and
-/// merging further pieces in can only narrow it (to a common ancestor, see
-/// `chunk::chunk_markdown`). A document's FIRST chunk is always seeded from its
-/// first section — the preamble, which has no breadcrumb, or the first heading,
-/// which has no ancestors because no heading precedes it — so chunk 0 never
-/// carries a breadcrumb, whatever the document's heading structure. Since a create-path dedup query is doc-start text scored
-/// against the corpus, matching chunk 0's basis is what matters.
-///
-/// If a future chunking change breaks that invariant — anything that can give
-/// a document's first chunk a prefix this function does not build — the dedup
-/// gate silently starts comparing unlike text and lets near-duplicates through
-/// with no error. `mcp::tests::build_dedup_query_matches_chunk_prepend_format`
-/// is the pin; keep it honest rather than adjusting it to match a regression.
-pub(crate) fn build_dedup_query(
-    body: &str,
-    description: Option<&str>,
-    prepend_description: bool,
-) -> String {
-    let assembled = match (prepend_description, description) {
-        (true, Some(desc)) => format!("{}\n\n{}", desc, body),
-        _ => body.to_string(),
-    };
-    assembled.chars().take(DEDUP_QUERY_CHAR_LIMIT).collect()
 }
 
 /// The dedup gate's effective `(enabled, threshold)` for a document governed by
@@ -137,44 +97,6 @@ pub(crate) fn effective_related<E: QueryEmbedder, Q: RetrievalStore>(
         schema.related_limit.unwrap_or(deps.related_limit),
         schema.related_min_score.unwrap_or(deps.related_min_score),
     )
-}
-
-/// Search options for the dedup gate.
-///
-/// Deliberately pinned to dense-only rather than inheriting `search.hybrid`, so
-/// the returned score is a cosine similarity comparable to
-/// `write.dedup_threshold`. Hybrid RRF scores top out around 0.03 — against a
-/// cosine threshold like the 0.80 default the gate could never fire — and a
-/// cross-encoder relevance score is not a similarity at all, so reranking is
-/// also kept out of this path (see the `reranker: None` at the call site).
-#[cfg(test)]
-pub(crate) fn dedup_search_opts() -> crate::retrieval::SearchOptions {
-    dedup_search_opts_with_limit(1)
-}
-
-/// [`dedup_search_opts`] asking for the `limit` nearest chunks, one per document
-/// when more than one is wanted, so the extras are distinct neighbours (#356).
-/// The top hit is the same chunk `dedup_search_opts` returns.
-pub(crate) fn dedup_search_opts_with_limit(limit: usize) -> crate::retrieval::SearchOptions {
-    crate::retrieval::SearchOptions {
-        limit: limit.max(1) as u64,
-        min_score: None,
-        hybrid: false,
-        // Unused in the dense-only path, which performs no RRF fusion.
-        rrf_candidates: 0,
-        // Same reasoning as `hybrid` above: phrase matching adds a third fused
-        // arm, which this dense-only comparison has no use for.
-        phrase: false,
-        explain: false,
-        modified_after: None,
-        modified_before: None,
-        path_filter: None,
-        rerank_candidate_limit: None,
-        // The dedup gate wants the single closest existing chunk, full stop — not
-        // a diversified page of results (limit: 1 above makes a per-document cap
-        // moot anyway, but this keeps intent explicit rather than accidental).
-        diversity_max_per_document: (limit > 1).then_some(1),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +173,11 @@ pub fn render_unified_diff(old: &str, new: &str, relpath: &str) -> String {
 /// create-path dedup gate — see `crate::retrieval::RetrievalDeps`.
 pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     pub retrieval: RetrievalDeps<'a, E, Q>,
+    /// Who is writing. Every path the pipeline touches is checked against this
+    /// principal's write grants in [`safe_write_path`], and the create-path dedup
+    /// query is confined to what it may read, so neither a refusal nor a `related`
+    /// list names a document it may not see.
+    pub principal: crate::policy::Principal,
     /// Canonicalized knowledge-base root. Every filesystem action re-resolves
     /// against this immediately before it happens (see `resolve_safe_write_path`),
     /// closing the TOCTOU window a slow schema/dedup lookup would otherwise leave
@@ -314,7 +241,7 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     /// is rebuilt from each document's current on-disk body, not trusted as an
     /// authoritative index). This exists for callers/tests that have no
     /// `StateDb` handle at all — it is NOT a normal operating mode. Both real
-    /// callers (`mcp.rs`'s `KbSearchServer`, `web.rs`'s `UiState`) have a
+    /// callers (`mcp/`'s `KbSearchServer`, `web.rs`'s `UiState`) have a
     /// `StateDb` available via their own `Arc<OnceCell<StateDb>>` and MUST
     /// pass `Some` here so production writes always rewrite incoming links.
     pub state: Option<&'a StateDb>,
@@ -482,7 +409,7 @@ pub enum WriteError {
     /// filesystem path in their message (e.g. "cannot canonicalize data root
     /// '<abs>': <io error>"). Kept distinct from `UnsafePath` so a transport
     /// that must not leak container paths to an untrusted caller (`web.rs`) can
-    /// map this to a generic message while `mcp.rs` — a trusted surface where
+    /// map this to a generic message while `mcp/` — a trusted surface where
     /// this text is diagnostically useful and was already being returned
     /// before this variant existed — keeps emitting it verbatim.
     Internal { msg: String },
@@ -685,13 +612,13 @@ fn resolve_safe_write_path_detailed(
 /// Validate that `rel_path` is safe to write inside `data_root`, returning the
 /// absolute target path on success or an error string on failure.
 ///
-/// Moved here (from `mcp.rs`) so this core write module does not depend back on
-/// the transport layer it is meant to be independent of — `mcp.rs`'s tool
+/// Moved here (from `mcp/`) so this core write module does not depend back on
+/// the transport layer it is meant to be independent of — `mcp/`'s tool
 /// methods call this via `crate::write::resolve_safe_write_path`.
 ///
 /// A thin `String`-returning wrapper over [`resolve_safe_write_path_detailed`]:
 /// every caller outside this module predates the `PathSafetyError` split and
-/// expects a flat string (several of them — `mcp.rs`'s `create_document` and
+/// expects a flat string (several of them — `mcp/`'s `create_document` and
 /// `write_raw_file` — relay it directly to a trusted MCP client), so this
 /// function's behavior and exact message text are unchanged by that split.
 pub fn resolve_safe_write_path(data_root: &Path, rel_path: &str) -> Result<PathBuf, String> {
@@ -707,15 +634,34 @@ fn safe_write_path<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     rel_path: &str,
 ) -> Result<PathBuf, WriteError> {
-    resolve_safe_write_path_detailed(deps.canonical_data_path, rel_path).map_err(|e| match e {
-        PathSafetyError::Rejected(msg) => WriteError::UnsafePath {
-            msg: format!("Invalid path: {}", msg),
+    let abs = resolve_safe_write_path_detailed(deps.canonical_data_path, rel_path).map_err(
+        |e| match e {
+            PathSafetyError::Rejected(msg) => WriteError::UnsafePath {
+                msg: format!("Invalid path: {}", msg),
+            },
+            PathSafetyError::Internal(msg) => WriteError::Internal {
+                msg: format!("Invalid path: {}", msg),
+            },
         },
-        PathSafetyError::Internal(msg) => WriteError::Internal {
-            msg: format!("Invalid path: {}", msg),
-        },
-    })
+    )?;
+    // Access control. Every create, edit, move (source and destination), delete,
+    // archive, batch entry, directory move and rewritten referencing document
+    // resolves its path here, so this one check is what keeps a principal's write
+    // grant from being wider than its policy, in the pipeline both transports
+    // share rather than in either adapter. It runs after path safety, so a
+    // malformed path keeps its own refusal, and it says nothing about whether the
+    // target exists.
+    deps.principal
+        .authorize_path(rel_path, crate::policy::Op::Write)
+        .map_err(|_| WriteError::UnsafePath {
+            msg: NOT_PERMITTED.to_string(),
+        })?;
+    Ok(abs)
 }
+
+/// The refusal text for a write the caller's policy does not grant. The web adapter
+/// maps exactly this text to `403`.
+pub const NOT_PERMITTED: &str = "not permitted";
 
 /// Reject `rel_path` if it does not match `include_patterns` — a path the
 /// indexer would never pick up (e.g. anything outside `**/*.md`, including
@@ -735,13 +681,13 @@ fn safe_write_path<E: QueryEmbedder, Q: RetrievalStore>(
 ///
 /// Reuses `WriteError::UnsafePath` rather than adding a new variant so every
 /// existing caller's (necessarily exhaustive) match over `WriteError` keeps
-/// compiling unchanged — see `mcp.rs`'s and `web.rs`'s error-mapping functions.
+/// compiling unchanged — see `mcp/`'s and `web.rs`'s error-mapping functions.
 ///
 /// Also applies `indexing.exclude`/`exclude_files` (#312), so the gate answers
 /// "could this path ever be indexed" the same way a reconcile does.
 ///
 /// `pub(crate)` (rather than folded entirely into `check_include_pattern`
-/// below) so `mcp.rs`'s `create_document` adapter can run this exact check —
+/// below) so `mcp/`'s `create_document` adapter can run this exact check —
 /// same message text — ahead of its own `exists()` pre-check, restoring the
 /// pre-refactor error priority when a path both exists on disk and fails this
 /// check. See that call site's comment.
@@ -815,8 +761,8 @@ fn check_include_pattern<E: QueryEmbedder, Q: RetrievalStore>(
 // (#179) Content-mode helpers: frontmatter patch / append
 //
 // Both compute a full `new_content` string from the current content, the same
-// way `mcp.rs`'s `apply_surgical` does for old_string/new_string — pure
-// functions that `mcp.rs` wraps in a `DocChange::Relative` closure, which
+// way `mcp/`'s `apply_surgical` does for old_string/new_string — pure
+// functions that `mcp/` wraps in a `DocChange::Relative` closure, which
 // `write_document` runs on the content it reads under `GIT_LOCK`. That keeps
 // the core pipeline (schema validation, the dedup gate, the commit, the
 // pre-commit rollback) unaware of which kind of relative edit produced the new
@@ -909,7 +855,7 @@ fn split_frontmatter_bytes(content: &str) -> Option<(&str, &str)> {
 
 /// Remove the value at a dot-path, mirroring `schema::get_by_dotpath`'s own
 /// traversal. Not in `schema.rs` alongside its `get`/`set` siblings because
-/// this module's remit is deliberately kept to `write.rs`/`mcp.rs`/`web.rs`
+/// this module's remit is deliberately kept to `write.rs`/`mcp/`/`web.rs`
 /// (see this crate's write-pipeline module boundaries) — the two sibling
 /// functions are schema-declaration helpers `schema.rs` owns for its own
 /// `apply_defaults`; this one is document-frontmatter-only. Returns whether
@@ -952,7 +898,7 @@ fn remove_by_dotpath(frontmatter: &mut HashMap<String, serde_json::Value>, path:
 /// order (or comments) the document's own frontmatter happened to have,
 /// exactly the same trade-off this codebase already made for
 /// schema file when `update_schema` rewrites one.
-fn render_frontmatter_block(
+pub(crate) fn render_frontmatter_block(
     frontmatter: &HashMap<String, serde_json::Value>,
     newline: &str,
 ) -> Result<String, String> {
@@ -1700,16 +1646,6 @@ async fn validate_document<E: QueryEmbedder, Q: RetrievalStore>(
     Ok(validated)
 }
 
-/// Adapter that routes `embed_query` to the wrapped embedder's `embed_document`,
-/// so the dedup search embeds like with like against the indexed chunks.
-struct DocumentSideEmbedder<'a, E: QueryEmbedder>(&'a E);
-
-impl<E: QueryEmbedder> QueryEmbedder for DocumentSideEmbedder<'_, E> {
-    async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>> {
-        self.0.embed_document(q).await
-    }
-}
-
 /// The create-path dedup gate: refuse when an existing document is a near
 /// duplicate of `validated`. Runs before the lock — it embeds and queries
 /// Qdrant, which can take a while — and only for a create, whose content is fixed.
@@ -1747,41 +1683,19 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
         );
         return Ok(Vec::new());
     }
-    // Detach the reranker: `dedup_threshold` is a cosine similarity, and a
-    // cross-encoder relevance score is not comparable to it.
-    // Embed on the document side: the text is compared against indexed chunks, so it
-    // takes `embedding.document_prefix`, not the query prefix.
-    let document_side = DocumentSideEmbedder(deps.retrieval.embed_client);
-    let dedup_deps = RetrievalDeps {
-        embed_client: &document_side,
-        qdrant: deps.retrieval.qdrant,
-        collection: deps.retrieval.collection,
-        data_path: deps.retrieval.data_path,
-        include_patterns: deps.retrieval.include_patterns,
-        reranker: None,
-    };
-    match crate::retrieval::search(
-        &dedup_deps,
+    // The search is dense-only, reranker-detached and document-side embedded, so
+    // its scores are cosines comparable to `dedup_threshold` (see `similarity`).
+    match crate::similarity::find_near_duplicates(
+        &deps.retrieval,
+        deps.canonical_data_path,
         &query_text,
-        &SearchFilters::default(),
-        &dedup_search_opts_with_limit(related_limit),
+        &deps.principal.reach(crate::policy::Op::Read),
+        related_limit,
     )
     .await
     {
-        Ok(results) => {
-            let hits: Vec<(String, f32)> = results
-                .into_iter()
-                .map(|r| {
-                    let path = r
-                        .payload
-                        .get("file_path")
-                        .and_then(|v| v.as_str())
-                        .map(|p| crate::retrieval::relative_to_data(p, deps.canonical_data_path))
-                        .unwrap_or_default();
-                    (path, r.score)
-                })
-                .collect();
-            let top = hits.first().cloned();
+        Ok(hits) => {
+            let top = hits.first().map(|n| (n.path.clone(), n.score));
             if let Some((path, score)) = top.as_ref() {
                 tracing::debug!(
                     "Dedup gate for '{}': nearest '{}' at dense cosine {:.4} (threshold {:.2})",
@@ -1799,7 +1713,7 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
                 });
             }
             return Ok(related_from_hits(
-                hits,
+                hits.into_iter().map(|n| (n.path, n.score)).collect(),
                 rel_path,
                 related_min_score,
                 related_limit,
@@ -1819,28 +1733,18 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
 /// scoring at least `min_score`, never `own_path`, each document once, nearest
 /// first, at most `limit` (#356).
 fn related_from_hits(
-    mut hits: Vec<(String, f32)>,
+    hits: Vec<(String, f32)>,
     own_path: &str,
     min_score: f32,
     limit: usize,
 ) -> Vec<RelatedDocument> {
-    let own = crate::retrieval::kb_root_relative(own_path);
-    hits.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let mut out: Vec<RelatedDocument> = Vec::new();
-    for (path, score) in hits {
-        if out.len() >= limit {
-            break;
-        }
-        if path.is_empty()
-            || score < min_score
-            || crate::retrieval::kb_root_relative(&path) == own
-            || out.iter().any(|r| r.path == path)
-        {
-            continue;
-        }
-        out.push(RelatedDocument { path, score });
-    }
-    out
+    crate::similarity::rank_neighbours(hits, own_path, min_score, limit)
+        .into_iter()
+        .map(|n| RelatedDocument {
+            path: n.path,
+            score: n.score,
+        })
+        .collect()
 }
 
 /// Read a document, `None` when it does not exist.
@@ -2780,8 +2684,8 @@ async fn rewrite_inbound_links<E: QueryEmbedder, Q: RetrievalStore>(
             Ok(p) => p,
             Err(_) => {
                 warn!(
-                    "Skipping link rewrite in '{}' for '{}': the path no longer resolves \
-                     safely (stale document_links row?)",
+                    "Skipping link rewrite in '{}' for '{}': outside the caller's write access, \
+                     or the path no longer resolves safely (stale document_links row?)",
                     ref_path, source_rel
                 );
                 continue;
@@ -4267,6 +4171,14 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     let walk = crate::schema::SchemaWalkFilter::from_config(deps.indexing);
     let mut governed_dirs: HashSet<&Path> = HashSet::new();
     for (old_rel, new_rel, raw) in &schema_contents {
+        // A schema file may not land where the binary supplies the schema (the memory
+        // area): the next rebuild would refuse it and block indexing.
+        if schemas.is_builtin_scope(Path::new(new_rel).parent().unwrap_or(Path::new(""))) {
+            return Err(DirectoryMoveError::InvalidSchemaInSource {
+                path: old_rel.clone(),
+                reason: crate::schema::BUILTIN_SCOPE_REASON.to_string(),
+            });
+        }
         if !walk.governs(Path::new(new_rel)) && !walk.governs(Path::new(old_rel)) {
             continue;
         }
@@ -4647,8 +4559,9 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 Ok(p) => p,
                 Err(_) => {
                     warn!(
-                        "Skipping link rewrite in '{}' while moving directory '{}' -> '{}': the \
-                     path no longer resolves safely (stale document_links row?)",
+                        "Skipping link rewrite in '{}' while moving directory '{}' -> '{}': outside \
+                     the caller's write access, or the path no longer resolves safely \
+                     (stale document_links row?)",
                         ref_path, source_dir, dest_dir
                     );
                     continue;
@@ -4976,7 +4889,10 @@ pub async fn delete_document_with<E: QueryEmbedder, Q: RetrievalStore>(
                     inbound.len(),
                     inbound.join(", ")
                 );
-                referencing_paths = inbound;
+                // Only documents the caller may read: the warning is for the
+                // caller, and a path outside its reach is not something it may learn.
+                let reach = deps.principal.reach(crate::policy::Op::Read);
+                referencing_paths = inbound.into_iter().filter(|p| reach.covers(p)).collect();
             }
             Ok(_) => {}
             Err(e) => {
@@ -5191,11 +5107,15 @@ mod tests {
     use crate::config::ResolvedConfig;
     use crate::embed::EmbedClient;
     use crate::qdrant::QdrantStore;
+    use crate::similarity::{
+        DEDUP_QUERY_CHAR_LIMIT, DocumentSideEmbedder, dedup_search_opts,
+        dedup_search_opts_with_limit,
+    };
     use std::sync::Arc;
 
     // -----------------------------------------------------------------------
     // dedup_verdict / build_dedup_query / dedup_search_opts — pure unit tests
-    // (ported from mcp.rs; these are now write.rs's own logic)
+    // (ported from mcp/; these are now write.rs's own logic)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -5234,7 +5154,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_safe_write_path unit tests (ported from mcp.rs; the function
+    // resolve_safe_write_path unit tests (ported from mcp/; the function
     // itself moved here too — see this module's `resolve_safe_write_path`)
     // -----------------------------------------------------------------------
 
@@ -6093,7 +6013,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Test harness: a WriteDeps backed by a temp dir and (unreachable) real
-    // EmbedClient/QdrantStore — matching the pattern `mcp.rs`'s own write tests
+    // EmbedClient/QdrantStore — matching the pattern `mcp/`'s own write tests
     // use, since dedup is disabled by default in `make_test_resolved_config`.
     // -----------------------------------------------------------------------
 
@@ -6149,6 +6069,8 @@ mod tests {
         /// git working copy, or every git-backed test's `git status --porcelain
         /// == ""` assertion would start seeing it as an untracked file.
         _state_db_dir: Option<tempfile::TempDir>,
+        /// Who writes; `None` is an unrestricted principal.
+        principal: Option<crate::policy::Principal>,
     }
 
     impl Harness {
@@ -6182,6 +6104,7 @@ mod tests {
                 token: None,
                 state_db: None,
                 reindex_queue: crate::reindex::ReindexQueue::new(),
+                principal: None,
                 _state_db_dir: None,
             }
         }
@@ -6201,6 +6124,12 @@ mod tests {
 
         fn deps(&self) -> WriteDeps<'_, EmbedClient, QdrantStore> {
             WriteDeps {
+                principal: self.principal.clone().unwrap_or_else(|| {
+                    crate::policy::Principal::unrestricted(
+                        "test",
+                        crate::policy::PrincipalSource::Anonymous,
+                    )
+                }),
                 retrieval: RetrievalDeps {
                     embed_client: &self.embed,
                     qdrant: &self.qdrant,
@@ -6280,6 +6209,163 @@ mod tests {
             expected_version: Some(leak(document_version(old_content.as_bytes()))),
             dest_path: Some(dest_rel),
             archive: None,
+        }
+    }
+
+    /// Access control in the shared write pipeline: a principal confined to
+    /// `memory/` is refused every write that touches anything else, with one answer
+    /// whether or not the target exists, and nothing on disk changes.
+    mod access_control {
+        use super::*;
+        use crate::policy::scoped_principal_for_test;
+
+        const TOOLS: &[&str] = &["write_document", "delete_document", "search"];
+
+        fn is_not_permitted(err: &WriteError) -> bool {
+            matches!(err, WriteError::UnsafePath { msg } if msg == NOT_PERMITTED)
+        }
+
+        fn kb() -> (tempfile::TempDir, Harness) {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("memory/general")).unwrap();
+            std::fs::create_dir_all(tmp.path().join("notes")).unwrap();
+            std::fs::create_dir_all(tmp.path().join("notes-old")).unwrap();
+            std::fs::write(
+                tmp.path().join("notes/secret.md"),
+                "---\ntitle: S\n---\nbody",
+            )
+            .unwrap();
+            let mut config = crate::mcp::make_test_resolved_config(tmp.path());
+            Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
+            let mut harness = Harness::new(&tmp, config);
+            harness.principal = Some(scoped_principal_for_test(
+                TOOLS,
+                &["memory"],
+                &["memory/general"],
+            ));
+            (tmp, harness)
+        }
+
+        #[tokio::test]
+        async fn create_edit_and_delete_outside_the_write_grant_are_refused_the_same_way() {
+            let (tmp, harness) = kb();
+            let before = std::fs::read_to_string(tmp.path().join("notes/secret.md")).unwrap();
+            // An existing document, a missing one, a sibling that only shares a name
+            // prefix, and a path inside the READ grant but outside the write grant.
+            for rel in [
+                "notes/secret.md",
+                "notes/absent.md",
+                "notes-old/a.md",
+                "memory/other.md",
+            ] {
+                for is_create in [true, false] {
+                    let err = write_document(&harness.deps(), make_req(rel, "x", is_create))
+                        .await
+                        .unwrap_err();
+                    assert!(is_not_permitted(&err), "{rel} create={is_create}: {err:?}");
+                }
+                let err = delete_document(&harness.deps(), rel, None, None)
+                    .await
+                    .unwrap_err();
+                assert!(is_not_permitted(&err), "delete {rel}: {err:?}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("notes/secret.md")).unwrap(),
+                before
+            );
+            assert!(!tmp.path().join("notes/absent.md").exists());
+            assert!(!tmp.path().join("memory/other.md").exists());
+        }
+
+        #[tokio::test]
+        async fn a_move_is_refused_when_either_end_is_outside_the_write_grant() {
+            let (tmp, harness) = kb();
+            std::fs::write(
+                tmp.path().join("memory/general/a.md"),
+                "---\ntitle: A\n---\nbody",
+            )
+            .unwrap();
+            // Source in scope, destination out; and the reverse (pulling a document
+            // out of notes/ into the grant would be a read of it).
+            for (src, dest) in [
+                ("memory/general/a.md", "notes/a.md"),
+                ("notes/secret.md", "memory/general/s.md"),
+            ] {
+                let err = write_document(&harness.deps(), make_move_req(src, dest, "x", "x"))
+                    .await
+                    .unwrap_err();
+                assert!(is_not_permitted(&err), "{src} -> {dest}: {err:?}");
+            }
+            assert!(tmp.path().join("memory/general/a.md").exists());
+            assert!(tmp.path().join("notes/secret.md").exists());
+            assert!(!tmp.path().join("notes/a.md").exists());
+            assert!(!tmp.path().join("memory/general/s.md").exists());
+        }
+
+        #[tokio::test]
+        async fn a_directory_move_needs_a_write_grant_over_both_directories() {
+            let (tmp, harness) = kb();
+            for (src, dest) in [
+                ("notes", "memory/general/notes"),
+                ("memory/general", "notes/stolen"),
+                // The grant is `memory/general`, so its parent is not covered.
+                ("memory", "memory-new"),
+            ] {
+                let err = move_directory(&harness.deps(), src, dest, None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&err, DirectoryMoveError::UnsafePath { msg } if msg == NOT_PERMITTED),
+                    "{src} -> {dest}: {err:?}"
+                );
+            }
+            assert!(tmp.path().join("notes/secret.md").exists());
+        }
+
+        #[tokio::test]
+        async fn one_entry_outside_the_grant_refuses_the_whole_batch() {
+            let (tmp, harness) = kb();
+            let requests = [
+                BatchWriteRequest {
+                    rel_path: "memory/general/ok.md",
+                    change: DocChange::Create("---\ntitle: Ok\n---\nbody"),
+                    force_new: Some(true),
+                    expected_version: None,
+                },
+                BatchWriteRequest {
+                    rel_path: "notes/evil.md",
+                    change: DocChange::Create("---\ntitle: E\n---\nbody"),
+                    force_new: Some(true),
+                    expected_version: None,
+                },
+            ];
+            let err = write_documents_batch(&harness.deps(), &requests, None)
+                .await
+                .unwrap_err();
+            match err {
+                BatchWriteError::Documents { failures } => {
+                    assert!(
+                        failures
+                            .iter()
+                            .any(|(p, e)| p == "notes/evil.md" && is_not_permitted(e)),
+                        "{failures:?}"
+                    );
+                }
+                other => panic!("expected a refused batch, got {other:?}"),
+            }
+            assert!(!tmp.path().join("memory/general/ok.md").exists());
+            assert!(!tmp.path().join("notes/evil.md").exists());
+        }
+
+        #[tokio::test]
+        async fn a_principal_with_no_write_grant_cannot_write_inside_its_read_area() {
+            let (tmp, mut harness) = kb();
+            harness.principal = Some(scoped_principal_for_test(TOOLS, &["memory"], &[]));
+            let err = write_document(&harness.deps(), make_req("memory/general/x.md", "x", true))
+                .await
+                .unwrap_err();
+            assert!(is_not_permitted(&err), "{err:?}");
+            assert!(!tmp.path().join("memory/general/x.md").exists());
         }
     }
 
@@ -6390,7 +6476,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // write_document core tests (ported from mcp.rs's write/delete suite,
+    // write_document core tests (ported from mcp/'s write/delete suite,
     // exercised directly against `write::write_document`/`write::delete_document`
     // rather than through the MCP tool layer)
     // -----------------------------------------------------------------------
@@ -6766,7 +6852,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Git-backed pre-commit / post-commit rollback tests (ported from mcp.rs)
+    // Git-backed pre-commit / post-commit rollback tests (ported from mcp/)
     // -----------------------------------------------------------------------
 
     fn head_sha(work: &tempfile::TempDir) -> String {
@@ -6834,7 +6920,7 @@ mod tests {
             .unwrap();
     }
 
-    /// See `mcp.rs`'s identical helper for why this is repo-local git CONFIG
+    /// See `mcp/`'s identical helper for why this is repo-local git CONFIG
     /// rather than a `.git/hooks/pre-commit` script.
     fn force_git_commit_to_fail(work: &tempfile::TempDir) {
         for args in [
@@ -11428,6 +11514,58 @@ mod tests {
         assert_eq!(success.moved.len(), 2, "the document and its schema file");
         assert!(work.path().join("dest8/sub/a.md").exists());
         assert_eq!(git_status(&work), "");
+    }
+
+    /// A schema file may not be moved into the memory area, whose schema is built
+    /// into the binary: the next rebuild would refuse it and block indexing.
+    #[tokio::test]
+    async fn move_directory_refuses_a_schema_file_into_the_builtin_memory_area() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let schema_rel = format!("proj/{}", crate::schema::SCHEMA_FILE_NAME);
+        std::fs::create_dir_all(work.path().join("proj")).unwrap();
+        std::fs::write(
+            work.path().join(&schema_rel),
+            "fields:\n  status:\n    required: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.path().join("proj/a.md"),
+            "---\nstatus: draft\n---\n# A",
+        )
+        .unwrap();
+        git_commit_paths(&work, &[&schema_rel, "proj/a.md"], "add proj");
+
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
+        let harness = Harness::new(&work, config.clone());
+        let memory = crate::config::MemoryConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let cache = crate::schema::SchemaCache::build_with(
+            &work.path().canonicalize().unwrap(),
+            &config.frontmatter,
+            &config.indexing,
+            &crate::memory::builtin_scopes(&memory),
+        )
+        .unwrap();
+        *harness.schema_cache.write().unwrap() = Arc::new(cache);
+
+        let err = move_directory(&harness.deps(), "proj", "memory/proj", None)
+            .await
+            .expect_err("a schema file into the built-in area must be refused");
+        match err {
+            DirectoryMoveError::InvalidSchemaInSource { reason, .. } => {
+                assert_eq!(reason, crate::schema::BUILTIN_SCOPE_REASON);
+            }
+            other => panic!("expected InvalidSchemaInSource, got {other:?}"),
+        }
+        assert!(!work.path().join("memory").exists(), "nothing moved");
+        // Anywhere else the same move is fine.
+        move_directory(&harness.deps(), "proj", "elsewhere", None)
+            .await
+            .expect("outside the memory area the schema moves");
     }
 
     /// A legacy-named schema moves under its own name; a source directory holding

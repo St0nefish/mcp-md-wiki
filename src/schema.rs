@@ -80,6 +80,12 @@ pub const SCHEMA_FILE_NAMES: [&str; 2] = [SCHEMA_FILE_NAME, LEGACY_SCHEMA_FILE_N
 pub(crate) const BOTH_NAMES_REASON: &str = "both .schema.yaml and legacy .kb-schema.yaml \
      are present in this directory; merge them into .schema.yaml and delete the legacy file";
 
+/// The reason a schema file at or under a built-in scope (the memory area) is
+/// invalid: that directory's schema is supplied by the binary and cannot be
+/// overridden, so the file has to go.
+pub(crate) const BUILTIN_SCOPE_REASON: &str = "this directory's schema is built into the server \
+     (memory mode) and cannot be overridden: remove the file";
+
 /// `reason` (an [`InvalidSchemaFile::reason`], or [`SchemaCache::raw_file_at`]'s error)
 /// as a model should read it. [`BOTH_NAMES_REASON`] names both files, so it is
 /// replaced; every other reason (a parse error, the size limit) names none.
@@ -2917,6 +2923,9 @@ pub struct SchemaCache {
     /// reindex worker's and `update_schema`'s) can finish in either order, and
     /// the one that read the tree first must not win.
     generation: u64,
+    /// Directories whose schema is built into the binary (the memory area), so a
+    /// schema file may not be written, or moved, at or under one.
+    builtin_dirs: Vec<PathBuf>,
 }
 
 /// One schema file that [`SchemaCache::build`] refused, and why.
@@ -3311,10 +3320,41 @@ impl SchemaCache {
     /// A directory holding both [`SCHEMA_FILE_NAME`] and [`LEGACY_SCHEMA_FILE_NAME`]
     /// is an invalid schema file ([`BOTH_NAMES_REASON`]), never resolved by picking
     /// one: the two could disagree, and which one wins would be invisible.
+    #[cfg(test)]
     pub fn build(
         data_path: &Path,
         fallback: &FrontmatterConfig,
         indexing: &crate::config::IndexingConfig,
+    ) -> Result<Self, SchemaBuildError> {
+        Self::build_with(data_path, fallback, indexing, &[])
+    }
+
+    /// [`Self::build`] for a config: the schemas the binary supplies itself for the
+    /// directories the config reserves (the memory area) are laid in alongside the
+    /// files on disk. Every caller that has a `ResolvedConfig` uses this, so no
+    /// cache is ever built without them.
+    pub fn build_for_config(
+        data_path: &Path,
+        config: &crate::config::ResolvedConfig,
+    ) -> Result<Self, SchemaBuildError> {
+        Self::build_with(
+            data_path,
+            &config.frontmatter,
+            &config.indexing,
+            &crate::memory::builtin_scopes(&config.memory),
+        )
+    }
+
+    /// [`Self::build`] with `builtin` scopes: directory (KB-relative) and the schema
+    /// the binary defines for it. A built-in scope behaves as if its `.schema.yaml`
+    /// were on disk, except that it cannot be edited or shadowed: a schema file on
+    /// disk at or under that directory makes the build fail, like any other invalid
+    /// schema file, naming the file to remove.
+    pub fn build_with(
+        data_path: &Path,
+        fallback: &FrontmatterConfig,
+        indexing: &crate::config::IndexingConfig,
+        builtin: &[(PathBuf, SchemaFile)],
     ) -> Result<Self, SchemaBuildError> {
         // Stamped before the walk reads anything: see `SchemaCache::generation`.
         let generation = REBUILD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -3341,6 +3381,17 @@ impl SchemaCache {
 
         for (rel_dir, abs_file) in discovered {
             if doubled.contains(&rel_dir) {
+                continue;
+            }
+            if builtin.iter().any(|(dir, _)| rel_dir.starts_with(dir)) {
+                let file_name = abs_file
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(SCHEMA_FILE_NAME));
+                invalid.push(InvalidSchemaFile {
+                    path: rel_dir.join(file_name),
+                    reason: BUILTIN_SCOPE_REASON.to_string(),
+                });
                 continue;
             }
             let file_name = abs_file
@@ -3380,6 +3431,9 @@ impl SchemaCache {
             invalid.sort_by(|a, b| a.path.cmp(&b.path));
             return Err(SchemaBuildError { invalid });
         }
+        for (dir, file) in builtin {
+            raw.insert(dir.clone(), file.clone());
+        }
 
         let scopes = merge_cascade(&raw, &config_root);
 
@@ -3389,6 +3443,7 @@ impl SchemaCache {
             root: config_root,
             root_path: data_path.to_path_buf(),
             generation,
+            builtin_dirs: builtin.iter().map(|(dir, _)| dir.clone()).collect(),
         })
     }
 
@@ -3454,7 +3509,14 @@ impl SchemaCache {
             root: self.root.clone(),
             root_path: self.root_path.clone(),
             generation: self.generation,
+            builtin_dirs: self.builtin_dirs.clone(),
         }
+    }
+
+    /// Whether `rel_dir` (KB-relative) is at or under a directory whose schema is
+    /// built into the binary.
+    pub fn is_builtin_scope(&self, rel_dir: &Path) -> bool {
+        self.builtin_dirs.iter().any(|d| rel_dir.starts_with(d))
     }
 
     /// The raw, unmerged schema file governing `rel_dir`, read from disk, and the
@@ -3593,6 +3655,7 @@ impl SchemaCache {
             root: ResolvedSchema::from_config(fallback),
             root_path: PathBuf::new(),
             generation: 0,
+            builtin_dirs: Vec::new(),
         }
     }
 

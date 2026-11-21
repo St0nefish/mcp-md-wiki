@@ -77,6 +77,7 @@ async fn run(
         prefix,
         limit,
         cursor,
+        &crate::policy::Reach::All,
     )
     .await
 }
@@ -299,6 +300,7 @@ async fn non_git_directory_is_unavailable_and_an_empty_repo_has_no_changes() {
         None,
         None,
         None,
+        &crate::policy::Reach::All,
     )
     .await
     .unwrap();
@@ -344,6 +346,7 @@ async fn commit_ids_appear_only_when_asked_for() {
         None,
         None,
         None,
+        &crate::policy::Reach::All,
     )
     .await
     .unwrap();
@@ -364,4 +367,61 @@ async fn over_long_parameters_are_invalid() {
     ] {
         assert!(matches!(res, Err(ChangesSinceError::Invalid(_))), "{res:?}");
     }
+}
+
+/// What a principal confined to `dirs` sees of `since` 2026-01-01.
+async fn run_scoped(repo: &Repo, dirs: &[&str]) -> serde_json::Value {
+    changes_since_json(
+        true,
+        repo.path(),
+        &IndexingConfig::default(),
+        Some("2026-01-01"),
+        None,
+        None,
+        None,
+        &crate::policy::Reach::Prefixes(dirs.iter().map(|d| d.to_string()).collect()),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_scoped_reader_sees_only_changes_inside_its_reach() {
+    let r = Repo::new();
+    r.write("seed.md", "seed\n");
+    r.commit_at("seed", "2025-12-01T00:00:00Z");
+    r.write("mem/a.md", "a\n");
+    r.write("mem-old/b.md", "b\n");
+    r.write("secret/c.md", "c\n");
+    r.commit_at("add three", "2026-02-01T00:00:00Z");
+    let v = run_scoped(&r, &["mem"]).await;
+    assert_eq!(
+        statuses(&v),
+        vec![("mem/a.md".to_string(), "added".to_string())],
+        "a sibling sharing a prefix and an unrelated directory are both out of reach"
+    );
+    // Nothing granted: nothing seen, and nothing about what exists elsewhere.
+    let none = run_scoped(&r, &[]).await;
+    assert_eq!(none["changes"], serde_json::json!([]));
+    assert!(none.get("truncated").is_none());
+}
+
+#[tokio::test]
+async fn a_rename_across_the_boundary_never_names_the_far_side() {
+    let r = Repo::new();
+    r.write("secret/plan.md", BODY);
+    r.write("mem/x.md", "x\n");
+    r.commit_at("seed", "2025-12-01T00:00:00Z");
+    r.git(&["mv", "secret/plan.md", "mem/plan.md"], None);
+    r.commit_at("move in", "2026-02-01T00:00:00Z");
+    let v = run_scoped(&r, &["mem"]).await;
+    let changes = v["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{v}");
+    assert_eq!(changes[0]["path"], "mem/plan.md");
+    assert_eq!(changes[0]["status"], "added");
+    assert!(
+        changes[0].get("old_path").is_none(),
+        "the origin outside the reach must not be reported: {v}"
+    );
+    assert!(!v.to_string().contains("secret"), "{v}");
 }

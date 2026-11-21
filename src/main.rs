@@ -13,6 +13,8 @@ mod judge;
 mod lint;
 mod markdown_fmt;
 mod mcp;
+mod memory;
+mod policy;
 mod qdrant;
 mod reindex;
 mod reload;
@@ -21,10 +23,12 @@ mod retrieval;
 mod schema;
 mod secrets;
 mod server;
+mod similarity;
 mod sparse;
 mod state;
 mod status;
 mod sync;
+mod token;
 mod tool_schema;
 mod validate;
 mod web;
@@ -145,6 +149,25 @@ struct GetArgs {
 }
 
 #[derive(Subcommand)]
+enum TokenCommand {
+    /// Generate a secret for an `mcp.tokens` entry and write it to a new file
+    ///
+    /// The secret is written only to `--out` (mode 0600, never overwritten) and is
+    /// not printed. The command prints the `mcp.tokens` entry to add to config.yaml.
+    Mint {
+        /// The token's name (1-64 visible ASCII characters), as `mcp.tokens[].name`
+        #[arg(long)]
+        name: String,
+        /// The `mcp.policy` entry the token acts under
+        #[arg(long)]
+        policy: String,
+        /// File to create for the secret; it must not exist
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Start the server (MCP + webhook endpoints) [default]
     Serve,
@@ -178,6 +201,11 @@ enum Commands {
         /// uses, so the JSON on stdout is always parseable on its own.
         #[arg(long)]
         json: bool,
+    },
+    /// Manage the named static tokens of `mcp.tokens`
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
     },
     /// Run corpus health checks against the last indexed state (#354)
     ///
@@ -491,6 +519,11 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("{} file(s) failed validation in strict mode", invalid_count);
             }
         }
+        Commands::Token {
+            command: TokenCommand::Mint { name, policy, out },
+        } => {
+            println!("{}", token::mint(&name, &policy, &out, &cfg.mcp.policy)?);
+        }
         Commands::Lint { check, json, limit } => {
             let state_db_path = cfg.state_db_path();
             if !std::path::Path::new(&state_db_path).exists() {
@@ -505,11 +538,7 @@ async fn main() -> anyhow::Result<()> {
             // The schema tree gives the tag check its permitted values. An invalid
             // tree must not stop the other checks: the tag check says it was skipped.
             let schemas = if checks.contains(&lint::Check::Tags) {
-                match schema::SchemaCache::build(
-                    &cfg.canonical_data_path(),
-                    &cfg.frontmatter,
-                    &cfg.indexing,
-                ) {
+                match schema::SchemaCache::build_for_config(&cfg.canonical_data_path(), &cfg) {
                     Ok(schemas) => Some(schemas),
                     Err(e) => {
                         eprintln!(
@@ -1074,7 +1103,7 @@ fn build_cli_schema_cache(
     consequence: &str,
 ) -> anyhow::Result<schema::SchemaCache> {
     let data_path = Path::new(cfg.data_path());
-    match schema::SchemaCache::build(data_path, &cfg.frontmatter, &cfg.indexing) {
+    match schema::SchemaCache::build_for_config(data_path, cfg) {
         Ok(schemas) => Ok(schemas),
         Err(e) => {
             eprintln!("SCHEMA ERRORS ({}):", e.invalid.len());

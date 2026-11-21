@@ -2245,6 +2245,9 @@ pub const MAX_CHANGES_PARAM_LEN: usize = 4096;
 /// refused before any git call. `include_commit` adds each entry's `commit` (the
 /// revision id): the REST route sets it, the MCP tool does not, since git is an
 /// internal detail to a tool caller.
+// One more than clippy allows: `reach` is the access-control scope, kept a separate
+// argument so a caller cannot forget it by building a defaulted struct.
+#[allow(clippy::too_many_arguments)]
 pub async fn changes_since_json(
     include_commit: bool,
     data_path: &str,
@@ -2253,6 +2256,7 @@ pub async fn changes_since_json(
     path_prefix: Option<&str>,
     limit: Option<usize>,
     cursor: Option<&str>,
+    reach: &crate::policy::Reach,
 ) -> Result<serde_json::Value, ChangesSinceError> {
     use crate::git::{self, CommitDiffError, NetChangeKind as K};
     for (name, value) in [
@@ -2339,7 +2343,10 @@ pub async fn changes_since_json(
             None
         }
     };
-    let is_doc = |p: &str| filter.as_ref().is_none_or(|f| f.is_indexable(p));
+    // A path outside `reach` is not a document as far as the caller is concerned, so a
+    // rename across the boundary reads as an add or a delete (`visible_change`) and
+    // never names the far side.
+    let is_doc = |p: &str| reach.covers(p) && filter.as_ref().is_none_or(|f| f.is_indexable(p));
     let prefix = path_prefix
         .map(|p| kb_root_relative(p.trim()))
         .and_then(|p| normalize_path_needle(Some(p)));
@@ -3082,7 +3089,7 @@ pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
 
 /// Query-mode search with no result paging (`offset` fixed at 0) — see
 /// [`search_paged`] for the funnel/offset-bound reasoning and the
-/// paging-capable version `search_chunks`/`search_grouped` in `mcp.rs` call
+/// paging-capable version `search_chunks`/`search_grouped` in `mcp/` call
 /// to honor the `search` tool's `offset` parameter (#224). Kept as a
 /// separate, thin entry point so this crate's non-MCP callers — the CLI
 /// `search` subcommand (`main.rs`), the write-path dedup gate (`write.rs`),
@@ -3144,7 +3151,7 @@ pub struct GroupedSearchOutcome {
 /// [`MAX_OFFSET_DEPTH`] ceiling; there is no `rerank_candidate_limit` to also
 /// consider. Unlike [`search`]/[`search_paged`], there is no separate
 /// `offset`-free wrapper here — this crate's only caller
-/// (`mcp.rs`'s `search_grouped` tool handler) always has an `offset` in hand
+/// (`mcp/`'s `search_grouped` tool handler) always has an `offset` in hand
 /// (`0` when the caller didn't ask for paging), so a second entry point would
 /// have no real caller of its own.
 pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>(
@@ -3567,20 +3574,40 @@ pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>
     document_index: &D,
     raw: &str,
 ) -> Result<Document, GetDocumentError> {
+    get_document_in(deps, document_index, raw, &crate::policy::Reach::All).await
+}
+
+/// [`get_document`] for a caller that may read only what `reach` covers.
+///
+/// A document outside `reach` is indistinguishable from one that does not exist:
+/// the literal path falls through to the fuzzy step exactly as a missing file
+/// does, and that step sees only in-reach paths, so its unique-basename
+/// resolution, its "ambiguous" list and its suggestions can neither name nor
+/// resolve to something the caller may not read. The link lists are cut to
+/// in-reach documents the same way ([`document_links`]).
+pub async fn get_document_in<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>(
+    deps: &RetrievalDeps<'_, E, Q>,
+    document_index: &D,
+    raw: &str,
+    reach: &crate::policy::Reach,
+) -> Result<Document, GetDocumentError> {
     // 1. Try the literal path as given.
     match resolve_within_data(raw, deps.data_path, deps.include_patterns) {
         Ok(canonical) => {
-            let content = tokio::fs::read_to_string(&canonical)
-                .await
-                .map_err(|e| GetDocumentError::Io(e.to_string()))?;
             let rel_path = relative_to_data(&canonical.to_string_lossy(), deps.data_path);
-            let (links_out, links_in) = document_links(document_index, &rel_path).await;
-            return Ok(Document {
-                path: canonical,
-                content,
-                links_out,
-                links_in,
-            });
+            if reach.covers(&rel_path) {
+                let content = tokio::fs::read_to_string(&canonical)
+                    .await
+                    .map_err(|e| GetDocumentError::Io(e.to_string()))?;
+                let (links_out, links_in) = document_links(document_index, &rel_path, reach).await;
+                return Ok(Document {
+                    path: canonical,
+                    content,
+                    links_out,
+                    links_in,
+                });
+            }
+            // Out of reach: carry on as though the file were not there.
         }
         Err(ResolveErr::NotFound) => {
             // Fall through to fuzzy basename matching.
@@ -3615,10 +3642,13 @@ pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>
     //    indexing run wide and self-heals on the next; `list_documents` already reads
     //    from `documents` under the identical tradeoff, so this is consistent with
     //    the rest of the codebase rather than a new risk.
-    let all_paths = document_index.all_paths().await.unwrap_or_else(|e| {
+    let mut all_paths = document_index.all_paths().await.unwrap_or_else(|e| {
         warn!("Failed to fetch indexed paths for fuzzy lookup: {e:#}");
         Vec::new()
     });
+    // Before anything is counted, matched or suggested: a path the caller may not
+    // read must not decide "unique", "ambiguous" or "closest".
+    all_paths.retain(|p| reach.covers(&relative_to_data(p, deps.data_path)));
 
     let basename = Path::new(raw)
         .file_name()
@@ -3637,7 +3667,7 @@ pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>
                     .await
                     .map_err(|e| GetDocumentError::Io(e.to_string()))?;
                 let rel_path = relative_to_data(&canonical.to_string_lossy(), deps.data_path);
-                let (links_out, links_in) = document_links(document_index, &rel_path).await;
+                let (links_out, links_in) = document_links(document_index, &rel_path, reach).await;
                 Ok(Document {
                     path: canonical,
                     content,
@@ -3692,11 +3722,12 @@ pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>
 /// document body it serves: a transient failure on either of these two queries
 /// must not turn an otherwise-successful read into an error. Same non-fatal
 /// posture as the fuzzy fallback's `all_paths()` call above, and the same
-/// rationale as `capped_casualties` in `mcp.rs` for why the cap is reported
+/// rationale as `capped_casualties` in `mcp/` for why the cap is reported
 /// (`LinkPage::total`/`has_more`) rather than silently applied.
 async fn document_links<D: DocumentIndex>(
     document_index: &D,
     rel_path: &str,
+    reach: &crate::policy::Reach,
 ) -> (LinkPage<OutboundLink>, LinkPage<InboundLink>) {
     let links_out = document_index
         .links_out(rel_path, MAX_LINKS_PER_DIRECTION)
@@ -3718,6 +3749,29 @@ async fn document_links<D: DocumentIndex>(
                 total: 0,
             }
         });
+    scope_links(links_out, links_in, reach)
+}
+
+/// Cut a link graph to what `reach` may read: an edge to or from a document outside
+/// it is dropped, whether or not that document exists (an inbound edge from there, an
+/// outbound edge to an existing one, or an inferred neighbour). A link to a path
+/// that does not exist anywhere is the document's own text and stays. The totals are
+/// recomputed from what is left, since the stored ones count the dropped edges and a
+/// caller could read an out-of-reach document's existence off the difference.
+fn scope_links(
+    mut links_out: LinkPage<OutboundLink>,
+    mut links_in: LinkPage<InboundLink>,
+    reach: &crate::policy::Reach,
+) -> (LinkPage<OutboundLink>, LinkPage<InboundLink>) {
+    if matches!(reach, crate::policy::Reach::All) {
+        return (links_out, links_in);
+    }
+    links_out
+        .links
+        .retain(|l| (!l.exists && l.kind != "semantic") || reach.covers(&l.target_path));
+    links_in.links.retain(|l| reach.covers(&l.source_path));
+    links_out.total = links_out.links.len() as u64;
+    links_in.total = links_in.links.len() as u64;
     (links_out, links_in)
 }
 
@@ -4525,7 +4579,12 @@ mod tests {
             Ok(self.paths.clone())
         }
 
-        async fn paths_matching(&self, needle: &str, cap: u64) -> anyhow::Result<PathMatches> {
+        async fn paths_matching(
+            &self,
+            needle: &str,
+            _scope: Option<&[String]>,
+            cap: u64,
+        ) -> anyhow::Result<PathMatches> {
             if let Some(ref msg) = self.err {
                 anyhow::bail!("{}", msg);
             }
@@ -4841,7 +4900,7 @@ mod tests {
             let path_filter = match needle {
                 Some(n) => Some(PathFilter::from(
                     index
-                        .paths_matching(n, PATH_FILTER_MAX_PATHS)
+                        .paths_matching(n, None, PATH_FILTER_MAX_PATHS)
                         .await
                         .unwrap(),
                 )),
@@ -5438,7 +5497,7 @@ mod tests {
     #[tokio::test]
     async fn search_conditions_passed_through_unchanged() {
         // `SearchFilters` carries already-lowered Qdrant conditions now — building
-        // and validating them is the caller's job (mcp.rs's rich `filters`, or
+        // and validating them is the caller's job (mcp/'s rich `filters`, or
         // web.rs's plain domain/type/tags); `search` itself just ANDs whatever it's
         // handed onto the query, unexamined.
         let embed = MockEmbedder::ok(vec![0.1, 0.2, 0.3]);

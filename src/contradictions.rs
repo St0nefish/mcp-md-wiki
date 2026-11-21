@@ -45,6 +45,7 @@ use crate::ingest::{KbEntry, NeighborStore, inspect_kb_path, make_point_id};
 use crate::judge::{
     Confidence, ConflictingStatements, Judge, PairInput, truncate_on_char_boundary,
 };
+use crate::similarity::{Neighbour, rank_neighbours};
 use crate::state::{ContradictionPair, StateDb};
 
 /// `verdict` of a pair the judge found conflicting.
@@ -247,28 +248,19 @@ pub async fn run_once<N: NeighborStore>(
 
         // One hit per neighbouring document, best score; drop the document itself,
         // anything under the floor and anything the index no longer knows.
-        let mut best: HashMap<&str, f32> = HashMap::new();
-        for hit in &hits {
-            let Some(target) = hit.payload.get("file_path").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if target == path.as_str()
-                || hit.score < params.min_similarity
-                || !hashes.contains_key(target)
-            {
-                continue;
-            }
-            best.entry(target)
-                .and_modify(|s| *s = s.max(hit.score))
-                .or_insert(hit.score);
-        }
-        let mut ranked: Vec<(&str, f32)> = best.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        ranked.truncate(params.top_k as usize);
+        let known = hits.iter().filter_map(|hit| {
+            let target = hit.payload.get("file_path")?.as_str()?;
+            hashes.contains_key(target).then_some((target, hit.score))
+        });
+        let ranked = rank_neighbours(known, path, params.min_similarity, params.top_k as usize);
 
         let mut required = Vec::new();
-        for (neighbour, score) in ranked {
-            let key = pair_key(path, neighbour);
+        for Neighbour {
+            path: neighbour,
+            score,
+        } in ranked
+        {
+            let key = pair_key(path, &neighbour);
             let hash_a = &hashes[&key.0];
             let hash_b = &hashes[&key.1];
             if pair_is_settled(stored.get(&key), hash_a, hash_b, deps.judge.is_some()) {

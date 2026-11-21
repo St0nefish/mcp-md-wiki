@@ -1,6 +1,6 @@
 [package]
 name = "mcp-md-wiki"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 # Keep in lockstep with `channel` in rust-toolchain.toml and `RUST_VERSION`
@@ -93,6 +93,8 @@ sha1_smol = "1"
 hmac = "0.12"
 hex = "0.4"
 subtle = "2"
+# OS randomness for `token mint` (already in the tree transitively).
+getrandom = "0.3"
 
 # UUID
 uuid = { version = "1", features = ["v5"] }

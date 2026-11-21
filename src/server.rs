@@ -35,7 +35,8 @@ use crate::webhook::{self, WebhookState};
 use oauth_resource_server::axum::{AuthLayer, metadata_router, require_auth};
 use oauth_resource_server::mcp::McpToolScopes;
 use oauth_resource_server::{
-    OAuthValidator, PROTECTED_RESOURCE_METADATA_PREFIX, StaticTokenDecision, static_token_policy,
+    OAuthValidator, PROTECTED_RESOURCE_METADATA_PREFIX, StaticTokenDecision, StaticTokens,
+    static_token_policy,
 };
 
 #[derive(Clone)]
@@ -283,21 +284,18 @@ impl StatusState {
         // Only for the breakdown's derived-field exclusion: an invalid schema tree
         // must not stop `status` from reporting, so a failed build is just `None`,
         // said once on stderr so the unfiltered breakdown has an explanation.
-        let schema_cache = match SchemaCache::build(
-            &config.canonical_data_path(),
-            &config.frontmatter,
-            &config.indexing,
-        ) {
-            Ok(cache) => Some(Arc::new(RwLock::new(Arc::new(cache)))),
-            Err(e) => {
-                eprintln!(
-                    "warning: {} schema file(s) are invalid (run `validate` for details); \
+        let schema_cache =
+            match SchemaCache::build_for_config(&config.canonical_data_path(), &config) {
+                Ok(cache) => Some(Arc::new(RwLock::new(Arc::new(cache)))),
+                Err(e) => {
+                    eprintln!(
+                        "warning: {} schema file(s) are invalid (run `validate` for details); \
                      the field breakdown does not leave out derived fields",
-                    e.invalid.len()
-                );
-                None
-            }
-        };
+                        e.invalid.len()
+                    );
+                    None
+                }
+            };
         Ok(Self {
             schema_cache,
             qdrant: Arc::new(QdrantStore::new(&config.qdrant)?),
@@ -1422,15 +1420,56 @@ pub fn render_prometheus(
 /// that the decision and `oauth` agree (a decision made with OAuth on needs a
 /// validator, and vice versa). No configuration mistake can produce an open
 /// server here.
+fn auth_layer_with(
+    decision: StaticTokenDecision,
+    oauth: Option<Arc<OAuthValidator>>,
+    named: Option<StaticTokens>,
+) -> Result<AuthLayer> {
+    AuthLayer::builder()
+        .optional_oauth(oauth)
+        .optional_static_tokens(named)
+        .static_challenge(None)
+        .build_with_decision(decision)
+        .context("Failed to build the bearer-auth layer")
+}
+
+/// [`auth_layer_with`] with no named tokens.
+#[cfg(test)]
 fn auth_layer(
     decision: StaticTokenDecision,
     oauth: Option<Arc<OAuthValidator>>,
 ) -> Result<AuthLayer> {
-    AuthLayer::builder()
-        .optional_oauth(oauth)
-        .static_challenge(None)
-        .build_with_decision(decision)
-        .context("Failed to build the bearer-auth layer")
+    auth_layer_with(decision, oauth, None)
+}
+
+/// The `mcp.tokens` secrets as the crate's labelled static-token set, so the
+/// layer reports which named token authenticated a request
+/// ([`StaticTokenMatch::label`]). `None` when none are configured.
+fn named_static_tokens(named: &[(String, String)]) -> Result<Option<StaticTokens>> {
+    if named.is_empty() {
+        return Ok(None);
+    }
+    let mut tokens = StaticTokens::new();
+    for (name, secret) in named {
+        tokens = tokens
+            .with(Some(name.as_str()), secret.as_str())
+            .map_err(|e| anyhow::anyhow!("mcp.tokens '{name}': {e}"))?;
+    }
+    Ok(Some(tokens))
+}
+
+/// What the static-token policy is given as the bearer token: `bearer_token_env`'s
+/// value when it holds one, else the first `mcp.tokens` secret. A deployment with
+/// only named tokens has no `bearer_token_env`, and without this the policy would
+/// read it as "no static token configured" and refuse to start (or, with
+/// `mcp.allow_unauthenticated`, open the server). The named set itself is handed to
+/// the layer separately ([`named_static_tokens`]); a secret given both ways counts
+/// once, under its name.
+fn bearer_for_policy(bearer: Option<String>, named: &[(String, String)]) -> Option<String> {
+    match bearer {
+        Some(v) if !v.trim().is_empty() => Some(v),
+        other => named.first().map(|(_, s)| s.clone()).or(other),
+    }
 }
 
 /// The layer that puts [`MCP_WRITE_SCOPE`] in front of the web UI's write routes
@@ -1443,18 +1482,126 @@ fn auth_layer(
 fn api_write_auth_layer(
     decision: StaticTokenDecision,
     oauth: Option<Arc<OAuthValidator>>,
+    named: Option<StaticTokens>,
 ) -> Result<Option<AuthLayer>> {
     if oauth.is_none() {
         return Ok(None);
     }
     AuthLayer::builder()
         .optional_oauth(oauth)
+        .optional_static_tokens(named)
         .static_challenge(None)
         .require_scopes([MCP_WRITE_SCOPE])
         .static_token_bypasses_scopes()
         .build_with_decision(decision)
         .map(Some)
         .context("Failed to build the write-scoped bearer-auth layer for the web API")
+}
+
+/// Resolve the request's authenticated credential to a [`crate::policy::Principal`]
+/// and store it in the request extensions for the handlers behind it. Runs just
+/// inside `require_auth`, which leaves the credential there; the principal is built
+/// from the LIVE config's access control on every request, so a reloaded
+/// `mcp.policy` governs the next request.
+///
+/// With a policy configured, a principal that maps to no policy is refused here with
+/// `403` before it reaches any handler: default deny, not "nothing happens to be
+/// allowed deeper down".
+pub(crate) async fn principal_layer(
+    State(state): State<PrincipalState>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let config = config::load_shared_config(&state.config);
+    let oauth = request
+        .extensions()
+        .get::<oauth_resource_server::AuthorizedToken>();
+    let static_match = request
+        .extensions()
+        .get::<oauth_resource_server::StaticTokenMatch>();
+    let principal = match (oauth, static_match) {
+        (Some(token), _) => {
+            let has_claim = |name: &str, value: &str| token.has_claim_value(name, value);
+            config
+                .mcp
+                .access
+                .principal(crate::policy::Credential::Oauth(
+                    crate::policy::OauthFacts {
+                        subject: token.subject.as_deref(),
+                        scopes: &token.scopes,
+                        client_id: token.client_id.as_deref(),
+                        has_claim_value: &has_claim,
+                    },
+                ))
+        }
+        (None, Some(m)) => config
+            .mcp
+            .access
+            .principal(crate::policy::Credential::Static(m.label())),
+        (None, None) => config.mcp.access.principal(crate::policy::Credential::None),
+    };
+    if config.mcp.access.enforcing() && !principal.has_access() {
+        warn!(
+            principal = principal.id(),
+            "request refused: no access policy applies"
+        );
+        return forbidden_response(state.oauth.as_deref());
+    }
+    request.extensions_mut().insert(principal);
+    next.run(request).await
+}
+
+/// Keep a route to principals whose policy has `admin: true` (the legacy token and
+/// every principal while no policy is enforced always qualify). Runs inside
+/// [`principal_layer`]; a request with no principal fails closed once a policy
+/// exists.
+async fn require_admin(
+    State(state): State<PrincipalState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let config = config::load_shared_config(&state.config);
+    let principal = crate::policy::Principal::from_extension(
+        request.extensions().get::<crate::policy::Principal>(),
+        config.mcp.access.enforcing(),
+    );
+    if !principal.can_admin() {
+        warn!(
+            principal = principal.id(),
+            "operator route refused: not an admin policy"
+        );
+        return forbidden_response(state.oauth.as_deref());
+    }
+    next.run(request).await
+}
+
+/// What the principal and admin layers need: the live config to resolve access
+/// from, and the OAuth validator (when OAuth is on) for the refusal's challenge.
+#[derive(Clone)]
+pub(crate) struct PrincipalState {
+    pub(crate) config: SharedConfig,
+    pub(crate) oauth: Option<Arc<OAuthValidator>>,
+}
+
+/// The refusal for a principal a policy does not permit: no detail about what was
+/// asked for. With OAuth configured it carries the same `insufficient_scope`
+/// challenge every other 403 does (including the `resource_metadata` pointer), so a
+/// client can tell a policy refusal from a transport failure and re-authorize.
+fn forbidden_response(oauth: Option<&OAuthValidator>) -> Response {
+    let mut response = (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({"error": "forbidden"})),
+    )
+        .into_response();
+    if let Some(validator) = oauth
+        && let Ok(challenge) =
+            axum::http::HeaderValue::from_str(&validator.insufficient_scope_challenge())
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::WWW_AUTHENTICATE, challenge);
+    }
+    response
 }
 
 /// Decide the static bearer token the auth layer holds — as the crate's
@@ -1752,13 +1899,33 @@ fn top_level_areas(data_path: &Path) -> Vec<String> {
 /// `values_in_use` for open fields), a `search` filter on an unknown field or
 /// value is refused with the options listed, and an authored derived field is
 /// a validation error naming the folder rule.
+#[cfg(test)]
 fn build_instructions(base: &str, data_path: &Path, disabled_tools: &[String]) -> String {
+    build_instructions_for(base, data_path, disabled_tools, &crate::policy::Reach::All)
+}
+
+/// [`build_instructions`] for a reader confined to `reach`: only the top-level areas
+/// that contain something it may read are listed, so the instructions do not name
+/// the rest of the knowledge base.
+fn build_instructions_for(
+    base: &str,
+    data_path: &Path,
+    disabled_tools: &[String],
+    reach: &crate::policy::Reach,
+) -> String {
     /// Cap on the areas listed, so the line stays bounded however many
     /// top-level directories a knowledge base grows.
     const MAX_AREAS_LISTED: usize = 30;
 
     let mut lines = vec![base.to_string()];
     let mut areas = top_level_areas(data_path);
+    if let crate::policy::Reach::Prefixes(dirs) = reach {
+        // An area is visible when some granted directory is that area or inside it.
+        areas.retain(|area| {
+            dirs.iter()
+                .any(|d| d.is_empty() || d == area || d.starts_with(&format!("{area}/")))
+        });
+    }
     let overflow = areas.len().saturating_sub(MAX_AREAS_LISTED);
     areas.truncate(MAX_AREAS_LISTED);
     if overflow > 0 {
@@ -1791,10 +1958,21 @@ pub(crate) async fn compose_server_instructions(
     config: &ResolvedConfig,
     data_path: &Path,
 ) -> String {
-    let full = build_instructions(
+    compose_server_instructions_for(config, data_path, &crate::policy::Reach::All).await
+}
+
+/// [`compose_server_instructions`] as a reader confined to `reach` should see it
+/// (see [`build_instructions_for`]).
+pub(crate) async fn compose_server_instructions_for(
+    config: &ResolvedConfig,
+    data_path: &Path,
+    reach: &crate::policy::Reach,
+) -> String {
+    let full = build_instructions_for(
         &descriptions::compose_server_mechanics(),
         data_path,
         &config.mcp.disabled_tools,
+        reach,
     );
 
     // The only filesystem access left in this function: resolving the
@@ -2149,8 +2327,15 @@ const MCP_PATH: &str = "/mcp";
 /// advertises (`mcp.oauth.scopes_supported`) are `mcp:read` and `mcp:write`.
 const MCP_WRITE_SCOPE: &str = "mcp:write";
 /// The tools that change the knowledge base or its schema; `descriptions::TOOL_NAMES`
-/// holds the full set.
-const MCP_WRITE_TOOLS: [&str; 3] = ["write_document", "delete_document", "update_schema"];
+/// and `MEMORY_TOOL_NAMES` hold the full set.
+const MCP_WRITE_TOOLS: [&str; 6] = [
+    "write_document",
+    "delete_document",
+    "update_schema",
+    "memory_create",
+    "memory_update",
+    "memory_forget",
+];
 /// Open by design, unlike the four paths above — see `web.rs`'s module doc for why
 /// `/health` and the UI routes carry no `require_auth` layer.
 const HEALTH_PATH: &str = "/health";
@@ -2279,6 +2464,8 @@ struct RouterAssemblyDeps {
     /// `mcp.allowed_hosts`, which also guards the web UI's `/api/*` routes
     /// (`web::ui_router_with_api_auth`).
     allowed_hosts: Vec<String>,
+    /// The live config the principal layer resolves each request's access from.
+    shared_config: SharedConfig,
 }
 
 /// Per-tool scope enforcement for `/mcp` (#360): a write tool needs
@@ -2333,10 +2520,21 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
     if let Some(tool_scopes) = mcp_tool_scopes(&deps.auth) {
         mcp_router = mcp_router.route_layer(tool_scopes);
     }
-    let mcp_router = mcp_router.route_layer(middleware::from_fn_with_state(
-        deps.auth.clone(),
-        require_auth,
-    ));
+    // Resolves the principal from what `require_auth` left, so it sits between the
+    // two: inside the auth layer, outside the scope layer's view of the handlers.
+    let principals = PrincipalState {
+        config: deps.shared_config.clone(),
+        oauth: deps.auth.oauth().cloned(),
+    };
+    let mcp_router = mcp_router
+        .route_layer(middleware::from_fn_with_state(
+            principals.clone(),
+            principal_layer,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            deps.auth.clone(),
+            require_auth,
+        ));
 
     // `/status` and `/metrics` sit behind the same bearer token as `/mcp`, not open like
     // `/health`. `/health` answers "is it up" and reveals nothing; these enumerate tag
@@ -2352,6 +2550,16 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
             axum::routing::get(contradictions_handler),
         )
         .with_state(deps.status_state)
+        // Operator routes: authenticated, then resolved to a principal, then kept to
+        // principals whose policy says `admin` (everyone, while no policy is set).
+        .route_layer(middleware::from_fn_with_state(
+            principals.clone(),
+            require_admin,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            principals.clone(),
+            principal_layer,
+        ))
         .route_layer(middleware::from_fn_with_state(
             deps.auth.clone(),
             require_auth,
@@ -2367,6 +2575,14 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
         .route(ADMIN_RELOAD_PATH, axum::routing::post(reload_handler))
         .route(ADMIN_SYNC_PATH, axum::routing::post(sync_handler))
         .with_state(deps.admin_state)
+        .route_layer(middleware::from_fn_with_state(
+            principals.clone(),
+            require_admin,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            principals.clone(),
+            principal_layer,
+        ))
         .route_layer(middleware::from_fn_with_state(
             deps.auth.clone(),
             require_auth,
@@ -2422,9 +2638,10 @@ async fn build_startup_schema_cache(
     data_path: std::path::PathBuf,
     frontmatter: crate::config::FrontmatterConfig,
     indexing: crate::config::IndexingConfig,
+    builtin: Vec<(std::path::PathBuf, crate::schema::SchemaFile)>,
 ) -> Result<SchemaCache> {
     let schemas = tokio::task::spawn_blocking(move || {
-        SchemaCache::build(&data_path, &frontmatter, &indexing)
+        SchemaCache::build_with(&data_path, &frontmatter, &indexing, &builtin)
     })
     .await
     .context("Schema walk panicked during startup")?
@@ -2503,6 +2720,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         instructions_data_path.clone(),
         config.frontmatter.clone(),
         config.indexing.clone(),
+        crate::memory::builtin_scopes(&config.memory),
     )
     .await?;
     let shared_schema_cache: schema::SharedSchemaCache =
@@ -2885,9 +3103,16 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     };
 
     // Bearer token for MCP auth
+    let named_secrets = crate::secrets::named_token_secrets(&config.mcp.tokens)?;
+    if !named_secrets.is_empty() {
+        info!(
+            tokens = ?config.mcp.tokens.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            "named static tokens configured (mcp.tokens)"
+        );
+    }
     let decision = static_bearer_token(
         &config.mcp.bearer_token_env,
-        bearer_token,
+        bearer_for_policy(bearer_token, &named_secrets),
         config.mcp.oauth.as_ref(),
         config.mcp.allow_unauthenticated,
     )?;
@@ -2906,8 +3131,10 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
              clients will not be told to request it"
         );
     }
-    let api_write_auth = api_write_auth_layer(decision.clone(), oauth.clone())?;
-    let auth = auth_layer(decision, oauth)?;
+    let named_tokens = named_static_tokens(&named_secrets)?;
+    let api_write_auth =
+        api_write_auth_layer(decision.clone(), oauth.clone(), named_tokens.clone())?;
+    let auth = auth_layer_with(decision, oauth, named_tokens)?;
 
     // Rate limiting, per client address as chosen by `rate_limit.client_ip_source`
     // (see `ClientIpKeyExtractor` for why this is not `SmartIpKeyExtractor`, #275).
@@ -2966,6 +3193,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         api_auth: config.ui.api_auth,
         api_write_auth,
         allowed_hosts: config.mcp.allowed_hosts.clone(),
+        shared_config: Arc::clone(&shared_config),
         webhook_state: webhook_secret.map(|secret| WebhookState {
             config: Arc::clone(&shared_config),
             secret,
@@ -3124,7 +3352,7 @@ mod tests {
             true,
         )
         .unwrap();
-        api_write_auth_layer(decision, oauth).unwrap()
+        api_write_auth_layer(decision, oauth, None).unwrap()
     }
 
     #[test]
@@ -3439,6 +3667,7 @@ mod tests {
             dir.path().to_path_buf(),
             Default::default(),
             Default::default(),
+            Vec::new(),
         )
         .await
         .expect_err("an invalid schema file must stop startup");
@@ -3454,6 +3683,7 @@ mod tests {
             dir.path().to_path_buf(),
             Default::default(),
             Default::default(),
+            Vec::new(),
         )
         .await
         .expect("a valid tree starts");
@@ -3577,6 +3807,7 @@ mod tests {
             formatting: crate::config::FormattingConfig::off(),
             contradictions: Default::default(),
             contradictions_judge: None,
+            memory: Default::default(),
             provenance: Default::default(),
         })
     }
@@ -4932,6 +5163,28 @@ mod tests {
     }
 
     #[test]
+    fn a_scoped_reader_is_told_only_about_the_areas_it_can_read() {
+        let dir = tempfile::tempdir().unwrap();
+        for area in ["memory", "notes", "secrets", "work"] {
+            std::fs::create_dir_all(dir.path().join(area)).unwrap();
+        }
+        let reach = crate::policy::Reach::Prefixes(vec!["memory/general".into(), "work".into()]);
+        let text = build_instructions_for("base", dir.path(), &[], &reach);
+        assert!(text.contains("memory"), "{text}");
+        assert!(text.contains("work"), "{text}");
+        assert!(!text.contains("notes"), "{text}");
+        assert!(!text.contains("secrets"), "{text}");
+
+        let nothing = build_instructions_for(
+            "base",
+            dir.path(),
+            &[],
+            &crate::policy::Reach::Prefixes(Vec::new()),
+        );
+        assert!(!nothing.contains("Top-level areas"), "{nothing}");
+    }
+
+    #[test]
     fn build_instructions_caps_the_areas_line() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..40 {
@@ -5528,6 +5781,7 @@ mod tests {
             api_auth: false,
             api_write_auth: test_api_write_auth(bearer_token.clone(), oauth.clone()),
             allowed_hosts: Vec::new(),
+            shared_config: Arc::clone(&shared_config),
             webhook_state: Some(WebhookState {
                 config: Arc::clone(&shared_config),
                 secret: "webhook-secret".into(),
@@ -6629,7 +6883,7 @@ mod tests {
         // none any more), but installed at runtime via the description
         // overlay `test_mcp_router_with_hosts` builds from
         // `descriptions::compose_tool_descriptions`. This is the end-to-end
-        // half of the overlay contract; `mcp.rs`'s unit tests exercise
+        // half of the overlay contract; `mcp/`'s unit tests exercise
         // `overlay_description`/`get_tool` directly.
         // Same defaults `test_mcp_router_with_hosts` built the handler's overlay
         // from (`make_test_resolved_config`): heading_metadata off, all three
@@ -6679,8 +6933,8 @@ mod tests {
     /// rather than `make_test_resolved_config`'s defaults — needed by the
     /// `mcp.disabled_tools` end-to-end tests below, which exercise real
     /// `tools/list`/`tools/call` JSON-RPC dispatch through `KbSearchServer`'s
-    /// hand-written `ServerHandler` methods (`enabled_tool_router`, mcp.rs),
-    /// not the lower-level router calls `mcp.rs`'s own unit tests use.
+    /// hand-written `ServerHandler` methods (`enabled_tool_router`, mcp/),
+    /// not the lower-level router calls `mcp/`'s own unit tests use.
     fn test_mcp_router_with_config(config: Arc<ResolvedConfig>) -> Router {
         let tmp = tempfile::tempdir().unwrap();
         let instructions = Arc::new(RwLock::new("test instructions".to_string()));
@@ -6946,6 +7200,564 @@ mod tests {
         );
         deps.api_auth = api_auth;
         (jwks, assemble_router(deps))
+    }
+
+    // --- per-principal access control (mcp.policy / mcp.tokens / mcp.principals) ---
+
+    fn policy_cfg(tools: &[&str], read: &[&str], admin: bool) -> crate::policy::PolicyConfig {
+        crate::policy::PolicyConfig {
+            tools: tools.iter().map(|s| s.to_string()).collect(),
+            read: read.iter().map(|s| s.to_string()).collect(),
+            write: Vec::new(),
+            admin,
+        }
+    }
+
+    fn named(name: &str, secret: &str) -> (String, String) {
+        (name.to_string(), secret.to_string())
+    }
+
+    /// The assembled router with two named tokens under policies (`reader`: search
+    /// only, no admin; `ops`: everything, admin), the legacy token `legacy-secret`
+    /// and, when `oauth` is given, a rule mapping `mcp:ops` to `ops`.
+    async fn policy_assembled(dir: &std::path::Path, oauth: Option<Arc<OAuthValidator>>) -> Router {
+        policy_assembled_with(dir, oauth, Some("legacy-secret")).await
+    }
+
+    /// As [`policy_assembled`], with the legacy `bearer_token_env` value chosen (`None`:
+    /// only the named tokens exist).
+    async fn policy_assembled_with(
+        dir: &std::path::Path,
+        oauth: Option<Arc<OAuthValidator>>,
+        legacy: Option<&str>,
+    ) -> Router {
+        let policies = std::collections::BTreeMap::from([
+            (
+                "reader".to_string(),
+                policy_cfg(&["search"], &["memory"], false),
+            ),
+            ("ops".to_string(), policy_cfg(&["*"], &["/"], true)),
+            (
+                "viewer".to_string(),
+                policy_cfg(
+                    &["search", "get_document", "get_schema", "changes_since"],
+                    &["memory"],
+                    false,
+                ),
+            ),
+            (
+                "searcher".to_string(),
+                crate::policy::PolicyConfig {
+                    write: vec!["memory".to_string()],
+                    ..policy_cfg(&["search"], &["memory"], false)
+                },
+            ),
+        ]);
+        let tokens = vec![
+            crate::policy::TokenConfig {
+                name: "viewer-tok".into(),
+                secret_env: "V".into(),
+                policy: "viewer".into(),
+            },
+            crate::policy::TokenConfig {
+                name: "searcher-tok".into(),
+                secret_env: "S".into(),
+                policy: "searcher".into(),
+            },
+            crate::policy::TokenConfig {
+                name: "reader-tok".into(),
+                secret_env: "R".into(),
+                policy: "reader".into(),
+            },
+            crate::policy::TokenConfig {
+                name: "ops-tok".into(),
+                secret_env: "O".into(),
+                policy: "ops".into(),
+            },
+        ];
+        let rules = if oauth.is_some() {
+            vec![crate::policy::PrincipalRule {
+                matcher: crate::policy::PrincipalMatch {
+                    scope: Some("mcp:ops".into()),
+                    ..Default::default()
+                },
+                policy: "ops".into(),
+            }]
+        } else {
+            Vec::new()
+        };
+        let access = crate::policy::AccessControl::compile(
+            &policies,
+            &tokens,
+            &rules,
+            &descriptions::TOOL_NAMES,
+            oauth.is_some(),
+        )
+        .unwrap();
+        let secrets = vec![
+            named("reader-tok", "reader-secret"),
+            named("ops-tok", "ops-secret"),
+            named("viewer-tok", "viewer-secret"),
+            named("searcher-tok", "searcher-secret"),
+        ];
+        let mut deps =
+            test_router_assembly_deps_with_oauth(dir, legacy.map(str::to_string), oauth.clone());
+        // A policy is refused at load without it (the web routes need a principal).
+        deps.api_auth = true;
+        let mut resolved = (*config::load_shared_config(&deps.shared_config)).clone();
+        resolved.mcp.access = access;
+        *deps.shared_config.write().unwrap() = Arc::new(resolved);
+        let decision = static_bearer_token(
+            "T",
+            bearer_for_policy(legacy.map(str::to_string), &secrets),
+            oauth.as_deref().map(|v| v.config()),
+            false,
+        )
+        .unwrap();
+        deps.auth =
+            auth_layer_with(decision, oauth, named_static_tokens(&secrets).unwrap()).unwrap();
+        assemble_router(deps)
+    }
+
+    async fn get_with(app: &Router, method: &str, uri: &str, bearer: &str) -> StatusCode {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn operator_routes_need_an_admin_policy_once_a_policy_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = policy_assembled(dir.path(), None).await;
+        for (method, uri) in [
+            ("GET", STATUS_PATH),
+            ("GET", METRICS_PATH),
+            ("GET", STATUS_LINKS_PATH),
+            ("GET", STATUS_LINT_PATH),
+            ("GET", STATUS_CONTRADICTIONS_PATH),
+            ("POST", ADMIN_RELOAD_PATH),
+            ("POST", ADMIN_SYNC_PATH),
+        ] {
+            assert_eq!(
+                get_with(&app, method, uri, "reader-secret").await,
+                StatusCode::FORBIDDEN,
+                "a non-admin named token must be refused on {uri}"
+            );
+            for allowed in ["ops-secret", "legacy-secret"] {
+                let status = get_with(&app, method, uri, allowed).await;
+                assert!(
+                    status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+                    "{allowed} must reach {uri}, got {status}"
+                );
+            }
+            // A wrong secret is an authentication failure, not a policy one.
+            assert_eq!(
+                get_with(&app, method, uri, "nope").await,
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+        }
+    }
+
+    async fn mcp_json(app: &Router, bearer: &str, body: String) -> serde_json::Value {
+        let req = Request::builder()
+            .method("POST")
+            .uri(MCP_PATH)
+            .header("host", "kb.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("{status}: {e}: {}", String::from_utf8_lossy(&bytes)))
+    }
+
+    #[tokio::test]
+    async fn a_scoped_token_sees_only_its_tools_and_is_refused_the_rest_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = policy_assembled(dir.path(), None).await;
+
+        let list = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+            .to_string();
+        let listed = mcp_json(&app, "reader-secret", list.clone()).await;
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["search"], "only the granted tool is listed");
+
+        // Every other tool answers exactly as a tool that does not exist does.
+        let unknown = mcp_json(&app, "reader-secret", tool_call_body("no_such_tool")).await;
+        for tool in descriptions::TOOL_NAMES.iter().filter(|t| **t != "search") {
+            let got = mcp_json(&app, "reader-secret", tool_call_body(tool)).await;
+            assert_eq!(
+                got["error"], unknown["error"],
+                "{tool} must be indistinguishable from an unknown tool"
+            );
+        }
+        // The unrestricted principals still see everything.
+        for bearer in ["ops-secret", "legacy-secret"] {
+            let listed = mcp_json(&app, bearer, list.clone()).await;
+            assert_eq!(
+                listed["result"]["tools"].as_array().unwrap().len(),
+                descriptions::TOOL_NAMES.len(),
+                "{bearer}"
+            );
+        }
+    }
+
+    async fn api_status(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        bearer: &str,
+        body: Option<&str>,
+    ) -> StatusCode {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {bearer}"));
+        if body.is_some() {
+            req = req.header("content-type", "application/json");
+        }
+        let req = req
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn a_scoped_token_cannot_reach_outside_its_area_through_the_web_api() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::create_dir_all(dir.path().join("notes")).unwrap();
+        std::fs::write(
+            dir.path().join("notes/secret.md"),
+            "---\ntitle: S\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("memory/m.md"), "---\ntitle: M\n---\nbody").unwrap();
+        let app = policy_assembled(dir.path(), None).await;
+        // Holds every read tool, so what is refused below is refused for its path.
+        let r = "viewer-secret";
+
+        // Reads outside the read grant: refused outright, or exactly as a
+        // document that does not exist.
+        for uri in [
+            "/api/history",
+            "/api/history?path=notes/secret.md",
+            "/api/schema/notes",
+        ] {
+            assert_eq!(
+                api_status(&app, "GET", uri, r, None).await,
+                StatusCode::FORBIDDEN,
+                "{uri}"
+            );
+        }
+        let existing = api_status(&app, "GET", "/api/doc/notes/secret.md", r, None).await;
+        let missing = api_status(&app, "GET", "/api/doc/notes/absent.md", r, None).await;
+        assert_eq!(
+            existing, missing,
+            "an out-of-reach document must read as absent"
+        );
+        assert_eq!(existing, StatusCode::NOT_FOUND);
+
+        // Inside the grant the same routes are not refused by policy.
+        for uri in ["/api/schema/memory", "/api/history?path=memory/m.md"] {
+            assert_ne!(
+                api_status(&app, "GET", uri, r, None).await,
+                StatusCode::FORBIDDEN,
+                "{uri}"
+            );
+        }
+
+        // Writes: the reader has no write grant anywhere.
+        let create = r#"{"content":"x","create":true}"#;
+        let delete = r#"{"expected_version":"x"}"#;
+        for path in ["notes/new.md", "memory/new.md"] {
+            assert_eq!(
+                api_status(&app, "POST", &format!("/api/doc/{path}"), r, Some(create)).await,
+                StatusCode::FORBIDDEN,
+                "POST {path}"
+            );
+        }
+        for path in ["notes/secret.md", "notes/absent.md", "memory/m.md"] {
+            assert_eq!(
+                api_status(&app, "DELETE", &format!("/api/doc/{path}"), r, Some(delete)).await,
+                StatusCode::FORBIDDEN,
+                "DELETE {path}"
+            );
+        }
+        assert!(dir.path().join("notes/secret.md").exists());
+        assert!(dir.path().join("memory/m.md").exists());
+        assert!(!dir.path().join("memory/new.md").exists());
+    }
+
+    #[tokio::test]
+    async fn the_tool_allowlist_binds_the_web_api_as_well_as_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::write(dir.path().join("memory/m.md"), "---\ntitle: M\n---\nbody").unwrap();
+        let app = policy_assembled(dir.path(), None).await;
+        // `searcher` may call only `search`, though its paths allow reading and
+        // writing `memory`: every route that is another tool is refused.
+        let t = "searcher-secret";
+        for (method, uri, body) in [
+            ("GET", "/api/doc/memory/m.md", None),
+            ("GET", "/api/schema/memory", None),
+            ("GET", "/api/history?path=memory/m.md", None),
+            ("GET", "/api/changes", None),
+            (
+                "POST",
+                "/api/doc/memory/new.md",
+                Some(r#"{"content":"x","create":true}"#),
+            ),
+            (
+                "DELETE",
+                "/api/doc/memory/m.md",
+                Some(r#"{"expected_version":"x"}"#),
+            ),
+        ] {
+            assert_eq!(
+                api_status(&app, method, uri, t, body).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}"
+            );
+        }
+        assert!(dir.path().join("memory/m.md").exists());
+        assert!(!dir.path().join("memory/new.md").exists());
+        // A route of the tool it does hold is not refused by policy.
+        assert_ne!(
+            api_status(&app, "GET", "/api/graph", t, None).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    async fn api_body(app: &Router, uri: &str, bearer: &str) -> serde_json::Value {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("{uri}: {status}: {e}: {}", String::from_utf8_lossy(&bytes)))
+    }
+
+    #[tokio::test]
+    async fn a_scoped_token_gets_only_its_own_area_in_the_graph_and_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seed the index the assembled router will open lazily, at the path its
+        // config names.
+        let db = crate::state::StateDb::new(std::path::Path::new(
+            &status_config(dir.path()).state_db_path(),
+        ))
+        .await
+        .unwrap();
+        for path in ["memory/m.md", "notes/secret.md", "notes-old/x.md"] {
+            let fm =
+                std::collections::HashMap::from([("title".to_string(), serde_json::json!(path))]);
+            db.upsert_document_metadata(path, &fm, 0, "h", 1)
+                .await
+                .unwrap();
+        }
+        db.replace_links(
+            "memory/m.md",
+            "markdown",
+            &[("notes/secret.md".to_string(), None)],
+        )
+        .await
+        .unwrap();
+        let app = policy_assembled(dir.path(), None).await;
+
+        let graph = api_body(&app, "/api/graph", "reader-secret").await;
+        let text = graph.to_string();
+        assert!(text.contains("memory/m.md"), "{text}");
+        assert!(
+            !text.contains("notes"),
+            "no node or edge may name it: {text}"
+        );
+
+        let listing = api_body(&app, "/api/enumerate", "reader-secret").await;
+        assert_eq!(listing["total"], serde_json::json!(1), "{listing}");
+        assert!(!listing.to_string().contains("notes"), "{listing}");
+
+        // The same routes for an unrestricted caller show everything.
+        let all = api_body(&app, "/api/graph", "ops-secret").await.to_string();
+        assert!(all.contains("notes/secret.md"), "{all}");
+
+        // Changes is git-backed and this directory is not a repository: it must
+        // answer without 403 and without leaking.
+        let status = api_status(&app, "GET", "/api/changes", "viewer-secret", None).await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn initialize_gives_a_scoped_token_instructions_naming_only_its_areas() {
+        let dir = tempfile::tempdir().unwrap();
+        for area in ["memory", "notes", "secrets"] {
+            std::fs::create_dir_all(dir.path().join(area)).unwrap();
+        }
+        let app = policy_assembled(dir.path(), None).await;
+        let body = initialize_request_body();
+
+        let instructions = |bearer: &'static str| {
+            let app = app.clone();
+            let body = body.clone();
+            async move { mcp_json(&app, bearer, body).await["result"]["instructions"].to_string() }
+        };
+        let reader = instructions("reader-secret").await;
+        assert!(reader.contains("memory"), "{reader}");
+        assert!(
+            !reader.contains("notes") && !reader.contains("secrets"),
+            "{reader}"
+        );
+
+        let ops = instructions("ops-secret").await;
+        assert!(ops.contains("notes") && ops.contains("secrets"), "{ops}");
+    }
+
+    #[tokio::test]
+    async fn a_named_token_reaches_mcp_and_an_unmapped_oauth_token_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
+        let app = policy_assembled(dir.path(), Some(test_oauth_validator(&jwks.url))).await;
+        let named_call =
+            mcp_post(&app, Some("Bearer reader-secret"), tool_call_body("search")).await;
+        assert!(
+            named_call.status() != StatusCode::FORBIDDEN
+                && named_call.status() != StatusCode::UNAUTHORIZED,
+            "{}",
+            named_call.status()
+        );
+        // A valid OAuth token that no mcp.principals rule matches: refused before
+        // any tool runs, with the plain forbidden body and no scope challenge.
+        let read_only = format!("Bearer {}", scoped_token("mcp:read"));
+        let resp = mcp_post(&app, Some(&read_only), tool_call_body("search")).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], br#"{"error":"forbidden"}"#);
+        // The rule's scope maps the token to the ops policy.
+        let ops = format!("Bearer {}", scoped_token("mcp:read mcp:ops"));
+        let resp = mcp_post(&app, Some(&ops), tool_call_body("search")).await;
+        assert!(resp.status() != StatusCode::FORBIDDEN, "{}", resp.status());
+        assert_eq!(
+            get_with(&app, "GET", STATUS_PATH, &scoped_token("mcp:read mcp:ops")).await,
+            StatusCode::OK
+        );
+    }
+
+    /// With no `bearer_token_env`, the first named token is also what the static-token
+    /// policy is handed. It must still authenticate as ITSELF — the restricted
+    /// `reader` principal — and never as the unrestricted legacy token, which is what
+    /// an unlabelled match would be.
+    #[tokio::test]
+    async fn the_first_named_token_stays_restricted_when_it_is_the_only_static_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = policy_assembled_with(dir.path(), None, None).await;
+        // `reader-tok` is the first named token and a non-admin policy.
+        for (method, uri) in [("GET", STATUS_PATH), ("POST", ADMIN_RELOAD_PATH)] {
+            assert_eq!(
+                get_with(&app, method, uri, "reader-secret").await,
+                StatusCode::FORBIDDEN,
+                "{uri}"
+            );
+            assert!(get_with(&app, method, uri, "ops-secret").await != StatusCode::FORBIDDEN);
+        }
+        assert_eq!(
+            get_with(&app, "GET", STATUS_PATH, "legacy-secret").await,
+            StatusCode::UNAUTHORIZED,
+            "no legacy token exists in this deployment"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_named_token_stays_restricted_alongside_oauth() {
+        let dir = tempfile::tempdir().unwrap();
+        let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
+        let app =
+            policy_assembled_with(dir.path(), Some(test_oauth_validator(&jwks.url)), None).await;
+        assert_eq!(
+            get_with(&app, "GET", STATUS_PATH, "reader-secret").await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(get_with(&app, "GET", STATUS_PATH, "ops-secret").await != StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_policy_refusal_carries_the_oauth_challenge_when_oauth_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
+        let app = policy_assembled(dir.path(), Some(test_oauth_validator(&jwks.url))).await;
+        let req = Request::builder()
+            .uri(STATUS_PATH)
+            .header("authorization", "Bearer reader-secret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let challenge = www_authenticate(&resp);
+        assert!(
+            challenge.contains("insufficient_scope") && challenge.contains("resource_metadata"),
+            "{challenge}"
+        );
+        // And with OAuth off there is no challenge to give.
+        let plain = policy_assembled(dir.path(), None).await;
+        let req = Request::builder()
+            .uri(STATUS_PATH)
+            .header("authorization", "Bearer reader-secret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = plain.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get("www-authenticate").is_none());
+    }
+
+    #[test]
+    fn named_tokens_alone_are_enough_to_start_and_authenticate() {
+        let named = vec![named("a", "secret-a"), named("b", "secret-b")];
+        // No bearer_token_env value: the policy still sees a static token.
+        let decision =
+            static_bearer_token("T", bearer_for_policy(None, &named), None, false).unwrap();
+        assert!(matches!(decision, StaticTokenDecision::StaticOnly(_)));
+        // Without them it still refuses to start with nothing configured.
+        assert!(static_bearer_token("T", bearer_for_policy(None, &[]), None, false).is_err());
+        // A blank bearer value does not hide the named tokens.
+        assert_eq!(
+            bearer_for_policy(Some("  ".into()), &named).as_deref(),
+            Some("secret-a")
+        );
+        // A real bearer value wins and the named set is merged, not replaced.
+        assert_eq!(
+            bearer_for_policy(Some("legacy".into()), &named).as_deref(),
+            Some("legacy")
+        );
+        let layer = auth_layer_with(decision, None, named_static_tokens(&named).unwrap());
+        assert!(layer.is_ok());
+        assert!(named_static_tokens(&[]).unwrap().is_none());
+        // The crate refuses a duplicate secret; so does the set builder.
+        assert!(named_static_tokens(&[named_pair("x", "same"), named_pair("y", "same")]).is_err());
+    }
+
+    fn named_pair(name: &str, secret: &str) -> (String, String) {
+        named(name, secret)
     }
 
     #[tokio::test]
