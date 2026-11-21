@@ -889,7 +889,7 @@ fn no_model_facing_surface_names_the_schema_file() {
         true,
     );
     let server = make_overlay_test_server_with_config(HashMap::new(), config);
-    for tool in KbSearchServer::tool_router().list_all() {
+    for tool in server.enabled_tool_router().list_all() {
         let tool = server.get_tool(tool.name.as_ref()).unwrap();
         assert_no_schema_file_name(tool.description.as_deref().unwrap_or(""));
         assert_no_schema_file_name(

@@ -1394,6 +1394,11 @@ impl KbSearchServer {
         if !other_fields_in_use.is_empty() {
             structured["other_fields_in_use"] = serde_json::json!(other_fields_in_use);
         }
+        // So a client can check the memory tools' contract without a second call.
+        if self.memory_enabled {
+            structured["memory_contract_version"] =
+                serde_json::json!(crate::memory::logic::CONTRACT_VERSION);
+        }
         // The `dedup:` override cascade (#272), only when this scope sets a key —
         // unset keys fall back to the server's global `write.dedup_*`, which a
         // schema read has no business reporting.
@@ -1474,6 +1479,19 @@ impl KbSearchServer {
         };
 
         self.authorize_write(&rel_dir.to_string_lossy())?;
+
+        // The memory area's schema is built into the binary; a file written there
+        // would be refused at the next rebuild, so say so now.
+        let config = self.config();
+        if self.memory_enabled {
+            let root = crate::memory::root_dir(&config.memory);
+            if crate::policy::prefix_covers(&root, &rel_dir.to_string_lossy()) {
+                return Err(invalid(
+                    "the memory area's schema is built into the server and cannot be changed"
+                        .to_string(),
+                ));
+            }
+        }
 
         // Root-scope mutations need an explicit opt-in when the root schema's
         // `root_edit: {require_ack: true}` asks for one (#345; see
@@ -1785,11 +1803,10 @@ impl KbSearchServer {
         // still succeeds — the write is committed — but says loudly that the change
         // is not in effect yet.
         let rebuild_data_path = self.canonical_data_path.clone();
-        let rebuild_frontmatter = self.config().frontmatter.clone();
-        let rebuild_indexing = self.config().indexing.clone();
+        let rebuild_config = self.config();
         let mut refused_rebuild: Option<crate::schema::SchemaBuildError> = None;
         match tokio::task::spawn_blocking(move || {
-            SchemaCache::build(&rebuild_data_path, &rebuild_frontmatter, &rebuild_indexing)
+            SchemaCache::build_for_config(&rebuild_data_path, &rebuild_config)
         })
         .await
         {

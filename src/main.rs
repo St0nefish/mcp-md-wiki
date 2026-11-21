@@ -13,6 +13,7 @@ mod judge;
 mod lint;
 mod markdown_fmt;
 mod mcp;
+mod memory;
 mod policy;
 mod qdrant;
 mod reindex;
@@ -537,11 +538,7 @@ async fn main() -> anyhow::Result<()> {
             // The schema tree gives the tag check its permitted values. An invalid
             // tree must not stop the other checks: the tag check says it was skipped.
             let schemas = if checks.contains(&lint::Check::Tags) {
-                match schema::SchemaCache::build(
-                    &cfg.canonical_data_path(),
-                    &cfg.frontmatter,
-                    &cfg.indexing,
-                ) {
+                match schema::SchemaCache::build_for_config(&cfg.canonical_data_path(), &cfg) {
                     Ok(schemas) => Some(schemas),
                     Err(e) => {
                         eprintln!(
@@ -1106,7 +1103,7 @@ fn build_cli_schema_cache(
     consequence: &str,
 ) -> anyhow::Result<schema::SchemaCache> {
     let data_path = Path::new(cfg.data_path());
-    match schema::SchemaCache::build(data_path, &cfg.frontmatter, &cfg.indexing) {
+    match schema::SchemaCache::build_for_config(data_path, cfg) {
         Ok(schemas) => Ok(schemas),
         Err(e) => {
             eprintln!("SCHEMA ERRORS ({}):", e.invalid.len());

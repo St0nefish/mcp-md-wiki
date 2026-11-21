@@ -1,0 +1,40 @@
+# The schema of the memory area. Built into the binary (never read from the
+# knowledge base): clients do not author memory frontmatter, the server does.
+fields:
+  id:
+    type: text
+    required: true
+    indexed: true
+  type:
+    type: enum
+    required: true
+    indexed: true
+    values: [preference, fact, decision, finding, procedure]
+  status:
+    type: enum
+    required: true
+    indexed: true
+    values: [proposed, confirmed, superseded, forgotten]
+  source_client:
+    type: text
+    indexed: true
+  source_url:
+    type: text
+  created:
+    type: timestamp
+    required: true
+  updated:
+    type: timestamp
+  supersedes:
+    type: text
+    indexed: true
+  confidence:
+    type: number
+  tags:
+    type: list
+    indexed: true
+    items:
+      type: text
+# The memory tools run their own duplicate check, with the memory threshold.
+dedup:
+  enabled: false

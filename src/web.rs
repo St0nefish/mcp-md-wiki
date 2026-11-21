@@ -2469,6 +2469,7 @@ mod tests {
             formatting: crate::config::FormattingConfig::off(),
             contradictions: Default::default(),
             contradictions_judge: None,
+            memory: Default::default(),
             provenance: Default::default(),
         })
     }

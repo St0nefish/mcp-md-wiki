@@ -43,6 +43,79 @@ pub struct Config {
     pub formatting: FormattingConfig,
     #[serde(default)]
     pub contradictions: ContradictionsConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+/// `memory` — the memory tool group (`memory_create`, `memory_search`, ...). Off
+/// unless `enabled`: with the section absent the server exposes exactly the tools it
+/// always has. Every key is restart-required: the tool list, the hidden schema for
+/// the memory area and the per-area folders are all fixed when the server starts.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Turn the group on. Needs a section (`memory: {enabled: true}`); a bare
+    /// `memory:` is a null, which is the same as leaving it out.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory (KB-relative) the memories live under, one subfolder per area.
+    /// Its schema is built into the binary; an on-disk `.schema.yaml` at or under it
+    /// is refused.
+    #[serde(default = "default_memory_root")]
+    pub root: String,
+    /// The area (subfolder of `root`) a memory goes to when the caller names none.
+    #[serde(default = "default_memory_area")]
+    pub default_area: String,
+    /// `status` a new memory gets. `proposed` keeps it out of `memory_recall` until
+    /// someone confirms it.
+    #[serde(default)]
+    pub default_status: MemoryDefaultStatus,
+    /// Cosine similarity at or above which `memory_create` treats an existing live
+    /// memory as a duplicate. Same scale as `write.dedup_threshold`.
+    #[serde(default = "default_memory_duplicate_threshold")]
+    pub duplicate_threshold: f32,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root: default_memory_root(),
+            default_area: default_memory_area(),
+            default_status: MemoryDefaultStatus::default(),
+            duplicate_threshold: default_memory_duplicate_threshold(),
+        }
+    }
+}
+
+/// The `status` a newly created memory starts in (`memory.default_status`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryDefaultStatus {
+    #[default]
+    Proposed,
+    Confirmed,
+}
+
+impl MemoryDefaultStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Confirmed => "confirmed",
+        }
+    }
+}
+
+fn default_memory_root() -> String {
+    "memory".to_string()
+}
+
+fn default_memory_area() -> String {
+    "general".to_string()
+}
+
+fn default_memory_duplicate_threshold() -> f32 {
+    0.85
 }
 
 /// `source` — YAML side. Every setting is either a secret name-indirection field
@@ -1896,6 +1969,11 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("contradictions.judge_api_key_env", "contradictions"),
     ("contradictions.judge_timeout_secs", "contradictions"),
     ("contradictions.judge_max_document_bytes", "contradictions"),
+    ("memory.enabled", "memory"),
+    ("memory.root", "memory"),
+    ("memory.default_area", "memory"),
+    ("memory.default_status", "memory"),
+    ("memory.duplicate_threshold", "memory"),
 ];
 
 /// Recursively flattens a `serde_json::Value` tree into dot-joined leaf paths,
@@ -2013,6 +2091,17 @@ fn yaml_top_level_sections(content: &str) -> HashSet<&'static str> {
         .collect()
 }
 
+/// Whether `area` can name a folder under `memory.root`: one path segment, visible
+/// ASCII letters, digits, `-` and `_`, not starting with `_` or `.` (which are reserved
+/// for archive and hidden directories).
+pub(crate) fn valid_memory_area(area: &str) -> bool {
+    (1..=64).contains(&area.len())
+        && area
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && !area.starts_with('_')
+}
+
 /// Validates a tool-name list — `mcp.disabled_tools` or `mcp.enabled_tools` — against
 /// `descriptions::TOOL_NAMES`: bails naming every unknown name at once, then bails on
 /// the first duplicate. Shared by both settings' validation in
@@ -2027,8 +2116,7 @@ fn yaml_top_level_sections(content: &str) -> HashSet<&'static str> {
 /// nothing (an unknown name in `ToolRouter::disable_route` is a no-op) or crashing a
 /// live `tools/call`.
 fn validate_tool_name_list(names: &[String], setting: &str) -> anyhow::Result<()> {
-    let valid: std::collections::HashSet<&str> =
-        crate::descriptions::TOOL_NAMES.iter().copied().collect();
+    let valid: std::collections::HashSet<&str> = crate::descriptions::all_tool_names().collect();
     let mut unknown: Vec<&str> = names
         .iter()
         .map(|t| t.as_str())
@@ -2040,7 +2128,9 @@ fn validate_tool_name_list(names: &[String], setting: &str) -> anyhow::Result<()
         anyhow::bail!(
             "{setting} names unknown tool(s): {} — valid names are {}",
             unknown.join(", "),
-            crate::descriptions::TOOL_NAMES.join(", ")
+            crate::descriptions::all_tool_names()
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     let mut seen = std::collections::HashSet::new();
@@ -2084,6 +2174,8 @@ pub struct ResolvedConfig {
     pub contradictions: ContradictionsConfig,
     /// The contradiction judge's wiring — `Some` only when `contradictions.judge` is on.
     pub contradictions_judge: Option<ResolvedJudgeConfig>,
+    /// The memory tool group's settings (validated; `enabled` is what turns it on).
+    pub memory: MemoryConfig,
     /// Where every resolved setting's value came from — see [`ConfigProvenance`].
     pub provenance: ConfigProvenance,
 }
@@ -2122,6 +2214,39 @@ impl Config {
     #[cfg(test)]
     fn resolve(self) -> anyhow::Result<ResolvedConfig> {
         self.resolve_inner(&HashSet::new(), false)
+    }
+
+    /// Checks for the `memory` section. Always applied: a reload that turns the group
+    /// on must not be the first time a bad value is noticed.
+    fn validate_memory(&self) -> anyhow::Result<()> {
+        let m = &self.memory;
+        if !(0.0..=1.0).contains(&m.duplicate_threshold) {
+            anyhow::bail!("memory.duplicate_threshold must be between 0.0 and 1.0");
+        }
+        if !valid_memory_area(&m.default_area) {
+            anyhow::bail!(
+                "memory.default_area {:?} must be 1 to 64 characters of letters, digits, '-' \
+                 and '_', not starting with '_' or '.' (it becomes a folder name)",
+                m.default_area
+            );
+        }
+        let root = crate::policy::normalize_prefix(&m.root)
+            .map_err(|e| anyhow::anyhow!("memory.root: {e}"))?;
+        if root.is_empty() {
+            anyhow::bail!(
+                "memory.root must be a directory under the knowledge base root, not the root itself"
+            );
+        }
+        if m.enabled {
+            let archive = self.write.archive_prefix.trim_matches('/');
+            if root == archive || root.starts_with(&format!("{archive}/")) {
+                anyhow::bail!(
+                    "memory.root '{root}' is inside write.archive_prefix '{archive}': an archived \
+                     document would be indistinguishable from a memory"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Range checks for the `contradictions` section (#355). Always applied, like the
@@ -2555,7 +2680,12 @@ impl Config {
                 anyhow::bail!("set one of mcp.enabled_tools / mcp.disabled_tools, not both");
             }
             validate_tool_name_list(&self.mcp.disabled_tools, "mcp.disabled_tools")?;
-            if self.mcp.disabled_tools.len() == crate::descriptions::TOOL_NAMES.len() {
+            // The memory tools count only when the group is on: with it off they are
+            // never exposed, so disabling the core tools would leave nothing.
+            let every_core_disabled = crate::descriptions::TOOL_NAMES
+                .iter()
+                .all(|t| self.mcp.disabled_tools.iter().any(|d| d == t));
+            if every_core_disabled && !self.memory.enabled {
                 anyhow::bail!(
                     "mcp.disabled_tools disables every tool ({}) — the server would have no \
                      usable MCP surface at all",
@@ -2568,7 +2698,9 @@ impl Config {
                     anyhow::bail!(
                         "mcp.enabled_tools is empty — that would disable every tool ({}); name \
                          at least one, or omit mcp.enabled_tools entirely",
-                        crate::descriptions::TOOL_NAMES.join(", ")
+                        crate::descriptions::all_tool_names()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
             }
@@ -2599,6 +2731,7 @@ impl Config {
         crate::markdown_fmt::validate_config(&self.formatting.markdown)
             .map_err(|e| anyhow::anyhow!(e))?;
         self.validate_contradictions()?;
+        self.validate_memory()?;
         if self.ui.semantic_edges.k == 0 {
             anyhow::bail!("ui.semantic_edges.k must be >= 1");
         }
@@ -2621,7 +2754,7 @@ impl Config {
             &self.mcp.policy,
             &self.mcp.tokens,
             &self.mcp.principals,
-            &crate::descriptions::TOOL_NAMES,
+            &crate::descriptions::all_tool_names().collect::<Vec<_>>(),
             oauth.is_some(),
         )?;
         if access.enforcing() {
@@ -2762,9 +2895,8 @@ impl Config {
                     Some(enabled) => {
                         let enabled_set: std::collections::HashSet<&str> =
                             enabled.iter().map(String::as_str).collect();
-                        crate::descriptions::TOOL_NAMES
-                            .iter()
-                            .filter(|t| !enabled_set.contains(*t))
+                        crate::descriptions::available_tool_names(self.memory.enabled)
+                            .filter(|t| !enabled_set.contains(t))
                             .map(|t| t.to_string())
                             .collect()
                     }
@@ -2817,6 +2949,7 @@ impl Config {
                 None
             },
             contradictions: self.contradictions,
+            memory: self.memory,
             provenance: ConfigProvenance(
                 provenance
                     .into_iter()
@@ -3552,6 +3685,7 @@ mcp:
             formatting: FormattingConfig::default(),
             contradictions: ContradictionsConfig::default(),
             contradictions_judge: None,
+            memory: MemoryConfig::default(),
             provenance: ConfigProvenance::default(),
         };
 
@@ -4205,6 +4339,82 @@ mcp:
         "mcp:\n  policy:\n    agent:\n      tools: [search]\n      read: [memory]\n";
 
     #[test]
+    fn memory_is_off_unless_the_section_turns_it_on() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let off = Config::from_str("").unwrap();
+        assert!(!off.memory.enabled);
+        // A section that only sets values does not enable it either.
+        let still_off = Config::from_str("memory:\n  root: notes-memory\n").unwrap();
+        assert!(!still_off.memory.enabled);
+
+        let on = Config::from_str("memory:\n  enabled: true\n").unwrap();
+        assert!(on.memory.enabled);
+        assert_eq!(on.memory.root, "memory");
+        assert_eq!(on.memory.default_area, "general");
+        assert_eq!(on.memory.default_status, MemoryDefaultStatus::Proposed);
+        assert_eq!(on.memory.duplicate_threshold, 0.85);
+        clear_required_env();
+    }
+
+    #[test]
+    fn memory_mistakes_name_the_setting() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        for (yaml, needle) in [
+            (
+                "memory:\n  duplicate_threshold: 1.5\n",
+                "memory.duplicate_threshold",
+            ),
+            ("memory:\n  default_area: \"../x\"\n", "memory.default_area"),
+            ("memory:\n  default_area: _hidden\n", "memory.default_area"),
+            ("memory:\n  default_area: \"\"\n", "memory.default_area"),
+            ("memory:\n  root: \"/\"\n", "memory.root"),
+            ("memory:\n  root: \"a/../b\"\n", "memory.root"),
+            (
+                "memory:\n  enabled: true\n  root: _archive/m\n",
+                "write.archive_prefix",
+            ),
+            ("memory:\n  default_status: maybe\n", "unknown variant"),
+            ("memory:\n  surprise: 1\n", "unknown field"),
+        ] {
+            let e = Config::from_str(yaml).unwrap_err().to_string();
+            assert!(e.contains(needle), "{yaml:?}: {e}");
+        }
+        clear_required_env();
+    }
+
+    #[test]
+    fn the_memory_tool_names_are_valid_in_every_tool_list_but_only_exist_while_enabled() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        // Valid names even with the group off: a policy may be written ahead of it.
+        Config::from_str("mcp:\n  disabled_tools: [memory_forget]\n").unwrap();
+        // An allowlist's complement is taken over the tools that exist.
+        let off = Config::from_str("mcp:\n  enabled_tools: [search]\n").unwrap();
+        assert!(
+            off.mcp
+                .disabled_tools
+                .iter()
+                .all(|t| !t.starts_with("memory_")),
+            "{:?}",
+            off.mcp.disabled_tools
+        );
+        let on = Config::from_str("memory:\n  enabled: true\nmcp:\n  enabled_tools: [search]\n")
+            .unwrap();
+        for tool in crate::descriptions::MEMORY_TOOL_NAMES {
+            assert!(on.mcp.disabled_tools.iter().any(|t| t == tool), "{tool}");
+        }
+        // Disabling every core tool leaves the memory tools as the surface.
+        let all_core = crate::descriptions::TOOL_NAMES.join(", ");
+        assert!(Config::from_str(&format!("mcp:\n  disabled_tools: [{all_core}]\n")).is_err());
+        Config::from_str(&format!(
+            "memory:\n  enabled: true\nmcp:\n  disabled_tools: [{all_core}]\n"
+        ))
+        .unwrap();
+        clear_required_env();
+    }
+    #[test]
     fn mcp_policy_absent_means_nothing_is_enforced() {
         let _lock = ENV_MUTEX.lock().unwrap();
         set_required_env();
@@ -4457,6 +4667,7 @@ mcp:
             formatting: FormattingConfig::default(),
             contradictions: ContradictionsConfig::default(),
             contradictions_judge: None,
+            memory: MemoryConfig::default(),
             provenance: ConfigProvenance::default(),
         }
     }

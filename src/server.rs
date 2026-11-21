@@ -284,21 +284,18 @@ impl StatusState {
         // Only for the breakdown's derived-field exclusion: an invalid schema tree
         // must not stop `status` from reporting, so a failed build is just `None`,
         // said once on stderr so the unfiltered breakdown has an explanation.
-        let schema_cache = match SchemaCache::build(
-            &config.canonical_data_path(),
-            &config.frontmatter,
-            &config.indexing,
-        ) {
-            Ok(cache) => Some(Arc::new(RwLock::new(Arc::new(cache)))),
-            Err(e) => {
-                eprintln!(
-                    "warning: {} schema file(s) are invalid (run `validate` for details); \
+        let schema_cache =
+            match SchemaCache::build_for_config(&config.canonical_data_path(), &config) {
+                Ok(cache) => Some(Arc::new(RwLock::new(Arc::new(cache)))),
+                Err(e) => {
+                    eprintln!(
+                        "warning: {} schema file(s) are invalid (run `validate` for details); \
                      the field breakdown does not leave out derived fields",
-                    e.invalid.len()
-                );
-                None
-            }
-        };
+                        e.invalid.len()
+                    );
+                    None
+                }
+            };
         Ok(Self {
             schema_cache,
             qdrant: Arc::new(QdrantStore::new(&config.qdrant)?),
@@ -2330,8 +2327,15 @@ const MCP_PATH: &str = "/mcp";
 /// advertises (`mcp.oauth.scopes_supported`) are `mcp:read` and `mcp:write`.
 const MCP_WRITE_SCOPE: &str = "mcp:write";
 /// The tools that change the knowledge base or its schema; `descriptions::TOOL_NAMES`
-/// holds the full set.
-const MCP_WRITE_TOOLS: [&str; 3] = ["write_document", "delete_document", "update_schema"];
+/// and `MEMORY_TOOL_NAMES` hold the full set.
+const MCP_WRITE_TOOLS: [&str; 6] = [
+    "write_document",
+    "delete_document",
+    "update_schema",
+    "memory_create",
+    "memory_update",
+    "memory_forget",
+];
 /// Open by design, unlike the four paths above — see `web.rs`'s module doc for why
 /// `/health` and the UI routes carry no `require_auth` layer.
 const HEALTH_PATH: &str = "/health";
@@ -2634,9 +2638,10 @@ async fn build_startup_schema_cache(
     data_path: std::path::PathBuf,
     frontmatter: crate::config::FrontmatterConfig,
     indexing: crate::config::IndexingConfig,
+    builtin: Vec<(std::path::PathBuf, crate::schema::SchemaFile)>,
 ) -> Result<SchemaCache> {
     let schemas = tokio::task::spawn_blocking(move || {
-        SchemaCache::build(&data_path, &frontmatter, &indexing)
+        SchemaCache::build_with(&data_path, &frontmatter, &indexing, &builtin)
     })
     .await
     .context("Schema walk panicked during startup")?
@@ -2715,6 +2720,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         instructions_data_path.clone(),
         config.frontmatter.clone(),
         config.indexing.clone(),
+        crate::memory::builtin_scopes(&config.memory),
     )
     .await?;
     let shared_schema_cache: schema::SharedSchemaCache =
@@ -3661,6 +3667,7 @@ mod tests {
             dir.path().to_path_buf(),
             Default::default(),
             Default::default(),
+            Vec::new(),
         )
         .await
         .expect_err("an invalid schema file must stop startup");
@@ -3676,6 +3683,7 @@ mod tests {
             dir.path().to_path_buf(),
             Default::default(),
             Default::default(),
+            Vec::new(),
         )
         .await
         .expect("a valid tree starts");
@@ -3799,6 +3807,7 @@ mod tests {
             formatting: crate::config::FormattingConfig::off(),
             contradictions: Default::default(),
             contradictions_judge: None,
+            memory: Default::default(),
             provenance: Default::default(),
         })
     }

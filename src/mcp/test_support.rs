@@ -546,3 +546,71 @@ pub(super) fn head_subject(work: &tempfile::TempDir) -> String {
         .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
+/// A git-backed server with the memory tool group on (`memory.enabled`), its
+/// built-in schema laid into the schema cache the way startup does. The duplicate
+/// check is bypassed by the tests themselves (`on_duplicate: keep_both`), since no
+/// embedding service runs here.
+pub(super) struct MemoryHarness {
+    pub(super) _bare: tempfile::TempDir,
+    pub(super) work: tempfile::TempDir,
+    pub(super) server: KbSearchServer,
+}
+
+pub(super) fn memory_harness() -> MemoryHarness {
+    let bare = crate::git::tests::create_bare_repo("master");
+    let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+    let mut config = make_test_resolved_config(work.path());
+    {
+        let c = Arc::get_mut(&mut config).unwrap();
+        c.write.dedup_enabled = false;
+        c.source.git_url = Some(format!("file://{}", bare.path().display()));
+        c.memory.enabled = true;
+    }
+    let canonical = work.path().canonicalize().unwrap();
+    let schema_cache: crate::schema::SharedSchemaCache = Arc::new(RwLock::new(Arc::new(
+        crate::schema::SchemaCache::build_with(
+            &canonical,
+            &config.frontmatter,
+            &config.indexing,
+            &crate::memory::builtin_scopes(&config.memory),
+        )
+        .unwrap(),
+    )));
+    let qdrant = Arc::new(
+        QdrantStore::new(&crate::config::ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test".into(),
+        })
+        .unwrap(),
+    );
+    let embed = Arc::new(EmbedClient::new(&crate::config::ResolvedEmbeddingConfig {
+        base_url: "http://localhost:8080/v1".into(),
+        model: "test".into(),
+        api_key: None,
+        vector_size: 768,
+        batch_size: 32,
+        request_timeout_secs: 60,
+        batch_concurrency: 4,
+        query_prefix: String::new(),
+        document_prefix: String::new(),
+    }));
+    let server = KbSearchServer::new(
+        embed,
+        qdrant,
+        "test".into(),
+        work.path().to_path_buf(),
+        &["**/*.md".to_string()],
+        Arc::new(RwLock::new(String::new())),
+        crate::config::shared_config(config),
+        schema_cache,
+        None,
+        Arc::new(crate::reindex::ReindexQueue::new()),
+        empty_test_description_overlay(),
+    )
+    .unwrap();
+    MemoryHarness {
+        _bare: bare,
+        work,
+        server,
+    }
+}

@@ -697,6 +697,7 @@ async fn validation_failure_carries_field_errors_in_data() {
         formatting: crate::config::FormattingConfig::off(),
         contradictions: crate::config::ContradictionsConfig::default(),
         contradictions_judge: None,
+        memory: Default::default(),
         provenance: Default::default(),
     });
 
@@ -966,6 +967,7 @@ async fn dedup_gate_disabled_via_config_does_not_embed() {
         formatting: crate::config::FormattingConfig::off(),
         contradictions: crate::config::ContradictionsConfig::default(),
         contradictions_judge: None,
+        memory: Default::default(),
         provenance: Default::default(),
     });
 

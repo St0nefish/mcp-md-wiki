@@ -46,6 +46,35 @@ pub const TOOL_NAMES: [&str; 7] = [
     "update_schema",
 ];
 
+/// The memory tool group's names (`memory.enabled`). Kept apart from [`TOOL_NAMES`]
+/// so a server without the group lists exactly the tools it always has: they are
+/// valid names in every tool list (`mcp.disabled_tools`, `mcp.enabled_tools`,
+/// `mcp.policy`), but only exist as tools while `memory.enabled` is on.
+pub const MEMORY_TOOL_NAMES: [&str; 6] = [
+    "memory_create",
+    "memory_search",
+    "memory_get",
+    "memory_update",
+    "memory_forget",
+    "memory_recall",
+];
+
+/// Every name a tool list may carry: [`TOOL_NAMES`] then [`MEMORY_TOOL_NAMES`].
+pub fn all_tool_names() -> impl Iterator<Item = &'static str> {
+    TOOL_NAMES.iter().chain(MEMORY_TOOL_NAMES.iter()).copied()
+}
+
+/// The tools a server actually has: [`TOOL_NAMES`], and [`MEMORY_TOOL_NAMES`] while
+/// `memory.enabled` is on.
+pub fn available_tool_names(memory_enabled: bool) -> impl Iterator<Item = &'static str> {
+    TOOL_NAMES.iter().copied().chain(
+        MEMORY_TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(move |_| memory_enabled),
+    )
+}
+
 /// Whether `tool` is enabled — i.e. not named in the live `mcp.disabled_tools`.
 /// Gates every server-instructions sentence that names a specific tool
 /// ([`SCHEMA_POINTER_SENTENCE`]), so instructions never point a caller at a
@@ -70,6 +99,12 @@ fn compiled_tool_base(tool: &str) -> Option<&'static str> {
         "delete_document" => Some(include_str!("../assets/mcp/tools/delete_document.md")),
         "get_schema" => Some(include_str!("../assets/mcp/tools/get_schema.md")),
         "update_schema" => Some(include_str!("../assets/mcp/tools/update_schema.md")),
+        "memory_create" => Some(include_str!("../assets/mcp/tools/memory_create.md")),
+        "memory_search" => Some(include_str!("../assets/mcp/tools/memory_search.md")),
+        "memory_get" => Some(include_str!("../assets/mcp/tools/memory_get.md")),
+        "memory_update" => Some(include_str!("../assets/mcp/tools/memory_update.md")),
+        "memory_forget" => Some(include_str!("../assets/mcp/tools/memory_forget.md")),
+        "memory_recall" => Some(include_str!("../assets/mcp/tools/memory_recall.md")),
         _ => None,
     }
 }
@@ -419,9 +454,8 @@ pub fn compose_tool_descriptions(
     phrase_effective: bool,
     effective_granularities: &[Granularity],
 ) -> HashMap<String, String> {
-    TOOL_NAMES
-        .iter()
-        .filter_map(|&tool| {
+    all_tool_names()
+        .filter_map(|tool| {
             let extension = load_tool_extension(extensions_dir, tool);
             compose_tool_description(
                 tool,
@@ -950,8 +984,8 @@ mod tests {
     #[test]
     fn compose_tool_descriptions_covers_every_tool() {
         let overlay = compose_tool_descriptions(None, false, &ALL);
-        assert_eq!(overlay.len(), TOOL_NAMES.len());
-        for tool in TOOL_NAMES {
+        assert_eq!(overlay.len(), all_tool_names().count());
+        for tool in all_tool_names() {
             assert!(
                 overlay.contains_key(tool),
                 "missing overlay entry for '{tool}'"

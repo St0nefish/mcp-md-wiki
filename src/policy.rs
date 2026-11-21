@@ -288,6 +288,39 @@ pub enum Reach {
 }
 
 impl Reach {
+    /// This reach confined to the directory `dir` (normalized, `""` for the root):
+    /// what a caller may reach that is also inside `dir`.
+    pub fn within(&self, dir: &str) -> Reach {
+        match self {
+            Reach::All => Reach::Prefixes(vec![dir.to_string()]),
+            Reach::Prefixes(prefixes) => {
+                let mut out: Vec<String> = Vec::new();
+                for p in prefixes {
+                    // Whichever is deeper is inside both.
+                    let inside = if prefix_covers(p, dir) {
+                        dir
+                    } else if prefix_covers(dir, p) {
+                        p
+                    } else {
+                        continue;
+                    };
+                    if !out.iter().any(|o| o == inside) {
+                        out.push(inside.to_string());
+                    }
+                }
+                Reach::Prefixes(out)
+            }
+        }
+    }
+
+    /// The directories of a restricted reach, `None` when it is everything.
+    pub fn dirs(&self) -> Option<Vec<String>> {
+        match self {
+            Reach::All => None,
+            Reach::Prefixes(dirs) => Some(dirs.clone()),
+        }
+    }
+
     /// Whether a document at `path` is within reach.
     pub fn covers(&self, path: &str) -> bool {
         match self {

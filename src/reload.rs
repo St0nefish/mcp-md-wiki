@@ -1470,6 +1470,51 @@ const DIFF_TABLE: &[DiffField] = &[
         }],
     },
     DiffField {
+        path: "memory.enabled",
+        get: |c| Some(d(&c.memory.enabled)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "memory.enabled",
+            note: "whether the memory tool group exists is fixed at startup (the tools, the built-in schema and the folders).",
+        }],
+    },
+    DiffField {
+        path: "memory.root",
+        get: |c| Some(d(&c.memory.root)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "memory.root",
+            note: "the memory root is baked into the built-in schema scope and the tool paths at startup.",
+        }],
+    },
+    DiffField {
+        path: "memory.default_area",
+        get: |c| Some(d(&c.memory.default_area)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "memory.default_area",
+            note: "read with the rest of the memory settings, which are fixed at startup.",
+        }],
+    },
+    DiffField {
+        path: "memory.default_status",
+        get: |c| Some(d(&c.memory.default_status)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "memory.default_status",
+            note: "read with the rest of the memory settings, which are fixed at startup.",
+        }],
+    },
+    DiffField {
+        path: "memory.duplicate_threshold",
+        get: |c| Some(d(&c.memory.duplicate_threshold)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "memory.duplicate_threshold",
+            note: "read with the rest of the memory settings, which are fixed at startup.",
+        }],
+    },
+    DiffField {
         path: "contradictions.top_k",
         get: |c| Some(d(&c.contradictions.top_k)),
         consumers: &[ConsumerEntry {

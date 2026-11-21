@@ -898,7 +898,7 @@ fn remove_by_dotpath(frontmatter: &mut HashMap<String, serde_json::Value>, path:
 /// order (or comments) the document's own frontmatter happened to have,
 /// exactly the same trade-off this codebase already made for
 /// schema file when `update_schema` rewrites one.
-fn render_frontmatter_block(
+pub(crate) fn render_frontmatter_block(
     frontmatter: &HashMap<String, serde_json::Value>,
     newline: &str,
 ) -> Result<String, String> {

@@ -3,6 +3,7 @@
 // `crate::mcp`'s own items.
 mod access;
 mod get_document;
+mod memory;
 mod overlay;
 mod payload;
 mod schema;

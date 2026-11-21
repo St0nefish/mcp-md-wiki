@@ -15,6 +15,7 @@ use rmcp::{
 use tracing::{error, warn};
 
 mod get_document;
+mod memory;
 mod schema_tools;
 mod search;
 mod search_ctx;
@@ -217,6 +218,15 @@ pub struct KbSearchServer {
     /// /admin/reload` is observed by the very next call — see that method's doc
     /// comment for exactly which settings this makes dynamic.
     config: crate::config::SharedConfig,
+    /// Whether the memory tool group exists in this process: `memory.enabled` as it
+    /// was at startup. The group's built-in schema and folders are fixed when the
+    /// server starts, so a reload that flips the setting is a restart-required
+    /// change, and the tools follow the startup value, not the live one.
+    memory_enabled: bool,
+    /// Test seam: the neighbours the next duplicate check sees instead of asking the
+    /// vector store, taken (used once) by `memory_duplicates`.
+    #[cfg(test)]
+    test_duplicate_hits: Arc<std::sync::Mutex<Option<Vec<crate::similarity::Neighbour>>>>,
     /// The shared, cached schema tree — built once at server startup and kept
     /// current by the reindex worker (which rebuilds it before indexing any
     /// dirty schema file) and by `update_schema`'s own synchronous rebuild.
@@ -330,6 +340,7 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
         formatting: crate::config::FormattingConfig::off(),
         contradictions: crate::config::ContradictionsConfig::default(),
         contradictions_judge: None,
+        memory: Default::default(),
         provenance: Default::default(),
     })
 }
@@ -370,6 +381,7 @@ impl KbSearchServer {
         let canonical_data_path = data_path.canonicalize().with_context(|| {
             format!("Failed to canonicalize data path: {}", data_path.display())
         })?;
+        let memory_enabled = crate::config::load_shared_config(&config).memory.enabled;
         Ok(Self {
             embed_client,
             qdrant,
@@ -382,6 +394,9 @@ impl KbSearchServer {
             include_patterns: Arc::new(build_include_globset(include_patterns)),
             instructions,
             config,
+            memory_enabled,
+            #[cfg(test)]
+            test_duplicate_hits: Default::default(),
             schema_cache,
             rerank_client,
             state_db: Arc::new(tokio::sync::OnceCell::new()),
@@ -412,6 +427,12 @@ impl KbSearchServer {
         let mut router = Self::tool_router();
         for name in &self.config().mcp.disabled_tools {
             router.disable_route(name.clone());
+        }
+        // The memory tools exist only while the group is on (see `memory_enabled`).
+        if !self.memory_enabled {
+            for name in crate::descriptions::MEMORY_TOOL_NAMES {
+                router.disable_route(name.to_string());
+            }
         }
         router
     }
@@ -603,6 +624,7 @@ impl KbSearchServer {
             + Self::get_document_router()
             + Self::write_router()
             + Self::schema_router()
+            + Self::memory_router()
     }
 }
 
@@ -617,7 +639,19 @@ impl ServerHandler for KbSearchServer {
                 poisoned.into_inner()
             })
             .clone();
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        if self.memory_enabled {
+            // Clients check the contract version before they use the memory tools
+            // (docs/memory-contract.md).
+            capabilities.experimental = Some(std::collections::BTreeMap::from([(
+                "mcp-md-wiki/memory".to_string(),
+                serde_json::Map::from_iter([(
+                    "contract_version".to_string(),
+                    serde_json::json!(crate::memory::logic::CONTRACT_VERSION),
+                )]),
+            )]));
+        }
+        ServerConfig::new(capabilities)
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),

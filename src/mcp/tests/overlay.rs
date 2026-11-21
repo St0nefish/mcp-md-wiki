@@ -240,7 +240,8 @@ fn list_tools_returns_the_overlay_composed_descriptions() {
         crate::descriptions::compose_tool_descriptions(None, false, &effective_granularities);
     let server = make_overlay_test_server(overlay.clone());
 
-    let tools: Vec<Tool> = KbSearchServer::tool_router()
+    let tools: Vec<Tool> = server
+        .enabled_tool_router()
         .list_all()
         .into_iter()
         .map(|tool| server.overlay_description(tool))
@@ -330,10 +331,12 @@ fn enabled_tool_router_omits_every_disabled_name_from_list_all() {
 #[test]
 fn enabled_tool_router_with_no_disabled_tools_matches_the_bare_tool_router() {
     let server = make_test_server_with_disabled_tools(Vec::new());
+    // The memory tools are in the bare router but exist only while the group is on.
     let bare: Vec<String> = KbSearchServer::tool_router()
         .list_all()
         .into_iter()
         .map(|t| t.name.to_string())
+        .filter(|name| !crate::descriptions::MEMORY_TOOL_NAMES.contains(&name.as_str()))
         .collect();
     let enabled: Vec<String> = server
         .enabled_tool_router()
@@ -771,7 +774,8 @@ fn list_tools_schemas_are_self_contained_for_llama_cpp_backed_clients() {
         // dropping the `self_contained` step there fails this test;
         // `get_tool_input_schema_matches_the_list_tools_overlay_path`
         // pins `list_tools` to the same chain.
-        let tools: Vec<Tool> = KbSearchServer::tool_router()
+        let tools: Vec<Tool> = server
+            .enabled_tool_router()
             .list_all()
             .into_iter()
             .map(|tool| {

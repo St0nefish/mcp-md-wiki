@@ -3254,7 +3254,7 @@ async fn discover_relative(config: &ResolvedConfig) -> Result<(PathBuf, Vec<Path
 /// worker classifies the failure as permanent (`reindex::is_permanent_failure`) —
 /// no retry can fix a file on disk, and the fix itself queues a full reconcile.
 fn build_run_schemas(data_path: &Path, config: &ResolvedConfig) -> Result<SchemaCache> {
-    SchemaCache::build(data_path, &config.frontmatter, &config.indexing).map_err(|e| {
+    SchemaCache::build_for_config(data_path, config).map_err(|e| {
         anyhow::Error::new(e).context("Refusing to index while a schema file is invalid")
     })
 }
@@ -4548,6 +4548,7 @@ mod tests {
             formatting: crate::config::FormattingConfig::off(),
             contradictions: Default::default(),
             contradictions_judge: None,
+            memory: Default::default(),
             provenance: Default::default(),
         }
     }

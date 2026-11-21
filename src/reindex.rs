@@ -443,10 +443,8 @@ fn schema_rebuild_runner(
 ) -> RebuildFuture {
     Box::pin(async move {
         let data_path = config.canonical_data_path();
-        let frontmatter = config.frontmatter.clone();
-        let indexing = config.indexing.clone();
         match tokio::task::spawn_blocking(move || {
-            crate::schema::SchemaCache::build(&data_path, &frontmatter, &indexing)
+            crate::schema::SchemaCache::build_for_config(&data_path, &config)
         })
         .await
         {
