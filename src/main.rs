@@ -21,6 +21,7 @@ mod retrieval;
 mod schema;
 mod secrets;
 mod server;
+mod similarity;
 mod sparse;
 mod state;
 mod status;

@@ -416,7 +416,7 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::ReindexScheduled,
             setting: "chunking.prepend_description",
             note: "changes the text every chunk embeds (and the create_document dedup query \
-                   text — write.rs build_dedup_query); affected documents are re-chunked and \
+                   text — similarity.rs build_dedup_query); affected documents are re-chunked and \
                    re-embedded automatically by the full reconcile this reload queued.",
         }],
     },

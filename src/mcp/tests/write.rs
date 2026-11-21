@@ -7,15 +7,13 @@ use crate::mcp::schema_tools::*;
 use crate::mcp::test_support::*;
 use crate::mcp::write_document::*;
 use crate::mcp::*;
+use crate::similarity::{DEDUP_QUERY_CHAR_LIMIT, build_dedup_query, dedup_search_opts};
 use crate::write::FrontmatterEdit;
 use crate::write::{
-    self, DirectoryMoveError, WriteError, WriteSuccess, build_commit_message, build_dedup_query,
-    dedup_search_opts, dedup_verdict, render_unified_diff,
+    self, DirectoryMoveError, WriteError, WriteSuccess, build_commit_message, dedup_verdict,
+    render_unified_diff,
 };
 use std::path::Path;
-/// Mirrors `write::DEDUP_QUERY_CHAR_LIMIT` (private there), so the ported
-/// `build_dedup_query_*` tests below keep compiling unchanged.
-const DEDUP_QUERY_CHAR_LIMIT: usize = 2000;
 
 // --- list_documents filter parsing ---
 

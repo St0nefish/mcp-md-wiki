@@ -943,7 +943,7 @@ pub struct WriteConfig {
     ///
     /// Always compared against a *dense* cosine score: the dedup search is
     /// pinned to dense-only with the reranker detached (see
-    /// `mcp::dedup_search_opts`), so this value is independent of
+    /// `similarity::dedup_search_opts_with_limit`), so this value is independent of
     /// `search.hybrid` — whose RRF scores top out near 0.03 — and of
     /// `reranking.enabled`, whose relevance scores are not similarities.
     #[serde(default = "default_dedup_threshold")]

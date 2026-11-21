@@ -29,19 +29,15 @@ use crate::config::ValidationConfig;
 use crate::embed::QueryEmbedder;
 use crate::git;
 use crate::qdrant::RetrievalStore;
-use crate::retrieval::{RetrievalDeps, SearchFilters};
+use crate::retrieval::RetrievalDeps;
 use crate::schema::{self, SharedSchemaCache};
+use crate::similarity::build_dedup_query;
 use crate::state::StateDb;
 use crate::validate::{self, ValidationResult};
 
 // ---------------------------------------------------------------------------
 // Dedup gate (create-path near-duplicate refusal)
 // ---------------------------------------------------------------------------
-
-/// Maximum number of characters from the new document's content used to build
-/// the dedup query text. Keeps the embedding request within typical token limits
-/// (most embedding models cap at ~512–8192 tokens; 2000 chars ≈ 400–500 tokens).
-const DEDUP_QUERY_CHAR_LIMIT: usize = 2000;
 
 /// A near-duplicate found during dedup gate evaluation.
 #[derive(Debug, Clone)]
@@ -63,42 +59,6 @@ pub fn dedup_verdict(top: Option<(String, f32)>, threshold: f32) -> Option<Dupli
         }),
         _ => None,
     }
-}
-
-/// Build the dedup query text on the same textual basis the indexer uses, then
-/// truncate it to `DEDUP_QUERY_CHAR_LIMIT`.
-///
-/// This must stay aligned with `chunk::chunk_markdown`: every indexed chunk is
-/// prefixed with its document's own `description` when
-/// `chunking.prepend_description` is set, so a dedup query built without that
-/// prefix would be compared against a different textual basis than the
-/// candidates it is scored against.
-///
-/// It deliberately does NOT reproduce `chunking.prepend_heading_path`'s
-/// breadcrumb, and that is safe for a non-obvious structural reason worth
-/// stating: a chunk's breadcrumb is seeded from the section that starts it and
-/// merging further pieces in can only narrow it (to a common ancestor, see
-/// `chunk::chunk_markdown`). A document's FIRST chunk is always seeded from its
-/// first section — the preamble, which has no breadcrumb, or the first heading,
-/// which has no ancestors because no heading precedes it — so chunk 0 never
-/// carries a breadcrumb, whatever the document's heading structure. Since a create-path dedup query is doc-start text scored
-/// against the corpus, matching chunk 0's basis is what matters.
-///
-/// If a future chunking change breaks that invariant — anything that can give
-/// a document's first chunk a prefix this function does not build — the dedup
-/// gate silently starts comparing unlike text and lets near-duplicates through
-/// with no error. `mcp::tests::write::build_dedup_query_matches_chunk_prepend_format`
-/// is the pin; keep it honest rather than adjusting it to match a regression.
-pub(crate) fn build_dedup_query(
-    body: &str,
-    description: Option<&str>,
-    prepend_description: bool,
-) -> String {
-    let assembled = match (prepend_description, description) {
-        (true, Some(desc)) => format!("{}\n\n{}", desc, body),
-        _ => body.to_string(),
-    };
-    assembled.chars().take(DEDUP_QUERY_CHAR_LIMIT).collect()
 }
 
 /// The dedup gate's effective `(enabled, threshold)` for a document governed by
@@ -137,44 +97,6 @@ pub(crate) fn effective_related<E: QueryEmbedder, Q: RetrievalStore>(
         schema.related_limit.unwrap_or(deps.related_limit),
         schema.related_min_score.unwrap_or(deps.related_min_score),
     )
-}
-
-/// Search options for the dedup gate.
-///
-/// Deliberately pinned to dense-only rather than inheriting `search.hybrid`, so
-/// the returned score is a cosine similarity comparable to
-/// `write.dedup_threshold`. Hybrid RRF scores top out around 0.03 — against a
-/// cosine threshold like the 0.80 default the gate could never fire — and a
-/// cross-encoder relevance score is not a similarity at all, so reranking is
-/// also kept out of this path (see the `reranker: None` at the call site).
-#[cfg(test)]
-pub(crate) fn dedup_search_opts() -> crate::retrieval::SearchOptions {
-    dedup_search_opts_with_limit(1)
-}
-
-/// [`dedup_search_opts`] asking for the `limit` nearest chunks, one per document
-/// when more than one is wanted, so the extras are distinct neighbours (#356).
-/// The top hit is the same chunk `dedup_search_opts` returns.
-pub(crate) fn dedup_search_opts_with_limit(limit: usize) -> crate::retrieval::SearchOptions {
-    crate::retrieval::SearchOptions {
-        limit: limit.max(1) as u64,
-        min_score: None,
-        hybrid: false,
-        // Unused in the dense-only path, which performs no RRF fusion.
-        rrf_candidates: 0,
-        // Same reasoning as `hybrid` above: phrase matching adds a third fused
-        // arm, which this dense-only comparison has no use for.
-        phrase: false,
-        explain: false,
-        modified_after: None,
-        modified_before: None,
-        path_filter: None,
-        rerank_candidate_limit: None,
-        // The dedup gate wants the single closest existing chunk, full stop — not
-        // a diversified page of results (limit: 1 above makes a per-document cap
-        // moot anyway, but this keeps intent explicit rather than accidental).
-        diversity_max_per_document: (limit > 1).then_some(1),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1700,16 +1622,6 @@ async fn validate_document<E: QueryEmbedder, Q: RetrievalStore>(
     Ok(validated)
 }
 
-/// Adapter that routes `embed_query` to the wrapped embedder's `embed_document`,
-/// so the dedup search embeds like with like against the indexed chunks.
-struct DocumentSideEmbedder<'a, E: QueryEmbedder>(&'a E);
-
-impl<E: QueryEmbedder> QueryEmbedder for DocumentSideEmbedder<'_, E> {
-    async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>> {
-        self.0.embed_document(q).await
-    }
-}
-
 /// The create-path dedup gate: refuse when an existing document is a near
 /// duplicate of `validated`. Runs before the lock — it embeds and queries
 /// Qdrant, which can take a while — and only for a create, whose content is fixed.
@@ -1747,41 +1659,19 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
         );
         return Ok(Vec::new());
     }
-    // Detach the reranker: `dedup_threshold` is a cosine similarity, and a
-    // cross-encoder relevance score is not comparable to it.
-    // Embed on the document side: the text is compared against indexed chunks, so it
-    // takes `embedding.document_prefix`, not the query prefix.
-    let document_side = DocumentSideEmbedder(deps.retrieval.embed_client);
-    let dedup_deps = RetrievalDeps {
-        embed_client: &document_side,
-        qdrant: deps.retrieval.qdrant,
-        collection: deps.retrieval.collection,
-        data_path: deps.retrieval.data_path,
-        include_patterns: deps.retrieval.include_patterns,
-        reranker: None,
-    };
-    match crate::retrieval::search(
-        &dedup_deps,
+    // The search is dense-only, reranker-detached and document-side embedded, so
+    // its scores are cosines comparable to `dedup_threshold` (see `similarity`).
+    match crate::similarity::find_near_duplicates(
+        &deps.retrieval,
+        deps.canonical_data_path,
         &query_text,
-        &SearchFilters::default(),
-        &dedup_search_opts_with_limit(related_limit),
+        None,
+        related_limit,
     )
     .await
     {
-        Ok(results) => {
-            let hits: Vec<(String, f32)> = results
-                .into_iter()
-                .map(|r| {
-                    let path = r
-                        .payload
-                        .get("file_path")
-                        .and_then(|v| v.as_str())
-                        .map(|p| crate::retrieval::relative_to_data(p, deps.canonical_data_path))
-                        .unwrap_or_default();
-                    (path, r.score)
-                })
-                .collect();
-            let top = hits.first().cloned();
+        Ok(hits) => {
+            let top = hits.first().map(|n| (n.path.clone(), n.score));
             if let Some((path, score)) = top.as_ref() {
                 tracing::debug!(
                     "Dedup gate for '{}': nearest '{}' at dense cosine {:.4} (threshold {:.2})",
@@ -1799,7 +1689,7 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
                 });
             }
             return Ok(related_from_hits(
-                hits,
+                hits.into_iter().map(|n| (n.path, n.score)).collect(),
                 rel_path,
                 related_min_score,
                 related_limit,
@@ -1819,28 +1709,18 @@ async fn dedup_gate<E: QueryEmbedder, Q: RetrievalStore>(
 /// scoring at least `min_score`, never `own_path`, each document once, nearest
 /// first, at most `limit` (#356).
 fn related_from_hits(
-    mut hits: Vec<(String, f32)>,
+    hits: Vec<(String, f32)>,
     own_path: &str,
     min_score: f32,
     limit: usize,
 ) -> Vec<RelatedDocument> {
-    let own = crate::retrieval::kb_root_relative(own_path);
-    hits.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let mut out: Vec<RelatedDocument> = Vec::new();
-    for (path, score) in hits {
-        if out.len() >= limit {
-            break;
-        }
-        if path.is_empty()
-            || score < min_score
-            || crate::retrieval::kb_root_relative(&path) == own
-            || out.iter().any(|r| r.path == path)
-        {
-            continue;
-        }
-        out.push(RelatedDocument { path, score });
-    }
-    out
+    crate::similarity::rank_neighbours(hits, own_path, min_score, limit)
+        .into_iter()
+        .map(|n| RelatedDocument {
+            path: n.path,
+            score: n.score,
+        })
+        .collect()
 }
 
 /// Read a document, `None` when it does not exist.
@@ -5191,6 +5071,10 @@ mod tests {
     use crate::config::ResolvedConfig;
     use crate::embed::EmbedClient;
     use crate::qdrant::QdrantStore;
+    use crate::similarity::{
+        DEDUP_QUERY_CHAR_LIMIT, DocumentSideEmbedder, dedup_search_opts,
+        dedup_search_opts_with_limit,
+    };
     use std::sync::Arc;
 
     // -----------------------------------------------------------------------

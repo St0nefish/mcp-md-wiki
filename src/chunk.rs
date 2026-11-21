@@ -222,7 +222,7 @@ impl RawChunk {
 /// breadcrumb followed by the `"\n\n"` separator.
 ///
 /// The truncation is a hard character-count cut, deliberately matching
-/// `write::build_dedup_query`'s `DEDUP_QUERY_CHAR_LIMIT` truncation style
+/// `similarity::build_dedup_query`'s `DEDUP_QUERY_CHAR_LIMIT` truncation style
 /// (`.chars().take(n).collect()`, no ellipsis) rather than word-wrapping —
 /// this is a budget backstop for a pathological document, not something
 /// expected to fire in normal use, so simplicity wins over a prettier cut.
