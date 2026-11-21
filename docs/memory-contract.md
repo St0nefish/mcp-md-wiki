@@ -5,7 +5,9 @@ version as `memory_contract_version` in `get_schema` results and under
 `capabilities.experimental["mcp-md-wiki/memory"].contract_version` in the
 `initialize` response; a client should check it equals the version it was written
 for and stay out of the way (no recall, no writes) when it does not. The number
-changes only when a parameter or result field a client uses changes meaning.
+changes only when a parameter or result field a client uses changes meaning. The
+plugins in `clients/` do not perform this check yet (they fail open on an unexpected
+result instead), so bump the version only together with an update to them.
 
 The tools exist only while `memory.enabled` is on. Every result is one JSON object
 (the MCP `structuredContent`); errors are plain MCP errors with a short message.

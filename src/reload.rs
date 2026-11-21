@@ -1659,6 +1659,10 @@ pub fn reload_config(
     // yet sending; the change is reported `restart_required` and lands on restart.
     new.embedding.query_prefix = old.embedding.query_prefix.clone();
     new.embedding.document_prefix = old.embedding.document_prefix.clone();
+    // Likewise the memory settings: the tools, the built-in schema scope and the
+    // policies' prefixes were all fixed at startup, and every schema rebuild reads this
+    // section, so a live change would move the schema out from under the running tools.
+    new.memory = old.memory.clone();
     crate::config::store_shared_config(shared, new);
     queue.mark_full();
     Ok(report)
@@ -1861,6 +1865,37 @@ mod tests {
         let live = crate::config::load_shared_config(&shared);
         assert_eq!(live.embedding.query_prefix, "");
         assert_eq!(live.embedding.document_prefix, "");
+
+        clear_required_env();
+    }
+
+    #[test]
+    fn a_memory_reload_is_restart_required_and_not_applied_live() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "memory:\n  enabled: true\n  root: memory\n");
+        let shared =
+            crate::config::shared_config(std::sync::Arc::new(Config::load(&path).unwrap()));
+
+        write_config(
+            tmp.path(),
+            "memory:\n  enabled: false\n  root: elsewhere\n  default_status: confirmed\n",
+        );
+        let queue = crate::reindex::ReindexQueue::new();
+        let report = reload_config(&path, &shared, &queue).unwrap();
+        let names: Vec<&str> = report
+            .restart_required
+            .iter()
+            .map(|c| c.setting.as_str())
+            .collect();
+        for key in ["memory.enabled", "memory.root", "memory.default_status"] {
+            assert!(names.contains(&key), "{key}: {names:?}");
+        }
+        let live = crate::config::load_shared_config(&shared);
+        assert!(live.memory.enabled);
+        assert_eq!(live.memory.root, "memory");
 
         clear_required_env();
     }

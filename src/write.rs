@@ -4171,6 +4171,14 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     let walk = crate::schema::SchemaWalkFilter::from_config(deps.indexing);
     let mut governed_dirs: HashSet<&Path> = HashSet::new();
     for (old_rel, new_rel, raw) in &schema_contents {
+        // A schema file may not land where the binary supplies the schema (the memory
+        // area): the next rebuild would refuse it and block indexing.
+        if schemas.is_builtin_scope(Path::new(new_rel).parent().unwrap_or(Path::new(""))) {
+            return Err(DirectoryMoveError::InvalidSchemaInSource {
+                path: old_rel.clone(),
+                reason: crate::schema::BUILTIN_SCOPE_REASON.to_string(),
+            });
+        }
         if !walk.governs(Path::new(new_rel)) && !walk.governs(Path::new(old_rel)) {
             continue;
         }
@@ -11506,6 +11514,58 @@ mod tests {
         assert_eq!(success.moved.len(), 2, "the document and its schema file");
         assert!(work.path().join("dest8/sub/a.md").exists());
         assert_eq!(git_status(&work), "");
+    }
+
+    /// A schema file may not be moved into the memory area, whose schema is built
+    /// into the binary: the next rebuild would refuse it and block indexing.
+    #[tokio::test]
+    async fn move_directory_refuses_a_schema_file_into_the_builtin_memory_area() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let schema_rel = format!("proj/{}", crate::schema::SCHEMA_FILE_NAME);
+        std::fs::create_dir_all(work.path().join("proj")).unwrap();
+        std::fs::write(
+            work.path().join(&schema_rel),
+            "fields:\n  status:\n    required: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.path().join("proj/a.md"),
+            "---\nstatus: draft\n---\n# A",
+        )
+        .unwrap();
+        git_commit_paths(&work, &[&schema_rel, "proj/a.md"], "add proj");
+
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
+        let harness = Harness::new(&work, config.clone());
+        let memory = crate::config::MemoryConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let cache = crate::schema::SchemaCache::build_with(
+            &work.path().canonicalize().unwrap(),
+            &config.frontmatter,
+            &config.indexing,
+            &crate::memory::builtin_scopes(&memory),
+        )
+        .unwrap();
+        *harness.schema_cache.write().unwrap() = Arc::new(cache);
+
+        let err = move_directory(&harness.deps(), "proj", "memory/proj", None)
+            .await
+            .expect_err("a schema file into the built-in area must be refused");
+        match err {
+            DirectoryMoveError::InvalidSchemaInSource { reason, .. } => {
+                assert_eq!(reason, crate::schema::BUILTIN_SCOPE_REASON);
+            }
+            other => panic!("expected InvalidSchemaInSource, got {other:?}"),
+        }
+        assert!(!work.path().join("memory").exists(), "nothing moved");
+        // Anywhere else the same move is fine.
+        move_directory(&harness.deps(), "proj", "elsewhere", None)
+            .await
+            .expect("outside the memory area the schema moves");
     }
 
     /// A legacy-named schema moves under its own name; a source directory holding

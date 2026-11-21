@@ -2923,6 +2923,9 @@ pub struct SchemaCache {
     /// reindex worker's and `update_schema`'s) can finish in either order, and
     /// the one that read the tree first must not win.
     generation: u64,
+    /// Directories whose schema is built into the binary (the memory area), so a
+    /// schema file may not be written, or moved, at or under one.
+    builtin_dirs: Vec<PathBuf>,
 }
 
 /// One schema file that [`SchemaCache::build`] refused, and why.
@@ -3440,6 +3443,7 @@ impl SchemaCache {
             root: config_root,
             root_path: data_path.to_path_buf(),
             generation,
+            builtin_dirs: builtin.iter().map(|(dir, _)| dir.clone()).collect(),
         })
     }
 
@@ -3505,7 +3509,14 @@ impl SchemaCache {
             root: self.root.clone(),
             root_path: self.root_path.clone(),
             generation: self.generation,
+            builtin_dirs: self.builtin_dirs.clone(),
         }
+    }
+
+    /// Whether `rel_dir` (KB-relative) is at or under a directory whose schema is
+    /// built into the binary.
+    pub fn is_builtin_scope(&self, rel_dir: &Path) -> bool {
+        self.builtin_dirs.iter().any(|d| rel_dir.starts_with(d))
     }
 
     /// The raw, unmerged schema file governing `rel_dir`, read from disk, and the
@@ -3644,6 +3655,7 @@ impl SchemaCache {
             root: ResolvedSchema::from_config(fallback),
             root_path: PathBuf::new(),
             generation: 0,
+            builtin_dirs: Vec::new(),
         }
     }
 

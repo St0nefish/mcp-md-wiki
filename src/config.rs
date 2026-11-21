@@ -2691,14 +2691,16 @@ impl Config {
             validate_tool_name_list(&self.mcp.disabled_tools, "mcp.disabled_tools")?;
             // The memory tools count only when the group is on: with it off they are
             // never exposed, so disabling the core tools would leave nothing.
-            let every_core_disabled = crate::descriptions::TOOL_NAMES
+            let available: Vec<&str> =
+                crate::descriptions::available_tool_names(self.memory.enabled).collect();
+            if available
                 .iter()
-                .all(|t| self.mcp.disabled_tools.iter().any(|d| d == t));
-            if every_core_disabled && !self.memory.enabled {
+                .all(|t| self.mcp.disabled_tools.iter().any(|d| d == t))
+            {
                 anyhow::bail!(
                     "mcp.disabled_tools disables every tool ({}) — the server would have no \
                      usable MCP surface at all",
-                    crate::descriptions::TOOL_NAMES.join(", ")
+                    available.join(", ")
                 );
             }
             if let Some(enabled) = &self.mcp.enabled_tools {
@@ -4363,6 +4365,22 @@ mcp:
         assert_eq!(on.memory.default_area, "general");
         assert_eq!(on.memory.default_status, MemoryDefaultStatus::Proposed);
         assert_eq!(on.memory.duplicate_threshold, 0.85);
+        clear_required_env();
+    }
+
+    #[test]
+    fn disabling_every_tool_that_exists_is_refused_with_memory_on_too() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let all = crate::descriptions::all_tool_names()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let e = Config::from_str(&format!(
+            "memory:\n  enabled: true\nmcp:\n  disabled_tools: [{all}]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("disables every tool"), "{e}");
         clear_required_env();
     }
 
