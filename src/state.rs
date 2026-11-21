@@ -2244,13 +2244,13 @@ impl StateDb {
         dir_prefix: Option<&str>,
         limit: i64,
     ) -> Result<Vec<(String, i64)>> {
-        let pattern = dir_prefix.map(escape_like_dir_prefix);
+        let dir = dir_prefix.map(|d| d.to_string());
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT field, COUNT(DISTINCT file_path) AS n FROM document_fields \
-             WHERE (?1 IS NULL OR file_path LIKE ?1 ESCAPE '\\') \
+             WHERE (?1 IS NULL OR substr(file_path, 1, length(?1) + 1) = ?1 || '/') \
              GROUP BY field ORDER BY n DESC, field ASC LIMIT ?2",
         )
-        .bind(pattern)
+        .bind(dir)
         .bind(limit.max(0))
         .fetch_all(&self.pool)
         .await?;
@@ -2265,17 +2265,18 @@ impl StateDb {
         dir_prefix: Option<&str>,
         limit: i64,
     ) -> Result<Vec<(String, i64)>> {
-        let pattern = dir_prefix.map(escape_like_dir_prefix);
+        let dir = dir_prefix.map(|d| d.to_string());
         // SQLite reads a negative LIMIT as "no limit", so a caller passing one through
         // from arithmetic would silently get the whole vocabulary instead of a page.
         let limit = limit.max(0);
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT value_text, COUNT(DISTINCT file_path) AS n FROM document_fields \
-             WHERE field = ?1 AND (?2 IS NULL OR file_path LIKE ?2 ESCAPE '\\') \
+             WHERE field = ?1 \
+               AND (?2 IS NULL OR substr(file_path, 1, length(?2) + 1) = ?2 || '/') \
              GROUP BY value_text ORDER BY n DESC, value_text ASC LIMIT ?3",
         )
         .bind(field)
-        .bind(pattern)
+        .bind(dir)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -2424,15 +2425,6 @@ fn escape_like_metachars(raw: &str) -> String {
         }
     }
     out
-}
-
-/// Escape a KB-relative directory (no trailing slash) into the `LIKE ... ESCAPE '\'`
-/// pattern for every path beneath it, as `fields_in_use` and `top_values` filter on.
-///
-/// The `/%` is added after escaping, so it is the only wildcard and is never
-/// caller-controlled — the same rule [`escape_like_substring`] follows.
-fn escape_like_dir_prefix(dir: &str) -> String {
-    format!("{}/%", escape_like_metachars(dir))
 }
 
 /// Escape a caller-supplied path fragment for a *substring* `LIKE ... ESCAPE '\'`.
@@ -2973,6 +2965,37 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = StateDb::new(&path).await.unwrap();
         (db, dir)
+    }
+
+    #[tokio::test]
+    async fn usage_counts_under_a_directory_match_it_exactly() {
+        let (db, _dir) = test_db().await;
+        for (path, tag) in [
+            ("notes/a.md", "mine"),
+            ("Notes/b.md", "other-case"),
+            ("notes-old/c.md", "sibling"),
+            ("n_tes/d.md", "wildcard"),
+        ] {
+            let fm = HashMap::from([("tag".to_string(), serde_json::json!(tag))]);
+            db.upsert_document_metadata(path, &fm, 0, "h", 1)
+                .await
+                .unwrap();
+        }
+        let values: Vec<String> = db
+            .top_values("tag", Some("notes"), 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
+        assert_eq!(values, ["mine"], "only notes/…, exactly");
+        let fields = db.fields_in_use(Some("notes"), 10).await.unwrap();
+        assert_eq!(fields, [("tag".to_string(), 1)]);
+        // A `_` in the scope is not a wildcard.
+        let wild = db.top_values("tag", Some("n_tes"), 10).await.unwrap();
+        assert_eq!(wild, [("wildcard".to_string(), 1)]);
+        // No scope: everything.
+        assert_eq!(db.top_values("tag", None, 10).await.unwrap().len(), 4);
     }
 
     #[tokio::test]

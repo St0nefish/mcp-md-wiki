@@ -58,9 +58,16 @@ Rules worth knowing:
   what the caller can read. Write tools check every path they touch, including a move's
   destination and archive targets. Fuzzy path resolution is refused for a caller that
   writes.
+- **`tools` binds the web API too.** Each `/api/*` route is checked against the same
+  allowlist as the MCP tool it mirrors (`search` for search, enumerate and the graph;
+  `get_document` for documents and history; `get_schema`; `changes_since`;
+  `write_document` / `delete_document` for `POST` / `DELETE /api/doc`), so a token limited
+  to `memory_recall` cannot write through the browser routes.
 - **`/status*`, `/metrics` and `/admin/*`** need a policy with `admin: true`.
 - Config load refuses a policy together with `ui.api_auth: false` or
   `allow_unauthenticated`, since the web routes would have no caller to scope.
+- `memory.enabled` requires `document` in `search.granularities`; the memory tools rank
+  whole documents.
 - Live reload covers `mcp.policy` and `mcp.principals`; `mcp.tokens` needs a restart.
 - OAuth callers are mapped with `mcp.principals` (first match wins, on `scope`,
   `client_id` or a `claim`). `mcp:write` is still required for the write tools.

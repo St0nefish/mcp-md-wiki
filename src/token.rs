@@ -93,7 +93,9 @@ pub fn mint(
             policy: policy.to_string(),
         }],
         &[],
-        &crate::descriptions::TOOL_NAMES,
+        // Every tool a policy may name, the memory tools included: a configured policy
+        // that grants `memory_create` must still compile here.
+        &crate::descriptions::all_tool_names().collect::<Vec<_>>(),
         false,
     )
     .context("not a usable token")?;
@@ -169,6 +171,21 @@ mod tests {
         assert!(mint("bad name", "memory", &fresh, &policies()).is_err());
         assert!(mint("default", "memory", &fresh, &policies()).is_err());
         assert!(!fresh.exists());
+    }
+
+    #[test]
+    fn mint_accepts_a_policy_that_grants_the_memory_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("hermes.token");
+        let policies = BTreeMap::from([(
+            "memory".to_string(),
+            PolicyConfig {
+                tools: vec!["memory_create".into(), "memory_recall".into()],
+                ..Default::default()
+            },
+        )]);
+        mint("hermes", "memory", &out, &policies).unwrap();
+        assert!(out.exists());
     }
 
     #[test]

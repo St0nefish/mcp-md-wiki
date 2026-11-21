@@ -260,7 +260,7 @@ impl KbSearchServer {
             return Err(McpError::invalid_params("tool not found".to_string(), None));
         }
         let config = self.config();
-        let root = memory::root_dir(&config.memory);
+        let root = memory::root_dir(&self.memory_cfg);
         Ok((config, root))
     }
 
@@ -396,7 +396,7 @@ impl KbSearchServer {
         let mut out = Vec::new();
         for hit in hits
             .into_iter()
-            .filter(|h| h.score >= config.memory.duplicate_threshold)
+            .filter(|h| h.score >= self.memory_cfg.duplicate_threshold)
         {
             let fm = match db {
                 Some(db) => db.document_frontmatter(&hit.path).await.ok().flatten(),
@@ -444,7 +444,7 @@ impl KbSearchServer {
             .as_deref()
             .map(str::trim)
             .filter(|a| !a.is_empty())
-            .unwrap_or(&config.memory.default_area)
+            .unwrap_or(&self.memory_cfg.default_area)
             .to_string();
         if !crate::config::valid_memory_area(&area) {
             return Err(invalid("area is not a valid folder name"));
@@ -515,7 +515,7 @@ impl KbSearchServer {
             tags: &tags,
             source_client: principal.id(),
             source_url: p.source_url.as_deref(),
-            status: config.memory.default_status.as_str(),
+            status: self.memory_cfg.default_status.as_str(),
             supersedes: replaces.as_ref().map(Found::id),
             now: &now,
         })
@@ -582,7 +582,7 @@ impl KbSearchServer {
             "created": true,
             "id": id,
             "path": path,
-            "status": config.memory.default_status.as_str(),
+            "status": self.memory_cfg.default_status.as_str(),
         });
         if let Some(old) = &replaces {
             result["superseded"] = json!(old.id());
@@ -630,15 +630,19 @@ impl KbSearchServer {
             .search(Parameters(SearchParams {
                 query: Some(query.to_string()),
                 filters: Some(SearchFiltersInput(filters)),
-                path_prefix: Some(prefix),
+                path_prefix: Some(prefix.clone()),
                 granularity: Some("document".to_string()),
                 limit: Some(limit),
                 ..Default::default()
             }))
             .await?;
-        Ok(memory_rows(
-            &response.structured_content.unwrap_or(Value::Null),
-        ))
+        // `path_prefix` is a substring match (`memory` also finds
+        // `projects/memory-leak/x.md`), so keep only what is really under the prefix:
+        // anything else with a `status` field would otherwise be returned, and
+        // recalled into a model's context, as a memory.
+        let mut rows = memory_rows(&response.structured_content.unwrap_or(Value::Null));
+        rows.retain(|(_, f)| crate::policy::prefix_covers(&prefix, &f.path));
+        Ok(rows)
     }
 
     #[tool(annotations(read_only_hint = true))]
@@ -782,7 +786,7 @@ impl KbSearchServer {
         }
 
         let now = Self::memory_now()?;
-        let after = config.memory.default_status.as_str();
+        let after = self.memory_cfg.default_status.as_str();
         let edit = |text: &str| -> Result<String, String> {
             match logic::status_of(text).as_deref() {
                 Some(s) if logic::LIVE_STATUSES.contains(&s) => {

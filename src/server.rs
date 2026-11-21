@@ -7237,8 +7237,33 @@ mod tests {
                 policy_cfg(&["search"], &["memory"], false),
             ),
             ("ops".to_string(), policy_cfg(&["*"], &["/"], true)),
+            (
+                "viewer".to_string(),
+                policy_cfg(
+                    &["search", "get_document", "get_schema", "changes_since"],
+                    &["memory"],
+                    false,
+                ),
+            ),
+            (
+                "searcher".to_string(),
+                crate::policy::PolicyConfig {
+                    write: vec!["memory".to_string()],
+                    ..policy_cfg(&["search"], &["memory"], false)
+                },
+            ),
         ]);
         let tokens = vec![
+            crate::policy::TokenConfig {
+                name: "viewer-tok".into(),
+                secret_env: "V".into(),
+                policy: "viewer".into(),
+            },
+            crate::policy::TokenConfig {
+                name: "searcher-tok".into(),
+                secret_env: "S".into(),
+                policy: "searcher".into(),
+            },
             crate::policy::TokenConfig {
                 name: "reader-tok".into(),
                 secret_env: "R".into(),
@@ -7272,6 +7297,8 @@ mod tests {
         let secrets = vec![
             named("reader-tok", "reader-secret"),
             named("ops-tok", "ops-secret"),
+            named("viewer-tok", "viewer-secret"),
+            named("searcher-tok", "searcher-secret"),
         ];
         let mut deps =
             test_router_assembly_deps_with_oauth(dir, legacy.map(str::to_string), oauth.clone());
@@ -7423,7 +7450,8 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("memory/m.md"), "---\ntitle: M\n---\nbody").unwrap();
         let app = policy_assembled(dir.path(), None).await;
-        let r = "reader-secret";
+        // Holds every read tool, so what is refused below is refused for its path.
+        let r = "viewer-secret";
 
         // Reads outside the read grant: refused outright, or exactly as a
         // document that does not exist.
@@ -7475,6 +7503,46 @@ mod tests {
         assert!(dir.path().join("notes/secret.md").exists());
         assert!(dir.path().join("memory/m.md").exists());
         assert!(!dir.path().join("memory/new.md").exists());
+    }
+
+    #[tokio::test]
+    async fn the_tool_allowlist_binds_the_web_api_as_well_as_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::write(dir.path().join("memory/m.md"), "---\ntitle: M\n---\nbody").unwrap();
+        let app = policy_assembled(dir.path(), None).await;
+        // `searcher` may call only `search`, though its paths allow reading and
+        // writing `memory`: every route that is another tool is refused.
+        let t = "searcher-secret";
+        for (method, uri, body) in [
+            ("GET", "/api/doc/memory/m.md", None),
+            ("GET", "/api/schema/memory", None),
+            ("GET", "/api/history?path=memory/m.md", None),
+            ("GET", "/api/changes", None),
+            (
+                "POST",
+                "/api/doc/memory/new.md",
+                Some(r#"{"content":"x","create":true}"#),
+            ),
+            (
+                "DELETE",
+                "/api/doc/memory/m.md",
+                Some(r#"{"expected_version":"x"}"#),
+            ),
+        ] {
+            assert_eq!(
+                api_status(&app, method, uri, t, body).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}"
+            );
+        }
+        assert!(dir.path().join("memory/m.md").exists());
+        assert!(!dir.path().join("memory/new.md").exists());
+        // A route of the tool it does hold is not refused by policy.
+        assert_ne!(
+            api_status(&app, "GET", "/api/graph", t, None).await,
+            StatusCode::FORBIDDEN
+        );
     }
 
     async fn api_body(app: &Router, uri: &str, bearer: &str) -> serde_json::Value {
@@ -7537,7 +7605,7 @@ mod tests {
 
         // Changes is git-backed and this directory is not a repository: it must
         // answer without 403 and without leaking.
-        let status = api_status(&app, "GET", "/api/changes", "reader-secret", None).await;
+        let status = api_status(&app, "GET", "/api/changes", "viewer-secret", None).await;
         assert_ne!(status, StatusCode::FORBIDDEN);
     }
 

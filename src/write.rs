@@ -2684,8 +2684,8 @@ async fn rewrite_inbound_links<E: QueryEmbedder, Q: RetrievalStore>(
             Ok(p) => p,
             Err(_) => {
                 warn!(
-                    "Skipping link rewrite in '{}' for '{}': the path no longer resolves \
-                     safely (stale document_links row?)",
+                    "Skipping link rewrite in '{}' for '{}': outside the caller's write access, \
+                     or the path no longer resolves safely (stale document_links row?)",
                     ref_path, source_rel
                 );
                 continue;
@@ -4551,8 +4551,9 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 Ok(p) => p,
                 Err(_) => {
                     warn!(
-                        "Skipping link rewrite in '{}' while moving directory '{}' -> '{}': the \
-                     path no longer resolves safely (stale document_links row?)",
+                        "Skipping link rewrite in '{}' while moving directory '{}' -> '{}': outside \
+                     the caller's write access, or the path no longer resolves safely \
+                     (stale document_links row?)",
                         ref_path, source_dir, dest_dir
                     );
                     continue;

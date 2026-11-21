@@ -159,6 +159,13 @@ fn not_permitted() -> Response {
         .into_response()
 }
 
+/// Whether `principal`'s `tools` allowlist grants `tool`. A `/api/*` route does what the
+/// MCP tool of that name does, so it is bound by the same allowlist; without this a
+/// token limited to `search` could still read or write documents through the web API.
+fn tool_allowed(principal: &crate::policy::Principal, tool: &str) -> bool {
+    principal.authorize_tool(tool).is_ok()
+}
+
 /// Whether `principal`'s policy grants a write to `rel_path`. The write pipeline
 /// checks every path again (`write::safe_write_path`); this is the early answer a
 /// handler gives before it touches the filesystem.
@@ -656,6 +663,9 @@ fn build_graph_response(
 }
 
 async fn graph_handler(State(state): State<UiState>, Caller(principal): Caller) -> Response {
+    if !tool_allowed(&principal, "search") {
+        return not_permitted();
+    }
     let db = match state.state_db().await {
         Ok(db) => db,
         Err(e) => {
@@ -845,6 +855,9 @@ async fn search_handler(
     Query(params): Query<SearchQueryParams>,
     Query(raw_pairs): Query<Vec<(String, String)>>,
 ) -> Response {
+    if !tool_allowed(&principal, "search") {
+        return not_permitted();
+    }
     let q = params.q.as_deref().map(str::trim).unwrap_or("");
     if q.is_empty() {
         return (
@@ -1085,6 +1098,9 @@ async fn enumerate_handler(
     Caller(principal): Caller,
     Query(params): Query<EnumerateQueryParams>,
 ) -> Response {
+    if !tool_allowed(&principal, "search") {
+        return not_permitted();
+    }
     let filters = match parse_filters_param(params.filters.as_deref()) {
         Ok(f) => f,
         Err(msg) => return bad_request(msg),
@@ -1197,6 +1213,9 @@ async fn get_doc_handler(
     Query(params): Query<DocQueryParams>,
     Query(raw_pairs): Query<Vec<(String, String)>>,
 ) -> Response {
+    if !tool_allowed(&principal, "get_document") {
+        return not_permitted();
+    }
     // Repeated `?heading_path=...` occurrences, in order. Empty (the
     // "omitted" case, since a query string cannot distinguish "omitted" from
     // "given zero times", and a lone `?heading_path=` gives one empty-string
@@ -1340,6 +1359,9 @@ async fn get_schema_handler(
     Caller(principal): Caller,
     AxumPath(raw_path): AxumPath<String>,
 ) -> Response {
+    if !tool_allowed(&principal, "get_schema") {
+        return not_permitted();
+    }
     let rel = match normalize_ui_path(&raw_path) {
         Ok(r) => r,
         Err(msg) => {
@@ -1440,6 +1462,9 @@ async fn history_handler(
     Caller(principal): Caller,
     Query(params): Query<HistoryQueryParams>,
 ) -> Response {
+    if !tool_allowed(&principal, "get_document") {
+        return not_permitted();
+    }
     let data_path = state.canonical_data_path.to_string_lossy().into_owned();
 
     // A history listing is corpus-wide (every commit, whatever it touched), so a
@@ -1590,6 +1615,9 @@ async fn changes_handler(
     Caller(principal): Caller,
     Query(params): Query<ChangesQueryParams>,
 ) -> Response {
+    if !tool_allowed(&principal, "changes_since") {
+        return not_permitted();
+    }
     let data_path = state.canonical_data_path.to_string_lossy().into_owned();
     let indexing = state.config().indexing.clone();
     match retrieval::changes_since_json(
@@ -1921,6 +1949,9 @@ async fn post_doc_handler(
     AxumPath(raw_path): AxumPath<String>,
     Json(body): Json<WriteDocBody>,
 ) -> Response {
+    if !tool_allowed(&principal, "write_document") {
+        return not_permitted();
+    }
     let rel_path = retrieval::kb_root_relative(raw_path.trim()).to_string();
     if rel_path.is_empty() {
         return bad_request("path parameter is empty");
@@ -2084,6 +2115,9 @@ async fn delete_doc_handler(
     AxumPath(raw_path): AxumPath<String>,
     Json(body): Json<DeleteDocBody>,
 ) -> Response {
+    if !tool_allowed(&principal, "delete_document") {
+        return not_permitted();
+    }
     let rel_path = retrieval::kb_root_relative(raw_path.trim()).to_string();
     if rel_path.is_empty() {
         return bad_request("path parameter is empty");

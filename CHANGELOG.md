@@ -33,6 +33,7 @@ subcommand.
   touches must lie inside a `write` prefix. Config load refuses a write prefix outside the read
   prefixes, and a policy combined with `ui.api_auth: false` or `allow_unauthenticated`.
   `mcp.policy` and `mcp.principals` are live-reloadable; `mcp.tokens` needs a restart.
+  A policy's `tools` allowlist also binds the matching `/api/*` web routes.
   Two exposures are accepted and documented: operator extension text is shown to every caller,
   and a commit subject in history can name a path outside reach when one commit touched several.
 - **`mcp-md-wiki token mint --name N --policy P --out FILE`** writes a random secret to a new

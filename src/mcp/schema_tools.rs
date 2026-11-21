@@ -1482,9 +1482,8 @@ impl KbSearchServer {
 
         // The memory area's schema is built into the binary; a file written there
         // would be refused at the next rebuild, so say so now.
-        let config = self.config();
         if self.memory_enabled {
-            let root = crate::memory::root_dir(&config.memory);
+            let root = crate::memory::root_dir(&self.memory_cfg);
             if crate::policy::prefix_covers(&root, &rel_dir.to_string_lossy()) {
                 return Err(invalid(
                     "the memory area's schema is built into the server and cannot be changed"

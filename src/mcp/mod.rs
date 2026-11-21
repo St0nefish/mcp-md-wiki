@@ -223,6 +223,10 @@ pub struct KbSearchServer {
     /// server starts, so a reload that flips the setting is a restart-required
     /// change, and the tools follow the startup value, not the live one.
     memory_enabled: bool,
+    /// The `memory` section as it was at startup, for the same reason: the root, the
+    /// default area and status, and the duplicate threshold are restart-required, so a
+    /// reload must not move the tools to a root the schema and the policies do not cover.
+    memory_cfg: crate::config::MemoryConfig,
     /// Test seam: the neighbours the next duplicate check sees instead of asking the
     /// vector store, taken (used once) by `memory_duplicates`.
     #[cfg(test)]
@@ -381,7 +385,8 @@ impl KbSearchServer {
         let canonical_data_path = data_path.canonicalize().with_context(|| {
             format!("Failed to canonicalize data path: {}", data_path.display())
         })?;
-        let memory_enabled = crate::config::load_shared_config(&config).memory.enabled;
+        let memory_cfg = crate::config::load_shared_config(&config).memory.clone();
+        let memory_enabled = memory_cfg.enabled;
         Ok(Self {
             embed_client,
             qdrant,
@@ -395,6 +400,7 @@ impl KbSearchServer {
             instructions,
             config,
             memory_enabled,
+            memory_cfg,
             #[cfg(test)]
             test_duplicate_hits: Default::default(),
             schema_cache,

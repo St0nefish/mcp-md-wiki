@@ -2238,6 +2238,15 @@ impl Config {
             );
         }
         if m.enabled {
+            // memory_search and memory_recall rank whole documents.
+            if !effective_granularities(&self.search, &self.chunking)
+                .contains(&Granularity::Document)
+            {
+                anyhow::bail!(
+                    "memory.enabled needs 'document' in search.granularities: memory_search and \
+                     memory_recall search at document granularity"
+                );
+            }
             let archive = self.write.archive_prefix.trim_matches('/');
             if root == archive || root.starts_with(&format!("{archive}/")) {
                 anyhow::bail!(
@@ -4376,6 +4385,10 @@ mcp:
                 "write.archive_prefix",
             ),
             ("memory:\n  default_status: maybe\n", "unknown variant"),
+            (
+                "memory:\n  enabled: true\nsearch:\n  granularities: [chunk]\n",
+                "search.granularities",
+            ),
             ("memory:\n  surprise: 1\n", "unknown field"),
         ] {
             let e = Config::from_str(yaml).unwrap_err().to_string();
