@@ -14,6 +14,8 @@ roughly forty issues across security hardening, indexing correctness, and doc dr
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-22
+
 ### Per-caller access control and an agent-memory tool group (#381)
 
 **Nothing changes unless you opt in:** with no `mcp.policy` and no `memory` section the server
@@ -1776,7 +1778,8 @@ operator upgrading an old deployment needs to know happened at some point:
   upgrade note](deploy/USAGE.md#backward-compatibility-and-upgrade-note) in
   `deploy/USAGE.md` for the full detail.
 
-[Unreleased]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/St0nefish/mcp-md-wiki/compare/v0.1.3...v0.2.0
