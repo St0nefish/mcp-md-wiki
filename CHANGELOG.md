@@ -109,6 +109,17 @@ bulk rewrite happens on upgrade).
   image follow the pin automatically; a local checkout is switched by rustup. Nothing
   changes at runtime.
 
+### The reconcile's mtime walk no longer blocks webhooks and writes
+
+`build_git_mtimes` held the global git lock for the whole `git log` walk that derives each
+document's last-commit time. On a large history that walk can take minutes (each chunk is
+bounded by the 120 s git timeout), and the push webhook's pull waits on the same lock before
+it replies, so the sender saw "awaiting headers" timeouts (Gitea's delivery to a changelog
+server failed 416 times over two days) while writes queued behind the reindex. The lock is
+now held only to read HEAD; the walk runs without it, pinned to that commit, and the
+result is no longer re-read from the shared cache (a concurrent caller at another HEAD
+could have swapped the cache's generation under it). No operator action and no reindex.
+
 ### Large corpora: the git-derived mtime lookup no longer times out (#386)
 
 The reconcile's `git log` for each document's last-commit time passed every path as a

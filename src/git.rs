@@ -768,17 +768,22 @@ fn chunk_paths_by_byte_budget(paths: &[String]) -> Vec<&[String]> {
 /// recently than any subsequent deletion of the same path could have been, so
 /// including `D` entries would only ever risk shadowing the real answer with a
 /// deletion timestamp for a path that was later recreated.
-pub async fn git_log_mtimes(
-    lock: &GitLock,
-    data_path: &str,
-    paths: &[String],
-) -> HashMap<String, i64> {
+///
+/// Takes no `&GitLock`: this is a pure read, and the walk can run for minutes on a
+/// large history (up to [`GIT_TIMEOUT`] per chunk), so holding the lock across it
+/// queued every webhook pull and write behind the reindex worker until Gitea gave up
+/// on the delivery. `rev` is the commit to walk — the caller resolves it once, under
+/// the lock, and passes the sha so every chunk reads the same history even if a pull
+/// moves HEAD mid-walk, and so the result matches the HEAD a cache keys it to. The
+/// objects a `rev` reaches are immutable, which is the same argument the read-only
+/// history functions below make for skipping the lock.
+pub async fn git_log_mtimes(data_path: &str, rev: &str, paths: &[String]) -> HashMap<String, i64> {
     if paths.is_empty() {
         return HashMap::new();
     }
 
     if paths.len() > GIT_LOG_MTIMES_UNSCOPED_THRESHOLD {
-        return git_log_mtimes_unscoped(lock, data_path, paths).await;
+        return git_log_mtimes_unscoped(data_path, rev, paths).await;
     }
 
     let chunks = chunk_paths_by_byte_budget(paths);
@@ -788,7 +793,7 @@ pub async fn git_log_mtimes(
     let mut failed_paths = 0usize;
 
     for (idx, chunk) in chunks.into_iter().enumerate() {
-        match git_log_mtimes_chunk(lock, data_path, chunk).await {
+        match git_log_mtimes_chunk(data_path, rev, chunk).await {
             Ok(map) => merged.extend(map),
             Err(e) => {
                 // #237: a failing chunk degrades only the paths IN that chunk — they
@@ -830,11 +835,11 @@ pub async fn git_log_mtimes(
 /// degrade independently of the others, rather than the all-or-nothing fallback the
 /// unbatched version had.
 async fn git_log_mtimes_chunk(
-    _lock: &GitLock,
     data_path: &str,
+    rev: &str,
     paths: &[String],
 ) -> Result<HashMap<String, i64>> {
-    run_git_log_mtimes(data_path, Some(paths)).await
+    run_git_log_mtimes(data_path, rev, Some(paths)).await
 }
 
 /// One unscoped `git log --name-only` over the whole history (#386), keeping only
@@ -850,11 +855,11 @@ async fn git_log_mtimes_chunk(
 /// [`GIT_TIMEOUT`]) leaves every path to fall back to filesystem mtime; it is
 /// logged once, and the next run at a new HEAD tries again.
 async fn git_log_mtimes_unscoped(
-    _lock: &GitLock,
     data_path: &str,
+    rev: &str,
     paths: &[String],
 ) -> HashMap<String, i64> {
-    match run_git_log_mtimes(data_path, None).await {
+    match run_git_log_mtimes(data_path, rev, None).await {
         Ok(mut map) => {
             let wanted: std::collections::HashSet<&str> =
                 paths.iter().map(String::as_str).collect();
@@ -873,12 +878,14 @@ async fn git_log_mtimes_unscoped(
     }
 }
 
-/// Builds and runs the mtime `git log`: scoped to `pathspec` when given, over the
-/// whole history when `None`. `--no-renames` keeps the output independent of the
-/// user's `diff.renames` setting (copy/rename detection is extra work here, and a
-/// renamed file is listed under its new name as an addition either way).
+/// Builds and runs the mtime `git log` from `rev`: scoped to `pathspec` when given,
+/// over the whole history reachable from `rev` when `None`. `--no-renames` keeps the
+/// output independent of the user's `diff.renames` setting (copy/rename detection is
+/// extra work here, and a renamed file is listed under its new name as an addition
+/// either way). `--` always follows `rev` so a path can never be read as a revision.
 async fn run_git_log_mtimes(
     data_path: &str,
+    rev: &str,
     pathspec: Option<&[String]>,
 ) -> Result<HashMap<String, i64>> {
     let safe_dir = format!("safe.directory={}", data_path);
@@ -891,9 +898,10 @@ async fn run_git_log_mtimes(
         "--diff-filter=ACMR",
         "--no-renames",
         "-z",
+        rev,
+        "--",
     ];
     if let Some(paths) = pathspec {
-        args.push("--");
         args.extend(paths.iter().map(|p| p.as_str()));
     }
 
@@ -4160,10 +4168,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn git_log_mtimes_returns_empty_map_for_an_empty_path_list() {
-        let lock = lock_git().await;
         // No repo needed at all — an empty `paths` short-circuits before spawning
         // git, so even a nonexistent directory is fine here.
-        let map = git_log_mtimes(&lock, "/nonexistent/does/not/matter", &[]).await;
+        let map = git_log_mtimes("/nonexistent/does/not/matter", "HEAD", &[]).await;
         assert!(map.is_empty());
     }
 
@@ -4221,8 +4228,8 @@ pub(crate) mod tests {
             .output()
             .unwrap();
 
-        let lock = lock_git().await;
-        let map = git_log_mtimes(&lock, work_path, &["a.md".to_string(), "b.md".to_string()]).await;
+        let map =
+            git_log_mtimes(work_path, "HEAD", &["a.md".to_string(), "b.md".to_string()]).await;
 
         // 2020-01-01T00:00:00Z and 2021-06-15T12:00:00Z as Unix seconds.
         assert_eq!(
@@ -4243,15 +4250,81 @@ pub(crate) mod tests {
         let work = clone_bare_repo(bare.path(), "main");
         let work_path = work.path().to_str().unwrap();
 
-        let lock = lock_git().await;
         // "untracked.md" was never committed — the caller must fall back to
         // filesystem mtime for it, which only works if this function leaves it
         // out of the map entirely rather than inventing a value.
-        let map = git_log_mtimes(&lock, work_path, &["untracked.md".to_string()]).await;
+        let map = git_log_mtimes(work_path, "HEAD", &["untracked.md".to_string()]).await;
         assert!(
             !map.contains_key("untracked.md"),
             "a path git has no history for must be absent, not defaulted to 0 or similar"
         );
+    }
+
+    /// Commits `file` (writing `content` first) at the fixed author/committer time
+    /// `epoch` (Unix seconds), so a test can assert exact mtimes.
+    fn commit_file_at(work_path: &str, file: &str, content: &str, epoch: i64) {
+        std::fs::write(std::path::Path::new(work_path).join(file), content).unwrap();
+        git_test_cmd(work_path)
+            .args(["add", file])
+            .output()
+            .unwrap();
+        let date = format!("@{epoch} +0000");
+        git_test_cmd(work_path)
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                &format!("touch {file}"),
+            ])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .output()
+            .unwrap();
+    }
+
+    /// The walk is lock-free: a webhook pull or write holding `GIT_LOCK` must not
+    /// stall it, and (the point of the change) it must not hold the lock itself.
+    #[tokio::test]
+    async fn git_log_mtimes_completes_while_the_git_lock_is_held() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+        commit_file_at(work_path, "a.md", "a v1", 1_577_836_800);
+
+        let _held = lock_git().await;
+        let map = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            git_log_mtimes(work_path, "HEAD", &["a.md".to_string()]),
+        )
+        .await
+        .expect("git_log_mtimes must not wait on GIT_LOCK");
+        assert_eq!(map.get("a.md"), Some(&1_577_836_800));
+    }
+
+    /// Every chunk reads the commit it was given, not whatever HEAD is by the time
+    /// it runs, so a pull landing mid-walk cannot mix two generations into a result
+    /// the cache then files under the older HEAD.
+    #[tokio::test]
+    async fn git_log_mtimes_reads_the_pinned_rev_not_the_moved_head() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+        commit_file_at(work_path, "a.md", "a v1", 1_577_836_800);
+        let pinned = {
+            let lock = lock_git().await;
+            rev_parse_head(&lock, work_path).await.unwrap()
+        };
+        // HEAD moves on after the sha was resolved.
+        commit_file_at(work_path, "a.md", "a v2", 1_623_758_400);
+
+        let at_pinned = git_log_mtimes(work_path, &pinned, &["a.md".to_string()]).await;
+        assert_eq!(at_pinned.get("a.md"), Some(&1_577_836_800));
+
+        let at_head = git_log_mtimes(work_path, "HEAD", &["a.md".to_string()]).await;
+        assert_eq!(at_head.get("a.md"), Some(&1_623_758_400));
     }
 
     // --- chunk_paths_by_byte_budget tests (#237) -------------------------------
@@ -4353,11 +4426,9 @@ pub(crate) mod tests {
             .collect();
         paths.push("a.md".to_string());
 
-        let lock = lock_git().await;
-
         // "Before" half: the unbatched single-invocation logic really does fail
         // against this input.
-        let unchunked = git_log_mtimes_chunk(&lock, work_path, &paths).await;
+        let unchunked = git_log_mtimes_chunk(work_path, "HEAD", &paths).await;
         assert!(
             unchunked.is_err(),
             "a ~4MB single argv should exceed this environment's real ARG_MAX and \
@@ -4366,7 +4437,7 @@ pub(crate) mod tests {
         );
 
         // "After" half: the chunked, public entry point still gets the right answer.
-        let map = git_log_mtimes(&lock, work_path, &paths).await;
+        let map = git_log_mtimes(work_path, "HEAD", &paths).await;
         assert_eq!(
             map.get("a.md"),
             Some(&1_600_000_000),
@@ -4413,8 +4484,7 @@ pub(crate) mod tests {
         let huge_path = "x".repeat(3_000_000);
         let paths = vec![huge_path, "a.md".to_string()];
 
-        let lock = lock_git().await;
-        let map = git_log_mtimes(&lock, work_path, &paths).await;
+        let map = git_log_mtimes(work_path, "HEAD", &paths).await;
 
         assert_eq!(
             map.get("a.md"),
@@ -4545,13 +4615,12 @@ pub(crate) mod tests {
         // A path git has no history for must stay absent from the unscoped answer too.
         wanted.push("changes/never-committed.md".to_string());
 
-        let lock = lock_git().await;
-        let unscoped = git_log_mtimes(&lock, work_path, &wanted).await;
+        let unscoped = git_log_mtimes(work_path, "HEAD", &wanted).await;
 
         let mut pathspec = HashMap::new();
         for path in &wanted {
             pathspec.extend(
-                git_log_mtimes_chunk(&lock, work_path, std::slice::from_ref(path))
+                git_log_mtimes_chunk(work_path, "HEAD", std::slice::from_ref(path))
                     .await
                     .unwrap(),
             );
@@ -4577,13 +4646,12 @@ pub(crate) mod tests {
     /// fallback — an empty map, not an error and not a partial answer.
     #[tokio::test]
     async fn git_log_mtimes_unscoped_failure_yields_an_empty_map() {
-        let lock = lock_git().await;
         let paths: Vec<String> = (0..=GIT_LOG_MTIMES_UNSCOPED_THRESHOLD)
             .map(|i| format!("{i}.md"))
             .collect();
         // Not a repository: `git log` exits non-zero.
         let dir = tempfile::tempdir().unwrap();
-        let map = git_log_mtimes(&lock, dir.path().to_str().unwrap(), &paths).await;
+        let map = git_log_mtimes(dir.path().to_str().unwrap(), "HEAD", &paths).await;
         assert!(map.is_empty());
     }
 
