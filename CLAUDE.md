@@ -268,6 +268,28 @@ exist but are not images to run.
 
 Bugs, features, and enhancements are tracked as GitHub issues (not in-repo TODO files).
 
+## Dependency advisories
+
+`ci-fast` runs `cargo audit` and `cargo deny` against the advisory database, which
+updates independently of this repo: a new advisory can fail CI on a branch (or on
+`master`) without any change to it. **Before shipping any PR, run `cargo audit` and
+`cargo deny check advisories` on the PR's `Cargo.lock`.** If an advisory is present,
+the active PR accounts for it, in this order:
+
+1. **Update the dependency (first and default).** Use the patched version the advisory
+   names. For a transitive crate that is a `Cargo.lock`-only change; use
+   `cargo update -p <crate> --precise <patched>` (a bare `cargo update -p <crate>` can
+   lock zero packages even when the patched release exists). Re-run both tools to
+   confirm it is gone.
+2. **If an update cannot resolve it** (no patched release yet, or a direct dependency
+   pins the old version), check for an open issue or PR that is already about to fix
+   it and is just pending merge; rebase onto or wait for that rather than ignoring.
+3. **Only then ignore it**, and only with a new issue to remove the ignore. File the
+   issue first, then add the entry to `.cargo/audit.toml` (and `deny.toml` if
+   `cargo deny` also flags it) with a comment that states why it is unreachable or
+   unfixable and names the issue (`#N`). An ignore without a tracking issue is not
+   acceptable.
+
 ## Build & run
 
 ```bash
