@@ -809,12 +809,12 @@ static GIT_MTIME_CACHE: std::sync::LazyLock<tokio::sync::Mutex<GitMtimeCache>> =
 /// #236: backed by [`GIT_MTIME_CACHE`], a process-global memo invalidated on HEAD
 /// change rather than a fresh `git log` walk on every call — see that struct's doc
 /// comment for the full rationale (and why the simpler "full reindexes only" or
-/// "narrow the pathspec" alternatives don't actually fix this). The `GIT_LOCK`
-/// acquisition below still covers the WHOLE sequence (HEAD resolution plus, on a
-/// cache miss, the chunked `git log` walk) as one logical operation, per this
-/// project's git-locking discipline — it is just usually a much shorter hold than
-/// before, because `rev_parse_head` does not walk history and a warm cache needs no
-/// subprocess at all.
+/// "narrow the pathspec" alternatives don't actually fix this). `GIT_LOCK` is held
+/// only for HEAD resolution (`rev_parse_head`, which does not walk history); the
+/// `git log` walk itself runs without it, pinned to the resolved sha. The walk is a
+/// pure read of immutable objects, and holding the lock across it — up to
+/// [`crate::git::GIT_TIMEOUT`] per chunk — queued the webhook's pull (and every
+/// write) behind the reindex worker until the sender's request timed out.
 ///
 /// Gated on git integration actually being configured (`source.git_url`) and the
 /// data path actually being a git clone (`.git` present) — a config without git
@@ -830,14 +830,17 @@ async fn build_git_mtimes(config: &ResolvedConfig, rel_keys: &[String]) -> HashM
         return HashMap::new();
     }
 
-    let lock = crate::git::lock_git().await;
-
     // Cheap — no history walk — so a run at a HEAD this process has already fully
-    // resolved skips the expensive part entirely. Any failure here (repo mid-op,
-    // unreadable, etc.) falls back to one uncached, #237-chunked lookup for exactly
-    // this run rather than either serving a possibly-wrong-generation cache or
-    // failing the calling indexing run over a metadata nicety.
-    let head = match crate::git::rev_parse_head(&lock, data_path).await {
+    // resolved skips the expensive part entirely. The lock covers only this call and
+    // is released before any walk. Any failure here (repo mid-op, unreadable, etc.)
+    // falls back to one uncached, #237-chunked lookup from `HEAD` for exactly this
+    // run rather than either serving a possibly-wrong-generation cache or failing
+    // the calling indexing run over a metadata nicety.
+    let head = {
+        let lock = crate::git::lock_git().await;
+        crate::git::rev_parse_head(&lock, data_path).await
+    };
+    let head = match head {
         Ok(h) => h,
         Err(e) => {
             warn!(
@@ -845,23 +848,31 @@ async fn build_git_mtimes(config: &ResolvedConfig, rel_keys: &[String]) -> HashM
                  uncached lookup for this run only (see #236): {:#}",
                 e
             );
-            return crate::git::git_log_mtimes(&lock, data_path, rel_keys).await;
+            return crate::git::git_log_mtimes(data_path, "HEAD", rel_keys).await;
         }
     };
 
-    let missing = {
+    let (mut found, missing) = {
         let mut cache = GIT_MTIME_CACHE.lock().await;
         cache.resolve(data_path, &head);
-        cache.split(rel_keys).1
+        cache.split(rel_keys)
     };
 
     if !missing.is_empty() {
-        let fresh = crate::git::git_log_mtimes(&lock, data_path, &missing).await;
-        let mut cache = GIT_MTIME_CACHE.lock().await;
-        cache.merge(data_path, &head, &missing, &fresh);
+        let fresh = crate::git::git_log_mtimes(data_path, &head, &missing).await;
+        GIT_MTIME_CACHE
+            .lock()
+            .await
+            .merge(data_path, &head, &missing, &fresh);
+        // The result is assembled here, not re-read from the cache: the walk above
+        // runs without `GIT_LOCK`, so a concurrent caller at another HEAD can swap
+        // the cache's generation between the merge and a re-read, and this call
+        // would then return nothing for paths it just resolved. `fresh` holds only
+        // paths git has history for, which is exactly what belongs in the result.
+        found.extend(fresh);
     }
 
-    GIT_MTIME_CACHE.lock().await.split(rel_keys).0
+    found
 }
 
 #[cfg(test)]
