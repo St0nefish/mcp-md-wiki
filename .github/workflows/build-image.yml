@@ -209,12 +209,26 @@ jobs:
           got=$(git rev-parse 'HEAD^{tree}')
           [[ "$got" == "$TREE" ]] || { echo "::error::checkout tree ${got}, expected ${TREE}"; exit 1; }
 
-      # A docker-container builder: the default docker driver can neither push by
-      # digest nor export a registry cache.
+      # DOCKER_HOST is set when the runner has its own rootless dind daemon; that refuses
+      # --privileged, so a docker-container builder cannot boot there. Its containerd
+      # image store lets the `docker` driver push by digest and export a registry cache.
+      - name: Pick buildx driver
+        id: buildx-driver
+        run: |
+          if [ -n "${DOCKER_HOST:-}" ]; then
+            echo "driver=docker" >> "$GITHUB_OUTPUT"
+          else
+            echo "driver=docker-container" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Without DOCKER_HOST (host daemon): a docker-container builder, since that daemon's
+      # classic image store can neither push by digest nor export a registry cache.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
-          name: ci-mcp-md-wiki-${{ github.job }}-buildx-${{ github.run_id }}
+          driver: ${{ steps.buildx-driver.outputs.driver }}
+          # A named builder is only for docker-container; the docker driver uses the daemon's.
+          name: ${{ steps.buildx-driver.outputs.driver == 'docker-container' && format('ci-mcp-md-wiki-{0}-buildx-{1}', github.job, github.run_id) || '' }}
 
       - name: Login to GHCR
         uses: docker/login-action@v3
