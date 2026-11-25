@@ -10,7 +10,8 @@ name: Build image
 #   - master.yml, on a merge commit (ref mode): reuses the tree's image when ci-slow built
 #     it, or builds it after the fallback tests passed.
 #
-# The build is pushed by digest, joined into an index under a staging tag
+# The build is pushed by digest (on a dind runner by a per-arch `:arch-<tree>-<arch>`
+# tag instead, since the docker driver cannot push by digest), joined into an index under a staging tag
 # (`:build-tree-<tree>`, nothing reads it) and gets `:tree-<tree>` only after the smoke
 # test passes, so a build that fails, or fails its smoke test, never carries the tag
 # anything resolves. When `:tree-<tree>` already exists nothing is rebuilt and the
@@ -211,7 +212,8 @@ jobs:
 
       # DOCKER_HOST is set when the runner has its own rootless dind daemon; that refuses
       # --privileged, so a docker-container builder cannot boot there. Its containerd
-      # image store lets the `docker` driver push by digest and export a registry cache.
+      # image store lets the `docker` driver export a registry cache, but the driver
+      # cannot push by digest, so that branch pushes a per-arch staging tag instead.
       - name: Pick buildx driver
         id: buildx-driver
         run: |
@@ -255,7 +257,8 @@ jobs:
             VERSION=${{ needs.prepare.outputs.version }}
             REVISION=${{ inputs.tree }}
           provenance: false
-          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          # `merge` joins by the digest either way; the docker driver needs a tag to push.
+          outputs: ${{ steps.buildx-driver.outputs.driver == 'docker' && format('type=image,name={0}:arch-{1}-{2},push=true', needs.prepare.outputs.image, inputs.tree, matrix.arch) || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', needs.prepare.outputs.image) }}
           cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.arch }}
           cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.arch }},mode=max
 
