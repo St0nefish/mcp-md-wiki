@@ -351,7 +351,9 @@ jobs:
             elapsed=$((elapsed + 2))
           done
           echo "qdrant ready at ${host} (rest ${rest_port}, grpc ${grpc_port})"
-          echo "QDRANT_URL=http://${host}:${rest_port}" >> "$GITHUB_ENV"
+          # QDRANT_URL is the app's own setting (src/config.rs), a gRPC endpoint like
+          # the deployment's :6334, so both point at the gRPC port.
+          echo "QDRANT_URL=http://${host}:${grpc_port}" >> "$GITHUB_ENV"
           echo "QDRANT_GRPC_URL=http://${host}:${grpc_port}" >> "$GITHUB_ENV"
 
       - name: Run live-Qdrant tests
