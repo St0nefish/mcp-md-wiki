@@ -2168,6 +2168,13 @@ mod tests {
         format!("mcp-md-wiki-test-{test_name}")
     }
 
+    /// gRPC endpoint of the live Qdrant the `#[ignore]`d tests talk to. CI's
+    /// `qdrant-integration` job publishes random ports on the Docker daemon's host and
+    /// exports `QDRANT_GRPC_URL`; unset, it is the local default.
+    fn live_qdrant_url() -> String {
+        std::env::var("QDRANT_GRPC_URL").unwrap_or_else(|_| "http://localhost:6334".into())
+    }
+
     /// Run a live-Qdrant test body, dropping its collection afterward
     /// whether the body panics or not. Without this, a failed assertion
     /// mid-test skips the trailing `delete_collection` call and orphans the
@@ -2307,13 +2314,13 @@ mod tests {
     /// that the server itself stores and returns those values unchanged, which no
     /// fake can stand in for without just re-asserting the conversion functions.
     ///
-    /// Requires a running Qdrant instance at localhost:6334.
+    /// Requires a running Qdrant instance (gRPC at QDRANT_GRPC_URL, default http://localhost:6334).
     /// Run with: cargo test qdrant_search_returns_payload -- --ignored
     #[tokio::test]
     #[ignore]
     async fn qdrant_search_returns_payload() {
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: live_qdrant_url(),
             collection: live_test_collection("qdrant_search_returns_payload"),
         };
         let store = QdrantStore::new(&config).unwrap();
@@ -2401,7 +2408,7 @@ mod tests {
     /// like every test here that needs a server): what it proves is the server's
     /// set-payload semantics under a filter selector, which no fake can.
     ///
-    /// Requires a running Qdrant instance at localhost:6334.
+    /// Requires a running Qdrant instance (gRPC at QDRANT_GRPC_URL, default http://localhost:6334).
     /// Run with: cargo test refresh_file_payload_replaces_fm_and_keeps_chunk_keys -- --ignored
     #[tokio::test]
     #[ignore]
@@ -2409,7 +2416,7 @@ mod tests {
         use qdrant_client::qdrant::ScrollPointsBuilder;
 
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: live_qdrant_url(),
             collection: live_test_collection(
                 "refresh_file_payload_replaces_fm_and_keeps_chunk_keys",
             ),
@@ -2548,13 +2555,13 @@ mod tests {
     /// `collection_info`, which no fake `VectorStore` can stand in for without just
     /// re-asserting the comparison logic.
     ///
-    /// Requires a running Qdrant instance at localhost:6334.
+    /// Requires a running Qdrant instance (gRPC at QDRANT_GRPC_URL, default http://localhost:6334).
     /// Run with: cargo test ensure_collection_rejects_a_dimension_mismatch -- --ignored
     #[tokio::test]
     #[ignore]
     async fn ensure_collection_rejects_a_dimension_mismatch() {
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: live_qdrant_url(),
             collection: live_test_collection("ensure_collection_rejects_a_dimension_mismatch"),
         };
         let store = QdrantStore::new(&config).unwrap();
@@ -2651,13 +2658,13 @@ mod tests {
     /// and `retrieval::tests::search_with_phrase_disabled_treats_quotes_as_literal_characters`,
     /// since reproducing an incompatible server would need one to test against.
     ///
-    /// Requires a running Qdrant instance at localhost:6334.
+    /// Requires a running Qdrant instance (gRPC at QDRANT_GRPC_URL, default http://localhost:6334).
     /// Run with: cargo test phrase_index_enables_exact_phrase_matching -- --ignored
     #[tokio::test]
     #[ignore]
     async fn phrase_index_enables_exact_phrase_matching() {
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: live_qdrant_url(),
             collection: live_test_collection("phrase_index_enables_exact_phrase_matching"),
         };
         let store = QdrantStore::new(&config).unwrap();
@@ -2841,13 +2848,13 @@ mod tests {
     /// work, not code in this crate; a fake `VectorStore` would only prove the fake
     /// implements the same filter logic correctly, not that Qdrant does.
     ///
-    /// Requires a running Qdrant instance at localhost:6334.
+    /// Requires a running Qdrant instance (gRPC at QDRANT_GRPC_URL, default http://localhost:6334).
     /// Run with: cargo test delete_by_files_removes_matching -- --ignored
     #[tokio::test]
     #[ignore]
     async fn delete_by_files_removes_matching() {
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: live_qdrant_url(),
             collection: live_test_collection("delete_by_files_removes_matching"),
         };
         let store = QdrantStore::new(&config).unwrap();
@@ -3034,13 +3041,13 @@ mod tests {
     /// `group_by` collapsing behavior, which no fake `RetrievalStore` can stand
     /// in for without just re-asserting the grouping logic.
     ///
-    /// Requires a running Qdrant instance at localhost:6334.
+    /// Requires a running Qdrant instance (gRPC at QDRANT_GRPC_URL, default http://localhost:6334).
     /// Run with: cargo test search_grouped_by_section_key_collapses_to_best_hit_per_section -- --ignored
     #[tokio::test]
     #[ignore]
     async fn search_grouped_by_section_key_collapses_to_best_hit_per_section() {
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: live_qdrant_url(),
             collection: live_test_collection(
                 "search_grouped_by_section_key_collapses_to_best_hit_per_section",
             ),
@@ -3312,13 +3319,13 @@ mod tests {
     /// shape. Neither is something a fake can stand in for: it's Qdrant's own
     /// vector-lookup-by-id behavior under test, not code in this crate.
     ///
-    /// Requires a running Qdrant instance at localhost:6334.
+    /// Requires a running Qdrant instance (gRPC at QDRANT_GRPC_URL, default http://localhost:6334).
     /// Run with: cargo test recommend_by_point_id_finds_nearest_neighbor -- --ignored
     #[tokio::test]
     #[ignore]
     async fn recommend_by_point_id_finds_nearest_neighbor() {
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: live_qdrant_url(),
             collection: live_test_collection("recommend_by_point_id_finds_nearest_neighbor"),
         };
         let store = QdrantStore::new(&config).unwrap();
@@ -3435,13 +3442,13 @@ mod tests {
     /// results. `retrieval.rs`'s own coverage cannot substitute — its
     /// `MockRetrievalStore` never evaluates the `Filter` it is handed.
     ///
-    /// Requires a running Qdrant instance at localhost:6334.
+    /// Requires a running Qdrant instance (gRPC at QDRANT_GRPC_URL, default http://localhost:6334).
     /// Run with: cargo test path_prefix_filter_semantics_hold_on_a_live_server -- --ignored
     #[tokio::test]
     #[ignore]
     async fn path_prefix_filter_semantics_hold_on_a_live_server() {
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: live_qdrant_url(),
             collection: live_test_collection("path_prefix_filter_semantics_hold_on_a_live_server"),
         };
         let store = QdrantStore::new(&config).unwrap();
@@ -4137,13 +4144,13 @@ mod tests {
     /// normally available in this environment) predicts for the same `any_of`
     /// filter against the same fixture shape.
     ///
-    /// Requires a running Qdrant instance at localhost:6334.
+    /// Requires a running Qdrant instance (gRPC at QDRANT_GRPC_URL, default http://localhost:6334).
     /// Run with: cargo test qdrant_filters_agree_with_the_offline_prediction -- --ignored
     #[tokio::test]
     #[ignore]
     async fn qdrant_filters_agree_with_the_offline_prediction() {
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: live_qdrant_url(),
             collection: live_test_collection("qdrant_filters_agree_with_the_offline_prediction"),
         };
         let store = QdrantStore::new(&config).unwrap();
@@ -4247,7 +4254,7 @@ mod tests {
     /// fractional seconds, correlated list filters (a cross-element negative case
     /// included) and plain `[]` sub-field filters.
     ///
-    /// Requires a running Qdrant instance at localhost:6334.
+    /// Requires a running Qdrant instance (gRPC at QDRANT_GRPC_URL, default http://localhost:6334).
     /// Run with: cargo test sqlite_and_qdrant_filters_agree_on_the_typed_fixture -- --ignored
     #[tokio::test]
     #[ignore]
@@ -4260,7 +4267,7 @@ mod tests {
         let indexed = filter_parity::indexed(&schemas);
 
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: live_qdrant_url(),
             collection: live_test_collection(
                 "sqlite_and_qdrant_filters_agree_on_the_typed_fixture",
             ),
@@ -4351,13 +4358,13 @@ mod tests {
     /// drops an unprefixed index the pre-#350 shape left on a declared field's name —
     /// read back from the server's own `payload_schema`.
     ///
-    /// Requires a running Qdrant instance at localhost:6334.
+    /// Requires a running Qdrant instance (gRPC at QDRANT_GRPC_URL, default http://localhost:6334).
     /// Run with: cargo test ensure_collection_reconciles_payload_index_kinds -- --ignored
     #[tokio::test]
     #[ignore]
     async fn ensure_collection_reconciles_payload_index_kinds() {
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: live_qdrant_url(),
             collection: live_test_collection("ensure_collection_reconciles_payload_index_kinds"),
         };
         let store = QdrantStore::new(&config).unwrap();

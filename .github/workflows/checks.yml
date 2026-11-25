@@ -233,8 +233,8 @@ jobs:
   # those.
   qdrant-integration:
     if: inputs.integration
-    # Always self-hosted, whatever `runner` says: `Start Qdrant` below depends on this
-    # runner being a container on the host's Docker daemon.
+    # Always self-hosted, whatever `runner` says: the job needs a Docker daemon
+    # (host socket or dind sidecar) to start Qdrant on.
     runs-on: self-hosted
     timeout-minutes: 30
     # Blocking as of #133. Three separate things had to be true first, and all
@@ -295,49 +295,19 @@ jobs:
 
       - name: Start Qdrant
         run: |
-          # The self-hosted runner is itself a container driving the host's
-          # Docker daemon through a mounted /var/run/docker.sock, so
-          # `docker compose up` creates a SIBLING container on the host and
-          # docker-compose.yml's `127.0.0.1:6334:6334` publishes onto the
-          # HOST's loopback -- which is not this container's loopback. Every
-          # run of this job since it was added failed for that reason, first
-          # in the wait step and then in `cargo test` itself, which hardcodes
-          # http://localhost:6334 (src/qdrant.rs).
+          # Publish Qdrant's ports on random free host ports and reach them via the
+          # Docker daemon's host (see `Wait for Qdrant to be ready`). Never share the
+          # runner's network namespace or assume a particular daemon layout: the
+          # daemon may be the host's socket or a dind sidecar, and published ports
+          # land on whichever host runs the daemon.
           #
-          # Put qdrant in THIS container's network namespace instead: then
-          # `localhost:6334` is literally correct, nothing is published on the
-          # host (so two PRs' jobs can't collide on 6333/6334), and the tests
-          # need no environment plumbing. `hostname` is NOT the container ID
-          # on this runner -- derive the real one from /proc/self/mountinfo,
-          # which is data-root/storage-driver agnostic because it keys off the
-          # second-to-last path component, not a fixed prefix.
-          #
-          # `exit` after the print so an over-mounted /etc/hostname (two
-          # matching mountinfo lines) yields ONE id rather than a multi-line
-          # value that sails past the emptiness check and then fails opaquely
-          # inside `docker run --network container:<two ids>`.
-          #
-          # By design this hard-fails on a non-containerized (bare-metal)
-          # runner: there is no /etc/hostname bind mount to derive an id from,
-          # so the check below trips and this now-REQUIRED job goes red. That
-          # is deliberate -- a bare-metal runner needs the published-ports
-          # approach instead, and silently falling back to it would reintroduce
-          # the cross-PR port collision this netns trick exists to avoid.
-          # Whoever migrates runners: rework this step, don't just delete it.
-          cid=$(awk '$5=="/etc/hostname"{n=split($4,p,"/"); print p[n-1]; exit}' /proc/self/mountinfo)
-          if [[ -z "$cid" ]]; then
-            echo "::error::could not determine this runner's own container id"
-            exit 1
-          fi
-          # The container name must be unique per runner, not a fixed string:
-          # several self-hosted runner containers share one Docker daemon, so a
-          # hardcoded `ci-qdrant` means PR-B's startup `docker rm -f` destroys
-          # the server PR-A is mid-`cargo test` against -- failing PR-A's
-          # required check for a fault it did not cause. `cid` is already unique
-          # per runner, so key the name off it, and export it so the `Stop
-          # Qdrant` step (a separate step, with its own shell) removes the same
-          # container this one created.
-          name="ci-mcp-md-wiki-${GITHUB_JOB}-qdrant-${cid}"
+          # The container name must be unique per run, not a fixed string: several
+          # self-hosted runners can share one Docker daemon, so a hardcoded
+          # `ci-qdrant` means PR-B's startup `docker rm -f` destroys the server PR-A
+          # is mid-`cargo test` against -- failing PR-A's required check for a fault
+          # it did not cause. Export the name so the `Stop Qdrant` step (a separate
+          # step, with its own shell) removes the same container this one created.
+          name="ci-mcp-md-wiki-${GITHUB_JOB}-qdrant-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           echo "CI_QDRANT_NAME=${name}" >> "$GITHUB_ENV"
           docker rm -f "$name" 2>/dev/null || true
           # Image stays single-sourced from docker-compose.yml so the pin
@@ -345,25 +315,44 @@ jobs:
           image=$(docker compose -f docker-compose.yml config --images qdrant)
           docker run -d --name "$name" \
             --label ci.repo=mcp-md-wiki --label "ci.job=${GITHUB_JOB}" --label "ci.run=${GITHUB_RUN_ID}" \
-            --network "container:${cid}" "$image"
+            -p 6333 -p 6334 "$image"
 
       - name: Wait for Qdrant to be ready
         run: |
-          # Now genuinely this container's loopback, so a direct probe is
-          # correct (poll, not sleep -- see deploy.sh's fix, #198).
+          # Host the published ports are reachable on: the host of a tcp:// DOCKER_HOST
+          # (a dind sidecar); otherwise the local daemon, whose ports are reachable
+          # on loopback or, from a runner container, on the default gateway.
+          rest_port=$(docker port "$CI_QDRANT_NAME" 6333/tcp | head -n1 | sed 's/.*://')
+          grpc_port=$(docker port "$CI_QDRANT_NAME" 6334/tcp | head -n1 | sed 's/.*://')
+          candidates=()
+          if [[ "${DOCKER_HOST:-}" == tcp://* ]]; then
+            h=${DOCKER_HOST#tcp://}; h=${h%%/*}; h=${h%:*}
+            candidates+=("${h#[}")
+          else
+            candidates+=(127.0.0.1)
+            gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}' || true)
+            [[ -n "$gw" ]] && candidates+=("$gw")
+          fi
           timeout=60
           elapsed=0
-          while true; do
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:6333/readyz || echo "000")
-            [[ "$code" == "200" ]] && break
+          host=""
+          while [[ -z "$host" ]]; do
+            for c in "${candidates[@]}"; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' "http://${c}:${rest_port}/readyz" || echo "000")
+              if [[ "$code" == "200" ]]; then host=$c; break; fi
+            done
+            [[ -n "$host" ]] && break
             if (( elapsed >= timeout )); then
-              echo "::error::qdrant did not become ready within ${timeout}s (last HTTP status: ${code})"
+              echo "::error::qdrant did not become ready within ${timeout}s on ${candidates[*]} (last HTTP status: ${code})"
               docker logs "$CI_QDRANT_NAME"
               exit 1
             fi
             sleep 2
             elapsed=$((elapsed + 2))
           done
+          echo "qdrant ready at ${host} (rest ${rest_port}, grpc ${grpc_port})"
+          echo "QDRANT_URL=http://${host}:${rest_port}" >> "$GITHUB_ENV"
+          echo "QDRANT_GRPC_URL=http://${host}:${grpc_port}" >> "$GITHUB_ENV"
 
       - name: Run live-Qdrant tests
         run: cargo test -- --ignored
